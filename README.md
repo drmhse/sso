@@ -102,17 +102,17 @@ For detailed information on each package, please refer to their individual docum
 ### `sso/api`
 The Rust backend service. It contains all API endpoints, database logic, and authentication flows.
 *   **Technology**: Rust, Axum, Tokio, SQLx, SQLite
-*   **Documentation**: [sso/api/README.md](sso/api/README.md)
+*   **Documentation**: [api/README.md](api/README.md)
 
 ### `sso/web-client`
 The administrative frontend application. It provides the user interface for managing the platform and its organizations.
 *   **Technology**: Vue.js 3, Pinia, Vue Router, Tailwind CSS
-*   **Documentation**: [sso/web-client/README.md](sso/web-client/README.md)
+*   **Documentation**: [web-client/README.md](web-client/README.md)
 
 ### `sso/sso-sdk`
 The TypeScript client library for interacting with the `sso/api`.
 *   **Technology**: TypeScript, native `fetch`
-*   **Documentation**: [sso/sso-sdk/README.md](sso/sso-sdk/README.md)
+*   **Documentation**: [sso-sdk/README.md](sso-sdk/README.md)
 
 ## Development Workflow
 
