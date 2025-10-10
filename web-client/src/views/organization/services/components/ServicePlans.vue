@@ -287,6 +287,10 @@ const handleCreatePlan = async () => {
   creating.value = true;
 
   try {
+    if (!currentService.value?.service?.slug) {
+      throw new Error('Service information is not available');
+    }
+
     await servicesStore.createPlan(
       organizationStore.currentOrgSlug,
       currentService.value.service.slug,
@@ -305,7 +309,7 @@ const handleCreatePlan = async () => {
         showError(errorMsg);
       }
     } else {
-      showError('Failed to create plan. Please try again.');
+      showError(error.message || 'Failed to create plan. Please try again.');
     }
   } finally {
     creating.value = false;
@@ -313,7 +317,7 @@ const handleCreatePlan = async () => {
 };
 
 onMounted(async () => {
-  if (currentService.value) {
+  if (currentService.value?.service?.slug) {
     loading.value = true;
     try {
       await servicesStore.fetchPlans(

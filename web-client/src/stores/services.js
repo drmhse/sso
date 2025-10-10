@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { sso } from '@/api';
+import { ssoWithInterceptor as sso } from '@/api/interceptor';
 
 export const useServicesStore = defineStore('services', {
   state: () => ({
@@ -42,7 +42,8 @@ export const useServicesStore = defineStore('services', {
       this.error = null;
 
       try {
-        this.services = await sso.services.list(orgSlug);
+        const response = await sso.services.list(orgSlug);
+      this.services = response.services || response;
         return this.services;
       } catch (error) {
         console.error('Failed to fetch services:', error);
@@ -148,11 +149,21 @@ export const useServicesStore = defineStore('services', {
         this.oauthCredentials[provider] = credentials;
         return credentials;
       } catch (error) {
-        // If credentials don't exist (404), that's okay - just return null
-        if (error.status === 404 || error.response?.status === 404) {
+        // If credentials don't exist (404), that's okay - just return null silently
+        // Check if it's a 404 error using multiple approaches for robustness
+        const is404 =
+          error.statusCode === 404 ||
+          error.status === 404 ||
+          error.response?.status === 404 ||
+          (typeof error.isNotFound === 'function' && error.isNotFound()) ||
+          error.message?.toLowerCase().includes('not found');
+
+        if (is404) {
           this.oauthCredentials[provider] = null;
           return null;
         }
+
+        // Only log and throw for non-404 errors
         console.error(`Failed to fetch ${provider} credentials:`, error);
         throw error;
       }

@@ -50,6 +50,12 @@ export function useNotifications() {
     notifications.value = [];
   };
 
+  // Add commonly used aliases
+  const showSuccess = success;
+  const showError = error;
+  const showWarning = warning;
+  const showInfo = info;
+
   return {
     notifications,
     addNotification,
@@ -59,5 +65,10 @@ export function useNotifications() {
     warning,
     info,
     clear,
+    // Aliases for backward compatibility
+    showSuccess,
+    showError,
+    showWarning,
+    showInfo,
   };
 }

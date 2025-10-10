@@ -78,7 +78,7 @@
               </span>
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-              {{ org.tier_id || 'None' }}
+              {{ getTierDisplayName(org.tier_id) }}
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
               {{ formatDate(org.created_at) }}
@@ -132,13 +132,21 @@
           Approve <strong>{{ approvalModal.organization?.name }}</strong> and assign a tier.
         </p>
 
-        <BaseInput
-          v-model="approvalModal.tierId"
-          label="Tier ID"
-          placeholder="tier-starter"
-          required
-          hint="Enter the tier ID to assign to this organization"
-        />
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">
+            Tier <span class="text-red-500">*</span>
+          </label>
+          <select
+            v-model="approvalModal.tierId"
+            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+            required
+          >
+            <option v-for="tier in tiers" :key="tier.id" :value="tier.id">
+              {{ tier.display_name }} - ${{ (tier.price_cents / 100).toFixed(2) }}/{{ tier.currency }}
+            </option>
+          </select>
+          <p class="mt-1 text-sm text-gray-500">Select the tier to assign to this organization</p>
+        </div>
       </div>
     </BaseModal>
 
@@ -174,7 +182,6 @@ import { usePlatformStore } from '@/stores/platform';
 import { useNotifications } from '@/composables/useNotifications';
 import { formatDate } from '@/utils/formatters';
 import BaseModal from '@/components/BaseModal.vue';
-import BaseInput from '@/components/BaseInput.vue';
 import LoadingSpinner from '@/components/LoadingSpinner.vue';
 import EmptyState from '@/components/EmptyState.vue';
 
@@ -184,11 +191,12 @@ const { success, error } = useNotifications();
 const statusFilter = ref(null);
 
 const organizations = computed(() => platformStore.organizations);
+const tiers = computed(() => platformStore.tiers);
 
 const approvalModal = ref({
   isOpen: false,
   organization: null,
-  tierId: 'tier-starter',
+  tierId: 'tier_starter',
 });
 
 const rejectionModal = ref({
@@ -205,6 +213,12 @@ const statusClass = (status) => {
     rejected: 'bg-gray-100 text-gray-800',
   };
   return classes[status] || 'bg-gray-100 text-gray-800';
+};
+
+const getTierDisplayName = (tierId) => {
+  if (!tierId) return 'None';
+  const tier = tiers.value.find(t => t.id === tierId);
+  return tier ? tier.display_name : tierId;
 };
 
 const handleFilterChange = async () => {
@@ -231,7 +245,7 @@ const openApprovalModal = (org) => {
   approvalModal.value = {
     isOpen: true,
     organization: org,
-    tierId: 'tier-starter',
+    tierId: 'tier_starter',
   };
 };
 
@@ -239,7 +253,7 @@ const closeApprovalModal = () => {
   approvalModal.value = {
     isOpen: false,
     organization: null,
-    tierId: 'tier-starter',
+    tierId: 'tier_starter',
   };
 };
 
@@ -313,6 +327,7 @@ const handleActivate = async (org) => {
 };
 
 onMounted(() => {
+  platformStore.fetchTiers();
   platformStore.fetchOrganizations();
 });
 </script>

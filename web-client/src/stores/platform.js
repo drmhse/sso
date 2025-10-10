@@ -1,10 +1,11 @@
 import { defineStore } from 'pinia';
-import { sso } from '@/api';
+import { ssoWithInterceptor as sso } from '@/api/interceptor';
 
 export const usePlatformStore = defineStore('platform', {
   state: () => ({
     organizations: [],
     total: 0,
+    tiers: [],
     loading: false,
     error: null,
     filters: {
@@ -29,6 +30,19 @@ export const usePlatformStore = defineStore('platform', {
   },
 
   actions: {
+    /**
+     * Fetch all available organization tiers
+     */
+    async fetchTiers() {
+      try {
+        this.tiers = await sso.platform.getTiers();
+      } catch (error) {
+        console.error('Failed to fetch tiers:', error);
+        this.error = error.message || 'Failed to fetch tiers';
+        throw error;
+      }
+    },
+
     /**
      * Fetch organizations with optional filters
      */

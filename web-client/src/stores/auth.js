@@ -17,7 +17,7 @@ export const useAuthStore = defineStore('auth', {
     },
 
     isPlatformOwner: (state) => {
-      return state.claims?.platform_owner === true;
+      return state.claims?.is_platform_owner === true;
     },
 
     currentRole: (state) => {

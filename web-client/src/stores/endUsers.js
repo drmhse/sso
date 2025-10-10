@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { sso } from '@/api';
+import { ssoWithInterceptor as sso } from '@/api/interceptor';
 
 export const useEndUsersStore = defineStore('endUsers', {
   state: () => ({

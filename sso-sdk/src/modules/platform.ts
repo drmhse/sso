@@ -1,6 +1,7 @@
 import { HttpClient } from '../http';
 import {
   Organization,
+  OrganizationTier,
   PlatformOrganizationsListResponse,
   ListPlatformOrganizationsParams,
   ApproveOrganizationPayload,
@@ -17,6 +18,22 @@ import {
  */
 export class PlatformModule {
   constructor(private http: HttpClient) {}
+
+  /**
+   * List all available organization tiers.
+   *
+   * @returns Array of organization tiers
+   *
+   * @example
+   * ```typescript
+   * const tiers = await sso.platform.getTiers();
+   * console.log(tiers); // [{ id: 'tier_free', display_name: 'Free Tier', ... }]
+   * ```
+   */
+  public async getTiers(): Promise<OrganizationTier[]> {
+    const response = await this.http.get<OrganizationTier[]>('/api/platform/tiers');
+    return response.data;
+  }
 
   /**
    * Organization management for platform owners

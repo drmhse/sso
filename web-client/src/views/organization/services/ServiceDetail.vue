@@ -21,8 +21,8 @@
         </div>
 
         <div class="mt-4">
-          <h1 class="text-2xl font-bold text-gray-900">{{ currentService?.name || 'Service Details' }}</h1>
-          <p class="mt-1 text-sm text-gray-600 font-mono">{{ currentService?.slug }}</p>
+          <h1 class="text-2xl font-bold text-gray-900">{{ currentService?.service?.name || 'Service Details' }}</h1>
+          <p class="mt-1 text-sm text-gray-600 font-mono">{{ currentService?.service?.slug }}</p>
         </div>
       </div>
 
