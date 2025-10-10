@@ -122,6 +122,29 @@ localStorage.removeItem('jwt');
 
 ## API Reference
 
+### Analytics
+
+The analytics module provides login tracking and metrics for organizations.
+
+```typescript
+// Get login trends over time
+const trends = await sso.analytics.getLoginTrends('acme-corp', {
+  start_date: '2025-01-01',
+  end_date: '2025-01-31'
+});
+
+// Get logins grouped by service
+const byService = await sso.analytics.getLoginsByService('acme-corp');
+
+// Get logins grouped by OAuth provider
+const byProvider = await sso.analytics.getLoginsByProvider('acme-corp');
+
+// Get recent login events
+const recent = await sso.analytics.getRecentLogins('acme-corp', {
+  limit: 10
+});
+```
+
 ### Organizations
 
 ```typescript
@@ -155,28 +178,61 @@ await sso.organizations.oauthCredentials.set('acme-corp', 'github', {
   client_id: 'Iv1.abc123',
   client_secret: 'secret-value'
 });
+
+// Get configured OAuth credentials
+const creds = await sso.organizations.oauthCredentials.get('acme-corp', 'github');
+```
+
+### End-User Management
+
+Manage your organization's customers (end-users with subscriptions).
+
+```typescript
+// List all end-users for an organization
+const endUsers = await sso.organizations.endUsers.list('acme-corp', {
+  page: 1,
+  limit: 20
+});
+
+// Get detailed information about a specific end-user
+const endUser = await sso.organizations.endUsers.get('acme-corp', 'user-id');
+
+// Revoke all active sessions for an end-user
+const result = await sso.organizations.endUsers.revokeSessions('acme-corp', 'user-id');
 ```
 
 ### Services
 
 ```typescript
-// Create service
-const service = await sso.services.create('acme-corp', {
+// Create service (returns service with provider grants and default plan)
+const result = await sso.services.create('acme-corp', {
   slug: 'main-app',
   name: 'Main Application',
   service_type: 'web',
   github_scopes: ['user:email', 'read:org'],
+  microsoft_scopes: ['User.Read', 'email'],
+  google_scopes: ['openid', 'email', 'profile'],
   redirect_uris: ['https://app.acme.com/callback']
 });
+console.log(result.service.client_id);
+console.log(result.usage.current_services);
 
-// List services
-const services = await sso.services.list('acme-corp');
+// List services (returns services with usage metadata)
+const result = await sso.services.list('acme-corp');
+console.log(`Using ${result.usage.current_services} of ${result.usage.max_services} services`);
+result.services.forEach(svc => console.log(svc.name, svc.client_id));
 
-// Get service details
-const details = await sso.services.get('acme-corp', 'main-app');
+// Get service details (includes provider grants and plans)
+const service = await sso.services.get('acme-corp', 'main-app');
+console.log(service.service.redirect_uris);
+console.log(service.plans);
 
 // Update service
-await sso.services.update('acme-corp', 'main-app', {
+const updated = await sso.services.update('acme-corp', 'main-app', {
+  name: 'Main Application v2',
+  github_scopes: ['user:email', 'read:org', 'repo'],
+  microsoft_scopes: ['User.Read', 'email', 'Mail.Read'],
+  google_scopes: ['openid', 'email', 'profile', 'drive.readonly'],
   redirect_uris: ['https://app.acme.com/callback', 'https://app.acme.com/oauth']
 });
 
@@ -186,9 +242,14 @@ await sso.services.delete('acme-corp', 'old-service');
 // Manage plans
 const plan = await sso.services.plans.create('acme-corp', 'main-app', {
   name: 'pro',
+  description: 'Pro tier with advanced features',
   price_monthly: 29.99,
-  features: ['api-access', 'advanced-analytics']
+  features: ['api-access', 'advanced-analytics', 'priority-support']
 });
+
+// List all plans for a service
+const plans = await sso.services.plans.list('acme-corp', 'main-app');
+plans.forEach(plan => console.log(plan.name, plan.price_monthly));
 ```
 
 ### Invitations
@@ -227,6 +288,22 @@ await sso.user.updateProfile({ email: 'newemail@example.com' });
 
 // Get subscription
 const subscription = await sso.user.getSubscription();
+```
+
+### Social Account Identities
+
+Manage linked social accounts for the authenticated user.
+
+```typescript
+// List all linked social accounts
+const identities = await sso.user.identities.list();
+
+// Start linking a new social account
+const { authorization_url } = await sso.user.identities.startLink('github');
+window.location.href = authorization_url;
+
+// Unlink a social account
+await sso.user.identities.unlink('google');
 ```
 
 ### Provider Tokens
@@ -274,6 +351,12 @@ await sso.platform.promoteOwner({
   user_id: 'user-uuid-here'
 });
 
+// Demote platform owner to regular user
+await sso.platform.demoteOwner('user-uuid-here');
+
+// List available organization tiers
+const tiers = await sso.platform.getTiers();
+
 // Get audit log
 const logs = await sso.platform.getAuditLog({
   action: 'organization.approved',
@@ -305,6 +388,12 @@ try {
     }
     if (error.is('SERVICE_LIMIT_EXCEEDED')) {
       // Handle specific error
+    }
+    if (error.isForbidden()) {
+      // Handle permission errors
+    }
+    if (error.isAuthError()) {
+      // Handle authentication errors
     }
   }
 }
@@ -387,9 +476,25 @@ import type {
   Service,
   User,
   JwtClaims,
-  OAuthProvider
+  OAuthProvider,
+  SsoClientOptions,
+  SsoApiError,
+  AnalyticsQuery,
+  LoginTrendPoint,
+  LoginsByService,
+  LoginsByProvider,
+  RecentLogin,
+  Invitation,
+  Subscription,
+  ProviderToken,
+  UserProfile,
+  PlatformOrganizationResponse,
+  AuditLogEntry,
+  // ... and many more types
 } from '@drmhse/sso-sdk';
 ```
+
+All API responses, request payloads, and configuration options are fully typed for excellent IDE support and compile-time safety.
 
 ## License
 
