@@ -22,7 +22,7 @@
             Service Slug
           </label>
           <input
-            :value="currentService?.service?.slug"
+            :value="currentService?.slug"
             type="text"
             disabled
             readonly
@@ -53,14 +53,14 @@
         </label>
         <div class="flex gap-2">
           <input
-            :value="currentService?.service?.client_id"
+            :value="currentService?.client_id"
             type="text"
             readonly
             class="block w-full rounded-md border-gray-300 bg-gray-50 shadow-sm sm:text-sm font-mono"
           />
           <button
             type="button"
-            @click="copyToClipboard(currentService?.service?.client_id)"
+            @click="copyToClipboard(currentService?.client_id)"
             class="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
           >
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -252,11 +252,11 @@ const showDeleteConfirm = ref(false);
 
 const initializeForm = () => {
   if (currentService.value) {
-    const service = currentService.value.service;
+    const service = currentService.value;
     form.value = {
       name: service.name,
       service_type: service.service_type,
-      redirect_uris: [...service.redirect_uris],
+      redirect_uris: [...(service.redirect_uris || [])],
     };
 
     scopesInput.value = {
@@ -322,7 +322,7 @@ const handleUpdate = async () => {
   try {
     await servicesStore.updateService(
       organizationStore.currentOrgSlug,
-      currentService.value.service.slug,
+      currentService.value.slug,
       payload
     );
 
@@ -343,7 +343,7 @@ const handleDelete = async () => {
   try {
     await servicesStore.deleteService(
       organizationStore.currentOrgSlug,
-      currentService.value.service.slug
+      currentService.value.slug
     );
 
     showSuccess('Service deleted successfully');

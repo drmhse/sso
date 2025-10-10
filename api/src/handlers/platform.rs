@@ -118,6 +118,28 @@ where
 // Platform Governance Endpoints
 // ============================================================================
 
+/// GET /api/platform/tiers
+/// List all available organization tiers
+pub async fn list_tiers(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<Json<Vec<OrganizationTier>>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    let tiers = sqlx::query_as::<_, OrganizationTier>(
+        "SELECT * FROM organization_tiers ORDER BY price_cents ASC",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(Json(tiers))
+}
+
 /// GET /api/platform/organizations
 /// List organizations with optional filters
 pub async fn list_organizations(

@@ -7,6 +7,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -262,6 +263,40 @@ pub async fn require_org_admin_or_owner(
         user: auth_user.user.clone(),
         membership: check_org_admin(&state.pool, &auth_user.user.id, &org.id).await?,
     });
+
+    Ok(next.run(req).await)
+}
+
+/// Extractor struct for organization slug path parameter
+#[derive(Deserialize)]
+pub struct OrgSlugParam {
+    org_slug: String,
+}
+
+/// Middleware to require organization to be in active status
+/// This prevents access to certain features (services, BYOO credentials, etc.)
+/// while organization is pending approval
+pub async fn require_active_organization(
+    State(state): State<crate::handlers::auth::AppState>,
+    Path(path): Path<OrgSlugParam>,
+    req: Request,
+    next: Next,
+) -> std::result::Result<Response, AppError> {
+    // Get organization
+    let org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE slug = ?")
+        .bind(&path.org_slug)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(AppError::Database)?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Check if organization is active
+    if org.status != "active" {
+        return Err(AppError::Forbidden(format!(
+            "Organization is not active. Current status: {}. This feature is only available for active organizations.",
+            org.status
+        )));
+    }
 
     Ok(next.run(req).await)
 }

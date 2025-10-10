@@ -72,6 +72,39 @@ pub struct Service {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceResponse {
+    pub id: String,
+    pub org_id: String,
+    pub slug: String,
+    pub name: String,
+    pub service_type: String,
+    pub client_id: String,
+    pub github_scopes: Option<Vec<String>>,
+    pub microsoft_scopes: Option<Vec<String>>,
+    pub google_scopes: Option<Vec<String>>,
+    pub redirect_uris: Option<Vec<String>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<Service> for ServiceResponse {
+    fn from(service: Service) -> Self {
+        Self {
+            id: service.id,
+            org_id: service.org_id,
+            slug: service.slug,
+            name: service.name,
+            service_type: service.service_type,
+            client_id: service.client_id,
+            github_scopes: service.github_scopes.and_then(|s| serde_json::from_str(&s).ok()),
+            microsoft_scopes: service.microsoft_scopes.and_then(|s| serde_json::from_str(&s).ok()),
+            google_scopes: service.google_scopes.and_then(|s| serde_json::from_str(&s).ok()),
+            redirect_uris: service.redirect_uris.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at: service.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Plan {
     pub id: String,

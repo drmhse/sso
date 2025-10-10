@@ -31,8 +31,8 @@ use crate::handlers::organizations::{
 };
 use crate::handlers::platform::{
     activate_organization, approve_organization, demote_platform_owner, get_audit_log,
-    list_organizations, promote_platform_owner, reject_organization, suspend_organization,
-    update_organization_tier,
+    list_organizations, list_tiers, promote_platform_owner, reject_organization,
+    suspend_organization, update_organization_tier,
 };
 use crate::handlers::provider_token::get_provider_token;
 use crate::handlers::services::{
@@ -293,34 +293,10 @@ async fn main() -> anyhow::Result<()> {
         stripe_service: stripe_service.clone(),
     };
 
-    // Build protected routes (require JWT)
-    let protected_routes = Router::new()
-        .route("/api/user", get(get_user))
-        .route("/api/user", patch(update_user))
-        .route("/api/subscription", get(get_subscription))
-        .route("/api/provider-token/:provider", get(get_provider_token))
-        // Identity linking routes
-        .route("/api/user/identities", get(list_identities))
-        .route("/api/user/identities/:provider/link", post(start_link))
-        .route("/api/user/identities/:provider", delete(unlink_identity))
-        // Organization routes
-        .route("/api/organizations", get(list_user_organizations))
-        .route("/api/organizations/:org_slug", get(get_organization))
-        .route("/api/organizations/:org_slug", patch(update_organization))
-        .route("/api/organizations/:org_slug/members", get(list_members))
-        .route(
-            "/api/organizations/:org_slug/members/:user_id",
-            patch(update_member_role),
-        )
-        .route(
-            "/api/organizations/:org_slug/members/:user_id",
-            post(remove_member),
-        )
-        .route(
-            "/api/organizations/:org_slug/transfer-ownership",
-            post(transfer_ownership),
-        )
-        // OAuth credentials management
+    // Build routes that require active organization status
+    // These routes are restricted when org is pending/suspended
+    let active_org_routes = Router::new()
+        // OAuth credentials management (BYOO)
         .route(
             "/api/organizations/:org_slug/oauth-credentials/:provider",
             post(set_org_oauth_credentials),
@@ -339,7 +315,47 @@ async fn main() -> anyhow::Result<()> {
             "/api/organizations/:org_slug/users/:user_id/sessions",
             delete(revoke_end_user_sessions),
         )
-        // Invitation routes
+        // Service management routes - combine methods for the same path
+        .route("/api/organizations/:org_slug/services/:service_slug/plans",
+                get(list_service_plans).post(create_plan))
+        .route("/api/organizations/:org_slug/services/:service_slug",
+                get(get_service).patch(update_service).delete(delete_service))
+        .route("/api/organizations/:org_slug/services",
+                get(list_organization_services).post(create_service))
+        // Apply active organization check middleware
+        .route_layer(axum_middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::middleware::require_active_organization,
+        ));
+
+    // Build protected routes (require JWT)
+    let protected_routes = Router::new()
+        .route("/api/user", get(get_user))
+        .route("/api/user", patch(update_user))
+        .route("/api/subscription", get(get_subscription))
+        .route("/api/provider-token/:provider", get(get_provider_token))
+        // Identity linking routes
+        .route("/api/user/identities", get(list_identities))
+        .route("/api/user/identities/:provider/link", post(start_link))
+        .route("/api/user/identities/:provider", delete(unlink_identity))
+        // Organization routes (not restricted by org status)
+        .route("/api/organizations", get(list_user_organizations))
+        .route("/api/organizations/:org_slug", get(get_organization))
+        .route("/api/organizations/:org_slug", patch(update_organization))
+        .route("/api/organizations/:org_slug/members", get(list_members))
+        .route(
+            "/api/organizations/:org_slug/members/:user_id",
+            patch(update_member_role),
+        )
+        .route(
+            "/api/organizations/:org_slug/members/:user_id",
+            post(remove_member),
+        )
+        .route(
+            "/api/organizations/:org_slug/transfer-ownership",
+            post(transfer_ownership),
+        )
+        // Invitation routes (not restricted by org status)
         .route(
             "/api/organizations/:org_slug/invitations",
             post(create_invitation),
@@ -356,36 +372,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/invitations/accept", post(accept_invitation))
         .route("/api/invitations/decline", post(decline_invitation))
         .route("/invitations/accept", get(accept_invitation_redirect)) // For email links
-        // Service management routes
-        .route(
-            "/api/organizations/:org_slug/services",
-            get(list_organization_services),
-        )
-        .route(
-            "/api/organizations/:org_slug/services",
-            post(create_service),
-        )
-        .route(
-            "/api/organizations/:org_slug/services/:service_slug",
-            get(get_service),
-        )
-        .route(
-            "/api/organizations/:org_slug/services/:service_slug",
-            patch(update_service),
-        )
-        .route(
-            "/api/organizations/:org_slug/services/:service_slug",
-            delete(delete_service),
-        )
-        // Service plan management routes
-        .route(
-            "/api/organizations/:org_slug/services/:service_slug/plans",
-            get(list_service_plans),
-        )
-        .route(
-            "/api/organizations/:org_slug/services/:service_slug/plans",
-            post(create_plan),
-        )
+        // Merge active org routes
+        .merge(active_org_routes)
         .route_layer(axum_middleware::from_fn_with_state(
             (app_state.pool.clone(), app_state.jwt_service.clone()),
             crate::middleware::extract_user_from_jwt,
@@ -393,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build platform owner routes (require JWT + platform owner)
     let platform_routes = Router::new()
+        .route("/api/platform/tiers", get(list_tiers))
         .route("/api/platform/organizations", get(list_organizations))
         .route(
             "/api/platform/organizations/:id/approve",

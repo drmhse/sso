@@ -1,4 +1,4 @@
-use crate::db::models::{Membership, Organization, Plan, ProviderTokenGrant, Service};
+use crate::db::models::{Membership, Organization, Plan, ProviderTokenGrant, Service, ServiceResponse};
 use crate::error::Result;
 use crate::handlers::auth::AppState;
 use crate::middleware::AuthUser;
@@ -35,7 +35,7 @@ pub struct UpdateServiceRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ServiceWithGrantsResponse {
-    pub service: Service,
+    pub service: ServiceResponse,
     pub provider_grants: Vec<ProviderTokenGrant>,
     pub default_plan: Plan,
     pub usage: ServiceUsageInfo,
@@ -57,7 +57,7 @@ pub struct ServiceListResponse {
 #[derive(Debug, Serialize)]
 pub struct ServiceWithDetails {
     #[serde(flatten)]
-    pub service: Service,
+    pub service: ServiceResponse,
     pub plan_count: i64,
     pub subscription_count: i64,
 }
@@ -77,6 +77,7 @@ pub struct CreatePlanRequest {
     pub currency: String,
     pub features: Option<Vec<String>>,
 }
+
 
 #[derive(Debug, Serialize)]
 pub struct PlanResponse {
@@ -220,6 +221,7 @@ pub async fn create_service(
             id, org_id, slug, name, service_type, client_id,
             github_scopes, microsoft_scopes, google_scopes, redirect_uris, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING *
         "#,
     )
     .bind(&service_id)
@@ -245,6 +247,7 @@ pub async fn create_service(
             r#"
             INSERT INTO provider_token_grants (id, service_id, provider, required, created_at)
             VALUES (?, ?, ?, ?, ?)
+            RETURNING *
             "#,
         )
         .bind(&grant_id)
@@ -263,6 +266,7 @@ pub async fn create_service(
             r#"
             INSERT INTO provider_token_grants (id, service_id, provider, required, created_at)
             VALUES (?, ?, ?, ?, ?)
+            RETURNING *
             "#,
         )
         .bind(&grant_id)
@@ -281,6 +285,7 @@ pub async fn create_service(
             r#"
             INSERT INTO provider_token_grants (id, service_id, provider, required, created_at)
             VALUES (?, ?, ?, ?, ?)
+            RETURNING *
             "#,
         )
         .bind(&grant_id)
@@ -299,6 +304,7 @@ pub async fn create_service(
         r#"
         INSERT INTO plans (id, service_id, name, price_cents, currency, features, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
+        RETURNING *
         "#,
     )
     .bind(&plan_id)
@@ -322,7 +328,7 @@ pub async fn create_service(
     };
 
     Ok(Json(ServiceWithGrantsResponse {
-        service,
+        service: ServiceResponse::from(service),
         provider_grants,
         default_plan,
         usage,
@@ -418,7 +424,7 @@ pub async fn list_organization_services(
             .unwrap_or(0);
 
             ServiceWithDetails {
-                service,
+                service: ServiceResponse::from(service),
                 plan_count,
                 subscription_count,
             }
@@ -446,7 +452,7 @@ pub async fn get_service(
     State(state): State<AppState>,
     Path((org_slug, service_slug)): Path<(String, String)>,
     auth_user: axum::Extension<AuthUser>,
-) -> Result<Json<Service>> {
+) -> Result<Json<ServiceResponse>> {
     // Get organization and verify membership
     let org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE slug = ?")
         .bind(&org_slug)
@@ -474,7 +480,7 @@ pub async fn get_service(
             .await?
             .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
 
-    Ok(Json(service))
+    Ok(Json(ServiceResponse::from(service)))
 }
 
 // Update service configuration
@@ -483,7 +489,7 @@ pub async fn update_service(
     Path((org_slug, service_slug)): Path<(String, String)>,
     auth_user: axum::Extension<AuthUser>,
     Json(req): Json<UpdateServiceRequest>,
-) -> Result<Json<Service>> {
+) -> Result<Json<ServiceResponse>> {
     // Get organization
     let org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE slug = ?")
         .bind(&org_slug)
@@ -570,7 +576,7 @@ pub async fn update_service(
 
     let updated_service = query.fetch_one(&state.pool).await?;
 
-    Ok(Json(updated_service))
+    Ok(Json(ServiceResponse::from(updated_service)))
 }
 
 // Delete service
@@ -669,6 +675,7 @@ pub async fn create_plan(
         INSERT INTO plans (
             id, service_id, name, price_cents, currency, features, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        RETURNING *
         "#,
     )
     .bind(&id)
