@@ -233,3 +233,14 @@ pub struct PlatformAuditLog {
     pub metadata: Option<String>,
     pub created_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct LoginEvent {
+    pub id: String,
+    pub user_id: String,
+    pub service_id: String,
+    pub provider: String,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub created_at: DateTime<Utc>,
+}

@@ -11,3 +11,4 @@ export * from './service';
 export * from './invitation';
 export * from './platform';
 export * from './enduser';
+export * from './analytics';

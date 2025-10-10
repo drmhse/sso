@@ -138,3 +138,16 @@ export interface OAuthCredentials {
 export interface ListOrganizationsParams extends PaginationParams {
   status?: OrganizationStatus;
 }
+
+/**
+ * Member list response with pagination metadata
+ */
+export interface MemberListResponse {
+  members: OrganizationMember[];
+  total: number;
+  limit: {
+    current: number;
+    max: number;
+    source: string;
+  };
+}

@@ -7,6 +7,7 @@ import {
   UpdateOrganizationPayload,
   ListOrganizationsParams,
   OrganizationMember,
+  MemberListResponse,
   UpdateMemberRolePayload,
   TransferOwnershipPayload,
   SetOAuthCredentialsPayload,
@@ -114,16 +115,17 @@ export class OrganizationsModule {
      * List all members of an organization.
      *
      * @param orgSlug Organization slug
-     * @returns Array of organization members
+     * @returns Member list response with pagination metadata
      *
      * @example
      * ```typescript
-     * const members = await sso.organizations.members.list('acme-corp');
-     * members.forEach(m => console.log(m.email, m.role));
+     * const result = await sso.organizations.members.list('acme-corp');
+     * console.log(`Total members: ${result.total}`);
+     * result.members.forEach(m => console.log(m.email, m.role));
      * ```
      */
-    list: async (orgSlug: string): Promise<OrganizationMember[]> => {
-      const response = await this.http.get<OrganizationMember[]>(
+    list: async (orgSlug: string): Promise<MemberListResponse> => {
+      const response = await this.http.get<MemberListResponse>(
         `/api/organizations/${orgSlug}/members`
       );
       return response.data;

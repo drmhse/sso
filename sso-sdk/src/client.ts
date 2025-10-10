@@ -1,4 +1,5 @@
 import { HttpClient, createHttpAgent } from './http';
+import { AnalyticsModule } from './modules/analytics';
 import { AuthModule } from './modules/auth';
 import { UserModule } from './modules/user';
 import { OrganizationsModule } from './modules/organizations';
@@ -41,6 +42,11 @@ export class SsoClient {
   private http: HttpClient;
 
   /**
+   * Analytics and login tracking methods
+   */
+  public readonly analytics: AnalyticsModule;
+
+  /**
    * Authentication and OAuth flow methods
    */
   public readonly auth: AuthModule;
@@ -78,6 +84,7 @@ export class SsoClient {
     }
 
     // Instantiate all modules
+    this.analytics = new AnalyticsModule(this.http);
     this.auth = new AuthModule(this.http);
     this.user = new UserModule(this.http);
     this.organizations = new OrganizationsModule(this.http);

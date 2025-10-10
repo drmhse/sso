@@ -2,6 +2,7 @@ import { HttpClient } from '../http';
 import {
   Service,
   ServiceResponse,
+  ServiceListResponse,
   CreateServicePayload,
   CreateServiceResponse,
   UpdateServicePayload,
@@ -47,16 +48,17 @@ export class ServicesModule {
    * List all services for an organization.
    *
    * @param orgSlug Organization slug
-   * @returns Array of services
+   * @returns Service list response with usage metadata
    *
    * @example
    * ```typescript
-   * const services = await sso.services.list('acme-corp');
-   * services.forEach(svc => console.log(svc.name, svc.client_id));
+   * const result = await sso.services.list('acme-corp');
+   * console.log(`Using ${result.usage.current_services} of ${result.usage.max_services} services`);
+   * result.services.forEach(svc => console.log(svc.name, svc.client_id));
    * ```
    */
-  public async list(orgSlug: string): Promise<Service[]> {
-    const response = await this.http.get<Service[]>(`/api/organizations/${orgSlug}/services`);
+  public async list(orgSlug: string): Promise<ServiceListResponse> {
+    const response = await this.http.get<ServiceListResponse>(`/api/organizations/${orgSlug}/services`);
     return response.data;
   }
 

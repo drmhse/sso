@@ -100,3 +100,23 @@ export interface CreatePlanPayload {
   features: string[];
   is_default?: boolean;
 }
+
+/**
+ * Service with aggregated details
+ */
+export interface ServiceWithDetails extends Service {
+  plan_count: number;
+  subscription_count: number;
+}
+
+/**
+ * Service list response with usage metadata
+ */
+export interface ServiceListResponse {
+  services: ServiceWithDetails[];
+  usage: {
+    current_services: number;
+    max_services: number;
+    tier: string;
+  };
+}

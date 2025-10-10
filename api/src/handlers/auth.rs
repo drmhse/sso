@@ -455,6 +455,11 @@ pub async fn auth_callback(
             .execute(&state.pool)
             .await?;
 
+            // Record login event if service_id is available
+            if let Some(ref service_id) = oauth_ctx.service_id {
+                let _ = record_login_event(&state.pool, &user.id, service_id, provider).await;
+            }
+
             // Redirect with JWT as query parameter
             let redirect_url = format!("{}?token={}", redirect_uri, jwt);
             return Ok(Redirect::to(&redirect_url).into_response());
@@ -700,6 +705,7 @@ pub async fn token_exchange(
     let result = sqlx::query!(
         r#"
         SELECT
+            s.id as service_id,
             s.slug as service_slug,
             o.slug as org_slug,
             p.name as plan_name,
@@ -752,6 +758,21 @@ pub async fn token_exchange(
     )
     .execute(&state.pool)
     .await?;
+
+    // Record login event - get provider from most recent identity
+    if let Some(ref service_id) = result.service_id {
+        if let Ok(provider_str) = sqlx::query_scalar::<_, String>(
+            "SELECT provider FROM identities WHERE user_id = ? ORDER BY last_refreshed_at DESC LIMIT 1"
+        )
+        .bind(&user_id)
+        .fetch_one(&state.pool)
+        .await
+        {
+            if let Ok(provider) = Provider::from_str(&provider_str) {
+                let _ = record_login_event(&state.pool, &user_id, service_id, provider).await;
+            }
+        }
+    }
 
     Ok(Json(TokenResponse {
         access_token: token,
@@ -1292,4 +1313,29 @@ fn get_authorization_url_for_client(
         .unwrap_or_default();
 
     (auth_url.to_string(), csrf_token, verifier_secret)
+}
+
+/// Record login event for analytics
+async fn record_login_event(
+    pool: &SqlitePool,
+    user_id: &str,
+    service_id: &str,
+    provider: Provider,
+) -> Result<()> {
+    let id = Uuid::new_v4().to_string();
+    let provider_str = provider.as_str();
+
+    // Record login event (fire and forget - don't fail the login if this fails)
+    let _ = sqlx::query(
+        "INSERT INTO login_events (id, user_id, service_id, provider, created_at)
+         VALUES (?, ?, ?, ?, datetime('now'))"
+    )
+    .bind(&id)
+    .bind(user_id)
+    .bind(service_id)
+    .bind(provider_str)
+    .execute(pool)
+    .await;
+
+    Ok(())
 }

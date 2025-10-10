@@ -15,6 +15,10 @@ use crate::billing::stripe::StripeService;
 use crate::config::Config;
 use crate::db::models::DeviceCode;
 use crate::encryption::EncryptionService;
+use crate::handlers::analytics::{
+    get_login_trends, get_logins_by_provider, get_logins_by_service, get_recent_logins,
+    AnalyticsState,
+};
 use crate::handlers::auth::{
     activate_page, auth_admin_callback, auth_admin_provider, auth_callback, auth_provider,
     device_code, device_verify, logout, token_exchange, AppState, DbRequest,
@@ -293,6 +297,10 @@ async fn main() -> anyhow::Result<()> {
         stripe_service: stripe_service.clone(),
     };
 
+    let analytics_state = AnalyticsState {
+        pool: pool.clone(),
+    };
+
     // Build routes that require active organization status
     // These routes are restricted when org is pending/suspended
     let active_org_routes = Router::new()
@@ -326,6 +334,30 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(axum_middleware::from_fn_with_state(
             app_state.clone(),
             crate::middleware::require_active_organization,
+        ));
+
+    // Analytics routes (require JWT and org membership)
+    let analytics_routes = Router::new()
+        .route(
+            "/api/organizations/:org_slug/analytics/login-trends",
+            get(get_login_trends),
+        )
+        .route(
+            "/api/organizations/:org_slug/analytics/logins-by-service",
+            get(get_logins_by_service),
+        )
+        .route(
+            "/api/organizations/:org_slug/analytics/logins-by-provider",
+            get(get_logins_by_provider),
+        )
+        .route(
+            "/api/organizations/:org_slug/analytics/recent-logins",
+            get(get_recent_logins),
+        )
+        .with_state(analytics_state)
+        .route_layer(axum_middleware::from_fn_with_state(
+            (app_state.pool.clone(), app_state.jwt_service.clone()),
+            crate::middleware::extract_user_from_jwt,
         ));
 
     // Build protected routes (require JWT)
@@ -440,6 +472,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(protected_routes)
         .merge(platform_routes)
         .with_state(app_state)
+        // Analytics routes (separate state)
+        .merge(analytics_routes)
         // Webhook routes (separate state)
         .route("/webhooks/stripe", post(stripe_webhook))
         .with_state(webhook_state)
