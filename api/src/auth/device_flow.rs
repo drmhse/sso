@@ -1,3 +1,4 @@
+use crate::constants::DEVICE_CODE_EXPIRE_MINUTES;
 use crate::db::models::DeviceCode;
 use crate::error::{AppError, Result};
 use chrono::{Duration, Utc};
@@ -6,7 +7,6 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 const USER_CODE_LENGTH: usize = 8;
-const DEVICE_CODE_EXPIRATION_MINUTES: i64 = 15;
 
 pub struct DeviceFlowService;
 
@@ -41,7 +41,7 @@ impl DeviceFlowService {
         let id = Uuid::new_v4().to_string();
         let device_code_str = Self::generate_device_code();
         let user_code = Self::generate_user_code();
-        let expires_at = Utc::now() + Duration::minutes(DEVICE_CODE_EXPIRATION_MINUTES);
+        let expires_at = Utc::now() + Duration::minutes(DEVICE_CODE_EXPIRE_MINUTES);
 
         // Use INSERT ... RETURNING for efficiency
         let device_code = sqlx::query_as::<_, DeviceCode>(

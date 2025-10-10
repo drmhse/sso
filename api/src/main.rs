@@ -13,6 +13,7 @@ use crate::auth::jwt::JwtService;
 use crate::auth::sso::OAuthClient;
 use crate::billing::stripe::StripeService;
 use crate::config::Config;
+use crate::constants::DEVICE_CODE_EXPIRE_MINUTES;
 use crate::db::models::DeviceCode;
 use crate::encryption::EncryptionService;
 use crate::handlers::analytics::{
@@ -78,7 +79,7 @@ async fn handle_create_device_code_batch(
     );
 
     let mut query_builder = sqlx::query(&sql);
-    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(15);
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(DEVICE_CODE_EXPIRE_MINUTES);
 
     // Bind all pre-generated values from the batch
     for req in &batch {

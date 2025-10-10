@@ -8,6 +8,7 @@ use serde_json::json;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)] // Some error variants are kept for future use
 pub enum AppError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),

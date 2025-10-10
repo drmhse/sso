@@ -19,6 +19,7 @@ pub struct StartLinkResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Currently unused, kept for potential future API compatibility
 pub struct UnlinkRequest {
     pub provider: String,
 }

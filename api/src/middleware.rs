@@ -109,6 +109,7 @@ pub async fn require_platform_owner(
 }
 
 /// Middleware to require organization membership with specific roles
+#[allow(dead_code)] // Currently unused, kept for future middleware implementation
 pub async fn require_org_member(
     _org_id: String,
     _required_roles: Vec<String>,
@@ -183,6 +184,7 @@ pub async fn check_org_admin(pool: &SqlitePool, user_id: &str, org_id: &str) -> 
 
 /// Context for organization member operations
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Currently unused, kept for future middleware implementation
 pub struct OrgMemberContext {
     pub org: Organization,
     pub user: User,
@@ -190,6 +192,7 @@ pub struct OrgMemberContext {
 }
 
 /// Extractor for organization member context
+#[allow(dead_code)] // Currently unused, kept for future middleware implementation
 pub async fn extract_org_member_context(
     State(state): State<crate::handlers::auth::AppState>,
     Path(org_slug): Path<String>,
@@ -233,6 +236,7 @@ pub async fn extract_org_member_context(
 }
 
 /// Middleware to require organization admin or owner role
+#[allow(dead_code)] // Currently unused, kept for future middleware implementation
 pub async fn require_org_admin_or_owner(
     State(state): State<crate::handlers::auth::AppState>,
     Path(org_slug): Path<String>,

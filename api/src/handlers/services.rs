@@ -1,3 +1,4 @@
+use crate::constants::{DEFAULT_MAX_SERVICES, DEFAULT_TIER_NAME, VALID_SERVICE_TYPES};
 use crate::db::models::{Membership, Organization, Plan, ProviderTokenGrant, Service, ServiceResponse};
 use crate::error::Result;
 use crate::handlers::auth::AppState;
@@ -114,9 +115,9 @@ async fn get_service_limits(state: &AppState, org: &Organization) -> Result<(i64
                 .bind(tier_id)
                 .fetch_one(&state.pool)
                 .await
-                .unwrap_or_else(|_| "free".to_string())
+                .unwrap_or_else(|_| DEFAULT_TIER_NAME.to_string())
         } else {
-            "free".to_string()
+            DEFAULT_TIER_NAME.to_string()
         };
 
         let tier_default = sqlx::query_scalar::<_, i64>(
@@ -125,7 +126,7 @@ async fn get_service_limits(state: &AppState, org: &Organization) -> Result<(i64
         .bind(&tier_name)
         .fetch_one(&state.pool)
         .await
-        .unwrap_or(2); // Fallback to 2 if tier not found
+        .unwrap_or(DEFAULT_MAX_SERVICES); // Fallback to default if tier not found
 
         tier_default
     };
@@ -147,6 +148,14 @@ pub async fn create_service(
     auth_user: axum::Extension<AuthUser>,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<Json<ServiceWithGrantsResponse>> {
+    // Validate service type
+    if !VALID_SERVICE_TYPES.contains(&req.service_type.as_str()) {
+        return Err(crate::error::AppError::BadRequest(format!(
+            "Invalid service type. Must be one of: {}",
+            VALID_SERVICE_TYPES.join(", ")
+        )));
+    }
+
     // 1. AUTHENTICATE: Extract user from JWT (handled by middleware)
 
     // 2. LOAD & VALIDATE: organization by org_slug and ensure it's active
@@ -309,7 +318,7 @@ pub async fn create_service(
     )
     .bind(&plan_id)
     .bind(&service_id)
-    .bind("free")
+    .bind(DEFAULT_TIER_NAME)
     .bind(0)
     .bind("usd")
     .bind(serde_json::to_string::<Vec<String>>(&vec![]).unwrap()) // Empty features array
@@ -523,6 +532,12 @@ pub async fn update_service(
     }
 
     if let Some(service_type) = &req.service_type {
+        if !VALID_SERVICE_TYPES.contains(&service_type.as_str()) {
+            return Err(crate::error::AppError::BadRequest(format!(
+                "Invalid service type. Must be one of: {}",
+                VALID_SERVICE_TYPES.join(", ")
+            )));
+        }
         updates.push("service_type = ?");
         values.push(service_type.clone());
     }

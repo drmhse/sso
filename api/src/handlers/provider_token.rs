@@ -1,6 +1,7 @@
 use crate::auth::jwt::Claims;
 use crate::auth::sso::Provider;
 use crate::auth::token_refresher;
+use crate::constants::TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS;
 use crate::db::models::Identity;
 use crate::error::{AppError, Result};
 use crate::handlers::auth::AppState;
@@ -91,7 +92,7 @@ async fn refresh_provider_token_with_lock(
     state: &AppState,
     identity: &Identity,
 ) -> Result<Identity> {
-    let lock_timeout = 30;
+    let lock_timeout = TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS;
 
     // Try to acquire lock
     let lock_acquired = acquire_refresh_lock(&state.pool, &identity.user_id, lock_timeout).await?;

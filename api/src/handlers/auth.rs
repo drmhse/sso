@@ -1,6 +1,7 @@
 use crate::auth::device_flow::DeviceFlowService;
 use crate::auth::jwt::JwtService;
 use crate::auth::sso::{OAuthClient, Provider};
+use crate::constants::{DEVICE_CODE_EXPIRE_MINUTES, JWT_EXPIRE_HOURS, OAUTH_STATE_EXPIRE_MINUTES};
 use crate::db::models::{DeviceCode, Identity, User};
 use crate::error::{AppError, Result};
 use axum::{
@@ -171,7 +172,7 @@ pub async fn auth_provider(
     };
 
     // Store OAuth state
-    let expires_at = Utc::now() + chrono::Duration::minutes(10);
+    let expires_at = Utc::now() + chrono::Duration::minutes(OAUTH_STATE_EXPIRE_MINUTES);
     let pkce_value = if provider == Provider::Microsoft && !pkce_verifier.is_empty() {
         Some(pkce_verifier)
     } else {
@@ -443,7 +444,7 @@ pub async fn auth_callback(
             // Store session
             let session_id = uuid::Uuid::new_v4().to_string();
             let token_hash = JwtService::hash_token(&jwt);
-            let expires_at = Utc::now() + chrono::Duration::hours(24);
+            let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
 
             sqlx::query!(
                 "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
@@ -540,7 +541,7 @@ pub async fn device_code(
         device_code,
         user_code,
         verification_uri: format!("{}/activate", state.base_url),
-        expires_in: 900, // 15 minutes
+        expires_in: DEVICE_CODE_EXPIRE_MINUTES * 60, // Convert minutes to seconds
         interval: 5,     // Poll every 5 seconds
     }))
 }
@@ -605,7 +606,7 @@ pub async fn device_verify(
     }
 
     // Generate OAuth state for device flow
-    let expires_at = Utc::now() + chrono::Duration::minutes(10);
+    let expires_at = Utc::now() + chrono::Duration::minutes(OAUTH_STATE_EXPIRE_MINUTES);
     let state_token = uuid::Uuid::new_v4().to_string();
 
     // Store device flow state
@@ -744,7 +745,7 @@ pub async fn token_exchange(
     // Store session
     let session_id = Uuid::new_v4().to_string();
     let token_hash = JwtService::hash_token(&token);
-    let expires_at = Utc::now() + chrono::Duration::hours(24);
+    let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
 
     sqlx::query!(
         r#"
@@ -777,7 +778,7 @@ pub async fn token_exchange(
     Ok(Json(TokenResponse {
         access_token: token,
         token_type: "Bearer".to_string(),
-        expires_in: 86400, // 24 hours
+        expires_in: JWT_EXPIRE_HOURS * 3600, // Convert hours to seconds
     }))
 }
 
@@ -947,7 +948,7 @@ pub async fn auth_admin_provider(
         get_admin_authorization_url(&admin_oauth_client, provider, scopes);
 
     // Store OAuth state with is_admin_flow = true
-    let expires_at = Utc::now() + chrono::Duration::minutes(10);
+    let expires_at = Utc::now() + chrono::Duration::minutes(OAUTH_STATE_EXPIRE_MINUTES);
     let pkce_value = if provider == Provider::Microsoft && !pkce_verifier.is_empty() {
         Some(pkce_verifier)
     } else {
@@ -1099,7 +1100,7 @@ pub async fn auth_admin_callback(
     // Store session
     let session_id = Uuid::new_v4().to_string();
     let token_hash = JwtService::hash_token(&jwt);
-    let expires_at = Utc::now() + chrono::Duration::hours(24);
+    let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
 
     sqlx::query!(
         "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",

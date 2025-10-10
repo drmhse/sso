@@ -1,5 +1,5 @@
 use crate::constants::{
-    MAX_NAME_LENGTH, MAX_SLUG_LENGTH, MIN_NAME_LENGTH, MIN_SLUG_LENGTH, RESERVED_SLUGS,
+    DEFAULT_MAX_USERS, DEFAULT_TIER_NAME, MAX_NAME_LENGTH, MAX_SLUG_LENGTH, MIN_NAME_LENGTH, MIN_SLUG_LENGTH, RESERVED_SLUGS,
 };
 use crate::db::models::{Membership, Organization, OrganizationTier, User};
 use crate::error::{AppError, Result};
@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Internal create function, kept for future use
 pub struct CreateOrganizationRequest {
     pub slug: String,
     pub name: String,
@@ -119,7 +120,7 @@ pub async fn create_organization_public(
     }
 
     // Get free tier
-    let free_tier = sqlx::query!("SELECT id FROM organization_tiers WHERE name = 'free'")
+    let free_tier = sqlx::query!("SELECT id FROM organization_tiers WHERE name = ?", DEFAULT_TIER_NAME)
         .fetch_one(&mut *tx)
         .await
         .map_err(AppError::Database)?;
@@ -204,6 +205,7 @@ async fn find_or_create_user_tx(
 }
 
 /// Create a new organization (user becomes owner)
+#[allow(dead_code)] // Internal create function, kept for future use
 pub async fn create_organization(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -212,9 +214,9 @@ pub async fn create_organization(
     let user = &auth_user.user;
 
     // Validate slug format
-    if req.slug.len() < 3 || req.slug.len() > 50 {
+    if req.slug.len() < MIN_SLUG_LENGTH || req.slug.len() > MAX_SLUG_LENGTH {
         return Err(AppError::BadRequest(
-            "Slug must be between 3 and 50 characters".to_string(),
+            format!("Slug must be between {} and {} characters", MIN_SLUG_LENGTH, MAX_SLUG_LENGTH),
         ));
     }
 
@@ -243,7 +245,7 @@ pub async fn create_organization(
     }
 
     // Get free tier
-    let free_tier = sqlx::query!("SELECT id FROM organization_tiers WHERE name = 'free'")
+    let free_tier = sqlx::query!("SELECT id FROM organization_tiers WHERE name = ?", DEFAULT_TIER_NAME)
         .fetch_one(&mut *tx)
         .await
         .map_err(AppError::Database)?;
@@ -504,7 +506,7 @@ pub async fn list_members(
         if let Some(tier) = tier {
             (tier.default_max_users, tier.name)
         } else {
-            (3, "free".to_string()) // Default free tier
+            (DEFAULT_MAX_USERS, DEFAULT_TIER_NAME.to_string()) // Default free tier
         }
     };
 
@@ -541,7 +543,7 @@ pub async fn update_member_role(
     crate::middleware::check_org_owner(&state.pool, &user.id, &organization.id).await?;
 
     // Validate role
-    if !["owner", "admin", "member"].contains(&req.role.as_str()) {
+    if !crate::constants::VALID_ORG_ROLES.contains(&req.role.as_str()) {
         return Err(AppError::BadRequest(
             "Invalid role. Must be owner, admin, or member".to_string(),
         ));

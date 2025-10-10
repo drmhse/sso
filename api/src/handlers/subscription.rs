@@ -1,4 +1,5 @@
 use crate::auth::jwt::{Claims, JwtService};
+use crate::constants::DEFAULT_TIER_NAME;
 use crate::db::models::User;
 use crate::error::{AppError, Result};
 use crate::handlers::auth::AppState;
@@ -34,6 +35,7 @@ pub struct SubscriptionResponse {
 }
 
 /// Extract and validate JWT from request
+#[allow(dead_code)] // Alternative JWT extraction implementation, kept for reference
 pub async fn extract_claims(
     State(state): State<AppState>,
     mut req: Request,
@@ -174,7 +176,7 @@ pub async fn get_subscription(
         // No active subscription, return free plan
         Ok(Json(SubscriptionResponse {
             service: service_slug.to_string(),
-            plan: "free".to_string(),
+            plan: DEFAULT_TIER_NAME.to_string(),
             features: vec![],
             status: "active".to_string(),
             current_period_end: "N/A".to_string(),

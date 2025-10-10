@@ -1,3 +1,4 @@
+use crate::constants::{DEFAULT_MAX_USERS, INVITATION_EXPIRY_DAYS, VALID_INVITATION_ROLES};
 use crate::db::models::{Organization, OrganizationInvitation, User};
 use crate::error::{AppError, Result};
 use crate::handlers::auth::AppState;
@@ -29,6 +30,7 @@ pub struct InvitationResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Query parameters kept for future pagination implementation
 pub struct ListInvitationsQuery {
     pub page: Option<i64>,
     pub limit: Option<i64>,
@@ -58,9 +60,9 @@ pub async fn create_invitation(
         crate::middleware::check_org_admin(&state.pool, &user.id, &organization.id).await?;
 
     // Validate role
-    if !["admin", "member"].contains(&req.role.as_str()) {
+    if !VALID_INVITATION_ROLES.contains(&req.role.as_str()) {
         return Err(AppError::BadRequest(
-            "Invalid role. Must be 'admin' or 'member'".to_string(),
+            format!("Invalid role. Must be one of: {}", VALID_INVITATION_ROLES.join(", ")),
         ));
     }
 
@@ -100,7 +102,7 @@ pub async fn create_invitation(
     // Create invitation
     let invitation_id = Uuid::new_v4().to_string();
     let token = Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + ChronoDuration::days(7);
+    let expires_at = Utc::now() + ChronoDuration::days(INVITATION_EXPIRY_DAYS);
 
     // Log invitation creation
     tracing::info!(
@@ -273,7 +275,7 @@ async fn accept_invitation_internal(
 
                 tier.default_max_users
             } else {
-                3 // Free tier default
+                DEFAULT_MAX_USERS // Free tier default
             };
 
         if member_count >= tier_limit {
