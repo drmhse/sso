@@ -1,146 +1,137 @@
 # SSO Platform - Web Client
 
-Admin dashboard for the multi-tenant SSO platform. Built with Vue 3, Pinia, Vue Router, and Tailwind CSS.
+This package contains the administrative web client for the Multi-Tenant SSO Platform. It serves as the primary user interface for both Platform Owners and Organization Administrators to manage the system's resources, including organizations, services, team members, and platform-wide settings.
 
-## Features
+The application is built using Vue.js 3 and consumes the `sso-sdk` to interact with the backend API, providing a reactive and secure management experience.
 
-- **Authentication Flow**: OAuth-based admin login with GitHub, Google, and Microsoft
-- **Platform Owner Dashboard**: Manage organizations and platform-level settings
-- **Organization Dashboard**: Manage services, team members, and settings
-- **Role-Based Access Control**: Different views and permissions based on user roles
+## Core Features
 
-## Tech Stack
+*   **Secure Authentication**: Implements the OAuth2 administrative login flow for platform and organization access.
+*   **Dual-Mode Dashboards**: Provides distinct, permission-driven views for Platform Owners (platform-wide management) and Organization Administrators (tenant-specific management).
+*   **Comprehensive Management Interfaces**: User interfaces for managing organizations, services, team members, invitations, and BYOO (Bring Your Own OAuth) credentials.
+*   **Role-Based Access Control (RBAC)**: The UI dynamically adapts to the authenticated user's role, restricting access to sensitive operations based on claims within their JSON Web Token (JWT).
+*   **Reactive State Management**: Utilizes Pinia for a centralized, predictable, and typed state management layer that handles all API interactions.
 
-- **Framework**: Vue.js 3 (Composition API with `<script setup>`)
-- **State Management**: Pinia
-- **Routing**: Vue Router
-- **HTTP SDK**: `@drmhse/sso-sdk` (locally linked, powered by Axios)
-- **Styling**: Tailwind CSS + Headless UI
+## Technology Stack
+
+*   **Framework**: Vue.js 3 (Composition API with `<script setup>`)
+*   **State Management**: Pinia
+*   **Routing**: Vue Router
+*   **HTTP Client**: The `@drmhse/sso-sdk` package, which provides a typed interface to the backend API.
+*   **UI Framework**: Tailwind CSS with Headless UI for accessible components.
+*   **Build Tool**: Vite
 
 ## Prerequisites
 
-- Node.js 18+ and npm
-- The SSO SDK built and linked (see `../sso-sdk`)
-- Running SSO API backend (see `../api`)
+*   Node.js version 18 or higher.
+*   A running instance of the `sso/api` backend service.
+*   The `@drmhse/sso-sdk` package must be built and linked locally.
 
-## Setup
+## Local Development Setup
 
-1. **Install dependencies**:
-   ```bash
-   npm install
-   ```
+Follow these steps to run the web client in a local development environment.
 
-2. **Link the local SDK** (if not already linked):
-   ```bash
-   cd ../sso-sdk
-   npm link
-   cd ../web-client
-   npm link @drmhse/sso-sdk
-   ```
+1.  **Install Dependencies**
+    From the `sso/web-client` directory, install the required npm packages:
+    ```bash
+    npm install
+    ```
 
-3. **Configure environment variables**:
+2.  **Build and Link the SDK**
+    The web client depends on the `sso-sdk` package within this monorepo. For local development, you must build and link the SDK to make it available to this project.
 
-   Copy `.env.development` and update the API URL if needed:
-   ```bash
-   VITE_API_BASE_URL=http://localhost:3000
-   ```
+    ```bash
+    # Navigate to the SDK directory
+    cd ../sso-sdk
 
-4. **Start the development server**:
-   ```bash
-   npm run dev
-   ```
+    # Install dependencies and build the SDK
+    npm install
+    npm run build
 
-   The application will be available at `http://localhost:5173`
+    # Create a global symbolic link
+    npm link
 
-## Project Structure
+    # Navigate back to the web client directory
+    cd ../web-client
+
+    # Link the globally linked SDK to this project
+    npm link @drmhse/sso-sdk
+    ```
+
+3.  **Configure Environment Variables**
+    Create a local environment file by copying the development example:
+    ```bash
+    cp .env.development .env.local
+    ```
+    The default `VITE_API_BASE_URL` is set to `http://localhost:3000`, which corresponds to the default address of the local `sso/api` service. Adjust this value if your backend is running on a different address.
+
+4.  **Run the Development Server**
+    Start the Vite development server:
+    ```bash
+    npm run dev
+    ```
+    The application will be accessible at `http://localhost:5173`.
+
+### Available Scripts
+
+*   `npm run dev`: Starts the Vite development server with hot module replacement.
+*   `npm run build`: Compiles and bundles the application for production.
+*   `npm run preview`: Serves the production build locally for testing.
+
+## Architecture
+
+The client is architected for maintainability and a clear separation of concerns, following several key principles:
+
+*   **SDK-Driven Data Layer**: All communication with the backend API is abstracted away by the `sso-sdk`. No direct `fetch` or `axios` calls are made within the client application. A singleton instance of the `SsoClient` is initialized and shared across the application.
+
+*   **Centralized State Management**: [Pinia](https://pinia.vuejs.org/) is used as the single source of truth for application state. All API requests and data mutations are handled through Pinia store actions. This ensures predictable state transitions and decouples components from data-fetching logic.
+
+*   **Composable-Based Logic**: Reusable logic, such as permission checking (`usePermissions`) and notification management (`useNotifications`), is encapsulated in Vue Composition API composables for modularity and reuse.
+
+*   **Router-Controlled Access**: [Vue Router](https://router.vuejs.org/) manages navigation and access control. Navigation guards are used to protect routes, initialize the authentication state, and enforce role-based access rules defined in route metadata.
+
+### Project Structure
 
 ```
-/web-client
+sso/web-client/
 ├── src/
-│   ├── api/              # SDK singleton instance
-│   ├── assets/           # Static assets
-│   ├── components/       # Reusable UI components
-│   ├── composables/      # Reusable composition functions
-│   ├── layouts/          # Layout components
-│   ├── router/           # Vue Router configuration
-│   ├── stores/           # Pinia state stores
-│   ├── utils/            # Utility functions
-│   ├── views/            # Page components
-│   ├── App.vue           # Root component
-│   └── main.js           # Application entry point
-├── public/               # Public static files
-├── .env.development      # Development environment variables
-├── .env.production       # Production environment variables
-└── package.json
+│   ├── api/          # Singleton instance of the SSO SDK client
+│   ├── assets/       # Static assets (images, fonts)
+│   ├── components/   # Reusable, stateless UI components
+│   ├── composables/  # Reusable Vue Composition API functions
+│   ├── layouts/      # Main application layout components (e.g., AppLayout)
+│   ├── router/       # Vue Router configuration and navigation guards
+│   ├── stores/       # Pinia state management modules
+│   ├── utils/        # Utility functions (formatters, parsers)
+│   ├── views/        # Page-level components, mapped to routes
+│   └── main.js       # Application entry point
+└── ...
 ```
 
-## Implementation Status
+## Authentication and Routing
 
-### Phase 0: Core Authentication (✅ Complete)
-- ✅ Project setup with Vue 3, Pinia, Vue Router, Tailwind CSS
-- ✅ SDK integration (locally linked)
-- ✅ Authentication store with JWT handling
-- ✅ Router with navigation guards
-- ✅ Login, Callback, and Home views
-- ✅ Layout system (AppLayout, AuthLayout)
-- ✅ Permission composable for role-based access
-- ✅ Notification system
+Authentication is managed via JSON Web Tokens (JWTs) obtained from the API's OAuth2 administrative login flow.
 
-### Phase 1: Organization & Team Management (Pending)
-- Organization onboarding flow
-- Platform owner approval workflow
-- Team member management
-- Invitation system
+1.  **Token Storage**: The JWT is stored in `localStorage` under the key `sso_token`.
+2.  **State Initialization**: On application startup, the main navigation guard in `router/index.js` triggers the `initializeAuth` action in the `auth` Pinia store. This action validates the stored token by attempting to fetch the user's profile.
+3.  **Protected Routes**: Routes requiring authentication are marked with `meta: { requiresAuth: true }`. The navigation guard enforces this, redirecting unauthenticated users to the `/login` page.
+4.  **Role-Based Routes**: Routes requiring platform owner privileges are marked with `meta: { requiresPlatformOwner: true }`. The navigation guard checks the decoded JWT claims to enforce this rule.
+5.  **Logout**: The logout process involves calling the `POST /api/auth/logout` endpoint (via the SDK) to invalidate the session on the server, followed by clearing the token from `localStorage` and the Pinia store.
 
-### Phase 2: Service Management (Pending)
-- Service CRUD operations
-- BYOO (Bring Your Own OAuth) credentials
-- Service configuration
+## Configuration
 
-### Phase 3: User Management (Pending)
-- End-user management for organizations
+The application is configured via environment variables defined in `.env` files.
 
-### Phase 4: Billing (Pending)
-- Billing dashboard
-- Plan management
-- Stripe integration
+*   **`VITE_API_BASE_URL`**: The only required variable. It specifies the base URL of the `sso/api` backend.
+    *   In `/.env.development`, this defaults to `http://localhost:3000`.
+    *   In `/.env.production`, this should be set to the public URL of your deployed API.
 
-## Available Scripts
+## Building for Production
 
-- `npm run dev` - Start development server
-- `npm run build` - Build for production
-- `npm run preview` - Preview production build locally
+To create a production-ready build of the application, run the following command:
 
-## Authentication Flow
+```bash
+npm run build
+```
 
-1. User navigates to `/login`
-2. User clicks on OAuth provider button (GitHub, Google, or Microsoft)
-3. Application generates admin login URL via SDK
-4. User is redirected to OAuth provider
-5. After authentication, provider redirects to `/callback?token=...`
-6. Callback view extracts token and stores it
-7. User profile is fetched and stored in Pinia auth store
-8. Home view redirects based on user role:
-   - Platform owners → `/platform/dashboard`
-   - Organization members → `/orgs/{slug}/dashboard`
-   - New users → `/signup`
-
-## Key Architectural Decisions
-
-1. **SDK Singleton**: Single instance of `SsoClient` shared across the app
-2. **Pinia as State Layer**: All API calls go through Pinia stores
-3. **Component-Store Separation**: Views don't call SDK directly
-4. **Permission Composable**: Centralized role-checking logic
-5. **Layout System**: Dynamic layout based on route metadata
-
-## Development Notes
-
-- The SDK is locally linked - rebuild it when making SDK changes
-- All routes requiring authentication have `meta: { requiresAuth: true }`
-- Platform-only routes have `meta: { requiresPlatformOwner: true }`
-- JWT tokens are stored in localStorage as `sso_token`
-- Token validation happens on app initialization via navigation guard
-
-## Next Steps
-
-See `../frontend_implementation_plan.md` for detailed implementation phases.
+This will compile the Vue components and assets, outputting the optimized, static files to the `dist/` directory. This directory can then be served by any static web server.
