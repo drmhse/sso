@@ -1,0 +1,8 @@
+src
+node_modules
+*.log
+.DS_Store
+tsconfig.json
+.eslintrc.js
+.eslintrc.json
+*.tsbuildinfo

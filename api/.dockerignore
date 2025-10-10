@@ -1,0 +1,57 @@
+# Build artifacts
+target/
+**/*.rs.bk
+**/*.so
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+README.md
+docs/
+
+# Docker (self)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Test data
+data/
+load-tests/
+load-tests/
+**/load-test-*
+**/k6-results-*
+**/metrics-*
+**/*.log
+
+# Environment files (NEVER copy .env into image - mount at runtime instead)
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Coverage reports
+tarpaulin-report.html
+coverage/
+
+# Database (keep migrations, exclude existing DB files)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

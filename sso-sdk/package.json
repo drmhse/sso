@@ -1,0 +1,47 @@
+{
+  "name": "@drmhse/sso-sdk",
+  "version": "0.1.0",
+  "description": "Zero-dependency TypeScript SDK for the multi-tenant SSO Platform API",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "sso",
+    "oauth",
+    "authentication",
+    "typescript",
+    "sdk",
+    "multi-tenant",
+    "zero-dependency",
+    "fetch"
+  ],
+  "author": "DRM HSE <info@drmhse.com>",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "eslint": "^8.56.0",
+    "tsup": "^8.0.1",
+    "typescript": "^5.3.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/drmhse/sso.git",
+    "directory": "sso-sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
