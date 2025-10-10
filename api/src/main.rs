@@ -30,8 +30,9 @@ use crate::handlers::organizations::{
     set_org_oauth_credentials, transfer_ownership, update_member_role, update_organization,
 };
 use crate::handlers::platform::{
-    activate_organization, approve_organization, get_audit_log, list_organizations,
-    promote_platform_owner, reject_organization, suspend_organization, update_organization_tier,
+    activate_organization, approve_organization, demote_platform_owner, get_audit_log,
+    list_organizations, promote_platform_owner, reject_organization, suspend_organization,
+    update_organization_tier,
 };
 use crate::handlers::provider_token::get_provider_token;
 use crate::handlers::services::{
@@ -284,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_service: jwt_service.clone(),
         base_url: config.base_url.clone(),
         db_tx: tx, // Add the channel sender to the state
+        encryption: encryption.clone().map(Arc::new),
     };
 
     let webhook_state = WebhookState {
@@ -413,6 +415,10 @@ async fn main() -> anyhow::Result<()> {
             patch(update_organization_tier),
         )
         .route("/api/platform/owners", post(promote_platform_owner))
+        .route(
+            "/api/platform/owners/:user_id",
+            delete(demote_platform_owner),
+        )
         .route("/api/platform/audit-log", get(get_audit_log))
         .route_layer(axum_middleware::from_fn(
             crate::middleware::require_platform_owner,

@@ -12,6 +12,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -1172,75 +1173,130 @@ pub async fn list_end_users(
     .await
     .map_err(AppError::Database)?;
 
-    // Build end-user objects with their subscriptions and identities
-    let mut end_users = Vec::new();
-    for row in end_user_rows {
-        let user_id: String = row.get("id");
-        let user_obj = User {
-            id: user_id.clone(),
+    // Build user objects and collect their IDs
+    let users: Vec<User> = end_user_rows
+        .iter()
+        .map(|row| User {
+            id: row.get("id"),
             email: row.get("email"),
             is_platform_owner: row.get("is_platform_owner"),
             created_at: row.get("created_at"),
-        };
+        })
+        .collect();
 
-        // Get subscriptions for this user in this organization's services
-        let subscription_rows = sqlx::query(
-            "SELECT sub.service_id, s.slug as service_slug, s.name as service_name,
-                    sub.plan_id, p.name as plan_name, sub.status,
-                    sub.current_period_end, sub.created_at
-             FROM subscriptions sub
-             INNER JOIN services s ON sub.service_id = s.id
-             INNER JOIN plans p ON sub.plan_id = p.id
-             WHERE sub.user_id = ? AND s.org_id = ?
-             ORDER BY sub.created_at DESC",
-        )
-        .bind(&user_id)
-        .bind(&organization.id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(AppError::Database)?;
+    let user_ids: Vec<String> = users.iter().map(|u| u.id.clone()).collect();
 
-        let subscriptions: Vec<EndUserSubscription> = subscription_rows
-            .into_iter()
-            .map(|sub_row| EndUserSubscription {
-                service_id: sub_row.get("service_id"),
-                service_slug: sub_row.get("service_slug"),
-                service_name: sub_row.get("service_name"),
-                plan_id: sub_row.get("plan_id"),
-                plan_name: sub_row.get("plan_name"),
-                status: sub_row.get("status"),
-                current_period_end: sub_row.get("current_period_end"),
-                created_at: sub_row.get("created_at"),
-            })
-            .collect();
-
-        // Get identities for this user
-        let identity_rows = sqlx::query(
-            "SELECT provider, provider_user_id, created_at
-             FROM identities
-             WHERE user_id = ?
-             ORDER BY created_at ASC",
-        )
-        .bind(&user_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(AppError::Database)?;
-
-        let identities: Vec<EndUserIdentity> = identity_rows
-            .into_iter()
-            .map(|id_row| EndUserIdentity {
-                provider: id_row.get("provider"),
-                provider_user_id: id_row.get("provider_user_id"),
-                created_at: id_row.get("created_at"),
-            })
-            .collect();
-
-        end_users.push(EndUser {
-            user: user_obj,
-            subscriptions,
-            identities,
-        });
+    // Early return if no users found
+    if user_ids.is_empty() {
+        return Ok(Json(EndUserListResponse {
+            users: Vec::new(),
+            total: 0,
+            page,
+            limit,
+        }));
     }
+
+    // Build placeholders for IN clause (?, ?, ?, ...)
+    let placeholders = user_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Fetch ALL subscriptions for these users in one query
+    let subscription_query = format!(
+        "SELECT sub.user_id, sub.service_id, s.slug as service_slug, s.name as service_name,
+                sub.plan_id, p.name as plan_name, sub.status,
+                sub.current_period_end, sub.created_at
+         FROM subscriptions sub
+         INNER JOIN services s ON sub.service_id = s.id
+         INNER JOIN plans p ON sub.plan_id = p.id
+         WHERE sub.user_id IN ({}) AND s.org_id = ?
+         ORDER BY sub.created_at DESC",
+        placeholders
+    );
+
+    let mut subscription_query_builder = sqlx::query(&subscription_query);
+    for user_id in &user_ids {
+        subscription_query_builder = subscription_query_builder.bind(user_id);
+    }
+    subscription_query_builder = subscription_query_builder.bind(&organization.id);
+
+    let all_subscription_rows = subscription_query_builder
+        .fetch_all(&state.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+    // Group subscriptions by user_id
+    let mut subscriptions_by_user: HashMap<String, Vec<EndUserSubscription>> = HashMap::new();
+    for sub_row in all_subscription_rows {
+        let user_id: String = sub_row.get("user_id");
+        let subscription = EndUserSubscription {
+            service_id: sub_row.get("service_id"),
+            service_slug: sub_row.get("service_slug"),
+            service_name: sub_row.get("service_name"),
+            plan_id: sub_row.get("plan_id"),
+            plan_name: sub_row.get("plan_name"),
+            status: sub_row.get("status"),
+            current_period_end: sub_row.get("current_period_end"),
+            created_at: sub_row.get("created_at"),
+        };
+        subscriptions_by_user
+            .entry(user_id)
+            .or_insert_with(Vec::new)
+            .push(subscription);
+    }
+
+    // Fetch ALL identities for these users in one query
+    let identity_query = format!(
+        "SELECT user_id, provider, provider_user_id, created_at
+         FROM identities
+         WHERE user_id IN ({})
+         ORDER BY created_at ASC",
+        placeholders
+    );
+
+    let mut identity_query_builder = sqlx::query(&identity_query);
+    for user_id in &user_ids {
+        identity_query_builder = identity_query_builder.bind(user_id);
+    }
+
+    let all_identity_rows = identity_query_builder
+        .fetch_all(&state.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+    // Group identities by user_id
+    let mut identities_by_user: HashMap<String, Vec<EndUserIdentity>> = HashMap::new();
+    for id_row in all_identity_rows {
+        let user_id: String = id_row.get("user_id");
+        let identity = EndUserIdentity {
+            provider: id_row.get("provider"),
+            provider_user_id: id_row.get("provider_user_id"),
+            created_at: id_row.get("created_at"),
+        };
+        identities_by_user
+            .entry(user_id)
+            .or_insert_with(Vec::new)
+            .push(identity);
+    }
+
+    // Build end-user objects using the grouped data
+    let end_users: Vec<EndUser> = users
+        .into_iter()
+        .map(|user| {
+            let subscriptions = subscriptions_by_user
+                .remove(&user.id)
+                .unwrap_or_else(Vec::new);
+            let identities = identities_by_user.remove(&user.id).unwrap_or_else(Vec::new);
+
+            EndUser {
+                user,
+                subscriptions,
+                identities,
+            }
+        })
+        .collect();
 
     // Get total count
     let total: i64 = sqlx::query_scalar(

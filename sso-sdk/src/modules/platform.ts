@@ -163,17 +163,31 @@ export class PlatformModule {
   /**
    * Promote an existing user to platform owner.
    *
-   * @param payload Promotion payload with user email
+   * @param payload Promotion payload with user ID
    *
    * @example
    * ```typescript
    * await sso.platform.promoteOwner({
-   *   user_email: 'admin@example.com'
+   *   user_id: 'user-uuid-here'
    * });
    * ```
    */
   public async promoteOwner(payload: PromotePlatformOwnerPayload): Promise<void> {
     await this.http.post('/api/platform/owners', payload);
+  }
+
+  /**
+   * Demote a platform owner to regular user.
+   *
+   * @param userId The ID of the user to demote
+   *
+   * @example
+   * ```typescript
+   * await sso.platform.demoteOwner('user-uuid-here');
+   * ```
+   */
+  public async demoteOwner(userId: string): Promise<void> {
+    await this.http.delete(`/api/platform/owners/${userId}`);
   }
 
   /**

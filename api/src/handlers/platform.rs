@@ -675,6 +675,86 @@ pub async fn promote_platform_owner(
     Ok(Json(updated_user))
 }
 
+/// DELETE /api/platform/owners/:user_id
+/// Demote a platform owner to regular user
+pub async fn demote_platform_owner(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(user_id): Path<String>,
+) -> Result<Json<User>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    // Prevent self-demotion
+    if auth_user.user.id == user_id {
+        return Err(AppError::BadRequest(
+            "Cannot demote yourself".to_string(),
+        ));
+    }
+
+    let mut tx = state.pool.begin().await.map_err(AppError::Database)?;
+
+    // Fetch user to demote
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(AppError::Database)?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    if !user.is_platform_owner {
+        return Err(AppError::BadRequest(
+            "User is not a platform owner".to_string(),
+        ));
+    }
+
+    // Check if this is the last platform owner
+    let owner_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_platform_owner = 1")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+
+    if owner_count <= 1 {
+        return Err(AppError::BadRequest(
+            "Cannot demote the last platform owner".to_string(),
+        ));
+    }
+
+    // Update user
+    let updated_user = sqlx::query_as::<_, User>(
+        r#"
+        UPDATE users
+        SET is_platform_owner = 0
+        WHERE id = ?
+        RETURNING *
+        "#,
+    )
+    .bind(&user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Create audit log
+    create_audit_log(
+        &mut *tx,
+        &auth_user.user.id,
+        "demote_platform_owner",
+        "user",
+        &user_id,
+        Some(json!({
+            "user_email": updated_user.email,
+        })),
+    )
+    .await?;
+
+    tx.commit().await.map_err(AppError::Database)?;
+
+    Ok(Json(updated_user))
+}
+
 /// GET /api/platform/audit-log
 /// Get platform audit logs with optional filters
 pub async fn get_audit_log(

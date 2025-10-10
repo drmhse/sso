@@ -108,14 +108,8 @@ pub async fn get_user(
     Ok(Json(UserResponse {
         id: auth_user.user.id.clone(),
         email: auth_user.user.email.clone(),
-        org: auth_user
-            .claims
-            .org
-            .ok_or_else(|| AppError::BadRequest("Missing org in token".to_string()))?,
-        service: auth_user
-            .claims
-            .service
-            .ok_or_else(|| AppError::BadRequest("Missing service in token".to_string()))?,
+        org: auth_user.claims.org.unwrap_or_default(),
+        service: auth_user.claims.service.unwrap_or_default(),
     }))
 }
 
@@ -282,13 +276,7 @@ pub async fn update_user(
     Ok(Json(UserResponse {
         id: user.id,
         email: user.email,
-        org: auth_user
-            .claims
-            .org
-            .ok_or_else(|| AppError::BadRequest("Missing org in token".to_string()))?,
-        service: auth_user
-            .claims
-            .service
-            .ok_or_else(|| AppError::BadRequest("Missing service in token".to_string()))?,
+        org: auth_user.claims.org.unwrap_or_default(),
+        service: auth_user.claims.service.unwrap_or_default(),
     }))
 }

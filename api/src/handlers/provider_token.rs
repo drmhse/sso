@@ -1,5 +1,6 @@
 use crate::auth::jwt::Claims;
 use crate::auth::sso::Provider;
+use crate::auth::token_refresher;
 use crate::db::models::Identity;
 use crate::error::{AppError, Result};
 use crate::handlers::auth::AppState;
@@ -8,7 +9,7 @@ use axum::{
     Json,
 };
 use chrono::{Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Serialize)]
@@ -126,15 +127,19 @@ async fn refresh_provider_token(state: &AppState, identity: &Identity) -> Result
         .as_ref()
         .ok_or_else(|| AppError::OAuth("No refresh token available".to_string()))?;
 
-    // Call provider's token refresh endpoint
+    // Call provider's token refresh endpoint using centralized module
     let new_token = match provider {
         Provider::Github => {
             return Err(AppError::OAuth(
                 "GitHub tokens do not support refresh".to_string(),
             ));
         }
-        Provider::Microsoft => refresh_microsoft_token(refresh_token).await?,
-        Provider::Google => refresh_google_token(refresh_token).await?,
+        Provider::Microsoft => token_refresher::refresh_microsoft_token(refresh_token)
+            .await
+            .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?,
+        Provider::Google => token_refresher::refresh_google_token(refresh_token)
+            .await
+            .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?,
     };
 
     // Update identity in database
@@ -157,94 +162,6 @@ async fn refresh_provider_token(state: &AppState, identity: &Identity) -> Result
     .await?;
 
     Ok(updated_identity)
-}
-
-#[derive(Debug)]
-struct RefreshedToken {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_at: Option<chrono::DateTime<Utc>>,
-}
-
-async fn refresh_microsoft_token(refresh_token: &str) -> Result<RefreshedToken> {
-    #[derive(Deserialize)]
-    struct MicrosoftTokenResponse {
-        access_token: String,
-        refresh_token: Option<String>,
-        expires_in: i64,
-    }
-
-    let client = reqwest::Client::new();
-    let params = [
-        (
-            "client_id",
-            std::env::var("MICROSOFT_CLIENT_ID").unwrap_or_default(),
-        ),
-        (
-            "client_secret",
-            std::env::var("MICROSOFT_CLIENT_SECRET").unwrap_or_default(),
-        ),
-        ("refresh_token", refresh_token.to_string()),
-        ("grant_type", "refresh_token".to_string()),
-    ];
-
-    let response: MicrosoftTokenResponse = client
-        .post("https://login.microsoftonline.com/common/oauth2/v2.0/token")
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?
-        .json()
-        .await
-        .map_err(|e| AppError::OAuth(format!("Failed to parse token response: {}", e)))?;
-
-    let expires_at = Utc::now() + Duration::seconds(response.expires_in);
-
-    Ok(RefreshedToken {
-        access_token: response.access_token,
-        refresh_token: response.refresh_token,
-        expires_at: Some(expires_at),
-    })
-}
-
-async fn refresh_google_token(refresh_token: &str) -> Result<RefreshedToken> {
-    #[derive(Deserialize)]
-    struct GoogleTokenResponse {
-        access_token: String,
-        expires_in: i64,
-    }
-
-    let client = reqwest::Client::new();
-    let params = [
-        (
-            "client_id",
-            std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
-        ),
-        (
-            "client_secret",
-            std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
-        ),
-        ("refresh_token", refresh_token.to_string()),
-        ("grant_type", "refresh_token".to_string()),
-    ];
-
-    let response: GoogleTokenResponse = client
-        .post("https://oauth2.googleapis.com/token")
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?
-        .json()
-        .await
-        .map_err(|e| AppError::OAuth(format!("Failed to parse token response: {}", e)))?;
-
-    let expires_at = Utc::now() + Duration::seconds(response.expires_in);
-
-    Ok(RefreshedToken {
-        access_token: response.access_token,
-        refresh_token: None,
-        expires_at: Some(expires_at),
-    })
 }
 
 fn parse_scopes(scopes_json: &Option<String>) -> Vec<String> {

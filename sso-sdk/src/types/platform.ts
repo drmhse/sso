@@ -59,7 +59,7 @@ export interface UpdateOrganizationTierPayload {
  * Promote user to platform owner payload
  */
 export interface PromotePlatformOwnerPayload {
-  user_email: string;
+  user_id: string;
 }
 
 /**

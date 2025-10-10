@@ -24,7 +24,6 @@ services:
       - SERVER_PORT=3000
       - BASE_URL=http://localhost:3000
       - PLATFORM_OWNER_EMAIL=admin@example.com
-      - PLATFORM_OWNER_PASSWORD=password
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env:ro

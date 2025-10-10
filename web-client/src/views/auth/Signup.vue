@@ -79,9 +79,32 @@
                   </svg>
                 </div>
                 <div class="ml-3">
-                  <p class="text-sm text-green-800">
-                    Organization created successfully! Awaiting platform owner approval.
+                  <p class="text-sm font-semibold text-green-800 mb-2">
+                    Organization created successfully!
                   </p>
+                  <p class="text-sm text-green-700 mb-3">
+                    Complete authentication to access your organization dashboard:
+                  </p>
+                  <div class="space-y-2">
+                    <button
+                      @click="continueWithProvider('github')"
+                      class="w-full flex items-center justify-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-gray-800 hover:bg-gray-900"
+                    >
+                      Continue with GitHub
+                    </button>
+                    <button
+                      @click="continueWithProvider('google')"
+                      class="w-full flex items-center justify-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                    >
+                      Continue with Google
+                    </button>
+                    <button
+                      @click="continueWithProvider('microsoft')"
+                      class="w-full flex items-center justify-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                    >
+                      Continue with Microsoft
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -112,6 +135,9 @@
 <script setup>
 import { ref } from 'vue';
 import { sso } from '@/api';
+import { useAuthStore } from '@/stores/auth';
+
+const authStore = useAuthStore();
 
 const formData = ref({
   name: '',
@@ -122,6 +148,7 @@ const formData = ref({
 const loading = ref(false);
 const error = ref('');
 const success = ref(false);
+const createdOrgSlug = ref('');
 
 const handleSubmit = async () => {
   loading.value = true;
@@ -132,6 +159,7 @@ const handleSubmit = async () => {
     const payload = {
       name: formData.value.name,
       slug: formData.value.slug,
+      owner_email: authStore.userEmail,
     };
 
     if (formData.value.domain) {
@@ -140,6 +168,7 @@ const handleSubmit = async () => {
 
     await sso.organizations.createPublic(payload);
     success.value = true;
+    createdOrgSlug.value = formData.value.slug;
 
     // Reset form
     formData.value = {
@@ -153,5 +182,13 @@ const handleSubmit = async () => {
   } finally {
     loading.value = false;
   }
+};
+
+const continueWithProvider = (provider) => {
+  // Redirect to admin login with org_slug to get JWT with org claims
+  // The OAuth provider will recognize the recent auth and likely skip consent
+  window.location.href = sso.auth.getAdminLoginUrl(provider, {
+    org_slug: createdOrgSlug.value,
+  });
 };
 </script>

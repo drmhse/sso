@@ -37,6 +37,7 @@ pub struct AppState {
     pub jwt_service: Arc<JwtService>,
     pub base_url: String,
     pub db_tx: mpsc::Sender<DbRequest>, // Sender for the DB writer task
+    pub encryption: Option<Arc<crate::encryption::EncryptionService>>,
 }
 // --- End DB Task Definitions ---
 
@@ -280,6 +281,7 @@ pub async fn auth_callback(
             // Create or update identity for the linking user
             upsert_identity_with_details(
                 &state.pool,
+                state.encryption.as_ref(),
                 linking_user_id,
                 provider,
                 &user_info.provider_user_id,
@@ -310,6 +312,7 @@ pub async fn auth_callback(
     // Update identity with full token details
     upsert_identity_with_details(
         &state.pool,
+        state.encryption.as_ref(),
         &user.id,
         provider,
         &user_info.provider_user_id,
@@ -789,6 +792,7 @@ async fn find_or_create_user(pool: &SqlitePool, email: &str) -> Result<User> {
 
 async fn upsert_identity_with_details(
     pool: &SqlitePool,
+    encryption: Option<&Arc<crate::encryption::EncryptionService>>,
     user_id: &str,
     provider: Provider,
     provider_user_id: &str,
@@ -802,31 +806,74 @@ async fn upsert_identity_with_details(
     let scopes_json =
         serde_json::to_string(scopes).map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    let identity = sqlx::query_as::<_, Identity>(
-        r#"
-        INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, provider)
-        DO UPDATE SET
-            access_token = excluded.access_token,
-            refresh_token = COALESCE(excluded.refresh_token, refresh_token),
-            expires_at = excluded.expires_at,
-            provider_user_id = excluded.provider_user_id,
-            scopes = excluded.scopes,
-            last_refreshed_at = datetime('now')
-        RETURNING *
-        "#,
-    )
-    .bind(&id)
-    .bind(user_id)
-    .bind(provider_str)
-    .bind(provider_user_id)
-    .bind(access_token)
-    .bind(refresh_token)
-    .bind(expires_at)
-    .bind(scopes_json)
-    .fetch_one(pool)
-    .await?;
+    // Encrypt tokens if encryption service is available
+    let identity = if let Some(enc) = encryption {
+        let access_token_encrypted = enc
+            .encrypt(access_token)
+            .map_err(|e| AppError::InternalServerError(format!("Failed to encrypt access token: {}", e)))?;
+
+        let refresh_token_encrypted = refresh_token
+            .map(|rt| enc.encrypt(rt))
+            .transpose()
+            .map_err(|e| AppError::InternalServerError(format!("Failed to encrypt refresh token: {}", e)))?;
+
+        sqlx::query_as::<_, Identity>(
+            r#"
+            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, access_token_encrypted, refresh_token_encrypted, encryption_key_id, expires_at, scopes)
+            VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, provider)
+            DO UPDATE SET
+                access_token = NULL,
+                refresh_token = NULL,
+                access_token_encrypted = excluded.access_token_encrypted,
+                refresh_token_encrypted = COALESCE(excluded.refresh_token_encrypted, refresh_token_encrypted),
+                encryption_key_id = excluded.encryption_key_id,
+                expires_at = excluded.expires_at,
+                provider_user_id = excluded.provider_user_id,
+                scopes = excluded.scopes,
+                last_refreshed_at = datetime('now')
+            RETURNING *
+            "#,
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(provider_str)
+        .bind(provider_user_id)
+        .bind(&access_token_encrypted)
+        .bind(&refresh_token_encrypted)
+        .bind(enc.key_id())
+        .bind(expires_at)
+        .bind(scopes_json)
+        .fetch_one(pool)
+        .await?
+    } else {
+        // No encryption - store in plaintext (fallback for backward compatibility)
+        sqlx::query_as::<_, Identity>(
+            r#"
+            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, provider)
+            DO UPDATE SET
+                access_token = excluded.access_token,
+                refresh_token = COALESCE(excluded.refresh_token, refresh_token),
+                expires_at = excluded.expires_at,
+                provider_user_id = excluded.provider_user_id,
+                scopes = excluded.scopes,
+                last_refreshed_at = datetime('now')
+            RETURNING *
+            "#,
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(provider_str)
+        .bind(provider_user_id)
+        .bind(access_token)
+        .bind(refresh_token)
+        .bind(expires_at)
+        .bind(scopes_json)
+        .fetch_one(pool)
+        .await?
+    };
 
     Ok(identity)
 }
@@ -955,6 +1002,7 @@ pub async fn auth_admin_callback(
     // Update identity
     upsert_identity_with_details(
         &state.pool,
+        state.encryption.as_ref(),
         &user.id,
         provider,
         &user_info.provider_user_id,
@@ -1003,15 +1051,28 @@ pub async fn auth_admin_callback(
                 None,
             )?
         } else {
-            // User is not a member - redirect to create organization page
-            let create_org_url =
-                format!("{}/create-organization", config.platform_admin_redirect_uri);
-            return Ok(Redirect::to(&create_org_url).into_response());
+            // User is not a member - issue basic JWT so they can access signup page
+            state.jwt_service.create_token(
+                &user.id,
+                &user.email,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )?
         }
     } else {
-        // No org_slug provided and not platform owner - redirect to create organization page
-        let create_org_url = format!("{}/create-organization", config.platform_admin_redirect_uri);
-        return Ok(Redirect::to(&create_org_url).into_response());
+        // No org_slug provided and not platform owner - issue basic JWT for first-time users
+        state.jwt_service.create_token(
+            &user.id,
+            &user.email,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )?
     };
 
     // Store session
@@ -1036,72 +1097,62 @@ pub async fn auth_admin_callback(
 
 // Helper functions for admin OAuth
 
+/// Unified OAuth client builder to reduce code duplication.
+/// Creates an OAuth2 BasicClient for any provider with the given credentials and callback URI.
+fn build_oauth_client(
+    provider: Provider,
+    client_id: String,
+    client_secret: String,
+    callback_uri: String,
+) -> Result<oauth2::basic::BasicClient> {
+    use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
+
+    let (auth_url, token_url) = match provider {
+        Provider::Github => (
+            "https://github.com/login/oauth/authorize",
+            "https://github.com/login/oauth/access_token",
+        ),
+        Provider::Google => (
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+        ),
+        Provider::Microsoft => (
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        ),
+    };
+
+    Ok(BasicClient::new(
+        ClientId::new(client_id),
+        Some(ClientSecret::new(client_secret)),
+        AuthUrl::new(auth_url.to_string()).map_err(|e| AppError::OAuth(e.to_string()))?,
+        Some(TokenUrl::new(token_url.to_string()).map_err(|e| AppError::OAuth(e.to_string()))?),
+    )
+    .set_redirect_uri(RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?))
+}
+
 fn create_admin_oauth_client(
     config: &crate::config::Config,
     provider: Provider,
 ) -> Result<oauth2::basic::BasicClient> {
-    use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
+    let (client_id, client_secret) = match provider {
+        Provider::Github => (
+            config.platform_github_client_id.clone(),
+            config.platform_github_client_secret.clone(),
+        ),
+        Provider::Google => (
+            config.platform_google_client_id.clone(),
+            config.platform_google_client_secret.clone(),
+        ),
+        Provider::Microsoft => (
+            config.platform_microsoft_client_id.clone(),
+            config.platform_microsoft_client_secret.clone(),
+        ),
+    };
 
-    match provider {
-        Provider::Github => {
-            let callback_uri = format!("{}/auth/admin/github/callback", config.base_url);
-            Ok(BasicClient::new(
-                ClientId::new(config.platform_github_client_id.clone()),
-                Some(ClientSecret::new(
-                    config.platform_github_client_secret.clone(),
-                )),
-                AuthUrl::new("https://github.com/login/oauth/authorize".to_string())
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
-                        .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?,
-            ))
-        }
-        Provider::Google => {
-            let callback_uri = format!("{}/auth/admin/google/callback", config.base_url);
-            Ok(BasicClient::new(
-                ClientId::new(config.platform_google_client_id.clone()),
-                Some(ClientSecret::new(
-                    config.platform_google_client_secret.clone(),
-                )),
-                AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new("https://oauth2.googleapis.com/token".to_string())
-                        .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?,
-            ))
-        }
-        Provider::Microsoft => {
-            let callback_uri = format!("{}/auth/admin/microsoft/callback", config.base_url);
-            Ok(BasicClient::new(
-                ClientId::new(config.platform_microsoft_client_id.clone()),
-                Some(ClientSecret::new(
-                    config.platform_microsoft_client_secret.clone(),
-                )),
-                AuthUrl::new(
-                    "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".to_string(),
-                )
-                .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new(
-                        "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
-                    )
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?,
-            ))
-        }
-    }
+    let callback_uri = format!("{}/auth/admin/{}/callback", config.base_url, provider.as_str());
+
+    build_oauth_client(provider, client_id, client_secret, callback_uri)
 }
 
 fn get_admin_authorization_url(
@@ -1200,62 +1251,13 @@ fn create_custom_oauth_client(
     client_id: &str,
     client_secret: &str,
 ) -> Result<oauth2::basic::BasicClient> {
-    use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
-
-    match provider {
-        Provider::Github => {
-            let callback_uri = format!("{}/auth/github/callback", config.base_url);
-            Ok(BasicClient::new(
-                ClientId::new(client_id.to_string()),
-                Some(ClientSecret::new(client_secret.to_string())),
-                AuthUrl::new("https://github.com/login/oauth/authorize".to_string())
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
-                        .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?,
-            ))
-        }
-        Provider::Google => {
-            let callback_uri = format!("{}/auth/google/callback", config.base_url);
-            Ok(BasicClient::new(
-                ClientId::new(client_id.to_string()),
-                Some(ClientSecret::new(client_secret.to_string())),
-                AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new("https://oauth2.googleapis.com/token".to_string())
-                        .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?,
-            ))
-        }
-        Provider::Microsoft => {
-            let callback_uri = format!("{}/auth/microsoft/callback", config.base_url);
-            Ok(BasicClient::new(
-                ClientId::new(client_id.to_string()),
-                Some(ClientSecret::new(client_secret.to_string())),
-                AuthUrl::new(
-                    "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".to_string(),
-                )
-                .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new(
-                        "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
-                    )
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?,
-            ))
-        }
-    }
+    let callback_uri = format!("{}/auth/{}/callback", config.base_url, provider.as_str());
+    build_oauth_client(
+        provider,
+        client_id.to_string(),
+        client_secret.to_string(),
+        callback_uri,
+    )
 }
 
 fn get_authorization_url_for_client(

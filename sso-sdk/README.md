@@ -271,7 +271,7 @@ await sso.platform.organizations.updateTier('org-id', {
 
 // Promote platform owner
 await sso.platform.promoteOwner({
-  user_email: 'admin@example.com'
+  user_id: 'user-uuid-here'
 });
 
 // Get audit log
