@@ -67,26 +67,15 @@ Follow these steps to set up and run the entire platform locally for development
     ```
     The API will be available at `http://localhost:3000`. Database migrations are applied automatically on startup.
 
-4.  **Set Up the TypeScript SDK**
-    The SDK must be built and linked locally to be available to the `web-client`.
-    ```bash
-    # From the sso/sso-sdk directory
-    cd ../sso-sdk
-    npm install
-    npm run build
-    npm link
-    ```
-
-5.  **Set Up the Web Client**
-    Link the SDK and install dependencies for the frontend application.
+4.  **Set Up the Web Client**
+    Install dependencies for the frontend application. The web client will use the published SDK from npm.
     ```bash
     # From the sso/web-client directory
     cd ../web-client
     npm install
-    npm link @drmhse/sso-sdk
     ```
 
-6.  **Run the Web Client**
+5.  **Run the Web Client**
     Start the Vite development server.
     ```bash
     npm run dev
@@ -112,6 +101,7 @@ The administrative frontend application. It provides the user interface for mana
 ### `sso/sso-sdk`
 The TypeScript client library for interacting with the `sso/api`.
 *   **Technology**: TypeScript, native `fetch`
+*   **Installation**: `npm install @drmhse/sso-sdk`
 *   **Documentation**: [sso-sdk/README.md](sso-sdk/README.md)
 
 ## Development Workflow
@@ -119,8 +109,14 @@ The TypeScript client library for interacting with the `sso/api`.
 A typical development workflow involves the following sequence:
 
 1.  **API Changes**: Modify the Rust code in `sso/api`. Rebuild and restart the API service (`docker-compose up --build`).
-2.  **SDK Changes**: If an API contract has changed, update the types and methods in `sso/sso-sdk`. Rebuild the SDK with `npm run build`.
-3.  **Web Client Changes**: The `web-client` uses a linked version of the SDK, so changes are reflected automatically after the SDK is rebuilt. The Vite development server provides hot module replacement for frontend changes.
+2.  **SDK Changes**: If an API contract has changed, update the types and methods in `sso/sso-sdk`. After making changes, increment the version in `package.json` and run `npm run build && npm publish` to release a new version.
+3.  **Web Client Changes**: The `web-client` uses the published SDK from npm. Update the SDK version in `package.json` and run `npm install` to get the latest changes. The Vite development server provides hot module replacement for frontend changes.
+
+**Note**: For SDK development specifically, you may need to link the local SDK version to test changes before publishing:
+```bash
+cd sso-sdk && npm run build && npm link
+cd ../web-client && npm link @drmhse/sso-sdk
+```
 
 ## Testing
 
