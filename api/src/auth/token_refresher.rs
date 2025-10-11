@@ -10,6 +10,8 @@ pub struct RefreshedToken {
 
 pub async fn refresh_microsoft_token(
     refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
 ) -> Result<RefreshedToken, Box<dyn std::error::Error>> {
     #[derive(Deserialize)]
     struct MicrosoftTokenResponse {
@@ -20,14 +22,8 @@ pub async fn refresh_microsoft_token(
 
     let client = reqwest::Client::new();
     let params = [
-        (
-            "client_id",
-            std::env::var("MICROSOFT_CLIENT_ID").unwrap_or_default(),
-        ),
-        (
-            "client_secret",
-            std::env::var("MICROSOFT_CLIENT_SECRET").unwrap_or_default(),
-        ),
+        ("client_id", client_id.to_string()),
+        ("client_secret", client_secret.to_string()),
         ("refresh_token", refresh_token.to_string()),
         ("grant_type", "refresh_token".to_string()),
     ];
@@ -51,6 +47,8 @@ pub async fn refresh_microsoft_token(
 
 pub async fn refresh_google_token(
     refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
 ) -> Result<RefreshedToken, Box<dyn std::error::Error>> {
     #[derive(Deserialize)]
     struct GoogleTokenResponse {
@@ -60,14 +58,8 @@ pub async fn refresh_google_token(
 
     let client = reqwest::Client::new();
     let params = [
-        (
-            "client_id",
-            std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
-        ),
-        (
-            "client_secret",
-            std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
-        ),
+        ("client_id", client_id.to_string()),
+        ("client_secret", client_secret.to_string()),
         ("refresh_token", refresh_token.to_string()),
         ("grant_type", "refresh_token".to_string()),
     ];

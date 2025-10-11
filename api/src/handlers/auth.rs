@@ -251,7 +251,7 @@ pub async fn auth_callback(
         .as_ref()
         .and_then(|s| s.pkce_verifier.as_deref());
 
-    let token_details = if let Some(ref oauth_ctx) = oauth_state {
+    let (token_details, issuing_org_id) = if let Some(ref oauth_ctx) = oauth_state {
         if let Some(ref org_slug) = oauth_ctx.org_slug {
             // Get org_id and check for custom OAuth credentials
             let org_id = sqlx::query_scalar::<_, String>("SELECT id FROM organizations WHERE slug = ?")
@@ -287,27 +287,31 @@ pub async fn auth_callback(
                 let custom_client =
                     create_custom_oauth_client(&config, provider, &creds.client_id, &client_secret)?;
 
-                exchange_custom_code(&custom_client, provider, &callback.code, pkce_verifier).await?
+                let details = exchange_custom_code(&custom_client, provider, &callback.code, pkce_verifier).await?;
+                (details, Some(org_id))
             } else {
                 // Fall back to platform credentials
-                state
+                let details = state
                     .oauth_client
                     .exchange_code_with_details(provider, &callback.code, pkce_verifier)
-                    .await?
+                    .await?;
+                (details, None)
             }
         } else {
             // No org context, use platform credentials
-            state
+            let details = state
                 .oauth_client
                 .exchange_code_with_details(provider, &callback.code, pkce_verifier)
-                .await?
+                .await?;
+            (details, None)
         }
     } else {
         // No oauth state, use platform credentials
-        state
+        let details = state
             .oauth_client
             .exchange_code_with_details(provider, &callback.code, pkce_verifier)
-            .await?
+            .await?;
+        (details, None)
     };
 
     // Get user info from provider (standalone, not using OAuth client)
@@ -355,6 +359,7 @@ pub async fn auth_callback(
                 token_details.refresh_token.as_deref(),
                 token_details.expires_at,
                 &token_details.scopes,
+                issuing_org_id.as_deref(),
             )
             .await?;
 
@@ -386,6 +391,7 @@ pub async fn auth_callback(
         token_details.refresh_token.as_deref(),
         token_details.expires_at,
         &token_details.scopes,
+        issuing_org_id.as_deref(),
     )
     .await?;
 
@@ -946,6 +952,7 @@ async fn upsert_identity_with_details(
     refresh_token: Option<&str>,
     expires_at: Option<chrono::DateTime<Utc>>,
     scopes: &[String],
+    issuing_org_id: Option<&str>,
 ) -> Result<Identity> {
     let id = Uuid::new_v4().to_string();
     let provider_str = provider.as_str();
@@ -965,8 +972,8 @@ async fn upsert_identity_with_details(
 
         sqlx::query_as::<_, Identity>(
             r#"
-            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, access_token_encrypted, refresh_token_encrypted, encryption_key_id, expires_at, scopes)
-            VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, access_token_encrypted, refresh_token_encrypted, encryption_key_id, expires_at, scopes, issuing_org_id)
+            VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, provider)
             DO UPDATE SET
                 access_token = NULL,
@@ -977,6 +984,7 @@ async fn upsert_identity_with_details(
                 expires_at = excluded.expires_at,
                 provider_user_id = excluded.provider_user_id,
                 scopes = excluded.scopes,
+                issuing_org_id = excluded.issuing_org_id,
                 last_refreshed_at = datetime('now')
             RETURNING *
             "#,
@@ -990,14 +998,15 @@ async fn upsert_identity_with_details(
         .bind(enc.key_id())
         .bind(expires_at)
         .bind(scopes_json)
+        .bind(issuing_org_id)
         .fetch_one(pool)
         .await?
     } else {
         // No encryption - store in plaintext (fallback for backward compatibility)
         sqlx::query_as::<_, Identity>(
             r#"
-            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes, issuing_org_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, provider)
             DO UPDATE SET
                 access_token = excluded.access_token,
@@ -1005,6 +1014,7 @@ async fn upsert_identity_with_details(
                 expires_at = excluded.expires_at,
                 provider_user_id = excluded.provider_user_id,
                 scopes = excluded.scopes,
+                issuing_org_id = excluded.issuing_org_id,
                 last_refreshed_at = datetime('now')
             RETURNING *
             "#,
@@ -1017,6 +1027,7 @@ async fn upsert_identity_with_details(
         .bind(refresh_token)
         .bind(expires_at)
         .bind(scopes_json)
+        .bind(issuing_org_id)
         .fetch_one(pool)
         .await?
     };
@@ -1275,7 +1286,7 @@ pub async fn auth_admin_callback(
     // Find or create user
     let user = find_or_create_user(&state.pool, &user_info.email).await?;
 
-    // Update identity
+    // Update identity (admin flow always uses platform credentials, so issuing_org_id is None)
     upsert_identity_with_details(
         &state.pool,
         state.encryption.as_ref(),
@@ -1286,6 +1297,7 @@ pub async fn auth_admin_callback(
         token_details.refresh_token.as_deref(),
         token_details.expires_at,
         &token_details.scopes,
+        None,
     )
     .await?;
 

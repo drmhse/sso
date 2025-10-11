@@ -27,6 +27,8 @@ pub struct Identity {
     pub refresh_token_encrypted: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuing_org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

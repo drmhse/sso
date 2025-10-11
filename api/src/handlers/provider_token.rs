@@ -128,17 +128,60 @@ async fn refresh_provider_token(state: &AppState, identity: &Identity) -> Result
         .as_ref()
         .ok_or_else(|| AppError::OAuth("No refresh token available".to_string()))?;
 
-    // Call provider's token refresh endpoint using centralized module
+    // 1. Determine which credentials to use (same logic as background job)
+    let (client_id, client_secret) = if let Some(org_id) = &identity.issuing_org_id {
+        // Case 1: BYOO Token
+        let creds = sqlx::query!(
+            "SELECT client_id, client_secret_encrypted FROM organization_oauth_credentials WHERE org_id = ? AND provider = ?",
+            org_id,
+            identity.provider
+        )
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::OAuth("BYOO credentials not found for org".to_string()))?;
+
+        let secret = state.encryption.as_ref()
+            .ok_or_else(|| AppError::OAuth("Encryption service unavailable for BYOO secret".to_string()))?
+            .decrypt(&creds.client_secret_encrypted)
+            .map_err(|e| AppError::OAuth(format!("Failed to decrypt BYOO secret: {}", e)))?;
+
+        (creds.client_id, secret)
+    } else {
+        // Case 2: Platform Token (Admin or Default)
+        let user = sqlx::query!("SELECT is_platform_owner FROM users WHERE id = ?", identity.user_id)
+            .fetch_one(&state.pool).await?;
+
+        let config = crate::config::Config::from_env()
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+        if user.is_platform_owner {
+            // Case 2a: Platform Admin Credentials
+            match provider {
+                Provider::Google => (config.platform_google_client_id, config.platform_google_client_secret),
+                Provider::Microsoft => (config.platform_microsoft_client_id, config.platform_microsoft_client_secret),
+                Provider::Github => return Err(AppError::OAuth("GitHub admin token refresh not supported".to_string())),
+            }
+        } else {
+            // Case 2b: Platform Default Credentials
+            match provider {
+                Provider::Google => (config.google_client_id, config.google_client_secret),
+                Provider::Microsoft => (config.microsoft_client_id, config.microsoft_client_secret),
+                Provider::Github => return Err(AppError::OAuth("GitHub default token refresh not supported".to_string())),
+            }
+        }
+    };
+
+    // 2. Call provider's token refresh endpoint using centralized module
     let new_token = match provider {
         Provider::Github => {
             return Err(AppError::OAuth(
                 "GitHub tokens do not support refresh".to_string(),
             ));
         }
-        Provider::Microsoft => token_refresher::refresh_microsoft_token(refresh_token)
+        Provider::Microsoft => token_refresher::refresh_microsoft_token(refresh_token, &client_id, &client_secret)
             .await
             .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?,
-        Provider::Google => token_refresher::refresh_google_token(refresh_token)
+        Provider::Google => token_refresher::refresh_google_token(refresh_token, &client_id, &client_secret)
             .await
             .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?,
     };

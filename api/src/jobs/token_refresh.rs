@@ -63,27 +63,64 @@ impl TokenRefreshJob {
         let provider = Provider::from_str(&identity.provider)
             .map_err(|e| format!("Invalid provider: {}", e))?;
 
-        // Decrypt refresh token if encrypted
-        let refresh_token = if let Some(ref encrypted) = identity.refresh_token_encrypted {
-            if let Some(ref enc) = self.encryption {
-                enc.decrypt(encrypted)?
+        // 1. Determine which credentials to use
+        let (client_id, client_secret) = if let Some(org_id) = &identity.issuing_org_id {
+            // Case 1: BYOO Token
+            let creds = sqlx::query!(
+                "SELECT client_id, client_secret_encrypted FROM organization_oauth_credentials WHERE org_id = ? AND provider = ?",
+                org_id,
+                identity.provider
+            )
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or("BYOO credentials not found for org")?;
+
+            let secret = self.encryption.as_ref()
+                .ok_or("Encryption service unavailable for BYOO secret")?
+                .decrypt(&creds.client_secret_encrypted)?;
+
+            (creds.client_id, secret)
+        } else {
+            // Case 2: Platform Token (Admin or Default)
+            let user = sqlx::query!("SELECT is_platform_owner FROM users WHERE id = ?", identity.user_id)
+                .fetch_one(&self.pool).await?;
+
+            let config = crate::config::Config::from_env().map_err(|e| e.to_string())?;
+
+            if user.is_platform_owner {
+                // Case 2a: Platform Admin Credentials
+                match provider {
+                    Provider::Google => (config.platform_google_client_id, config.platform_google_client_secret),
+                    Provider::Microsoft => (config.platform_microsoft_client_id, config.platform_microsoft_client_secret),
+                    Provider::Github => return Err("GitHub admin token refresh not supported".into()),
+                }
             } else {
-                return Err("Encryption service not available".into());
+                // Case 2b: Platform Default Credentials
+                match provider {
+                    Provider::Google => (config.google_client_id, config.google_client_secret),
+                    Provider::Microsoft => (config.microsoft_client_id, config.microsoft_client_secret),
+                    Provider::Github => return Err("GitHub default token refresh not supported".into()),
+                }
             }
+        };
+
+        // 2. Get the refresh token
+        let refresh_token = if let Some(ref encrypted) = identity.refresh_token_encrypted {
+            if let Some(ref enc) = self.encryption { enc.decrypt(encrypted)? } else { return Err("Encryption service not available".into()); }
         } else if let Some(ref token) = identity.refresh_token {
             token.clone()
         } else {
             return Err("No refresh token available".into());
         };
 
-        // Call provider refresh endpoint using centralized module
+        // 3. Call the appropriate refresh function with the correct credentials
         let new_token = match provider {
-            Provider::Microsoft => token_refresher::refresh_microsoft_token(&refresh_token).await?,
-            Provider::Google => token_refresher::refresh_google_token(&refresh_token).await?,
-            Provider::Github => return Ok(()),
+            Provider::Microsoft => token_refresher::refresh_microsoft_token(&refresh_token, &client_id, &client_secret).await?,
+            Provider::Google => token_refresher::refresh_google_token(&refresh_token, &client_id, &client_secret).await?,
+            Provider::Github => return Ok(()), // GitHub refresh tokens are complex/optional, skip for now
         };
 
-        // Encrypt new tokens if encryption is enabled
+        // 4. Update the identity in the database
         if let Some(ref enc) = self.encryption {
             let access_encrypted = enc.encrypt(&new_token.access_token)?;
             let refresh_encrypted = new_token
