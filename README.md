@@ -2,11 +2,11 @@
 
 This repository contains the source code for a multi-tenant, production-grade Single Sign-On (SSO) platform. The system is designed to provide robust, secure, and flexible authentication for B2B2C applications, built with a focus on performance, security, and maintainability.
 
-The platform's core is a Rust backend using the Axum framework, supported by a TypeScript SDK for API interaction and a Vue.js web client for administration. Its primary architectural feature is a dual-flow authentication system that separates administrative access from end-user authentication, enabling tenants to use their own custom OAuth2 credentials (Bring Your Own OAuth - BYOO).
+The platform's core is a high-performance Rust backend using the Axum framework, supported by a zero-dependency TypeScript SDK for API interaction and a Vue.js web client for administration. Its primary architectural feature is a dual-flow authentication system that separates administrative access from end-user authentication, enabling tenants to use their own custom OAuth2 credentials (Bring Your Own OAuth - BYOO).
 
 ## Architecture Overview
 
-This project is structured as a monorepo containing three distinct but interconnected packages:
+This project is structured as a monorepo containing three distinct but interconnected packages. The `web-client` consumes the `sso-sdk`, which in turn communicates with the `api`.
 
 ```
 sso/
@@ -17,7 +17,7 @@ sso/
 
 *   **`sso/api`**: The core of the platform. This is a high-performance Rust application that exposes a RESTful API to handle all authentication flows, data storage, and business logic. It uses an optimized SQLite database for persistence and is designed for containerized deployment.
 
-*   **`sso/sso-sdk`**: A zero-dependency, strongly-typed TypeScript SDK that provides a clean, programmatic interface for the `sso/api`. It is framework-agnostic and can be used in any JavaScript or TypeScript environment (browser, Node.js, etc.).
+*   **`sso/sso-sdk`**: A zero-dependency, strongly-typed TypeScript SDK that provides a clean, programmatic interface for the `sso/api`. It is framework-agnostic and is published to npm as `@drmhse/sso-sdk`.
 
 *   **`sso/web-client`**: The administrative frontend for the platform. Built with Vue.js, it consumes the `sso-sdk` to provide a user interface for Platform Owners to manage tenants and for Organization Admins to manage their services, teams, and settings.
 
@@ -25,21 +25,24 @@ sso/
 
 *   **Multi-Tenant Architecture**: Securely isolated environments for each customer organization, with distinct users, services, and configurations.
 *   **Dual Authentication Flows**: Segregated authentication paths for platform/organization administrators versus application end-users.
-*   **Bring Your Own OAuth (BYOO)**: Allows tenant organizations to connect and use their own custom OAuth2 applications for providers like GitHub, Google, and Microsoft, enabling a white-labeled user experience.
+*   **Bring Your Own OAuth (BYOO)**: Allows tenant organizations to connect and use their own custom OAuth2 applications for providers like GitHub, Google, and Microsoft.
 *   **Device Authorization Flow (RFC 8628)**: Provides a secure authentication method for headless applications, command-line tools, and smart devices.
 *   **Platform Governance Layer**: A super-admin (Platform Owner) role with a complete approval workflow for new organizations, tier management, and platform-wide auditing capabilities.
-*   **Role-Based Access Control (RBAC)**: Granular permissions for Platform Owners, Organization Owners, Admins, and Members are enforced at the API level.
+*   **Comprehensive Analytics**: Detailed login, growth, and activity metrics for both individual organizations and the entire platform.
+*   **Identity Management**: End-users can link and unlink multiple social accounts (e.g., GitHub, Google) to a single profile.
+*   **End-User Management**: Tools for organization admins to manage their customers, including viewing profiles and revoking active sessions.
+*   **Role-Based Access Control (RBAC)**: Granular permissions for Platform Owners, Organization Owners, Admins, and Members enforced at the API level.
 *   **Secure Credential Management**: Tenant-provided OAuth secrets are encrypted at rest using AES-GCM.
+*   **High-Performance Design**: Built with Rust and Axum for speed and safety, leveraging an optimized SQLite database with WAL mode, batched writes, and background jobs for maintenance.
 *   **Stripe Webhook Integration**: Foundation for subscription and billing management.
 
 ## System Prerequisites
 
 To build and run this project locally, the following dependencies are required:
 
-*   **Rust**: Version 1.89 or higher (see `sso/api/Dockerfile`)
+*   **Rust**: Version 1.89 or higher
 *   **Node.js**: Version 18 or higher
 *   **Docker & Docker Compose**: For containerized deployment and local environment setup.
-*   **SQLite**: Version 3.43 or higher (for local development outside of Docker).
 
 ## Getting Started
 
@@ -57,12 +60,11 @@ Follow these steps to set up and run the entire platform locally for development
     cd api
     cp .env.example .env
     ```
-    Populate the `.env` file with the necessary secrets for JWT, OAuth providers, and Stripe.
+    Populate the `.env` file with the necessary secrets for JWT, OAuth providers, and Stripe. A crucial variable is `PLATFORM_OWNER_EMAIL`, which automatically grants super-admin privileges to the specified user upon their first login.
 
 3.  **Build and Run the Backend API**
-    Using Docker Compose is the recommended method as it encapsulates the environment.
+    Using Docker Compose is the recommended method as it encapsulates the environment. From the `sso/api` directory:
     ```bash
-    # From the sso/api directory
     docker-compose up --build -d
     ```
     The API will be available at `http://localhost:3000`. Database migrations are applied automatically on startup.
@@ -84,46 +86,113 @@ Follow these steps to set up and run the entire platform locally for development
 
 At this point, the complete system is running locally. You can access the admin dashboard to interact with the platform.
 
-## Package Reference
+## Usage Example (SDK)
 
-For detailed information on each package, please refer to their individual documentation.
+The `sso-sdk` provides a simple and powerful way to interact with the platform.
 
-### `sso/api`
-The Rust backend service. It contains all API endpoints, database logic, and authentication flows.
-*   **Technology**: Rust, Axum, Tokio, SQLx, SQLite
-*   **Documentation**: [api/README.md](api/README.md)
+```typescript
+import { SsoClient, SsoApiError } from '@drmhse/sso-sdk';
 
-### `sso/web-client`
-The administrative frontend application. It provides the user interface for managing the platform and its organizations.
-*   **Technology**: Vue.js 3, Pinia, Vue Router, Tailwind CSS
-*   **Documentation**: [web-client/README.md](web-client/README.md)
+// Initialize the client
+const sso = new SsoClient({
+  baseURL: 'http://localhost:3000',
+  token: localStorage.getItem('sso_token')
+});
 
-### `sso/sso-sdk`
-The TypeScript client library for interacting with the `sso/api`.
-*   **Technology**: TypeScript, native `fetch`
-*   **Installation**: `npm install @drmhse/sso-sdk`
-*   **Documentation**: [sso-sdk/README.md](sso-sdk/README.md)
+// Example: Redirect a user to log in
+function redirectToLogin() {
+  const loginUrl = sso.auth.getLoginUrl('github', {
+    org: 'acme-corp',
+    service: 'main-app',
+    redirect_uri: 'http://localhost:4000/callback' // Your app's callback URL
+  });
+  window.location.href = loginUrl;
+}
+
+// Example: Fetch user profile after authentication
+async function fetchUserProfile() {
+  try {
+    const profile = await sso.user.getProfile();
+    console.log(`Authenticated as: ${profile.email}`);
+  } catch (error) {
+    if (error instanceof SsoApiError && error.isAuthError()) {
+      console.error('Session expired. Please log in again.');
+    }
+  }
+}
+```
+
+## Live Examples
+
+The `examples/` directory contains runnable applications that demonstrate key authentication flows. These are the best way to see the SDK in action. Ensure the backend API is running before starting the examples.
+
+### `examples/sample-app`
+A simple Vue.js web application that showcases two key flows:
+1.  The standard **Web Redirect Flow** for end-user login.
+2.  The **Device Activation UI** (`/activate`) that works with the CLI examples, allowing users to authorize devices from their browser.
+
+**To run:**
+```bash
+cd examples/sample-app
+npm install
+npm run dev
+```
+
+### `examples/sample-byoo-cli`
+Demonstrates the **End-User (BYOO) Device Flow**. This is perfect for seeing how a tenant's own CLI application would authenticate its users through the SSO platform, using the tenant's custom OAuth credentials if configured.
+
+**To run:**
+```bash
+cd examples/sample-byoo-cli
+npm install
+npm start
+```
+
+### `examples/sample-admin-cli`
+Demonstrates the **Platform Admin Device Flow**. This is ideal for building secure administrative CLI tools for managing the entire SSO platform, separate from any specific tenant.
+
+**To run:**
+```bash
+cd examples/sample-admin-cli
+npm install
+npm start
+```
 
 ## Development Workflow
 
 A typical development workflow involves the following sequence:
 
 1.  **API Changes**: Modify the Rust code in `sso/api`. Rebuild and restart the API service (`docker-compose up --build`).
-2.  **SDK Changes**: If an API contract has changed, update the types and methods in `sso/sso-sdk`. After making changes, increment the version in `package.json` and run `npm run build && npm publish` to release a new version.
-3.  **Web Client Changes**: The `web-client` uses the published SDK from npm. Update the SDK version in `package.json` and run `npm install` to get the latest changes. The Vite development server provides hot module replacement for frontend changes.
+2.  **SDK Changes**: If an API contract has changed, update the types and methods in `sso/sso-sdk`. After making changes, increment the version in `package.json` and run `npm run build`.
+3.  **Local Testing**: To test SDK changes in the `web-client` before publishing, link the local package:
+    ```bash
+    # In sso/sso-sdk directory
+    npm link
+    
+    # In sso/web-client directory
+    npm link @drmhse/sso-sdk
+    ```
+4.  **Publish SDK**: Once changes are verified, publish the new version to npm from the `sso-sdk` directory:
+    ```bash
+    npm publish
+    ```
+5.  **Update Web Client**: Update the SDK version in `sso/web-client/package.json` and run `npm install` to pull the latest changes from npm.
 
-**Note**: For SDK development specifically, you may need to link the local SDK version to test changes before publishing:
-```bash
-cd sso-sdk && npm run build && npm link
-cd ../web-client && npm link @drmhse/sso-sdk
-```
+## Testing Strategy
 
-## Testing
+The platform employs a multi-layered testing strategy to ensure reliability and correctness.
 
-The platform's testing strategy includes:
+*   **Backend Unit Tests**: Located within the `sso/api` package, executed via `cargo test`. These cover individual functions and modules in the Rust backend.
+*   **End-to-End Integration Tests**: A comprehensive suite of Node.js tests located in `etc/test-integration/` that test the API endpoints against a running instance of the service.
+    ```bash
+    # Run all integration tests
+    cd etc/test-integration && npm test
 
-*   **Backend Unit & Integration Tests**: Located within the `sso/api` package, executed via `cargo test`.
-*   **End-to-End Integration Tests**: A separate test suite (e.g., in `sso/api/test-integration`) can be used to test API flows against a running instance of the service.
+    # Run specific test suites
+    npm run test:auth
+    npm run test:organizations
+    ```
+*   **Load Tests**: Performance testing scripts using k6 are located in `etc/load-tests/`.
 
 ## Deployment
 
@@ -131,17 +200,7 @@ The `sso/api` is designed for containerized deployment. The provided multi-stage
 
 *   **Configuration**: The application is configured exclusively through environment variables, adhering to twelve-factor app principles. No secrets are baked into the image.
 *   **Database**: The SQLite database file should be mounted as a persistent volume to `/app/data` within the container.
-*   **Statelessness**: The API service is stateless, allowing for horizontal scaling behind a load balancer (with considerations for a shared SQLite database if scaling beyond a single instance).
-
-## Contributing
-
-Contributions are welcome. Please adhere to the following process:
-
-1.  Fork the repository.
-2.  Create a new branch for your feature or bug fix.
-3.  Commit your changes with clear, descriptive messages.
-4.  Ensure all tests pass and any new functionality is covered by tests.
-5.  Open a pull request with a detailed description of your changes.
+*   **Resource Limits**: The service is optimized for low-resource environments. For a production VPS deployment, recommended resource limits are **1 vCPU** and **1GB RAM**.
 
 ## License
 

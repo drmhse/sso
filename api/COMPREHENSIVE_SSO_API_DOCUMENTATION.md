@@ -17,8 +17,10 @@ The platform is built in Rust using the Axum web framework and leverages a highl
 - **Platform Governance:** A super-admin (Platform Owner) layer for approving, managing, and monitoring organizations.
 - **Role-Based Access Control (RBAC):** Granular permissions for Platform Owners, Organization Owners, Admins, and Members.
 - **Device Authorization Flow (RFC 8628):** Secure authentication for CLI tools, smart devices, and other headless applications.
-- **Secure JWT Session Management:** Stateless authentication using JSON Web Tokens with a server-side revocation mechanism.
+- **Secure JWT Session Management:** Stateless authentication using JSON Web Tokens with a server-side revocation mechanism and refresh token rotation.
 - **Encrypted Credential Storage:** Organization-provided OAuth secrets are securely encrypted at rest using AES-GCM.
+- **Comprehensive Analytics:** Detailed login and growth metrics for both individual organizations and the entire platform.
+- **End-User Management:** Tools for organization admins to manage their customers, including session revocation.
 - **Stripe Webhook Integration:** Foundation for subscription and billing management.
 
 ---
@@ -69,6 +71,7 @@ An application belonging to an organization that uses the SSO platform for authe
   "microsoft_scopes": "string (JSON array)",
   "google_scopes": "string (JSON array)",
   "redirect_uris": "string (JSON array of allowed URIs)",
+  "device_activation_uri": "string (optional URI for device flow)",
   "created_at": "datetime"
 }
 ```
@@ -96,6 +99,32 @@ Stores the custom, encrypted OAuth credentials for an organization's specific pr
   "client_secret_encrypted": "blob (AES-GCM encrypted secret)",
   "encryption_key_id": "string",
   "created_at": "datetime"
+}
+```
+
+#### `Session`
+Tracks an active JWT session for revocation purposes and enables token refresh.
+```json
+{
+  "id": "string (UUID)",
+  "user_id": "string (FK to User)",
+  "token_hash": "string (SHA256 of the JWT)",
+  "expires_at": "datetime",
+  "refresh_token": "string (unique, for token rotation)",
+  "refresh_token_expires_at": "datetime",
+  "created_at": "datetime"
+}
+```
+
+#### `LoginEvent`
+Records a successful login for analytics and auditing.
+```json
+{
+    "id": "string (UUID)",
+    "user_id": "string (FK to User)",
+    "service_id": "string (FK to Service)",
+    "provider": "string (github|google|microsoft)",
+    "created_at": "datetime"
 }
 ```
 
@@ -141,51 +170,26 @@ There are three conceptual types of JWTs issued:
 
 #### Flow A: Platform / Organization Admin Login
 
-This flow is for administrators logging into a dashboard to manage the platform or a specific organization.
-
-**Endpoints:** `/auth/admin/:provider` and `/auth/admin/:provider/callback`
-
-1.  Admin visits the management dashboard and clicks "Login with GitHub/Google/etc.".
-2.  The frontend redirects to `/auth/admin/:provider?org_slug={optional_org_slug}`.
-3.  The SSO service uses the **platform's dedicated OAuth credentials** (from `PLATFORM_...` env vars) to redirect the admin to the provider.
-4.  After the admin approves, the provider redirects back to `/auth/admin/:provider/callback`.
-5.  The SSO service exchanges the code for a token and fetches the user's profile.
-6.  It looks up the user by email in the database.
-    *   **If `user.is_platform_owner` is true:** A **Platform Owner JWT** is generated.
-    *   **If user is a member of `{optional_org_slug}`:** An **Organization Management JWT** is generated.
-    *   **Otherwise:** The user is redirected to a frontend page to create a new organization.
-7.  The user is redirected to the platform's admin dashboard callback URL (`PLATFORM_ADMIN_REDIRECT_URI`) with the JWT.
+This flow is for administrators logging into a dashboard to manage the platform or a specific organization. It uses the `/auth/admin/*` endpoints and the platform's dedicated OAuth credentials.
 
 #### Flow B: End-User Login (with BYOO)
 
-This flow is for end-users of a tenant's application.
-
-**Endpoints:** `/auth/:provider` and `/auth/:provider/callback`
-
-1.  A user on an organization's app (e.g., `https://app.my-customer.com`) clicks "Login".
-2.  The customer's app redirects the user to the SSO service at `/auth/:provider?org=my-customer&service=main-app&redirect_uri=https://app.my-customer.com/callback`.
-3.  The SSO service looks up the organization `my-customer`.
-    *   **If `my-customer` has configured its own OAuth credentials (BYOO):** The SSO service uses those custom credentials to initiate the OAuth flow.
-    *   **Otherwise:** It falls back to using the default platform-wide OAuth application credentials.
-4.  The user is sent to the provider (GitHub, etc.) to authorize the application.
-5.  The provider redirects back to `/auth/:provider/callback`.
-6.  The SSO service exchanges the code, finds or creates the user, and generates an **End-User Service JWT** containing the user's identity within the context of `my-customer` and `main-app`.
-7.  The service performs a final redirect back to the `redirect_uri` provided in step 2, appending the JWT: `https://app.my-customer.com/callback?token={jwt}`.
+This flow is for end-users of a tenant's application. It uses the `/auth/:provider` endpoints and dynamically selects between the organization's custom OAuth credentials (BYOO) or the platform's default credentials.
 
 #### Flow C: Device Authorization (RFC 8628)
 
 This flow is for CLIs and other devices without a web browser.
+1.  **CLI:** `POST /auth/device/code` to get `user_code` and `verification_uri`.
+2.  **User:** Visits `verification_uri`, enters `user_code`. The frontend calls `POST /auth/device/verify` to get context and initiates a web login (Flow B).
+3.  **CLI:** Polls `POST /auth/token` with the `device_code` until it receives a JWT.
 
-**Endpoints:** `/auth/device/code`, `/activate`, `/auth/device/verify`, `/auth/token`
+#### Flow D: Refresh Token Flow
 
-1.  A CLI application makes a `POST` request to `/auth/device/code` with its `client_id`, `org`, and `service` slugs.
-2.  The API responds with a `device_code`, a human-friendly `user_code` (e.g., `WXYZ-1234`), and a `verification_uri`.
-3.  The CLI displays the `user_code` and asks the user to visit the `verification_uri` in a browser.
-4.  The user visits `/activate`, enters the `user_code`, and is then taken through a standard web login flow (Flow B, but without a final `redirect_uri`). Upon successful login, the device is marked as authorized.
-5.  Simultaneously, the CLI polls the `/auth/token` endpoint every few seconds, sending its `device_code`.
-    *   Initially, it receives a `pending` error.
-    *   Once the user completes step 4, the `/auth/token` endpoint responds with a valid **End-User Service JWT**.
-6.  The CLI can now use this JWT to make authenticated API calls.
+This flow allows clients to renew an expired access token without user interaction.
+1.  **Client:** Stores the `refresh_token` received during the initial login.
+2.  **Client:** When the `access_token` expires, sends a `POST /api/auth/refresh` request with the `refresh_token`.
+3.  **API:** Validates the refresh token, revokes it, and issues a new `access_token` and a new `refresh_token` (token rotation).
+4.  **Client:** Stores the new tokens and replaces the old ones.
 
 ---
 
@@ -197,107 +201,12 @@ All successful responses are `2xx`. Error responses follow a standard format (se
 
 These endpoints do not require a JWT.
 
-#### `POST /api/organizations`
-Create a new organization. The organization will be created with a `pending` status and must be approved by a Platform Owner.
-
-- **Request Body:**
-  ```json
-  {
-    "slug": "acme-corp",
-    "name": "Acme Corporation",
-    "owner_email": "founder@acme.com"
-  }
-  ```
-- **Success Response (`200 OK`):**
-  ```json
-  {
-    "organization": { /* Organization Object */ },
-    "owner": { /* User Object for the owner */ },
-    "membership": { /* Membership Object for the owner */ }
-  }
-  ```
-
-#### `GET /auth/:provider`
-Initiate the end-user OAuth2 web login flow.
-
-- **Path Parameters:**
-  - `provider`: `github` | `google` | `microsoft`
-- **Query Parameters:**
-  - `org` (required): The slug of the organization.
-  - `service` (required): The slug of the service.
-  - `redirect_uri` (optional): The final URL to redirect the user to with the JWT. Must be one of the URIs registered for the service.
-- **Response:** `302 Found` redirect to the OAuth provider.
-
-#### `GET /auth/:provider/callback`
-Callback URL for the OAuth2 provider for the end-user flow. This is handled by the browser and should not be called directly.
-
-#### `GET /auth/admin/:provider`
-Initiate the Platform/Organization Admin OAuth2 web login flow.
-
-- **Path Parameters:**
-  - `provider`: `github` | `google` | `microsoft`
-- **Query Parameters:**
-  - `org_slug` (optional): If the user intends to manage a specific organization.
-- **Response:** `302 Found` redirect to the OAuth provider using platform-specific admin credentials.
-
-#### `GET /auth/admin/:provider/callback`
-Callback URL for the admin OAuth2 flow.
-
-#### `POST /auth/device/code`
-Request a device and user code for the Device Flow.
-
-- **Request Body:**
-  ```json
-  {
-    "client_id": "service-client-id",
-    "org": "acme-corp",
-    "service": "acme-cli"
-  }
-  ```
-- **Success Response (`200 OK`):**
-  ```json
-  {
-    "device_code": "a_long_unguessable_string",
-    "user_code": "ABCD-1234",
-    "verification_uri": "https://sso.example.com/activate",
-    "expires_in": 900,
-    "interval": 5
-  }
-  ```
-
-#### `GET /activate`
-HTML page for the user to enter their `user_code`.
-
-#### `POST /auth/device/verify`
-Verify a `user_code` and initiate the web authentication part of the device flow. This is called from the `/activate` page form.
-
-- **Request Body:**
-  ```json
-  {
-    "user_code": "ABCD-1234"
-  }
-  ```
-- **Response:** `302 Found` redirect to the provider selection page.
-
-#### `POST /auth/token`
-Exchange a `device_code` for a JWT after user authorization. This is polled by the device/CLI.
-
-- **Request Body:**
-  ```json
-  {
-    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-    "device_code": "a_long_unguessable_string",
-    "client_id": "service-client-id"
-  }
-  ```
-- **Success Response (`200 OK`):**
-  ```json
-  {
-    "access_token": "your.jwt.token",
-    "token_type": "Bearer",
-    "expires_in": 86400
-  }
-  ```
+- `POST /api/organizations`: Create a new organization (pending status).
+- `GET /auth/:provider`: Initiate end-user OAuth login.
+- `GET /auth/admin/:provider`: Initiate admin OAuth login.
+- `POST /auth/device/code`: Request codes for Device Flow.
+- `POST /auth/device/verify`: Verify a `user_code` from the web UI to get login context.
+- `POST /auth/token`: Exchange a `device_code` for a JWT.
 
 ### 3.2. Authenticated User Endpoints
 **Authentication:** Requires any valid JWT.
@@ -308,104 +217,61 @@ Revokes the provided JWT, invalidating the current session.
 - **Headers:** `Authorization: Bearer {jwt}`
 - **Success Response:** `204 No Content`
 
-#### `GET /api/user`
-Get the profile of the currently authenticated user within their token's context.
+#### `POST /api/auth/refresh`
+Exchanges a valid refresh token for a new access token and a new refresh token (token rotation).
 
-- **Headers:** `Authorization: Bearer {jwt}`
+- **Request Body:**
+  ```json
+  {
+    "refresh_token": "your-refresh-token"
+  }
+  ```
 - **Success Response (`200 OK`):**
   ```json
   {
-    "id": "user-uuid",
-    "email": "user@example.com",
-    "org": "organization-slug-from-jwt",
-    "service": "service-slug-from-jwt"
+    "access_token": "new.jwt.access-token",
+    "refresh_token": "new-refresh-token",
+    "expires_in": 86400
   }
   ```
+
+#### `GET /api/user`
+Get the profile of the currently authenticated user.
+
+- **Headers:** `Authorization: Bearer {jwt}`
+- **Success Response (`200 OK`):** `{ "id": "...", "email": "...", "org": "...", "service": "..." }`
 
 #### `PATCH /api/user`
 Update the authenticated user's profile.
 
 - **Headers:** `Authorization: Bearer {jwt}`
-- **Request Body:**
-  ```json
-  {
-    "email": "new.email@example.com"
-  }
-  ```
-- **Success Response (`200 OK`):** Returns the updated User Response object.
+- **Request Body:** `{ "email": "new.email@example.com" }`
 
 #### `GET /api/subscription`
 Get the current user's subscription details for the service specified in the JWT.
 
 - **Headers:** `Authorization: Bearer {jwt}`
-- **Success Response (`200 OK`):**
-  ```json
-  {
-    "service": "service-slug",
-    "plan": "pro",
-    "features": ["api-access", "advanced-analytics"],
-    "status": "active",
-    "current_period_end": "2024-02-15T10:30:00Z"
-  }
-  ```
+- **Success Response (`200 OK`):** `{ "service": "...", "plan": "...", "features": [], "status": "...", "current_period_end": "..." }`
 
 #### `GET /api/provider-token/:provider`
-Retrieve a fresh, valid OAuth access token for an external provider on behalf of the user. This will automatically refresh the token if it's expired.
+Retrieve a fresh, valid OAuth access token for an external provider on behalf of the user.
 
 - **Headers:** `Authorization: Bearer {jwt}`
-- **Path Parameters:**
-  - `provider`: `github` | `google` | `microsoft`
-- **Success Response (`200 OK`):**
-  ```json
-  {
-    "access_token": "gho_16C7e42F292c6912E7710c838347Ae178B4a",
-    "refresh_token": "ghr_1B4a2e378f3bc1e6b2c5f1e4d7a8b9c0d",
-    "expires_at": "2024-02-15T10:30:00Z",
-    "scopes": ["user", "repo"],
-    "provider": "github"
-  }
-  ```
+- **Success Response (`200 OK`):** `{ "access_token": "...", "refresh_token": "...", "expires_at": "...", "scopes": [], "provider": "..." }`
 
-### 3.3. Organization Management Endpoints
-**Authentication:** Requires an **Organization Management JWT** or **Platform Owner JWT**. Access is restricted to members of the organization specified in the path.
+### 3.3. Identity Management Endpoints
+**Authentication:** Requires any valid JWT.
 
-#### `GET /api/organizations`
-List all organizations the authenticated user is a member of.
+- `GET /api/user/identities`: List all social accounts linked to the authenticated user.
+- `POST /api/user/identities/:provider/link`: Start the flow to link a new social account. Returns an `authorization_url` to redirect the user to.
+- `DELETE /api/user/identities/:provider`: Unlink a social account.
 
-- **Headers:** `Authorization: Bearer {jwt}`
-- **Query Parameters:** `page`, `limit`, `status`
-- **Success Response (`200 OK`):**
-  ```json
-  [
-    {
-      "organization": { /* Organization Object */ },
-      "membership_count": 5,
-      "service_count": 3,
-      "tier": { /* OrganizationTier Object */ }
-    }
-  ]
-  ```
+### 3.4. Organization Management Endpoints
+**Authentication:** Requires an **Organization Management JWT** or **Platform Owner JWT**.
 
-#### `GET /api/organizations/:org_slug`
-Get detailed information for a specific organization.
-
-- **Headers:** `Authorization: Bearer {jwt}`
-- **Success Response (`200 OK`):** Returns a single Organization Response object as shown above.
-
-#### `PATCH /api/organizations/:org_slug`
-Update organization details.
-**Authorization:** Requires `owner` or `admin` role.
-
-- **Headers:** `Authorization: Bearer {jwt}`
-- **Request Body:**
-  ```json
-  {
-    "name": "New Company Name",
-    "max_services": 20,
-    "max_users": 50
-  }
-  ```
-- **Success Response (`200 OK`):** Returns the updated Organization Response object.
+- `GET /api/organizations`: List all organizations the user is a member of.
+- `GET /api/organizations/:org_slug`: Get detailed information for a specific organization.
+- `PATCH /api/organizations/:org_slug`: Update organization details. (**Owner/Admin**)
 
 #### Member Management (`/api/organizations/:org_slug/members`)
 - `GET /`: List members of the organization.
@@ -414,77 +280,66 @@ Update organization details.
 - `POST /transfer-ownership`: Transfer ownership to another member. (**Owner only**)
 
 #### BYOO Credential Management (`/api/organizations/:org_slug/oauth-credentials/:provider`)
-- `POST /`: Set or update the custom OAuth credentials for a provider. (**Owner/Admin**)
-  - **Request Body:** `{ "client_id": "...", "client_secret": "..." }`
-- `GET /`: Get the configured `client_id` for a provider (secret is never returned). (**Member**)
+- `POST /`: Set or update custom OAuth credentials. (**Owner/Admin**)
+- `GET /`: Get the configured `client_id` (secret is never returned). (**Member**)
 
-### 3.4. Service & Plan Management Endpoints
-**Authentication:** Requires an **Organization Management JWT** or **Platform Owner JWT**. Access is restricted to the organization specified.
+#### End-User (Customer) Management (`/api/organizations/:org_slug/users`)
+- `GET /`: List all end-users (customers) of the organization's services. (**Member**)
+- `GET /:user_id`: Get detailed information for a specific end-user. (**Member**)
+- `DELETE /:user_id/sessions`: Revoke all active sessions for an end-user, forcing re-authentication. (**Owner/Admin**)
 
-#### `POST /api/organizations/:org_slug/services`
-Create a new service for an organization.
-**Authorization:** Requires `owner` or `admin` role.
+#### Organization Analytics (`/api/organizations/:org_slug/analytics`)
+- `GET /login-trends`: Get daily login counts over a date range.
+- `GET /logins-by-service`: Get login counts grouped by service.
+- `GET /logins-by-provider`: Get login counts grouped by OAuth provider.
+- `GET /recent-logins`: Get a list of the most recent login events.
 
-- **Request Body:**
-  ```json
-  {
-    "slug": "dashboard-app",
-    "name": "Company Dashboard",
-    "service_type": "web",
-    "github_scopes": ["user:email", "read:org"],
-    "redirect_uris": ["https://app.my-customer.com/callback"]
-  }
-  ```
-- **Success Response (`200 OK`):**
-  ```json
-  {
-    "service": { /* Service Object */ },
-    "provider_grants": [ /* ProviderTokenGrant Objects */ ],
-    "default_plan": { /* Plan Object for the 'free' tier */ },
-    "usage": {
-      "current_services": 2,
-      "max_services": 10,
-      "tier": "Pro Tier"
-    }
-  }
-  ```
+### 3.5. Service & Plan Management Endpoints
+**Authentication:** Requires an **Organization Management JWT** or **Platform Owner JWT**.
 
-#### Other Service Endpoints (`/api/organizations/:org_slug/services/:service_slug`)
-- `GET /`: Get service details. (**Member**)
-- `PATCH /`: Update service details. (**Owner/Admin**)
-- `DELETE /`: Delete a service. (**Owner only**)
-- `POST /plans`: Create a new subscription plan for the service. (**Owner/Admin**)
-- `GET /plans`: List all plans for the service. (**Member**)
+- `POST /api/organizations/:org_slug/services`: Create a new service. (**Owner/Admin**)
+- `GET /api/organizations/:org_slug/services`: List all services for an organization.
+- `GET /api/organizations/:org_slug/services/:service_slug`: Get service details.
+- `PATCH /api/organizations/:org_slug/services/:service_slug`: Update service details. (**Owner/Admin**)
+- `DELETE /api/organizations/:org_slug/services/:service_slug`: Delete a service. (**Owner only**)
+- `POST /api/organizations/:org_slug/services/:service_slug/plans`: Create a subscription plan. (**Owner/Admin**)
+- `GET /api/organizations/:org_slug/services/:service_slug/plans`: List all plans for a service.
 
-### 3.5. Invitation Management Endpoints
+### 3.6. Invitation Management Endpoints
 **Authentication:** Requires a JWT.
 
-- `POST /api/organizations/:org_slug/invitations`: Create and send an invitation. (**Owner/Admin**)
+- `POST /api/organizations/:org_slug/invitations`: Create an invitation. (**Owner/Admin**)
 - `GET /api/organizations/:org_slug/invitations`: List invitations for an organization. (**Owner/Admin**)
 - `POST /api/organizations/:org_slug/invitations/:invitation_id`: Cancel a pending invitation. (**Owner/Admin**)
 - `GET /api/invitations`: List invitations received by the current user.
-- `POST /api/invitations/accept`: Accept an invitation using its token.
-- `POST /api/invitations/decline`: Decline an invitation using its token.
+- `POST /api/invitations/accept`: Accept an invitation via token.
+- `POST /api/invitations/decline`: Decline an invitation via token.
 
-### 3.6. Platform Owner Endpoints
+### 3.7. Platform Owner Endpoints
 **Authentication:** Requires a **Platform Owner JWT**.
 
-- `GET /api/platform/organizations`: List all organizations on the platform with filters.
-- `POST /api/platform/organizations/:id/approve`: Approve a pending organization and assign a tier.
-- `POST /api/platform/organizations/:id/reject`: Reject a pending organization with a reason.
+- `GET /api/platform/organizations`: List all organizations on the platform.
+- `POST /api/platform/organizations/:id/approve`: Approve a pending organization.
+- `POST /api/platform/organizations/:id/reject`: Reject a pending organization.
 - `POST /api/platform/organizations/:id/suspend`: Suspend an active organization.
 - `POST /api/platform/organizations/:id/activate`: Re-activate a suspended organization.
-- `PATCH /api/platform/organizations/:id/tier`: Update an organization's tier and resource limits.
-- `POST /api/platform/owners`: Promote an existing user to a platform owner.
-- `GET /api/platform/audit-log`: Retrieve the platform-wide audit log with filters.
+- `PATCH /api/platform/organizations/:id/tier`: Update an organization's tier.
+- `POST /api/platform/owners`: Promote a user to platform owner.
+- `DELETE /api/platform/owners/:user_id`: Demote a platform owner.
+- `GET /api/platform/audit-log`: Retrieve the platform-wide audit log.
+- `GET /api/platform/tiers`: List all available organization tiers.
 
-### 3.7. Webhook Endpoints
+#### Platform Analytics (`/api/platform/analytics`)
+- `GET /overview`: Get high-level metrics for the entire platform.
+- `GET /organization-status`: Get a breakdown of organization counts by status.
+- `GET /growth-trends`: Get daily new user and new organization counts.
+- `GET /login-activity`: Get daily platform-wide login counts.
+- `GET /top-organizations`: List the most active organizations.
+- `GET /recent-organizations`: List the most recently created organizations.
 
-#### `POST /webhooks/stripe`
-Endpoint for receiving and processing Stripe webhook events.
+### 3.8. Webhook Endpoints
 
-- **Headers:** `Stripe-Signature` (required)
-- **Response:** `200 OK` on success.
+- `POST /webhooks/stripe`: Endpoint for receiving Stripe webhook events.
 
 ---
 
@@ -501,22 +356,17 @@ The system is configured entirely through environment variables.
 | `JWT_EXPIRATION_HOURS`            | No       | JWT lifetime in hours. Defaults to `24`.                                                       |
 | **Server**                        |          |                                                                                                |
 | `BASE_URL`                        | Yes      | The public base URL of the service (e.g., `http://localhost:3000`).                            |
-| `SERVER_HOST`                     | No       | Host to bind the server to. Defaults to `0.0.0.0`.                                             |
-| `SERVER_PORT`                     | No       | Port to bind the server to. Defaults to `3000`.                                                |
+| `SERVER_HOST` / `SERVER_PORT`     | No       | Host/port to bind to. Defaults to `0.0.0.0:3000`.                                              |
 | `PLATFORM_ADMIN_REDIRECT_URI`     | Yes      | The callback URL for the admin frontend application.                                           |
+| `PLATFORM_DEVICE_ACTIVATION_URI`  | Yes      | The URL for the platform-level device activation page.                                         |
 | **Platform Owner**                |          |                                                                                                |
 | `PLATFORM_OWNER_EMAIL`            | Yes      | Email of the user to be automatically designated as the platform owner on startup.             |
 | **Default OAuth Apps**            | Yes      | Credentials for the platform's default apps, used when an organization doesn't bring their own.  |
-| `GITHUB_CLIENT_ID`                | Yes      |                                                                                                |
-| `GITHUB_CLIENT_SECRET`            | Yes      |                                                                                                |
-| `GITHUB_REDIRECT_URI`             | Yes      |                                                                                                |
-| `GOOGLE_CLIENT_ID`...             | Yes      | ...and so on for Google and Microsoft.                                                         |
+| `GITHUB_CLIENT_ID` / `_SECRET`... | Yes      | ...and so on for Google and Microsoft.                                                         |
 | **Platform Admin OAuth Apps**     | Yes      | Credentials for the dedicated OAuth apps used **only for the admin login flow**.               |
-| `PLATFORM_GITHUB_CLIENT_ID`       | Yes      |                                                                                                |
-| `PLATFORM_GITHUB_CLIENT_SECRET`   | Yes      |                                                                                                |
-| `PLATFORM_GOOGLE_CLIENT_ID`...    | Yes      | ...and so on for Google and Microsoft.                                                         |
+| `PLATFORM_GITHUB_CLIENT_ID`...    | Yes      | ...and so on for Google and Microsoft.                                                         |
 | **Security**                      |          |                                                                                                |
-| `ENCRYPTION_KEY`                  | No       | 32-byte (64 hex characters) key for encrypting BYOO secrets. If not set, secrets are not encrypted. |
+| `ENCRYPTION_KEY`                  | **Yes**  | **Highly Recommended.** 32-byte (64 hex characters) key for encrypting BYOO secrets.             |
 | **Billing**                       |          |                                                                                                |
 | `STRIPE_SECRET_KEY`               | Yes      | Your Stripe API secret key.                                                                    |
 | `STRIPE_WEBHOOK_SECRET`           | Yes      | The signing secret for your Stripe webhook endpoint.                                           |
@@ -537,7 +387,7 @@ All API errors are returned with a consistent JSON structure.
   ```
 
 - **Common Error Codes & Statuses:**
-  - `400 Bad Request` (`BAD_REQUEST`, `DEVICE_CODE_EXPIRED`, `SERVICE_LIMIT_EXCEEDED`)
+  - `400 Bad Request` (`BAD_REQUEST`, `DEVICE_CODE_EXPIRED`, `SERVICE_LIMIT_EXCEEDED`, `TEAM_LIMIT_EXCEEDED`, `INVITATION_EXPIRED`)
   - `401 Unauthorized` (`UNAUTHORIZED`, `TOKEN_EXPIRED`, `JWT_ERROR`)
   - `403 Forbidden` (`FORBIDDEN`, `ORGANIZATION_NOT_ACTIVE`)
   - `404 Not Found` (`NOT_FOUND`)
