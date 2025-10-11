@@ -146,7 +146,7 @@ impl StripeService {
         let status = subscription.status.to_string();
         let current_period_end =
             chrono::DateTime::from_timestamp(subscription.current_period_end, 0)
-                .unwrap_or_else(|| Utc::now());
+                .unwrap_or_else(Utc::now);
 
         // Upsert subscription
         let id = Uuid::new_v4().to_string();

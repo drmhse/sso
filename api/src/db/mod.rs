@@ -9,7 +9,7 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
 
     // Create parent directory if it doesn't exist
     if let Some(parent) = std::path::Path::new(db_path).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| sqlx::Error::Io(e))?;
+        std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
     }
 
     let pool = SqlitePoolOptions::new()

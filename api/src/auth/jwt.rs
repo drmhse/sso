@@ -36,6 +36,7 @@ impl JwtService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_token(
         &self,
         user_id: &str,
@@ -61,12 +62,12 @@ impl JwtService {
             iat: now.timestamp(),
         };
 
-        encode(&Header::default(), &claims, &self.encoding_key).map_err(|e| AppError::Jwt(e))
+        encode(&Header::default(), &claims, &self.encoding_key).map_err(AppError::Jwt)
     }
 
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
         let token_data = decode::<Claims>(token, &self.decoding_key, &Validation::default())
-            .map_err(|e| AppError::Jwt(e))?;
+            .map_err(AppError::Jwt)?;
 
         // Check if token is expired
         let now = Utc::now().timestamp();
@@ -109,7 +110,7 @@ mod tests {
 
         assert_eq!(claims.sub, "user_123");
         assert_eq!(claims.email, "user@example.com");
-        assert_eq!(claims.is_platform_owner, false);
+        assert!(!claims.is_platform_owner);
         assert_eq!(claims.org, Some("acme-corp".to_string()));
         assert_eq!(claims.service, Some("analytics".to_string()));
         assert_eq!(claims.plan, Some("pro".to_string()));

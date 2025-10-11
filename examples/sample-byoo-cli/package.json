@@ -1,0 +1,16 @@
+{
+  "name": "sample-byoo-cli",
+  "version": "1.0.0",
+  "description": "Sample CLI demonstrating end-user (BYOO) device flow authentication",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["sso", "device-flow", "cli", "byoo"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@drmhse/sso-sdk": "file:../sso-sdk"
+  }
+}

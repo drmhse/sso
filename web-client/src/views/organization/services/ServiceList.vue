@@ -208,46 +208,65 @@
 
         <details class="border rounded-md p-4">
           <summary class="cursor-pointer font-medium text-gray-700">
-            Advanced: OAuth Scopes (Optional)
+            Advanced Options (Optional)
           </summary>
           <div class="mt-4 space-y-4">
             <div>
               <label class="block text-sm font-medium text-gray-700 mb-1">
-                GitHub Scopes
+                Device Activation URI
               </label>
               <input
-                v-model="scopesInput.github"
-                type="text"
-                placeholder="user:email, read:org"
+                v-model="form.device_activation_uri"
+                type="url"
+                placeholder="https://example.com/activate"
                 class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
               />
-              <p class="mt-1 text-xs text-gray-500">Comma-separated list</p>
+              <p class="mt-1 text-xs text-gray-500">Base URL for device flow (RFC 8628) - for CLI/mobile authentication</p>
             </div>
 
-            <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">
-                Google Scopes
-              </label>
-              <input
-                v-model="scopesInput.google"
-                type="text"
-                placeholder="email, profile"
-                class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
-              />
-              <p class="mt-1 text-xs text-gray-500">Comma-separated list</p>
-            </div>
+            <div class="border-t pt-4">
+              <p class="text-sm font-medium text-gray-700 mb-3">OAuth Scopes</p>
 
-            <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">
-                Microsoft Scopes
-              </label>
-              <input
-                v-model="scopesInput.microsoft"
-                type="text"
-                placeholder="User.Read, email"
-                class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
-              />
-              <p class="mt-1 text-xs text-gray-500">Comma-separated list</p>
+              <div class="space-y-3">
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">
+                    GitHub Scopes
+                  </label>
+                  <input
+                    v-model="scopesInput.github"
+                    type="text"
+                    placeholder="user:email, read:org"
+                    class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+                  />
+                  <p class="mt-1 text-xs text-gray-500">Comma-separated list</p>
+                </div>
+
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Google Scopes
+                  </label>
+                  <input
+                    v-model="scopesInput.google"
+                    type="text"
+                    placeholder="email, profile"
+                    class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+                  />
+                  <p class="mt-1 text-xs text-gray-500">Comma-separated list</p>
+                </div>
+
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Microsoft Scopes
+                  </label>
+                  <input
+                    v-model="scopesInput.microsoft"
+                    type="text"
+                    placeholder="User.Read, email"
+                    class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+                  />
+                  <p class="mt-1 text-xs text-gray-500">Comma-separated list</p>
+                </div>
+              </div>
             </div>
           </div>
         </details>
@@ -303,6 +322,7 @@ const form = ref({
   slug: '',
   service_type: '',
   redirect_uris: [''],
+  device_activation_uri: '',
 });
 
 const scopesInput = ref({
@@ -334,6 +354,7 @@ const resetForm = () => {
     slug: '',
     service_type: '',
     redirect_uris: [''],
+    device_activation_uri: '',
   };
   scopesInput.value = {
     github: '',
@@ -382,6 +403,11 @@ const handleCreateService = async () => {
     service_type: form.value.service_type,
     redirect_uris: validRedirectUris,
   };
+
+  // Add device activation URI if provided
+  if (form.value.device_activation_uri && form.value.device_activation_uri.trim().length > 0) {
+    payload.device_activation_uri = form.value.device_activation_uri.trim();
+  }
 
   const githubScopes = parseScopes(scopesInput.value.github);
   const googleScopes = parseScopes(scopesInput.value.google);

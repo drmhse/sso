@@ -124,7 +124,7 @@ pub async fn create_invitation(
     .bind(&req.role)
     .bind(&user.id)
     .bind(&token)
-    .bind(&expires_at)
+    .bind(expires_at)
     .bind(Utc::now())
     .fetch_one(&state.pool)
     .await

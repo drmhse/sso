@@ -5,7 +5,7 @@ use crate::constants::{DEVICE_CODE_EXPIRE_MINUTES, JWT_EXPIRE_HOURS, OAUTH_STATE
 use crate::db::models::{DeviceCode, Identity, User};
 use crate::error::{AppError, Result};
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Path, Query, State},
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use oauth2::url;
 use uuid::Uuid;
 
 // --- Define Message for DB Writer Task ---
@@ -48,12 +49,14 @@ pub struct AuthRequest {
     pub org: String,
     pub service: String,
     pub redirect_uri: Option<String>,
+    pub user_code: Option<String>,
 }
 
 // Admin Auth Request
 #[derive(Debug, Deserialize)]
 pub struct AdminAuthRequest {
     pub org_slug: Option<String>,
+    pub user_code: Option<String>,
 }
 
 // SSO Callback Query Parameters
@@ -85,6 +88,14 @@ pub struct DeviceCodeResponse {
 #[derive(Debug, Deserialize)]
 pub struct DeviceVerifyRequest {
     pub user_code: String,
+}
+
+// Device Verify Response
+#[derive(Debug, Serialize)]
+pub struct DeviceVerifyResponse {
+    pub org_slug: String,
+    pub service_slug: String,
+    pub available_providers: Vec<String>,
 }
 
 // Token Request
@@ -180,8 +191,8 @@ pub async fn auth_provider(
     };
 
     sqlx::query(
-        "INSERT INTO oauth_states (state, pkce_verifier, service_id, redirect_uri, org_slug, service_slug, is_admin_flow, user_id_for_linking, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, NULL, datetime('now'), ?)",
+        "INSERT INTO oauth_states (state, pkce_verifier, service_id, redirect_uri, org_slug, service_slug, is_admin_flow, user_id_for_linking, device_user_code, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, datetime('now'), ?)",
     )
     .bind(csrf_token.secret())
     .bind(pkce_value)
@@ -189,7 +200,8 @@ pub async fn auth_provider(
     .bind(&params.redirect_uri)
     .bind(&params.org)
     .bind(&params.service)
-    .bind(&expires_at)
+    .bind(&params.user_code)
+    .bind(expires_at)
     .execute(&state.pool)
     .await?;
 
@@ -394,16 +406,25 @@ pub async fn auth_callback(
             if let (Some(org_slug), Some(service_slug)) =
                 (&oauth_ctx.org_slug, &oauth_ctx.service_slug)
             {
-                // Find pending device code for this org/service
-                let device_code = sqlx::query_as::<_, DeviceCode>(
-                    "SELECT * FROM device_codes
-                     WHERE org_slug = ? AND service_slug = ? AND status = 'pending'
-                     ORDER BY created_at DESC LIMIT 1",
-                )
-                .bind(org_slug)
-                .bind(service_slug)
-                .fetch_optional(&state.pool)
-                .await?;
+                // Find device code using the user_code if provided, otherwise fall back to most recent
+                let device_code = if let Some(ref user_code) = oauth_ctx.device_user_code {
+                    sqlx::query_as::<_, DeviceCode>(
+                        "SELECT * FROM device_codes WHERE user_code = ? AND status = 'pending'"
+                    )
+                    .bind(user_code)
+                    .fetch_optional(&state.pool)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, DeviceCode>(
+                        "SELECT * FROM device_codes
+                         WHERE org_slug = ? AND service_slug = ? AND status = 'pending'
+                         ORDER BY created_at DESC LIMIT 1",
+                    )
+                    .bind(org_slug)
+                    .bind(service_slug)
+                    .fetch_optional(&state.pool)
+                    .await?
+                };
 
                 if let Some(dc) = device_code {
                     // Authorize the device code
@@ -415,21 +436,35 @@ pub async fn auth_callback(
                     .execute(&state.pool)
                     .await?;
                 }
-            }
 
-            // Show device authorization success page
-            let html = r#"
-                <!DOCTYPE html>
-                <html>
-                <head><title>Device Authorized</title></head>
-                <body>
-                    <h1>Device Successfully Authorized</h1>
-                    <p>Your device can now complete the authentication process.</p>
-                    <p>You can close this window.</p>
-                </body>
-                </html>
-            "#;
-            return Ok(Html(html).into_response());
+                // This is a device flow completion - redirect to service's success page
+                // Get service to find device activation URI
+                let service = sqlx::query_as::<_, crate::db::models::Service>(
+                    "SELECT s.* FROM services s JOIN organizations o ON s.org_id = o.id
+                     WHERE o.slug = ? AND s.slug = ?",
+                )
+                .bind(org_slug)
+                .bind(service_slug)
+                .fetch_optional(&state.pool)
+                .await?;
+
+                // Use the service's configured device activation URI
+                let base_activation_uri = service
+                    .and_then(|s| s.device_activation_uri)
+                    .ok_or_else(|| AppError::InternalServerError("Device activation URI not configured for this service".to_string()))?;
+
+                // Create success redirect URL with token
+                let mut success_url = url::Url::parse(&base_activation_uri)
+                    .map_err(|_| AppError::InternalServerError("Invalid device activation URI configured".to_string()))?;
+
+                // Set path to success page and include status and token
+                success_url.set_path("/activate/success");
+                success_url.query_pairs_mut()
+                    .append_pair("status", "success")
+                    .append_pair("device_flow", "true");
+
+                return Ok(Redirect::to(success_url.as_str()).into_response());
+            }
         }
     }
 
@@ -545,25 +580,38 @@ pub async fn device_code(
     State(state): State<AppState>,
     Json(req): Json<DeviceCodeRequest>,
 ) -> Result<Json<DeviceCodeResponse>> {
-    // Read operations can still happen directly as they don't block writers in WAL mode.
-    let service_count: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*) FROM services s
-        JOIN organizations o ON s.org_id = o.id
-        WHERE s.client_id = ? AND o.slug = ? AND s.slug = ?
-        "#,
-    )
-    .bind(&req.client_id)
-    .bind(&req.org)
-    .bind(&req.service)
-    .fetch_one(&state.pool)
-    .await?;
+    // Get config for platform device activation URI
+    let config = crate::config::Config::from_env()
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    if service_count == 0 {
-        return Err(AppError::BadRequest(
+    // Check if this is a platform-level device flow or service-level
+    let verification_uri = if req.org == "platform" && req.service == "admin-cli" && req.client_id.starts_with("platform-") {
+        // Platform-level device flow for admin CLI - use configured platform device activation URI
+        config.platform_device_activation_uri
+    } else {
+        // Service-level device flow - validate service exists
+        let service = sqlx::query_as::<_, crate::db::models::Service>(
+            r#"
+            SELECT s.* FROM services s
+            JOIN organizations o ON s.org_id = o.id
+            WHERE s.client_id = ? AND o.slug = ? AND s.slug = ?
+            "#,
+        )
+        .bind(&req.client_id)
+        .bind(&req.org)
+        .bind(&req.service)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        let service = service.ok_or_else(|| AppError::BadRequest(
             "Invalid client credentials".to_string(),
-        ));
-    }
+        ))?;
+
+        // Use service's device_activation_uri if set
+        service.device_activation_uri.ok_or_else(|| AppError::BadRequest(
+            "Device activation URI not configured for this service".to_string(),
+        ))?
+    };
 
     // --- Perform CPU-bound work here, in the parallel handler ---
     let id = Uuid::new_v4().to_string();
@@ -593,44 +641,17 @@ pub async fn device_code(
     Ok(Json(DeviceCodeResponse {
         device_code,
         user_code,
-        verification_uri: format!("{}/activate", state.base_url),
+        verification_uri,
         expires_in: DEVICE_CODE_EXPIRE_MINUTES * 60, // Convert minutes to seconds
         interval: 5,     // Poll every 5 seconds
     }))
 }
 
-/// Device Flow: Activation page
-pub async fn activate_page() -> Html<&'static str> {
-    Html(
-        r#"
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Device Activation</title>
-            <style>
-                body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; }
-                input { padding: 10px; font-size: 18px; width: 100%; margin: 10px 0; }
-                button { padding: 10px 20px; font-size: 16px; background: #007bff; color: white; border: none; cursor: pointer; }
-            </style>
-        </head>
-        <body>
-            <h1>Device Activation</h1>
-            <p>Enter the code displayed on your device:</p>
-            <form method="POST" action="/auth/device/verify">
-                <input type="text" name="user_code" placeholder="XXXX-XXXX" required pattern="[A-Z0-9]{4}-[A-Z0-9]{4}" />
-                <button type="submit">Activate</button>
-            </form>
-        </body>
-        </html>
-        "#,
-    )
-}
-
-/// Device Flow: Verify user code (after SSO login)
+/// Device Flow: Verify user code and return context for frontend
 pub async fn device_verify(
     State(state): State<AppState>,
-    Form(req): Form<DeviceVerifyRequest>,
-) -> Result<Response> {
+    Json(req): Json<DeviceVerifyRequest>,
+) -> Result<Json<DeviceVerifyResponse>> {
     // Find device code
     let device_code = DeviceFlowService::find_by_user_code(&state.pool, &req.user_code)
         .await?
@@ -643,86 +664,58 @@ pub async fn device_verify(
 
     // Check if already authorized
     if DeviceFlowService::is_authorized(&device_code) {
-        return Ok(Html(
-            r#"
-            <!DOCTYPE html>
-            <html>
-            <head><title>Already Authorized</title></head>
-            <body>
-                <h1>Device Already Authorized</h1>
-                <p>Your device has been authorized. You can close this window.</p>
-            </body>
-            </html>
-        "#,
-        )
-        .into_response());
+        return Err(AppError::BadRequest("Device already authorized".to_string()));
     }
 
-    // Generate OAuth state for device flow
-    let expires_at = Utc::now() + chrono::Duration::minutes(OAUTH_STATE_EXPIRE_MINUTES);
-    let state_token = uuid::Uuid::new_v4().to_string();
+    // Check if this is a platform-level admin device flow
+    if device_code.org_slug == "platform" && device_code.service_slug == "admin-cli" {
+        // Platform-level device flow - return all available admin providers
+        let available_providers = vec!["github".to_string(), "google".to_string(), "microsoft".to_string()];
 
-    // Store device flow state
-    let org_slug = device_code.org_slug.to_string();
-    let service_slug = device_code.service_slug.to_string();
-    let is_admin_flow = false;
-    sqlx::query(
-        "INSERT INTO oauth_states (state, pkce_verifier, service_id, redirect_uri, org_slug, service_slug, is_admin_flow, user_id_for_linking, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'), ?)",
+        return Ok(Json(DeviceVerifyResponse {
+            org_slug: device_code.org_slug,
+            service_slug: device_code.service_slug,
+            available_providers,
+        }));
+    }
+
+    // Service-level device flow - fetch organization and service
+    let org = sqlx::query_as::<_, crate::db::models::Organization>(
+        "SELECT * FROM organizations WHERE slug = ?"
     )
-    .bind(&state_token)
-    .bind(Option::<String>::None) // No PKCE for device flow
-    .bind(Option::<String>::None) // No specific service
-    .bind(Option::<String>::None) // No redirect URI
-    .bind(&org_slug)
-    .bind(&service_slug)
-    .bind(is_admin_flow)
-    .bind(&expires_at)
-    .execute(&state.pool)
+    .bind(&device_code.org_slug)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    let _service = sqlx::query_as::<_, crate::db::models::Service>(
+        "SELECT * FROM services WHERE org_id = ? AND slug = ?"
+    )
+    .bind(&org.id)
+    .bind(&device_code.service_slug)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+    // Fetch organization OAuth credentials to see which providers are configured
+    let org_credentials = sqlx::query_as::<_, crate::db::models::OrganizationOAuthCredential>(
+        "SELECT * FROM organization_oauth_credentials WHERE org_id = ?"
+    )
+    .bind(&org.id)
+    .fetch_all(&state.pool)
     .await?;
 
-    // Redirect to SSO provider selection page
-    let html = format!(
-        r#"
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Device Authorization</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }}
-                .provider-button {{ display: block; width: 100%; padding: 15px; margin: 10px 0;
-                                 background: #007bff; color: white; text-decoration: none;
-                                 text-align: center; border-radius: 5px; }}
-                .provider-button:hover {{ background: #0056b3; }}
-            </style>
-        </head>
-        <body>
-            <h1>Authorize Your Device</h1>
-            <p>Choose a provider to sign in and authorize:</p>
-            <a href="/auth/github?org={}&service={}&state={}" class="provider-button">
-                Sign in with GitHub
-            </a>
-            <a href="/auth/google?org={}&service={}&state={}" class="provider-button">
-                Sign in with Google
-            </a>
-            <a href="/auth/microsoft?org={}&service={}&state={}" class="provider-button">
-                Sign in with Microsoft
-            </a>
-        </body>
-        </html>
-    "#,
-        device_code.org_slug,
-        device_code.service_slug,
-        state_token,
-        device_code.org_slug,
-        device_code.service_slug,
-        state_token,
-        device_code.org_slug,
-        device_code.service_slug,
-        state_token
-    );
+    let available_providers: Vec<String> = org_credentials
+        .into_iter()
+        .map(|cred| cred.provider)
+        .collect();
 
-    Ok(Html(html).into_response())
+    // Return the context needed for the frontend to initiate the correct login flow
+    Ok(Json(DeviceVerifyResponse {
+        org_slug: device_code.org_slug,
+        service_slug: device_code.service_slug,
+        available_providers,
+    }))
 }
 
 /// Device Flow: Exchange device code for token
@@ -755,7 +748,45 @@ pub async fn token_exchange(
     .fetch_one(&state.pool)
     .await?;
 
-    // Get service and plan info
+    // Check if this is a platform-level device flow
+    if device_code.org_slug == "platform" && device_code.service_slug == "admin-cli" {
+        // Generate platform JWT for admin CLI
+        let token = state.jwt_service.create_token(
+            &user.id,
+            &user.email,
+            user.is_platform_owner,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        // Store session
+        let session_id = Uuid::new_v4().to_string();
+        let token_hash = JwtService::hash_token(&token);
+        let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+
+        sqlx::query!(
+            r#"
+            INSERT INTO sessions (id, user_id, token_hash, expires_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+            session_id,
+            user_id,
+            token_hash,
+            expires_at
+        )
+        .execute(&state.pool)
+        .await?;
+
+        return Ok(Json(TokenResponse {
+            access_token: token,
+            token_type: "Bearer".to_string(),
+            expires_in: JWT_EXPIRE_HOURS * 3600, // Convert hours to seconds
+        }));
+    }
+
+    // Service-level device flow - get service and plan info
     let result = sqlx::query!(
         r#"
         SELECT
@@ -865,6 +896,7 @@ async fn find_or_create_user(pool: &SqlitePool, email: &str) -> Result<User> {
     Ok(user)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upsert_identity_with_details(
     pool: &SqlitePool,
     encryption: Option<&Arc<crate::encryption::EncryptionService>>,
@@ -1010,8 +1042,8 @@ pub async fn auth_admin_provider(
 
     let is_admin_flow = true;
     sqlx::query(
-        "INSERT INTO oauth_states (state, pkce_verifier, service_id, redirect_uri, org_slug, service_slug, is_admin_flow, user_id_for_linking, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'), ?)",
+        "INSERT INTO oauth_states (state, pkce_verifier, service_id, redirect_uri, org_slug, service_slug, is_admin_flow, user_id_for_linking, device_user_code, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, datetime('now'), ?)",
     )
     .bind(csrf_token.secret())
     .bind(pkce_value)
@@ -1020,7 +1052,8 @@ pub async fn auth_admin_provider(
     .bind(&params.org_slug)
     .bind(Option::<String>::None)
     .bind(is_admin_flow)
-    .bind(&expires_at)
+    .bind(&params.user_code)
+    .bind(expires_at)
     .execute(&state.pool)
     .await?;
 
@@ -1085,15 +1118,69 @@ pub async fn auth_admin_callback(
     )
     .await?;
 
-    // Clean up OAuth state
-    if let Some(ref state_param) = callback.state {
-        let _ = sqlx::query("DELETE FROM oauth_states WHERE state = ?")
-            .bind(state_param)
+    // Check if this is a device flow completion - prioritize this over normal web login
+    if let Some(ref user_code) = oauth_state.device_user_code {
+        // Find the specific device code by user_code
+        let device_code = sqlx::query_as::<_, DeviceCode>(
+            "SELECT * FROM device_codes WHERE user_code = ? AND status = 'pending'",
+        )
+        .bind(user_code)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        if let Some(dc) = device_code {
+            // Authorize the device code
+            sqlx::query!(
+                "UPDATE device_codes SET user_id = ?, status = 'authorized' WHERE id = ?",
+                user.id,
+                dc.id
+            )
             .execute(&state.pool)
-            .await;
+            .await?;
+
+            // Clean up OAuth state
+            if let Some(ref state_param) = callback.state {
+                let _ = sqlx::query("DELETE FROM oauth_states WHERE state = ?")
+                    .bind(state_param)
+                    .execute(&state.pool)
+                    .await;
+            }
+
+            // Determine redirect URL based on org/service
+            let redirect_url = if dc.org_slug == "platform" && dc.service_slug == "admin-cli" {
+                // Platform admin CLI device flow - redirect to platform admin frontend
+                format!("{}?device_flow_status=success", config.platform_admin_redirect_uri)
+            } else {
+                // Service-level device flow - get service's device activation URI
+                let service = sqlx::query_as::<_, crate::db::models::Service>(
+                    "SELECT s.* FROM services s JOIN organizations o ON s.org_id = o.id
+                     WHERE o.slug = ? AND s.slug = ?",
+                )
+                .bind(&dc.org_slug)
+                .bind(&dc.service_slug)
+                .fetch_optional(&state.pool)
+                .await?;
+
+                let base_activation_uri = service
+                    .and_then(|s| s.device_activation_uri)
+                    .ok_or_else(|| AppError::InternalServerError("Device activation URI not configured for this service".to_string()))?;
+
+                let mut success_url = url::Url::parse(&base_activation_uri)
+                    .map_err(|_| AppError::InternalServerError("Invalid device activation URI configured".to_string()))?;
+
+                success_url.set_path("/activate/success");
+                success_url.query_pairs_mut()
+                    .append_pair("status", "success")
+                    .append_pair("device_flow", "true");
+
+                success_url.to_string()
+            };
+
+            return Ok(Redirect::to(&redirect_url).into_response());
+        }
     }
 
-    // Decision logic for JWT type
+    // If not a device flow, proceed with normal web login decision logic
     let jwt = if user.is_platform_owner {
         // Create Platform JWT (no org or service claims)
         state
@@ -1135,16 +1222,44 @@ pub async fn auth_admin_callback(
             )?
         }
     } else {
-        // No org_slug provided and not platform owner - issue basic JWT for first-time users
-        state.jwt_service.create_token(
-            &user.id,
-            &user.email,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )?
+        // Generic Admin Login (No org_slug provided):
+        // Check if the user belongs to any organizations.
+        let memberships = sqlx::query!(
+            r#"
+            SELECT o.slug
+            FROM memberships m
+            JOIN organizations o ON m.org_id = o.id
+            WHERE m.user_id = ?
+            ORDER BY m.created_at ASC
+            "#,
+            user.id
+        )
+        .fetch_all(&state.pool)
+        .await?;
+
+        if let Some(first_membership) = memberships.first() {
+            // User is a member of at least one org. Issue a token for the first one.
+            state.jwt_service.create_token(
+                &user.id,
+                &user.email,
+                false,
+                Some(&first_membership.slug),
+                None,
+                None,
+                None,
+            )?
+        } else {
+            // User is not a member of any org: Issue a basic JWT to prompt for creation.
+            state.jwt_service.create_token(
+                &user.id,
+                &user.email,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )?
+        }
     };
 
     // Store session

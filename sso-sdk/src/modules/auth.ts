@@ -3,6 +3,7 @@ import {
   OAuthProvider,
   DeviceCodeRequest,
   DeviceCodeResponse,
+  DeviceVerifyResponse,
   TokenRequest,
   TokenResponse,
   LoginUrlParams,
@@ -46,6 +47,10 @@ export class AuthModule {
       searchParams.append('redirect_uri', params.redirect_uri);
     }
 
+    if (params.user_code) {
+      searchParams.append('user_code', params.user_code);
+    }
+
     return `${baseURL}/auth/${provider}?${searchParams.toString()}`;
   }
 
@@ -71,6 +76,10 @@ export class AuthModule {
 
     if (params?.org_slug) {
       searchParams.append('org_slug', params.org_slug);
+    }
+
+    if (params?.user_code) {
+      searchParams.append('user_code', params.user_code);
     }
 
     const queryString = searchParams.toString();
@@ -99,6 +108,26 @@ export class AuthModule {
      */
     request: async (payload: DeviceCodeRequest): Promise<DeviceCodeResponse> => {
       const response = await this.http.post<DeviceCodeResponse>('/auth/device/code', payload);
+      return response.data;
+    },
+
+    /**
+     * Verify a user code and get the context (org_slug, service_slug)
+     * needed for the UI to initiate the appropriate OAuth flow.
+     *
+     * @param userCode The user-friendly code displayed on the device
+     * @returns Context with organization and service information
+     *
+     * @example
+     * ```typescript
+     * const context = await sso.auth.deviceCode.verify('ABCD-1234');
+     * // Use context.org_slug and context.service_slug to determine which OAuth flow to initiate
+     * ```
+     */
+    verify: async (userCode: string): Promise<DeviceVerifyResponse> => {
+      const response = await this.http.post<DeviceVerifyResponse>('/auth/device/verify', {
+        user_code: userCode
+      });
       return response.data;
     },
 

@@ -21,8 +21,8 @@ use crate::handlers::analytics::{
     AnalyticsState,
 };
 use crate::handlers::auth::{
-    activate_page, auth_admin_callback, auth_admin_provider, auth_callback, auth_provider,
-    device_code, device_verify, logout, token_exchange, AppState, DbRequest,
+    auth_admin_callback, auth_admin_provider, auth_callback, auth_provider, device_code,
+    device_verify, logout, token_exchange, AppState, DbRequest,
 };
 use crate::handlers::identities::{list_identities, start_link, unlink_identity};
 use crate::handlers::invitations::{
@@ -488,7 +488,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/admin/:provider/callback", get(auth_admin_callback))
         // Device flow routes
         .route("/auth/device/code", post(device_code))
-        .route("/activate", get(activate_page))
         .route("/auth/device/verify", post(device_verify))
         .route("/auth/token", post(token_exchange))
         // Public organization creation

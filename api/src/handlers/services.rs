@@ -22,6 +22,7 @@ pub struct CreateServiceRequest {
     pub microsoft_scopes: Option<Vec<String>>,
     pub google_scopes: Option<Vec<String>>,
     pub redirect_uris: Option<Vec<String>>,
+    pub device_activation_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +33,7 @@ pub struct UpdateServiceRequest {
     pub microsoft_scopes: Option<Vec<String>>,
     pub google_scopes: Option<Vec<String>>,
     pub redirect_uris: Option<Vec<String>>,
+    pub device_activation_uri: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,8 +230,8 @@ pub async fn create_service(
         r#"
         INSERT INTO services (
             id, org_id, slug, name, service_type, client_id,
-            github_scopes, microsoft_scopes, google_scopes, redirect_uris, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            github_scopes, microsoft_scopes, google_scopes, redirect_uris, device_activation_uri, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
         "#,
     )
@@ -243,6 +245,7 @@ pub async fn create_service(
     .bind(&microsoft_scopes_json)
     .bind(&google_scopes_json)
     .bind(&redirect_uris_json)
+    .bind(&req.device_activation_uri)
     .bind(Utc::now())
     .fetch_one(&mut *tx)
     .await?;
@@ -570,6 +573,11 @@ pub async fn update_service(
         scope_strings.push(uris_json);
     }
 
+    if let Some(device_activation_uri) = &req.device_activation_uri {
+        updates.push("device_activation_uri = ?");
+        values.push(device_activation_uri.clone());
+    }
+
     if updates.is_empty() {
         return Err(crate::error::AppError::BadRequest(
             "No fields to update".to_string(),
@@ -704,7 +712,7 @@ pub async fn create_plan(
     .bind(&id)
     .bind(&service.id)
     .bind(&req.name)
-    .bind(&req.price_cents)
+    .bind(req.price_cents)
     .bind(&req.currency)
     .bind(&features_json)
     .bind(Utc::now())

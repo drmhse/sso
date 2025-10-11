@@ -7,6 +7,8 @@
         </div>
 
         <div class="flex items-center space-x-4">
+          <OrgSwitcher />
+
           <span class="text-sm text-gray-700">{{ authStore.userEmail }}</span>
 
           <button
@@ -24,6 +26,7 @@
 <script setup>
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '@/stores/auth';
+import OrgSwitcher from '@/components/OrgSwitcher.vue';
 
 const router = useRouter();
 const authStore = useAuthStore();

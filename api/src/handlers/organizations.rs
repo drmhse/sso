@@ -437,7 +437,7 @@ pub async fn list_members(
     crate::middleware::check_org_membership(&state.pool, &user.id, &organization.id, &[]).await?;
 
     let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).min(100).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * limit;
 
     // Use simple query approach to avoid sqlx macro issues
@@ -666,12 +666,10 @@ pub async fn remove_member(
     .ok_or_else(|| AppError::NotFound("User is not a member of this organization".to_string()))?;
 
     // Check permissions: owner can remove anyone, admin can only remove members, not owners/admins
-    if caller_membership.role != "owner" {
-        if target_membership.role == "owner" || target_membership.role == "admin" {
-            return Err(AppError::Forbidden(
-                "Only owners can remove other owners and admins".to_string(),
-            ));
-        }
+    if caller_membership.role != "owner" && (target_membership.role == "owner" || target_membership.role == "admin") {
+        return Err(AppError::Forbidden(
+            "Only owners can remove other owners and admins".to_string(),
+        ));
     }
 
     // Remove membership
@@ -780,7 +778,7 @@ pub async fn list_user_organizations(
     let user = &auth_user.user;
 
     let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(20).min(100).max(1);
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * limit;
 
     // Build simple query with optional status filter
@@ -1155,7 +1153,7 @@ pub async fn list_end_users(
     crate::middleware::check_org_membership(&state.pool, &user.id, &organization.id, &[]).await?;
 
     let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).min(100).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * limit;
 
     // Get distinct users who have subscriptions to services owned by this organization
@@ -1245,7 +1243,7 @@ pub async fn list_end_users(
         };
         subscriptions_by_user
             .entry(user_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(subscription);
     }
 
@@ -1279,7 +1277,7 @@ pub async fn list_end_users(
         };
         identities_by_user
             .entry(user_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(identity);
     }
 
@@ -1289,8 +1287,8 @@ pub async fn list_end_users(
         .map(|user| {
             let subscriptions = subscriptions_by_user
                 .remove(&user.id)
-                .unwrap_or_else(Vec::new);
-            let identities = identities_by_user.remove(&user.id).unwrap_or_else(Vec::new);
+                .unwrap_or_default();
+            let identities = identities_by_user.remove(&user.id).unwrap_or_default();
 
             EndUser {
                 user,

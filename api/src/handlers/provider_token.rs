@@ -157,7 +157,7 @@ async fn refresh_provider_token(state: &AppState, identity: &Identity) -> Result
     )
     .bind(&new_token.access_token)
     .bind(&new_token.refresh_token)
-    .bind(&new_token.expires_at)
+    .bind(new_token.expires_at)
     .bind(&identity.id)
     .fetch_one(&state.pool)
     .await?;
@@ -191,8 +191,8 @@ async fn acquire_refresh_lock(
          VALUES (?, ?, ?)",
     )
     .bind(user_id)
-    .bind(&now)
-    .bind(&expires_at)
+    .bind(now)
+    .bind(expires_at)
     .execute(pool)
     .await?;
 

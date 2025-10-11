@@ -89,7 +89,7 @@ pub async fn start_link(
     .bind(Option::<String>::None)
     .bind(Option::<String>::None)
     .bind(&auth_user.user.id) // Set user_id_for_linking
-    .bind(&expires_at)
+    .bind(expires_at)
     .execute(&state.pool)
     .await?;
 

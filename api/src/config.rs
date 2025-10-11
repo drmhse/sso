@@ -36,6 +36,7 @@ pub struct Config {
     pub server_port: u16,
     pub base_url: String,
     pub platform_admin_redirect_uri: String,
+    pub platform_device_activation_uri: String,
 }
 
 impl Config {
@@ -96,6 +97,8 @@ impl Config {
             base_url: env::var("BASE_URL").map_err(|_| "BASE_URL must be set")?,
             platform_admin_redirect_uri: env::var("PLATFORM_ADMIN_REDIRECT_URI")
                 .map_err(|_| "PLATFORM_ADMIN_REDIRECT_URI must be set")?,
+            platform_device_activation_uri: env::var("PLATFORM_DEVICE_ACTIVATION_URI")
+                .map_err(|_| "PLATFORM_DEVICE_ACTIVATION_URI must be set")?,
         })
     }
 }

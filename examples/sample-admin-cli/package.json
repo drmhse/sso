@@ -1,0 +1,16 @@
+{
+  "name": "sample-admin-cli",
+  "version": "1.0.0",
+  "description": "Sample CLI demonstrating platform admin device flow authentication",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["sso", "device-flow", "cli", "admin"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@drmhse/sso-sdk": "file:../sso-sdk"
+  }
+}

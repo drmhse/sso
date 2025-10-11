@@ -18,6 +18,12 @@ const router = createRouter({
       meta: { layout: 'auth' },
     },
     {
+      path: '/activate',
+      name: 'ActivateDevice',
+      component: () => import('@/views/device/ActivateDevice.vue'),
+      meta: { layout: 'auth' },
+    },
+    {
       path: '/signup',
       name: 'Signup',
       component: () => import('@/views/auth/Signup.vue'),

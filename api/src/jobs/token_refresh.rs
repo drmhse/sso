@@ -38,7 +38,7 @@ impl TokenRefreshJob {
             AND (refresh_token IS NOT NULL OR refresh_token_encrypted IS NOT NULL)
             "#,
         )
-        .bind(&threshold)
+        .bind(threshold)
         .fetch_all(&self.pool)
         .await?;
 
@@ -105,7 +105,7 @@ impl TokenRefreshJob {
             )
             .bind(&access_encrypted)
             .bind(&refresh_encrypted)
-            .bind(&new_token.expires_at)
+            .bind(new_token.expires_at)
             .bind(enc.key_id())
             .bind(&identity.id)
             .execute(&self.pool)
@@ -123,7 +123,7 @@ impl TokenRefreshJob {
             )
             .bind(&new_token.access_token)
             .bind(&new_token.refresh_token)
-            .bind(&new_token.expires_at)
+            .bind(new_token.expires_at)
             .bind(&identity.id)
             .execute(&self.pool)
             .await?;

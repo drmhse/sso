@@ -117,6 +117,21 @@
         </p>
       </div>
 
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">
+          Device Activation URI (Optional)
+        </label>
+        <input
+          v-model="form.device_activation_uri"
+          type="url"
+          placeholder="https://example.com/activate"
+          class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+        />
+        <p class="mt-1 text-xs text-gray-500">
+          Base URL for device flow activation (RFC 8628). Used for CLI and mobile app authentication.
+        </p>
+      </div>
+
       <details class="border rounded-md p-4">
         <summary class="cursor-pointer font-medium text-gray-700">
           OAuth Scopes Configuration
@@ -235,6 +250,7 @@ const form = ref({
   name: '',
   service_type: '',
   redirect_uris: [],
+  device_activation_uri: '',
 });
 
 const scopesInput = ref({
@@ -257,6 +273,7 @@ const initializeForm = () => {
       name: service.name,
       service_type: service.service_type,
       redirect_uris: [...(service.redirect_uris || [])],
+      device_activation_uri: service.device_activation_uri || '',
     };
 
     scopesInput.value = {
@@ -308,6 +325,11 @@ const handleUpdate = async () => {
     service_type: form.value.service_type,
     redirect_uris: validRedirectUris,
   };
+
+  // Add device activation URI if provided
+  if (form.value.device_activation_uri && form.value.device_activation_uri.trim().length > 0) {
+    payload.device_activation_uri = form.value.device_activation_uri.trim();
+  }
 
   const githubScopes = parseScopes(scopesInput.value.github);
   const googleScopes = parseScopes(scopesInput.value.google);

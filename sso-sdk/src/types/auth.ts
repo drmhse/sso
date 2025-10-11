@@ -21,6 +21,15 @@ export interface DeviceCodeResponse {
 }
 
 /**
+ * Device verify response - returns context for initiating OAuth flow
+ */
+export interface DeviceVerifyResponse {
+  org_slug: string;
+  service_slug: string;
+  available_providers: string[];
+}
+
+/**
  * Token request payload for device flow
  */
 export interface TokenRequest {
@@ -56,6 +65,11 @@ export interface LoginUrlParams {
    * Optional redirect URI (must be registered with the service)
    */
   redirect_uri?: string;
+
+  /**
+   * Optional user code for device flow authorization
+   */
+  user_code?: string;
 }
 
 /**
@@ -66,6 +80,10 @@ export interface AdminLoginUrlParams {
    * Optional organization slug to manage
    */
   org_slug?: string;
+  /**
+   * Optional user code for device flow authorization
+   */
+  user_code?: string;
 }
 
 /**

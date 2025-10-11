@@ -69,6 +69,7 @@ pub struct Service {
     pub microsoft_scopes: Option<String>,
     pub google_scopes: Option<String>,
     pub redirect_uris: Option<String>,
+    pub device_activation_uri: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -84,6 +85,7 @@ pub struct ServiceResponse {
     pub microsoft_scopes: Option<Vec<String>>,
     pub google_scopes: Option<Vec<String>>,
     pub redirect_uris: Option<Vec<String>>,
+    pub device_activation_uri: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -100,6 +102,7 @@ impl From<Service> for ServiceResponse {
             microsoft_scopes: service.microsoft_scopes.and_then(|s| serde_json::from_str(&s).ok()),
             google_scopes: service.google_scopes.and_then(|s| serde_json::from_str(&s).ok()),
             redirect_uris: service.redirect_uris.and_then(|s| serde_json::from_str(&s).ok()),
+            device_activation_uri: service.device_activation_uri,
             created_at: service.created_at,
         }
     }
@@ -186,6 +189,7 @@ pub struct OAuthState {
     pub service_slug: Option<String>,
     pub is_admin_flow: bool,
     pub user_id_for_linking: Option<String>,
+    pub device_user_code: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -243,4 +247,18 @@ pub struct LoginEvent {
     pub ip_address: Option<String>,
     pub user_agent: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct OrganizationOAuthCredential {
+    pub id: String,
+    pub org_id: String,
+    pub provider: String,
+    pub client_id: String,
+    #[serde(skip_serializing)]
+    #[allow(dead_code)] // Used for database storage only
+    pub client_secret_encrypted: Vec<u8>,
+    pub encryption_key_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }

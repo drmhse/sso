@@ -14,6 +14,7 @@ export interface Service {
   microsoft_scopes: string[];
   google_scopes: string[];
   redirect_uris: string[];
+  device_activation_uri?: string;
   created_at: string;
 }
 
@@ -53,6 +54,7 @@ export interface CreateServicePayload {
   microsoft_scopes?: string[];
   google_scopes?: string[];
   redirect_uris: string[];
+  device_activation_uri?: string;
 }
 
 /**
@@ -79,6 +81,7 @@ export interface UpdateServicePayload {
   microsoft_scopes?: string[];
   google_scopes?: string[];
   redirect_uris?: string[];
+  device_activation_uri?: string;
 }
 
 /**
