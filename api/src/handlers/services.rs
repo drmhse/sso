@@ -583,13 +583,21 @@ pub async fn update_service(
         set_clause
     );
 
-    let mut query = sqlx::query_as::<_, Service>(&sql);
+    let mut query = sqlx::query(&sql);
     for value in &values {
         query = query.bind(value);
     }
     query = query.bind(&org.id).bind(&service_slug);
 
-    let updated_service = query.fetch_one(&state.pool).await?;
+    query.execute(&state.pool).await?;
+
+    // Fetch the updated service
+    let updated_service =
+        sqlx::query_as::<_, Service>("SELECT * FROM services WHERE org_id = ? AND slug = ?")
+            .bind(&org.id)
+            .bind(&service_slug)
+            .fetch_one(&state.pool)
+            .await?;
 
     Ok(Json(ServiceResponse::from(updated_service)))
 }

@@ -97,3 +97,73 @@ export interface GetAuditLogParams extends PaginationParams {
   start_date?: string;
   end_date?: string;
 }
+
+/**
+ * Platform overview metrics
+ */
+export interface PlatformOverviewMetrics {
+  total_organizations: number;
+  total_users: number;
+  total_end_users: number;
+  total_services: number;
+  total_logins_24h: number;
+  total_logins_30d: number;
+}
+
+/**
+ * Organization status breakdown
+ */
+export interface OrganizationStatusBreakdown {
+  pending: number;
+  active: number;
+  suspended: number;
+  rejected: number;
+}
+
+/**
+ * Growth trend data point
+ */
+export interface GrowthTrendPoint {
+  date: string;
+  new_organizations: number;
+  new_users: number;
+}
+
+/**
+ * Login activity data point
+ */
+export interface LoginActivityPoint {
+  date: string;
+  count: number;
+}
+
+/**
+ * Top organization metrics
+ */
+export interface TopOrganization {
+  id: string;
+  name: string;
+  slug: string;
+  user_count: number;
+  service_count: number;
+  login_count_30d: number;
+}
+
+/**
+ * Recent organization data
+ */
+export interface RecentOrganization {
+  id: string;
+  name: string;
+  slug: string;
+  status: OrganizationStatus;
+  created_at: string;
+}
+
+/**
+ * Platform analytics date range query params
+ */
+export interface PlatformAnalyticsDateRangeParams {
+  start_date?: string;
+  end_date?: string;
+}

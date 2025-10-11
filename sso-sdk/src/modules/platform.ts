@@ -10,6 +10,13 @@ import {
   PromotePlatformOwnerPayload,
   AuditLogEntry,
   GetAuditLogParams,
+  PlatformOverviewMetrics,
+  OrganizationStatusBreakdown,
+  GrowthTrendPoint,
+  LoginActivityPoint,
+  TopOrganization,
+  RecentOrganization,
+  PlatformAnalyticsDateRangeParams,
 } from '../types';
 
 /**
@@ -226,4 +233,126 @@ export class PlatformModule {
     const response = await this.http.get<AuditLogEntry[]>('/api/platform/audit-log', { params });
     return response.data;
   }
+
+  /**
+   * Platform analytics methods
+   */
+  public analytics = {
+    /**
+     * Get platform overview metrics.
+     *
+     * @returns Platform overview metrics
+     *
+     * @example
+     * ```typescript
+     * const metrics = await sso.platform.analytics.getOverview();
+     * console.log(metrics.total_organizations, metrics.total_users);
+     * ```
+     */
+    getOverview: async (): Promise<PlatformOverviewMetrics> => {
+      const response = await this.http.get<PlatformOverviewMetrics>('/api/platform/analytics/overview');
+      return response.data;
+    },
+
+    /**
+     * Get organization status breakdown.
+     *
+     * @returns Organization count by status
+     *
+     * @example
+     * ```typescript
+     * const breakdown = await sso.platform.analytics.getOrganizationStatus();
+     * console.log(breakdown.pending, breakdown.active);
+     * ```
+     */
+    getOrganizationStatus: async (): Promise<OrganizationStatusBreakdown> => {
+      const response = await this.http.get<OrganizationStatusBreakdown>(
+        '/api/platform/analytics/organization-status'
+      );
+      return response.data;
+    },
+
+    /**
+     * Get platform growth trends over time.
+     *
+     * @param params Optional date range parameters
+     * @returns Array of growth trend data points
+     *
+     * @example
+     * ```typescript
+     * const trends = await sso.platform.analytics.getGrowthTrends({
+     *   start_date: '2024-01-01',
+     *   end_date: '2024-01-31'
+     * });
+     * ```
+     */
+    getGrowthTrends: async (params?: PlatformAnalyticsDateRangeParams): Promise<GrowthTrendPoint[]> => {
+      const response = await this.http.get<GrowthTrendPoint[]>(
+        '/api/platform/analytics/growth-trends',
+        { params }
+      );
+      return response.data;
+    },
+
+    /**
+     * Get platform-wide login activity trends.
+     *
+     * @param params Optional date range parameters
+     * @returns Array of login activity data points
+     *
+     * @example
+     * ```typescript
+     * const activity = await sso.platform.analytics.getLoginActivity({
+     *   start_date: '2024-01-01',
+     *   end_date: '2024-01-31'
+     * });
+     * ```
+     */
+    getLoginActivity: async (params?: PlatformAnalyticsDateRangeParams): Promise<LoginActivityPoint[]> => {
+      const response = await this.http.get<LoginActivityPoint[]>(
+        '/api/platform/analytics/login-activity',
+        { params }
+      );
+      return response.data;
+    },
+
+    /**
+     * Get top organizations by activity.
+     *
+     * @returns Array of top organizations
+     *
+     * @example
+     * ```typescript
+     * const topOrgs = await sso.platform.analytics.getTopOrganizations();
+     * console.log(topOrgs[0].login_count_30d);
+     * ```
+     */
+    getTopOrganizations: async (): Promise<TopOrganization[]> => {
+      const response = await this.http.get<TopOrganization[]>(
+        '/api/platform/analytics/top-organizations'
+      );
+      return response.data;
+    },
+
+    /**
+     * Get recently created organizations.
+     *
+     * @param params Optional query parameters
+     * @returns Array of recent organizations
+     *
+     * @example
+     * ```typescript
+     * const recent = await sso.platform.analytics.getRecentOrganizations({
+     *   limit: 10
+     * });
+     * ```
+     */
+    getRecentOrganizations: async (params?: GetAuditLogParams): Promise<RecentOrganization[]> => {
+      const response = await this.http.get<RecentOrganization[]>(
+        '/api/platform/analytics/recent-organizations',
+        { params }
+      );
+      return response.data;
+    },
+  };
 }

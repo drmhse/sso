@@ -848,3 +848,412 @@ pub async fn get_audit_log(
 
     Ok(Json(AuditLogResponse { logs, total }))
 }
+
+// ============================================================================
+// Platform Analytics Endpoints
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct AnalyticsDateRangeQuery {
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlatformOverviewMetrics {
+    pub total_organizations: i64,
+    pub total_users: i64,
+    pub total_end_users: i64,
+    pub total_services: i64,
+    pub total_logins_24h: i64,
+    pub total_logins_30d: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrganizationStatusBreakdown {
+    pub pending: i64,
+    pub active: i64,
+    pub suspended: i64,
+    pub rejected: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GrowthTrendPoint {
+    pub date: String,
+    pub new_organizations: i64,
+    pub new_users: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoginActivityPoint {
+    pub date: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopOrganization {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub user_count: i64,
+    pub service_count: i64,
+    pub login_count_30d: i64,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct RecentOrganization {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub status: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+/// GET /api/platform/analytics/overview
+/// Get high-level platform metrics
+pub async fn get_platform_overview(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<Json<PlatformOverviewMetrics>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    // Get total organizations
+    let total_organizations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM organizations")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(AppError::Database)?;
+
+    // Get total platform admins (platform owners and org owners/admins)
+    let total_users: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT u.id) FROM users u
+         LEFT JOIN memberships m ON u.id = m.user_id
+         WHERE u.is_platform_owner = 1 OR m.role IN ('owner', 'admin')"
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Get total end-users (regular users, non-admins)
+    let total_end_users: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE is_platform_owner = 0"
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Get total services
+    let total_services: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM services")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+    // Get logins in last 24 hours
+    let total_logins_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM login_events WHERE created_at >= datetime('now', '-1 day')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Get logins in last 30 days
+    let total_logins_30d: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM login_events WHERE created_at >= datetime('now', '-30 days')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(Json(PlatformOverviewMetrics {
+        total_organizations,
+        total_users,
+        total_end_users,
+        total_services,
+        total_logins_24h,
+        total_logins_30d,
+    }))
+}
+
+/// GET /api/platform/analytics/organization-status
+/// Get organization count breakdown by status
+pub async fn get_organization_status_breakdown(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<Json<OrganizationStatusBreakdown>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM organizations WHERE status = 'pending'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM organizations WHERE status = 'active'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let suspended: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM organizations WHERE status = 'suspended'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let rejected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM organizations WHERE status = 'rejected'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(Json(OrganizationStatusBreakdown {
+        pending,
+        active,
+        suspended,
+        rejected,
+    }))
+}
+
+/// GET /api/platform/analytics/growth-trends
+/// Get platform growth trends over time
+pub async fn get_growth_trends(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(query): Query<AnalyticsDateRangeQuery>,
+) -> Result<Json<Vec<GrowthTrendPoint>>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    // Parse date range or use defaults (last 30 days)
+    let end_date = query
+        .end_date
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+    let start_date = query.start_date.unwrap_or_else(|| {
+        (Utc::now() - chrono::Duration::days(30))
+            .format("%Y-%m-%d")
+            .to_string()
+    });
+
+    // Get new organizations per day
+    let org_trends = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT
+            DATE(created_at) as date,
+            COUNT(*) as count
+        FROM organizations
+        WHERE DATE(created_at) >= DATE(?)
+          AND DATE(created_at) <= DATE(?)
+        GROUP BY DATE(created_at)
+        ORDER BY date ASC
+        "#,
+    )
+    .bind(&start_date)
+    .bind(&end_date)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Get new users per day (non-platform-owners)
+    let user_trends = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT
+            DATE(created_at) as date,
+            COUNT(*) as count
+        FROM users
+        WHERE is_platform_owner = 0
+          AND DATE(created_at) >= DATE(?)
+          AND DATE(created_at) <= DATE(?)
+        GROUP BY DATE(created_at)
+        ORDER BY date ASC
+        "#,
+    )
+    .bind(&start_date)
+    .bind(&end_date)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Merge the two trend lines
+    let mut trends_map: std::collections::HashMap<String, GrowthTrendPoint> =
+        std::collections::HashMap::new();
+
+    for (date, count) in org_trends {
+        trends_map
+            .entry(date.clone())
+            .or_insert_with(|| GrowthTrendPoint {
+                date,
+                new_organizations: 0,
+                new_users: 0,
+            })
+            .new_organizations = count;
+    }
+
+    for (date, count) in user_trends {
+        trends_map
+            .entry(date.clone())
+            .or_insert_with(|| GrowthTrendPoint {
+                date,
+                new_organizations: 0,
+                new_users: 0,
+            })
+            .new_users = count;
+    }
+
+    let mut result: Vec<GrowthTrendPoint> = trends_map.into_values().collect();
+    result.sort_by(|a, b| a.date.cmp(&b.date));
+
+    Ok(Json(result))
+}
+
+/// GET /api/platform/analytics/login-activity
+/// Get platform-wide login activity trends
+pub async fn get_login_activity(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(query): Query<AnalyticsDateRangeQuery>,
+) -> Result<Json<Vec<LoginActivityPoint>>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    // Parse date range or use defaults (last 30 days)
+    let end_date = query
+        .end_date
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+    let start_date = query.start_date.unwrap_or_else(|| {
+        (Utc::now() - chrono::Duration::days(30))
+            .format("%Y-%m-%d")
+            .to_string()
+    });
+
+    // Get login activity per day
+    let activity = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT
+            DATE(created_at) as date,
+            COUNT(*) as count
+        FROM login_events
+        WHERE DATE(created_at) >= DATE(?)
+          AND DATE(created_at) <= DATE(?)
+        GROUP BY DATE(created_at)
+        ORDER BY date ASC
+        "#,
+    )
+    .bind(&start_date)
+    .bind(&end_date)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let result = activity
+        .into_iter()
+        .map(|(date, count)| LoginActivityPoint { date, count })
+        .collect();
+
+    Ok(Json(result))
+}
+
+/// GET /api/platform/analytics/top-organizations
+/// Get most active organizations by various metrics
+pub async fn get_top_organizations(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<Json<Vec<TopOrganization>>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    let organizations = sqlx::query_as::<_, (String, String, String, i64, i64, i64)>(
+        r#"
+        SELECT
+            o.id,
+            o.name,
+            o.slug,
+            COALESCE((
+                SELECT COUNT(DISTINCT le.user_id)
+                FROM login_events le
+                JOIN services s ON le.service_id = s.id
+                WHERE s.org_id = o.id
+            ), 0) as user_count,
+            COALESCE((SELECT COUNT(*) FROM services WHERE org_id = o.id), 0) as service_count,
+            COALESCE((
+                SELECT COUNT(*)
+                FROM login_events le
+                JOIN services s ON le.service_id = s.id
+                WHERE s.org_id = o.id
+                  AND le.created_at >= datetime('now', '-30 days')
+            ), 0) as login_count_30d
+        FROM organizations o
+        WHERE o.status = 'active'
+        ORDER BY login_count_30d DESC, user_count DESC
+        LIMIT 10
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let result = organizations
+        .into_iter()
+        .map(|(id, name, slug, user_count, service_count, login_count_30d)| TopOrganization {
+            id,
+            name,
+            slug,
+            user_count,
+            service_count,
+            login_count_30d,
+        })
+        .collect();
+
+    Ok(Json(result))
+}
+
+/// GET /api/platform/analytics/recent-organizations
+/// Get recently created organizations
+pub async fn get_recent_organizations(
+    State(state): State<AppState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<Vec<RecentOrganization>>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(10).min(50);
+
+    let organizations = sqlx::query_as::<_, RecentOrganization>(
+        r#"
+        SELECT id, name, slug, status, created_at
+        FROM organizations
+        ORDER BY created_at DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(Json(organizations))
+}

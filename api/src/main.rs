@@ -36,8 +36,10 @@ use crate::handlers::organizations::{
 };
 use crate::handlers::platform::{
     activate_organization, approve_organization, demote_platform_owner, get_audit_log,
-    list_organizations, list_tiers, promote_platform_owner, reject_organization,
-    suspend_organization, update_organization_tier,
+    get_growth_trends, get_login_activity, get_organization_status_breakdown,
+    get_platform_overview, get_recent_organizations, get_top_organizations, list_organizations,
+    list_tiers, promote_platform_owner, reject_organization, suspend_organization,
+    update_organization_tier,
 };
 use crate::handlers::provider_token::get_provider_token;
 use crate::handlers::services::{
@@ -442,6 +444,31 @@ async fn main() -> anyhow::Result<()> {
             delete(demote_platform_owner),
         )
         .route("/api/platform/audit-log", get(get_audit_log))
+        // Platform analytics routes
+        .route(
+            "/api/platform/analytics/overview",
+            get(get_platform_overview),
+        )
+        .route(
+            "/api/platform/analytics/organization-status",
+            get(get_organization_status_breakdown),
+        )
+        .route(
+            "/api/platform/analytics/growth-trends",
+            get(get_growth_trends),
+        )
+        .route(
+            "/api/platform/analytics/login-activity",
+            get(get_login_activity),
+        )
+        .route(
+            "/api/platform/analytics/top-organizations",
+            get(get_top_organizations),
+        )
+        .route(
+            "/api/platform/analytics/recent-organizations",
+            get(get_recent_organizations),
+        )
         .route_layer(axum_middleware::from_fn(
             crate::middleware::require_platform_owner,
         ))

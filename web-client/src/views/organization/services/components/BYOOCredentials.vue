@@ -225,7 +225,7 @@ const saving = ref({
 
 const getCallbackUrl = (provider) => {
   const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
-  return `${baseUrl}/api/auth/callback/${provider}`;
+  return `${baseUrl}/auth/${provider}/callback`;
 };
 
 const copyToClipboard = async (text) => {

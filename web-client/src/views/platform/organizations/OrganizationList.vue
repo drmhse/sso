@@ -164,13 +164,19 @@
           Are you sure you want to reject <strong>{{ rejectionModal.organization?.name }}</strong>?
         </p>
 
-        <BaseInput
-          v-model="rejectionModal.reason"
-          label="Reason"
-          placeholder="Provide a reason for rejection"
-          required
-          hint="This reason will be visible to the organization owner"
-        />
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">
+            Reason <span class="text-red-500">*</span>
+          </label>
+          <input
+            v-model="rejectionModal.reason"
+            type="text"
+            placeholder="Provide a reason for rejection"
+            required
+            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+          />
+          <p class="mt-1 text-sm text-gray-500">This reason will be visible to the organization owner</p>
+        </div>
       </div>
     </BaseModal>
   </div>

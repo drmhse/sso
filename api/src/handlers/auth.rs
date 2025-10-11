@@ -5,7 +5,7 @@ use crate::constants::{DEVICE_CODE_EXPIRE_MINUTES, JWT_EXPIRE_HOURS, OAUTH_STATE
 use crate::db::models::{DeviceCode, Identity, User};
 use crate::error::{AppError, Result};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
@@ -234,19 +234,72 @@ pub async fn auth_callback(
     };
 
     // Exchange code with PKCE verifier to get full token details
+    // Check if we should use organization's BYOO credentials
     let pkce_verifier = oauth_state
         .as_ref()
         .and_then(|s| s.pkce_verifier.as_deref());
-    let token_details = state
-        .oauth_client
-        .exchange_code_with_details(provider, &callback.code, pkce_verifier)
-        .await?;
 
-    // Get user info from provider
-    let user_info = state
-        .oauth_client
-        .get_user_info(provider, &token_details.access_token)
-        .await?;
+    let token_details = if let Some(ref oauth_ctx) = oauth_state {
+        if let Some(ref org_slug) = oauth_ctx.org_slug {
+            // Get org_id and check for custom OAuth credentials
+            let org_id = sqlx::query_scalar::<_, String>("SELECT id FROM organizations WHERE slug = ?")
+                .bind(org_slug)
+                .fetch_one(&state.pool)
+                .await?;
+
+            let provider_str = provider.as_str();
+            let org_credentials = sqlx::query!(
+                "SELECT client_id, client_secret_encrypted, encryption_key_id
+                 FROM organization_oauth_credentials
+                 WHERE org_id = ? AND provider = ?",
+                org_id,
+                provider_str
+            )
+            .fetch_optional(&state.pool)
+            .await?;
+
+            if let Some(creds) = org_credentials {
+                // Use organization's custom OAuth credentials for token exchange
+                let encryption = crate::encryption::EncryptionService::new()
+                    .map_err(|e| AppError::InternalServerError(format!("Encryption unavailable: {}", e)))?;
+
+                let client_secret = encryption
+                    .decrypt(&creds.client_secret_encrypted)
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!("Failed to decrypt secret: {}", e))
+                    })?;
+
+                let config = crate::config::Config::from_env()
+                    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+                let custom_client =
+                    create_custom_oauth_client(&config, provider, &creds.client_id, &client_secret)?;
+
+                exchange_custom_code(&custom_client, provider, &callback.code, pkce_verifier).await?
+            } else {
+                // Fall back to platform credentials
+                state
+                    .oauth_client
+                    .exchange_code_with_details(provider, &callback.code, pkce_verifier)
+                    .await?
+            }
+        } else {
+            // No org context, use platform credentials
+            state
+                .oauth_client
+                .exchange_code_with_details(provider, &callback.code, pkce_verifier)
+                .await?
+        }
+    } else {
+        // No oauth state, use platform credentials
+        state
+            .oauth_client
+            .exchange_code_with_details(provider, &callback.code, pkce_verifier)
+            .await?
+    };
+
+    // Get user info from provider (standalone, not using OAuth client)
+    let user_info = get_provider_user_info(provider, &token_details.access_token).await?;
 
     // Check if this is a linking flow (user_id_for_linking is set)
     if let Some(ref oauth_ctx) = oauth_state {
@@ -576,7 +629,7 @@ pub async fn activate_page() -> Html<&'static str> {
 /// Device Flow: Verify user code (after SSO login)
 pub async fn device_verify(
     State(state): State<AppState>,
-    Json(req): Json<DeviceVerifyRequest>,
+    Form(req): Form<DeviceVerifyRequest>,
 ) -> Result<Response> {
     // Find device code
     let device_code = DeviceFlowService::find_by_user_code(&state.pool, &req.user_code)
@@ -1012,11 +1065,8 @@ pub async fn auth_admin_callback(
     let token_details =
         exchange_admin_code(&admin_oauth_client, provider, &callback.code, pkce_verifier).await?;
 
-    // Get user info from provider
-    let user_info = state
-        .oauth_client
-        .get_user_info(provider, &token_details.access_token)
-        .await?;
+    // Get user info from provider (standalone, not using OAuth client)
+    let user_info = get_provider_user_info(provider, &token_details.access_token).await?;
 
     // Find or create user
     let user = find_or_create_user(&state.pool, &user_info.email).await?;
@@ -1248,6 +1298,43 @@ async fn exchange_admin_code(
     })
 }
 
+async fn exchange_custom_code(
+    client: &oauth2::basic::BasicClient,
+    _provider: Provider,
+    code: &str,
+    pkce_verifier: Option<&str>,
+) -> Result<crate::auth::sso::TokenDetails> {
+    use oauth2::{AuthorizationCode, TokenResponse};
+
+    let mut token_request = client.exchange_code(AuthorizationCode::new(code.to_string()));
+
+    if let Some(verifier) = pkce_verifier {
+        token_request =
+            token_request.set_pkce_verifier(PkceCodeVerifier::new(verifier.to_string()));
+    }
+
+    let token = token_request
+        .request_async(oauth2::reqwest::async_http_client)
+        .await
+        .map_err(|e| AppError::OAuth(format!("Token exchange failed: {}", e)))?;
+
+    let expires_at = token
+        .expires_in()
+        .map(|duration| Utc::now() + chrono::Duration::seconds(duration.as_secs() as i64));
+
+    let scopes = token
+        .scopes()
+        .map(|scopes| scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    Ok(crate::auth::sso::TokenDetails {
+        access_token: token.access_token().secret().clone(),
+        refresh_token: token.refresh_token().map(|rt| rt.secret().clone()),
+        expires_at,
+        scopes,
+    })
+}
+
 // Helper functions for BYOO (Bring Your Own OAuth)
 
 fn validate_redirect_uri(redirect_uri: &str, service: &crate::db::models::Service) -> Result<()> {
@@ -1314,6 +1401,121 @@ fn get_authorization_url_for_client(
         .unwrap_or_default();
 
     (auth_url.to_string(), csrf_token, verifier_secret)
+}
+
+/// Get user info from provider (standalone, not using OAuth client for BYOO isolation)
+async fn get_provider_user_info(provider: Provider, access_token: &str) -> Result<crate::auth::sso::UserInfo> {
+    use serde::Deserialize;
+
+    match provider {
+        Provider::Github => {
+            #[derive(Deserialize)]
+            struct GithubUser {
+                id: u64,
+                email: Option<String>,
+                name: Option<String>,
+            }
+
+            #[derive(Deserialize)]
+            struct GithubEmail {
+                email: String,
+                primary: bool,
+                verified: bool,
+            }
+
+            let client = reqwest::Client::new();
+
+            let user: GithubUser = client
+                .get("https://api.github.com/user")
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("User-Agent", "SSO-Service")
+                .send()
+                .await
+                .map_err(|e| AppError::OAuth(format!("Failed to fetch user: {}", e)))?
+                .json()
+                .await
+                .map_err(|e| AppError::OAuth(format!("Failed to parse user: {}", e)))?;
+
+            let email = if let Some(email) = user.email {
+                email
+            } else {
+                let emails: Vec<GithubEmail> = client
+                    .get("https://api.github.com/user/emails")
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .header("User-Agent", "SSO-Service")
+                    .send()
+                    .await
+                    .map_err(|e| AppError::OAuth(format!("Failed to fetch emails: {}", e)))?
+                    .json()
+                    .await
+                    .map_err(|e| AppError::OAuth(format!("Failed to parse emails: {}", e)))?;
+
+                emails
+                    .into_iter()
+                    .find(|e| e.primary && e.verified)
+                    .map(|e| e.email)
+                    .ok_or_else(|| AppError::OAuth("No verified email found".to_string()))?
+            };
+
+            Ok(crate::auth::sso::UserInfo {
+                provider_user_id: user.id.to_string(),
+                email,
+                name: user.name,
+            })
+        }
+        Provider::Google => {
+            #[derive(Deserialize)]
+            struct GoogleUser {
+                id: String,
+                email: String,
+                name: Option<String>,
+            }
+
+            let client = reqwest::Client::new();
+            let user: GoogleUser = client
+                .get("https://www.googleapis.com/oauth2/v2/userinfo")
+                .header("Authorization", format!("Bearer {}", access_token))
+                .send()
+                .await
+                .map_err(|e| AppError::OAuth(format!("Failed to fetch user: {}", e)))?
+                .json()
+                .await
+                .map_err(|e| AppError::OAuth(format!("Failed to parse user: {}", e)))?;
+
+            Ok(crate::auth::sso::UserInfo {
+                provider_user_id: user.id,
+                email: user.email,
+                name: user.name,
+            })
+        }
+        Provider::Microsoft => {
+            #[derive(Deserialize)]
+            struct MicrosoftUser {
+                id: String,
+                #[serde(rename = "userPrincipalName")]
+                email: String,
+                #[serde(rename = "displayName")]
+                name: Option<String>,
+            }
+
+            let client = reqwest::Client::new();
+            let user: MicrosoftUser = client
+                .get("https://graph.microsoft.com/v1.0/me")
+                .header("Authorization", format!("Bearer {}", access_token))
+                .send()
+                .await
+                .map_err(|e| AppError::OAuth(format!("Failed to fetch user: {}", e)))?
+                .json()
+                .await
+                .map_err(|e| AppError::OAuth(format!("Failed to parse user: {}", e)))?;
+
+            Ok(crate::auth::sso::UserInfo {
+                provider_user_id: user.id,
+                email: user.email,
+                name: user.name,
+            })
+        }
+    }
 }
 
 /// Record login event for analytics
