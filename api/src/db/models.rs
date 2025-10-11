@@ -148,6 +148,13 @@ pub struct Session {
     pub user_id: String,
     pub token_hash: String,
     pub expires_at: DateTime<Utc>,
+    pub refresh_token: Option<String>,
+    pub refresh_token_expires_at: Option<DateTime<Utc>>,
+    pub org_slug: Option<String>,
+    pub service_id: Option<String>,
+    pub user_agent: Option<String>,
+    pub ip_address: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

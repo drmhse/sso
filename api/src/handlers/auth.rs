@@ -529,17 +529,32 @@ pub async fn auth_callback(
                 features,
             )?;
 
-            // Store session
+            // Generate refresh token
+            let refresh_token = uuid::Uuid::new_v4().to_string();
+
+            // Store session with refresh token
             let session_id = uuid::Uuid::new_v4().to_string();
             let token_hash = JwtService::hash_token(&jwt);
-            let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+            let now = Utc::now();
+            let expires_at = now + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+            let refresh_expires_at = now + chrono::Duration::days(30);
+            let created_at = now;
 
             sqlx::query!(
-                "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+                r#"
+                INSERT INTO sessions
+                (id, user_id, token_hash, expires_at, refresh_token, refresh_token_expires_at, org_slug, service_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
                 session_id,
                 user.id,
                 token_hash,
-                expires_at
+                expires_at,
+                refresh_token,
+                refresh_expires_at,
+                oauth_ctx.org_slug,
+                oauth_ctx.service_id,
+                created_at
             )
             .execute(&state.pool)
             .await?;
@@ -549,8 +564,8 @@ pub async fn auth_callback(
                 let _ = record_login_event(&state.pool, &user.id, service_id, provider).await;
             }
 
-            // Redirect with JWT as query parameter
-            let redirect_url = format!("{}?token={}", redirect_uri, jwt);
+            // Redirect with both tokens as query parameters
+            let redirect_url = format!("{}?access_token={}&refresh_token={}", redirect_uri, jwt, refresh_token);
             return Ok(Redirect::to(&redirect_url).into_response());
         }
     }
@@ -761,20 +776,32 @@ pub async fn token_exchange(
             None,
         )?;
 
-        // Store session
+        // Generate refresh token
+        let refresh_token = Uuid::new_v4().to_string();
+
+        // Store session with refresh token
         let session_id = Uuid::new_v4().to_string();
         let token_hash = JwtService::hash_token(&token);
-        let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+        let refresh_expires_at = now + chrono::Duration::days(30);
+        let created_at = now;
 
         sqlx::query!(
             r#"
-            INSERT INTO sessions (id, user_id, token_hash, expires_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO sessions
+            (id, user_id, token_hash, expires_at, refresh_token, refresh_token_expires_at, org_slug, service_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             session_id,
             user_id,
             token_hash,
-            expires_at
+            expires_at,
+            refresh_token,
+            refresh_expires_at,
+            None::<String>,
+            None::<String>,
+            created_at
         )
         .execute(&state.pool)
         .await?;
@@ -826,20 +853,32 @@ pub async fn token_exchange(
         Some(features),
     )?;
 
-    // Store session
+    // Generate refresh token
+    let refresh_token = Uuid::new_v4().to_string();
+
+    // Store session with refresh token
     let session_id = Uuid::new_v4().to_string();
     let token_hash = JwtService::hash_token(&token);
-    let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+    let refresh_expires_at = now + chrono::Duration::days(30);
+    let created_at = now;
 
     sqlx::query!(
         r#"
-        INSERT INTO sessions (id, user_id, token_hash, expires_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO sessions
+        (id, user_id, token_hash, expires_at, refresh_token, refresh_token_expires_at, org_slug, service_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         session_id,
         user_id,
         token_hash,
-        expires_at
+        expires_at,
+        refresh_token,
+        refresh_expires_at,
+        result.org_slug,
+        result.service_id,
+        created_at
     )
     .execute(&state.pool)
     .await?;
@@ -985,6 +1024,138 @@ async fn upsert_identity_with_details(
     Ok(identity)
 }
 
+/// Refresh Token: Exchange a refresh token for a new access token
+/// Implements token rotation for enhanced security
+#[derive(Debug, Deserialize)]
+pub struct RefreshTokenRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshTokenResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: i64,
+}
+
+pub async fn refresh_token(
+    State(state): State<AppState>,
+    Json(req): Json<RefreshTokenRequest>,
+) -> Result<Json<RefreshTokenResponse>> {
+    // Find the session by refresh token
+    let session = sqlx::query_as::<_, crate::db::models::Session>(
+        "SELECT * FROM sessions WHERE refresh_token = ?",
+    )
+    .bind(&req.refresh_token)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::Unauthorized("Invalid refresh token".to_string()))?;
+
+    // Check if refresh token has expired
+    if let Some(refresh_expires_at) = session.refresh_token_expires_at {
+        if refresh_expires_at < Utc::now() {
+            // Token expired, clean up and deny
+            sqlx::query!("DELETE FROM sessions WHERE id = ?", session.id)
+                .execute(&state.pool)
+                .await?;
+            return Err(AppError::Unauthorized("Refresh token expired".to_string()));
+        }
+    } else {
+        // No expiration set - invalid session
+        return Err(AppError::Unauthorized("Invalid session".to_string()));
+    }
+
+    // Get the user
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&session.user_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+    // Reconstruct JWT with original session context
+    // If service_id is present, get full service and subscription details
+    let (service_slug, plan_name, features) = if let Some(ref svc_id) = session.service_id {
+        let service = sqlx::query_as::<_, crate::db::models::Service>(
+            "SELECT * FROM services WHERE id = ?",
+        )
+        .bind(svc_id)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        if let Some(svc) = service {
+            // Get subscription if exists
+            let subscription = sqlx::query!(
+                r#"
+                SELECT p.name as plan_name, p.features
+                FROM subscriptions sub
+                JOIN plans p ON sub.plan_id = p.id
+                WHERE sub.user_id = ? AND sub.service_id = ? AND sub.status = 'active'
+                "#,
+                user.id,
+                svc.id
+            )
+            .fetch_optional(&state.pool)
+            .await?;
+
+            let plan = subscription
+                .as_ref()
+                .map(|s| s.plan_name.clone())
+                .unwrap_or_else(|| "free".to_string());
+            let feats = subscription
+                .as_ref()
+                .and_then(|s| s.features.as_ref())
+                .and_then(|f| serde_json::from_str::<Vec<String>>(f).ok());
+
+            (Some(svc.slug), Some(plan), feats)
+        } else {
+            (None, None, None)
+        }
+    } else {
+        (None, None, None)
+    };
+
+    // Create new access token with preserved context
+    let new_access_token = state.jwt_service.create_token(
+        &user.id,
+        &user.email,
+        user.is_platform_owner,
+        session.org_slug.as_deref(),
+        service_slug.as_deref(),
+        plan_name.as_deref(),
+        features,
+    )?;
+
+    // Implement token rotation: generate new refresh token
+    let new_refresh_token = Uuid::new_v4().to_string();
+    let new_token_hash = JwtService::hash_token(&new_access_token);
+    let new_access_expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+    let new_refresh_expires_at = Utc::now() + chrono::Duration::days(30);
+
+    // Update session with new tokens (token rotation)
+    sqlx::query!(
+        r#"
+        UPDATE sessions
+        SET token_hash = ?,
+            expires_at = ?,
+            refresh_token = ?,
+            refresh_token_expires_at = ?
+        WHERE id = ?
+        "#,
+        new_token_hash,
+        new_access_expires_at,
+        new_refresh_token,
+        new_refresh_expires_at,
+        session.id
+    )
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(RefreshTokenResponse {
+        access_token: new_access_token,
+        refresh_token: new_refresh_token,
+        expires_in: JWT_EXPIRE_HOURS * 3600,
+    }))
+}
+
 /// Logout: Invalidate JWT session
 pub async fn logout(
     State(state): State<AppState>,
@@ -1002,7 +1173,7 @@ pub async fn logout(
     // Hash token
     let token_hash = JwtService::hash_token(token);
 
-    // Delete session
+    // Delete session (also removes refresh token)
     sqlx::query!("DELETE FROM sessions WHERE token_hash = ?", token_hash)
         .execute(&state.pool)
         .await
@@ -1262,23 +1433,38 @@ pub async fn auth_admin_callback(
         }
     };
 
-    // Store session
+    // Generate refresh token
+    let refresh_token = Uuid::new_v4().to_string();
+
+    // Store session with refresh token
     let session_id = Uuid::new_v4().to_string();
     let token_hash = JwtService::hash_token(&jwt);
-    let expires_at = Utc::now() + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::hours(JWT_EXPIRE_HOURS);
+    let refresh_expires_at = now + chrono::Duration::days(30);
+    let created_at = now;
 
     sqlx::query!(
-        "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+        r#"
+        INSERT INTO sessions
+        (id, user_id, token_hash, expires_at, refresh_token, refresh_token_expires_at, org_slug, service_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
         session_id,
         user.id,
         token_hash,
-        expires_at
+        expires_at,
+        refresh_token,
+        refresh_expires_at,
+        oauth_state.org_slug,
+        None::<String>,
+        created_at
     )
     .execute(&state.pool)
     .await?;
 
-    // Redirect to platform admin frontend with JWT
-    let redirect_url = format!("{}?token={}", config.platform_admin_redirect_uri, jwt);
+    // Redirect to platform admin frontend with both tokens
+    let redirect_url = format!("{}?access_token={}&refresh_token={}", config.platform_admin_redirect_uri, jwt, refresh_token);
     Ok(Redirect::to(&redirect_url).into_response())
 }
 

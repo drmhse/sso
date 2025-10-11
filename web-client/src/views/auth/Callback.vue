@@ -60,20 +60,21 @@ onMounted(async () => {
       return;
     }
 
-    // Extract token from URL query parameters
-    const token = route.query.token;
+    // Extract tokens from URL query parameters
+    const accessToken = route.query.access_token;
+    const refreshToken = route.query.refresh_token;
     const error = route.query.error;
 
     if (error) {
       throw new Error(error);
     }
 
-    if (!token) {
-      throw new Error('No authentication token received');
+    if (!accessToken || !refreshToken) {
+      throw new Error('No authentication tokens received');
     }
 
-    // Handle the login callback
-    await authStore.handleLoginCallback(token);
+    // Handle the login callback with both tokens
+    await authStore.handleLoginCallback(accessToken, refreshToken);
 
     // Redirect to home (which will then redirect to the appropriate dashboard)
     router.push('/');

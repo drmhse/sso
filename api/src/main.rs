@@ -22,7 +22,7 @@ use crate::handlers::analytics::{
 };
 use crate::handlers::auth::{
     auth_admin_callback, auth_admin_provider, auth_callback, auth_provider, device_code,
-    device_verify, logout, token_exchange, AppState, DbRequest,
+    device_verify, logout, refresh_token, token_exchange, AppState, DbRequest,
 };
 use crate::handlers::identities::{list_identities, start_link, unlink_identity};
 use crate::handlers::invitations::{
@@ -483,6 +483,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/:provider", get(auth_provider))
         .route("/auth/:provider/callback", get(auth_callback))
         .route("/api/auth/logout", post(logout))
+        .route("/api/auth/refresh", post(refresh_token))
         // Admin authentication routes
         .route("/auth/admin/:provider", get(auth_admin_provider))
         .route("/auth/admin/:provider/callback", get(auth_admin_callback))

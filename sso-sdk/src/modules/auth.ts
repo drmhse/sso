@@ -9,6 +9,7 @@ import {
   LoginUrlParams,
   AdminLoginUrlParams,
   ProviderToken,
+  RefreshTokenResponse,
 } from '../types';
 
 /**
@@ -179,6 +180,38 @@ export class AuthModule {
    */
   public async logout(): Promise<void> {
     await this.http.post('/api/auth/logout');
+  }
+
+  /**
+   * Refresh an expired JWT access token using a refresh token.
+   * This implements token rotation - both the access token and refresh token
+   * will be renewed with each call.
+   *
+   * The refresh token must be stored securely on the client side.
+   * After a successful refresh, update both tokens in storage and call
+   * `sso.setAuthToken(newAccessToken)`.
+   *
+   * @param refreshToken The refresh token obtained during login
+   * @returns New access token and refresh token pair
+   *
+   * @example
+   * ```typescript
+   * try {
+   *   const tokens = await sso.auth.refreshToken(storedRefreshToken);
+   *   sso.setAuthToken(tokens.access_token);
+   *   localStorage.setItem('access_token', tokens.access_token);
+   *   localStorage.setItem('refresh_token', tokens.refresh_token);
+   * } catch (error) {
+   *   // Refresh failed - redirect to login
+   *   window.location.href = '/login';
+   * }
+   * ```
+   */
+  public async refreshToken(refreshToken: string): Promise<RefreshTokenResponse> {
+    const response = await this.http.post<RefreshTokenResponse>('/api/auth/refresh', {
+      refresh_token: refreshToken,
+    });
+    return response.data;
   }
 
   /**

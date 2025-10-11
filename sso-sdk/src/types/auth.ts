@@ -96,3 +96,19 @@ export interface ProviderToken {
   scopes: string[];
   provider: OAuthProvider;
 }
+
+/**
+ * Refresh token request payload
+ */
+export interface RefreshTokenRequest {
+  refresh_token: string;
+}
+
+/**
+ * Refresh token response
+ */
+export interface RefreshTokenResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+}

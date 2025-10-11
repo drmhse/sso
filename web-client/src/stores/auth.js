@@ -6,6 +6,7 @@ import router from '@/router';
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: localStorage.getItem('sso_token') || null,
+    refreshToken: localStorage.getItem('sso_refresh_token') || null,
     user: JSON.parse(localStorage.getItem('sso_user') || 'null'),
     claims: JSON.parse(localStorage.getItem('sso_claims') || 'null'),
     status: localStorage.getItem('sso_status') || 'idle', // 'idle' | 'loading' | 'authenticated' | 'error'
@@ -123,28 +124,31 @@ export const useAuthStore = defineStore('auth', {
 
     /**
      * Handle login callback after OAuth redirect.
-     * Stores token and fetches user data.
-     * @param {string} token - JWT token from OAuth callback
+     * Stores both access and refresh tokens, then fetches user data.
+     * @param {string} accessToken - JWT access token from OAuth callback
+     * @param {string} refreshToken - Refresh token from OAuth callback
      */
-    async handleLoginCallback(token) {
-      if (!token) {
-        throw new Error('Token is required');
+    async handleLoginCallback(accessToken, refreshToken) {
+      if (!accessToken || !refreshToken) {
+        throw new Error('Both access token and refresh token are required');
       }
 
       this.status = 'loading';
       localStorage.setItem('sso_status', 'loading');
 
       try {
-        // Store token
-        localStorage.setItem('sso_token', token);
-        this.token = token;
+        // Store both tokens
+        localStorage.setItem('sso_token', accessToken);
+        localStorage.setItem('sso_refresh_token', refreshToken);
+        this.token = accessToken;
+        this.refreshToken = refreshToken;
 
         // Decode token to get claims
-        this.claims = decodeJwt(token);
+        this.claims = decodeJwt(accessToken);
         localStorage.setItem('sso_claims', JSON.stringify(this.claims));
 
         // Set token in SDK client
-        sso.setAuthToken(token);
+        sso.setAuthToken(accessToken);
 
         // Fetch user profile
         const userData = await sso.user.getProfile();
@@ -175,10 +179,12 @@ export const useAuthStore = defineStore('auth', {
      */
     clearAuth() {
       localStorage.removeItem('sso_token');
+      localStorage.removeItem('sso_refresh_token');
       localStorage.removeItem('sso_user');
       localStorage.removeItem('sso_claims');
       localStorage.removeItem('sso_status');
       this.token = null;
+      this.refreshToken = null;
       this.user = null;
       this.claims = null;
       sso.setAuthToken(null);
@@ -197,6 +203,42 @@ export const useAuthStore = defineStore('auth', {
         this.user = userData;
       } catch (error) {
         console.error('Failed to refresh user:', error);
+        throw error;
+      }
+    },
+
+    /**
+     * Refresh the JWT access token using the refresh token.
+     * This implements automatic token rotation.
+     * @returns {Promise<{accessToken: string, refreshToken: string}>}
+     */
+    async refreshAccessToken() {
+      if (!this.refreshToken) {
+        throw new Error('No refresh token available');
+      }
+
+      try {
+        const response = await sso.auth.refreshToken(this.refreshToken);
+
+        // Update state and storage with new tokens
+        this.token = response.access_token;
+        this.refreshToken = response.refresh_token;
+        localStorage.setItem('sso_token', response.access_token);
+        localStorage.setItem('sso_refresh_token', response.refresh_token);
+        sso.setAuthToken(response.access_token);
+
+        // Update claims
+        this.claims = decodeJwt(response.access_token);
+        localStorage.setItem('sso_claims', JSON.stringify(this.claims));
+
+        return {
+          accessToken: response.access_token,
+          refreshToken: response.refresh_token,
+        };
+      } catch (error) {
+        console.error('Failed to refresh access token:', error);
+        // If refresh fails, the session is invalid - clear auth and redirect
+        this.logout();
         throw error;
       }
     },
