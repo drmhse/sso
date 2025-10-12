@@ -10,7 +10,6 @@ use axum::{
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-
 /// Extension type for storing authenticated user claims
 #[derive(Clone, Debug)]
 pub struct AuthUser {

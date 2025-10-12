@@ -10,7 +10,15 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+/// Hash an invitation token using SHA256
+fn hash_invitation_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateInvitationRequest {
@@ -27,6 +35,7 @@ pub struct UpdateInvitationRequest {
 pub struct InvitationResponse {
     pub invitation: OrganizationInvitation,
     pub inviter: User,
+    pub token: String, // Plaintext token for email links (only returned once)
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,7 +110,8 @@ pub async fn create_invitation(
 
     // Create invitation
     let invitation_id = Uuid::new_v4().to_string();
-    let token = Uuid::new_v4().to_string();
+    let token = Uuid::new_v4().to_string(); // Generate plaintext token
+    let token_hash = hash_invitation_token(&token); // Hash for storage
     let expires_at = Utc::now() + ChronoDuration::days(INVITATION_EXPIRY_DAYS);
 
     // Log invitation creation
@@ -123,7 +133,7 @@ pub async fn create_invitation(
     .bind(&req.email)
     .bind(&req.role)
     .bind(&user.id)
-    .bind(&token)
+    .bind(&token_hash) // Store hashed token
     .bind(expires_at)
     .bind(Utc::now())
     .fetch_one(&state.pool)
@@ -140,6 +150,7 @@ pub async fn create_invitation(
     Ok(Json(InvitationResponse {
         invitation,
         inviter,
+        token, // Return plaintext token for email links
     }))
 }
 
@@ -225,11 +236,14 @@ async fn accept_invitation_internal(
 ) -> Result<Json<()>> {
     let mut tx = state.pool.begin().await.map_err(AppError::Database)?;
 
+    // Hash the token to look it up
+    let token_hash = hash_invitation_token(&token);
+
     // Find invitation
     let invitation = sqlx::query_as::<_, OrganizationInvitation>(
         "SELECT * FROM organization_invitations WHERE token = ? AND status = 'pending'",
     )
-    .bind(&token)
+    .bind(&token_hash)
     .fetch_optional(&mut *tx)
     .await
     .map_err(AppError::Database)?

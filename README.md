@@ -86,6 +86,8 @@ Follow these steps to set up and run the entire platform locally for development
 
 At this point, the complete system is running locally. You can access the admin dashboard to interact with the platform.
 
+**Important Note on User Registration**: There is no traditional "sign up" form for unauthenticated users. Users are registered implicitly when they first authenticate via OAuth (GitHub, Google, or Microsoft). The admin dashboard's "signup" page is for already-authenticated users to create their first organization, not for initial user registration.
+
 ## Usage Example (SDK)
 
 The `sso-sdk` provides a simple and powerful way to interact with the platform.

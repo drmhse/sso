@@ -106,7 +106,7 @@ pub async fn create_organization_public(
 
     if existing.is_some() {
         return Err(AppError::BadRequest(
-            "Organization slug already exists".to_string(),
+            "Unable to create organization with the provided information".to_string(),
         ));
     }
 

@@ -65,6 +65,7 @@ use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::traits::PublicKeyParts;
 use serde::Serialize;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 
 const BATCH_SIZE: usize = 256; // Increase batch size for higher throughput
 const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5); // Decrease timeout
@@ -534,10 +535,31 @@ async fn main() -> anyhow::Result<()> {
             crate::middleware::extract_user_from_jwt,
         ));
 
-    // Build public routes
-    let public_routes = Router::new()
-        // JWKS endpoint (for JWT signature verification)
-        .route("/.well-known/jwks.json", get(jwks_handler))
+    // Create rate limiters
+    let auth_rate_limiter = GovernorLayer {
+        config: Box::leak(Box::new(
+            GovernorConfigBuilder::default()
+                .per_second(60)
+                .burst_size(20)
+                .use_headers()
+                .finish()
+                .expect("Failed to build auth rate limiter"),
+        )),
+    };
+
+    let device_rate_limiter = GovernorLayer {
+        config: Box::leak(Box::new(
+            GovernorConfigBuilder::default()
+                .per_second(60)
+                .burst_size(10)
+                .use_headers()
+                .finish()
+                .expect("Failed to build device rate limiter"),
+        )),
+    };
+
+    // Build authentication routes with rate limiting
+    let auth_routes = Router::new()
         // SSO routes
         .route("/auth/:provider", get(auth_provider))
         .route("/auth/:provider/callback", get(auth_callback))
@@ -546,12 +568,23 @@ async fn main() -> anyhow::Result<()> {
         // Admin authentication routes
         .route("/auth/admin/:provider", get(auth_admin_provider))
         .route("/auth/admin/:provider/callback", get(auth_admin_callback))
-        // Device flow routes
+        .layer(auth_rate_limiter);
+
+    // Build device flow routes with stricter rate limiting
+    let device_routes = Router::new()
         .route("/auth/device/code", post(device_code))
         .route("/auth/device/verify", post(device_verify))
         .route("/auth/token", post(token_exchange))
+        .layer(device_rate_limiter);
+
+    // Build public routes
+    let public_routes = Router::new()
+        // JWKS endpoint (for JWT signature verification)
+        .route("/.well-known/jwks.json", get(jwks_handler))
         // Public organization creation
-        .route("/api/organizations", post(create_organization_public));
+        .route("/api/organizations", post(create_organization_public))
+        .merge(auth_routes)
+        .merge(device_routes);
 
     // Combine all routes
     let app = Router::new()
