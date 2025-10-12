@@ -4,12 +4,12 @@ A zero-dependency, strongly-typed TypeScript SDK for interacting with the multi-
 
 ## Features
 
--   **Zero Dependencies**: Built on native `fetch` API - no external dependencies
--   **Framework Agnostic**: Pure TypeScript - works in any JavaScript environment
--   **Strongly Typed**: Complete TypeScript definitions for all API endpoints
--   **Stateless Design**: No internal state management - integrates with any state solution
--   **Predictable Error Handling**: Custom `SsoApiError` class with structured error information
--   **Modern**: Supports Node.js 18+ and all modern browsers
+-   **Zero Dependencies**: Built on native `fetch` API - no external dependencies.
+-   **Framework Agnostic**: Pure TypeScript - works in any JavaScript environment.
+-   **Strongly Typed**: Complete TypeScript definitions for all API endpoints.
+-   **Stateless Design**: No internal state management - integrates with any state solution.
+-   **Predictable Error Handling**: Custom `SsoApiError` class with structured error information.
+-   **Modern**: Supports Node.js 18+ and all modern browsers.
 
 ## Installation
 
@@ -97,7 +97,7 @@ const deviceAuth = await sso.auth.deviceCode.request({
 console.log(`Visit: ${deviceAuth.verification_uri}`);
 console.log(`Enter code: ${deviceAuth.user_code}`);
 
-// 3. Poll for the token
+// 4. Poll for the token
 const pollForToken = async () => {
   // Polling logic...
 };
@@ -109,11 +109,12 @@ pollForToken();
 // 2. After user enters the code, verify it to get context
 const context = await sso.auth.deviceCode.verify(userEnteredCode);
 
-// Redirect user to the appropriate login flow with the user_code
+// 3. Redirect user to the appropriate login flow, passing the user_code
+// This links the browser session to the device waiting for authorization.
 const loginUrl = sso.auth.getLoginUrl('github', { 
   org: context.org_slug,
   service: context.service_slug,
-  user_code: userEnteredCode,
+  user_code: userEnteredCode, // CRITICAL: Pass user_code here
 });
 window.location.href = loginUrl; // User logs in, authorizing the device
 ```
@@ -147,9 +148,9 @@ localStorage.removeItem('sso_refresh_token');
 
 ## API Reference
 
-### Analytics
+### Analytics (`sso.analytics`)
 
-The analytics module provides login tracking and metrics for organizations.
+Provides login tracking and metrics for a specific organization.
 
 ```typescript
 // Get login trends over time
@@ -159,7 +160,19 @@ const trends = await sso.analytics.getLoginTrends('acme-corp', {
 });
 ```
 
-### Organizations
+### Authentication (`sso.auth`)
+
+Handles all authentication flows, including OAuth, device flow, and token management.
+
+```typescript
+// Get a fresh OAuth token for an external provider (e.g., GitHub)
+const githubToken = await sso.auth.getProviderToken('github');
+// Use githubToken.access_token to make GitHub API calls
+```
+
+### Organizations (`sso.organizations`)
+
+Manages organizations, members, and BYOO credentials.
 
 ```typescript
 // Create organization (public endpoint)
@@ -176,7 +189,7 @@ await sso.organizations.oauthCredentials.set('acme-corp', 'github', {
 });
 ```
 
-### End-User Management
+#### End-User Management (`sso.organizations.endUsers`)
 
 Manage your organization's customers (end-users with subscriptions).
 
@@ -191,7 +204,9 @@ const endUsers = await sso.organizations.endUsers.list('acme-corp', {
 await sso.organizations.endUsers.revokeSessions('acme-corp', 'user-id-123');
 ```
 
-### Services & Plans
+### Services & Plans (`sso.services`)
+
+Manages the applications (services) and subscription plans for an organization.
 
 ```typescript
 // Create a service
@@ -211,9 +226,9 @@ await sso.services.plans.create('acme-corp', 'main-app', {
 });
 ```
 
-### User Profile & Identities
+### User Profile & Identities (`sso.user`)
 
-Manage the authenticated user's own profile and linked social accounts.
+Manages the authenticated user's own profile and linked social accounts.
 
 ```typescript
 // Get profile
@@ -227,7 +242,22 @@ window.location.href = authorization_url;
 await sso.user.identities.unlink('github');
 ```
 
-### Platform Administration
+### Invitations (`sso.invitations`)
+
+Manages team invitations for an organization.
+
+```typescript
+// Create and send an invitation
+await sso.invitations.create('acme-corp', {
+  email: 'new-dev@example.com',
+  role: 'member'
+});
+
+// List invitations for the current user
+const myInvites = await sso.invitations.listForUser();
+```
+
+### Platform Administration (`sso.platform`)
 
 Platform owner methods require a Platform Owner JWT.
 
@@ -241,8 +271,14 @@ const pendingOrgs = await sso.platform.organizations.list({
 await sso.platform.organizations.approve('org-id-123', {
   tier_id: 'tier-starter'
 });
+```
 
-// Get platform-wide analytics
+#### Platform Analytics (`sso.platform.analytics`)
+
+Provides platform-wide metrics for platform owners.
+
+```typescript
+// Get platform-wide analytics overview
 const overview = await sso.platform.analytics.getOverview();
 console.log(`Total Users: ${overview.total_users}`);
 ```

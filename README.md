@@ -19,7 +19,7 @@ sso/
 
 *   **`sso/sso-sdk`**: A zero-dependency, strongly-typed TypeScript SDK that provides a clean, programmatic interface for the `sso/api`. It is framework-agnostic and is published to npm as `@drmhse/sso-sdk`.
 
-*   **`sso/web-client`**: The administrative frontend for the platform. Built with Vue.js, it consumes the `sso-sdk` to provide a user interface for Platform Owners to manage tenants and for Organization Admins to manage their services, teams, and settings.
+*   **`sso/web-client`**: The administrative dashboard for the platform. Built with Vue.js, it consumes the `sso-sdk` to provide a user interface for Platform Owners to manage tenants and for Organization Admins to manage their services, teams, and settings.
 
 ## Core Features
 
@@ -149,7 +149,7 @@ npm start
 ```
 
 ### `examples/sample-admin-cli`
-Demonstrates the **Platform Admin Device Flow**. This is ideal for building secure administrative CLI tools for managing the entire SSO platform, separate from any specific tenant.
+Demonstrates the purpose and structure of the **Platform Admin Device Flow**. This is ideal for building secure administrative CLI tools for managing the entire SSO platform, separate from any specific tenant.
 
 **To run:**
 ```bash

@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/sso-sdk",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Zero-dependency TypeScript SDK for the multi-tenant SSO Platform API",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

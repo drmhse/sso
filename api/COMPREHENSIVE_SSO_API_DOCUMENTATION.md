@@ -17,7 +17,7 @@ The platform is built in Rust using the Axum web framework and leverages a highl
 - **Platform Governance:** A super-admin (Platform Owner) layer for approving, managing, and monitoring organizations.
 - **Role-Based Access Control (RBAC):** Granular permissions for Platform Owners, Organization Owners, Admins, and Members.
 - **Device Authorization Flow (RFC 8628):** Secure authentication for CLI tools, smart devices, and other headless applications.
-- **Secure JWT Session Management:** Stateless authentication using JSON Web Tokens with a server-side revocation mechanism and refresh token rotation.
+- **Secure JWT Session Management:** Stateless authentication using JSON Web Tokens with a server-side revocation mechanism and secure refresh token rotation.
 - **Encrypted Credential Storage:** Organization-provided OAuth secrets are securely encrypted at rest using AES-GCM.
 - **Comprehensive Analytics:** Detailed login and growth metrics for both individual organizations and the entire platform.
 - **End-User Management:** Tools for organization admins to manage their customers, including session revocation.
@@ -137,10 +137,10 @@ The system issues different types of JWTs depending on the authentication contex
   "sub": "user_id",
   "email": "user_email",
   "is_platform_owner": false,
-  "org": "organization_slug",   // Present in Org and Service JWTs
-  "service": "service_slug", // Present only in Service JWTs
-  "plan": "plan_name",
-  "features": ["feature1", "feature2"],
+  "org": "organization_slug",   // Optional: Present in Org and Service JWTs
+  "service": "service_slug", // Optional: Present only in Service JWTs
+  "plan": "plan_name",       // Optional
+  "features": ["feature1"],  // Optional
   "exp": 1672531199,
   "iat": 1672444800
 }
@@ -278,6 +278,7 @@ Retrieve a fresh, valid OAuth access token for an external provider on behalf of
 - `PATCH /:user_id`: Update a member's role. (**Owner only**)
 - `POST /:user_id`: Remove a member from the organization. (**Owner/Admin**)
 - `POST /transfer-ownership`: Transfer ownership to another member. (**Owner only**)
+  - **Request Body:** `{ "new_owner_email": "member@example.com" }`
 
 #### BYOO Credential Management (`/api/organizations/:org_slug/oauth-credentials/:provider`)
 - `POST /`: Set or update custom OAuth credentials. (**Owner/Admin**)
@@ -329,15 +330,17 @@ Retrieve a fresh, valid OAuth access token for an external provider on behalf of
 - `GET /api/platform/audit-log`: Retrieve the platform-wide audit log.
 - `GET /api/platform/tiers`: List all available organization tiers.
 
-#### Platform Analytics (`/api/platform/analytics`)
-- `GET /overview`: Get high-level metrics for the entire platform.
-- `GET /organization-status`: Get a breakdown of organization counts by status.
-- `GET /growth-trends`: Get daily new user and new organization counts.
-- `GET /login-activity`: Get daily platform-wide login counts.
-- `GET /top-organizations`: List the most active organizations.
-- `GET /recent-organizations`: List the most recently created organizations.
+### 3.8. Platform Analytics Endpoints
+**Authentication:** Requires a **Platform Owner JWT**.
 
-### 3.8. Webhook Endpoints
+- `GET /api/platform/analytics/overview`: Get high-level metrics for the entire platform.
+- `GET /api/platform/analytics/organization-status`: Get a breakdown of organization counts by status.
+- `GET /api/platform/analytics/growth-trends`: Get daily new user and new organization counts.
+- `GET /api/platform/analytics/login-activity`: Get daily platform-wide login counts.
+- `GET /api/platform/analytics/top-organizations`: List the most active organizations.
+- `GET /api/platform/analytics/recent-organizations`: List the most recently created organizations.
+
+### 3.9. Webhook Endpoints
 
 - `POST /webhooks/stripe`: Endpoint for receiving Stripe webhook events.
 
@@ -366,7 +369,7 @@ The system is configured entirely through environment variables.
 | **Platform Admin OAuth Apps**     | Yes      | Credentials for the dedicated OAuth apps used **only for the admin login flow**.               |
 | `PLATFORM_GITHUB_CLIENT_ID`...    | Yes      | ...and so on for Google and Microsoft.                                                         |
 | **Security**                      |          |                                                                                                |
-| `ENCRYPTION_KEY`                  | **Yes**  | **Highly Recommended.** 32-byte (64 hex characters) key for encrypting BYOO secrets.             |
+| `ENCRYPTION_KEY`                  | **Yes**  | **Critical.** 32-byte (64 hex characters) key for encrypting BYOO secrets. If not set, secrets are stored in plaintext. |
 | **Billing**                       |          |                                                                                                |
 | `STRIPE_SECRET_KEY`               | Yes      | Your Stripe API secret key.                                                                    |
 | `STRIPE_WEBHOOK_SECRET`           | Yes      | The signing secret for your Stripe webhook endpoint.                                           |
@@ -391,4 +394,4 @@ All API errors are returned with a consistent JSON structure.
   - `401 Unauthorized` (`UNAUTHORIZED`, `TOKEN_EXPIRED`, `JWT_ERROR`)
   - `403 Forbidden` (`FORBIDDEN`, `ORGANIZATION_NOT_ACTIVE`)
   - `404 Not Found` (`NOT_FOUND`)
-  - `500 Internal Server Error` (`INTERNAL_SERVER_ERROR`, `DATABASE_ERROR`, `OAUTH_ERROR`)
+  - `500 Internal Server Error` (`INTERNAL_SERVER_ERROR`, `DATABASE_ERROR`, `OAUTH_ERROR`, `STRIPE_ERROR`)

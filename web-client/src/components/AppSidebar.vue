@@ -9,7 +9,7 @@
           <div class="space-y-1">
             <router-link
               to="/platform/dashboard"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive('/platform/dashboard') ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive('/platform/dashboard') ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -19,7 +19,7 @@
             </router-link>
             <router-link
               to="/platform/organizations"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive('/platform/organizations') ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive('/platform/organizations') ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -29,7 +29,7 @@
             </router-link>
             <router-link
               to="/platform/audit-log"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive('/platform/audit-log') ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive('/platform/audit-log') ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -49,7 +49,7 @@
           <div class="space-y-1">
             <router-link
               :to="`/orgs/${currentOrgSlug}/dashboard`"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive(`/orgs/${currentOrgSlug}/dashboard`) ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive(`/orgs/${currentOrgSlug}/dashboard`) ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -60,7 +60,7 @@
             <router-link
               v-if="isOrgActive"
               :to="`/orgs/${currentOrgSlug}/services`"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive(`/orgs/${currentOrgSlug}/services`) ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive(`/orgs/${currentOrgSlug}/services`) ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -71,7 +71,7 @@
             <div
               v-else
               @click="handleRestrictedClick($event, 'Services')"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
             >
               <svg class="h-5 w-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
@@ -81,7 +81,7 @@
             <router-link
               v-if="canManageTeam && isOrgActive"
               :to="`/orgs/${currentOrgSlug}/members`"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive(`/orgs/${currentOrgSlug}/members`) ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive(`/orgs/${currentOrgSlug}/members`) ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -92,7 +92,7 @@
             <div
               v-else-if="canManageTeam && !isOrgActive"
               @click="handleRestrictedClick($event, 'Team Members')"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
             >
               <svg class="h-5 w-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
@@ -102,7 +102,7 @@
             <router-link
               v-if="isOrgActive"
               :to="`/orgs/${currentOrgSlug}/users`"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive(`/orgs/${currentOrgSlug}/users`) ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive(`/orgs/${currentOrgSlug}/users`) ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -113,7 +113,7 @@
             <div
               v-else
               @click="handleRestrictedClick($event, 'End Users')"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
             >
               <svg class="h-5 w-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
@@ -123,7 +123,7 @@
             <router-link
               v-if="isOrgActive"
               :to="`/orgs/${currentOrgSlug}/billing`"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive(`/orgs/${currentOrgSlug}/billing`) ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive(`/orgs/${currentOrgSlug}/billing`) ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -134,7 +134,7 @@
             <div
               v-else
               @click="handleRestrictedClick($event, 'Billing')"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
             >
               <svg class="h-5 w-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
@@ -144,7 +144,7 @@
             <router-link
               v-if="isOrgActive"
               :to="`/orgs/${currentOrgSlug}/settings`"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md transition-colors"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md transition-colors"
               :class="isActive(`/orgs/${currentOrgSlug}/settings`) ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-50'"
             >
               <svg class="h-5 w-5" :class="isActive(`/orgs/${currentOrgSlug}/settings`) ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -156,7 +156,7 @@
             <div
               v-else
               @click="handleRestrictedClick($event, 'Settings')"
-              class="group flex items-center gap-3 px-3 py-2 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
+              class="group flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-md text-gray-400 opacity-60 cursor-not-allowed"
             >
               <svg class="h-5 w-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -201,13 +201,16 @@
 
 <script setup>
 import { computed } from 'vue';
-import { useRoute } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '@/stores/auth';
 import { useOrganizationStore } from '@/stores/organization';
 import { usePermissions } from '@/composables/usePermissions';
 import { useNotifications } from '@/composables/useNotifications';
 
+const emit = defineEmits(['close']);
+
 const route = useRoute();
+const router = useRouter();
 const authStore = useAuthStore();
 const organizationStore = useOrganizationStore();
 const { isPlatformOwner, canManageTeam } = usePermissions();
@@ -226,4 +229,9 @@ const handleRestrictedClick = (event, feature) => {
     showWarning(`${feature} is only available for active organizations. Your organization is awaiting approval.`);
   }
 };
+
+// Close sidebar on mobile when navigating
+router.afterEach(() => {
+  emit('close');
+});
 </script>

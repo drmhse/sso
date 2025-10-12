@@ -1,30 +1,30 @@
 <template>
   <div class="min-h-screen bg-white">
     <!-- Navigation -->
-    <nav class="border-b border-gray-200 bg-white">
+    <nav class="border-b border-gray-200 bg-white sticky top-0 z-50">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div class="flex justify-between h-16">
           <div class="flex items-center">
-            <h1 class="text-2xl font-bold text-gray-900">SSO</h1>
+            <h1 class="text-xl sm:text-2xl font-bold text-gray-900">SSO</h1>
           </div>
-          <div class="flex items-center space-x-4">
+          <div class="flex items-center space-x-2 sm:space-x-4">
             <a
               href="https://github.com/drmhse/sso"
               target="_blank"
               rel="noopener noreferrer"
-              class="text-sm text-gray-600 hover:text-gray-900 transition-colors"
+              class="hidden sm:block text-sm text-gray-600 hover:text-gray-900 transition-colors"
             >
               GitHub
             </a>
             <button
               @click="goToLogin"
-              class="text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors"
+              class="hidden sm:block text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors px-3 py-2"
             >
               Sign in
             </button>
             <button
               @click="goToLogin"
-              class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 transition-colors"
+              class="inline-flex items-center px-3 sm:px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 transition-colors"
             >
               Get started
             </button>
@@ -34,20 +34,20 @@
     </nav>
 
     <!-- Hero Section -->
-    <section class="relative py-20 sm:py-24 lg:py-32">
+    <section class="relative py-12 sm:py-20 lg:py-32">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div class="text-center">
-          <h1 class="text-4xl sm:text-5xl lg:text-6xl font-bold text-gray-900 tracking-tight">
+          <h1 class="text-3xl sm:text-4xl md:text-5xl lg:text-6xl font-bold text-gray-900 tracking-tight leading-tight">
             Enterprise SSO for
-            <span class="text-blue-600"> $10/month</span>
+            <span class="text-blue-600 block sm:inline"> $10/month</span>
           </h1>
-          <p class="mt-6 text-xl sm:text-2xl text-gray-600 max-w-3xl mx-auto">
+          <p class="mt-4 sm:mt-6 text-lg sm:text-xl lg:text-2xl text-gray-600 max-w-3xl mx-auto px-4">
             Open-source identity platform that scales to millions of users. Self-hosted, fully featured, capital efficient.
           </p>
-          <div class="mt-10 flex flex-col sm:flex-row gap-4 justify-center items-center">
+          <div class="mt-8 sm:mt-10 flex flex-col sm:flex-row gap-3 sm:gap-4 justify-center items-stretch sm:items-center px-4">
             <button
               @click="goToLogin"
-              class="inline-flex items-center px-8 py-4 border border-transparent text-lg font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 transition-colors shadow-lg"
+              class="inline-flex items-center justify-center px-6 sm:px-8 py-3 sm:py-4 border border-transparent text-base sm:text-lg font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 transition-colors shadow-lg"
             >
               Start for free
               <svg class="ml-2 -mr-1 w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -58,7 +58,7 @@
               href="https://github.com/drmhse/sso"
               target="_blank"
               rel="noopener noreferrer"
-              class="inline-flex items-center px-8 py-4 border border-gray-300 text-lg font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 transition-colors"
+              class="inline-flex items-center justify-center px-6 sm:px-8 py-3 sm:py-4 border border-gray-300 text-base sm:text-lg font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 transition-colors"
             >
               <svg class="mr-2 w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                 <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.203 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.942.359.31.678.921.678 1.856 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd" />
@@ -67,24 +67,24 @@
             </a>
           </div>
           <p class="mt-6 text-sm text-gray-500">
-            5 minutes to deploy • MIT License • No vendor lock-in
+            5 minutes to deploy • Open Source • No vendor lock-in
           </p>
         </div>
       </div>
     </section>
 
     <!-- Cost Comparison -->
-    <section class="py-16 bg-gray-50">
+    <section class="py-12 sm:py-16 bg-gray-50">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div class="text-center mb-12">
-          <h2 class="text-3xl font-bold text-gray-900">
+        <div class="text-center mb-8 sm:mb-12">
+          <h2 class="text-2xl sm:text-3xl font-bold text-gray-900 px-4">
             Why pay $10,000/month to rent your login page?
           </h2>
-          <p class="mt-4 text-lg text-gray-600">
+          <p class="mt-3 sm:mt-4 text-base sm:text-lg text-gray-600 px-4">
             Traditional auth providers charge based on MAUs. We don't.
           </p>
         </div>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 sm:gap-8">
           <!-- Traditional SaaS -->
           <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
             <div class="text-center">
@@ -210,7 +210,24 @@
           </p>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-          <!-- Feature 1 -->
+          <!-- Feature 1: Multi-Tenancy & Governance -->
+          <div class="relative">
+            <div class="flex items-center mb-4">
+              <div class="flex-shrink-0">
+                <div class="flex items-center justify-center h-12 w-12 rounded-md bg-blue-600 text-white">
+                  <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
+                  </svg>
+                </div>
+              </div>
+              <h3 class="ml-4 text-lg font-semibold text-gray-900">Multi-Tenancy & Governance</h3>
+            </div>
+            <p class="text-gray-600">
+              Complete organization isolation with RBAC and a platform-owner approval workflow for new tenants.
+            </p>
+          </div>
+
+          <!-- Feature 2: BYOO -->
           <div class="relative">
             <div class="flex items-center mb-4">
               <div class="flex-shrink-0">
@@ -220,31 +237,14 @@
                   </svg>
                 </div>
               </div>
-              <h3 class="ml-4 text-lg font-semibold text-gray-900">Multi-Tenancy</h3>
-            </div>
-            <p class="text-gray-600">
-              Complete organization isolation with role-based access control. Every tenant gets their own secure workspace.
-            </p>
-          </div>
-
-          <!-- Feature 2 -->
-          <div class="relative">
-            <div class="flex items-center mb-4">
-              <div class="flex-shrink-0">
-                <div class="flex items-center justify-center h-12 w-12 rounded-md bg-blue-600 text-white">
-                  <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
-                  </svg>
-                </div>
-              </div>
               <h3 class="ml-4 text-lg font-semibold text-gray-900">Bring Your Own OAuth</h3>
             </div>
             <p class="text-gray-600">
-              Let your customers use their own OAuth credentials. Encrypted storage with AES-GCM keeps secrets safe.
+              Let customers use their own OAuth credentials. Encrypted storage with AES-GCM keeps secrets safe.
             </p>
           </div>
 
-          <!-- Feature 3 -->
+          <!-- Feature 3: Device Flow -->
           <div class="relative">
             <div class="flex items-center mb-4">
               <div class="flex-shrink-0">
@@ -254,14 +254,31 @@
                   </svg>
                 </div>
               </div>
-              <h3 class="ml-4 text-lg font-semibold text-gray-900">Device Flow</h3>
+              <h3 class="ml-4 text-lg font-semibold text-gray-900">Device Authorization Flow</h3>
             </div>
             <p class="text-gray-600">
-              RFC 8628 device authorization for CLIs and mobile apps. Authenticate without embedded browsers.
+              Secure RFC 8628 device flow for CLIs, mobile, and IoT apps without embedded browsers.
             </p>
           </div>
 
-          <!-- Feature 4 -->
+          <!-- Feature 4: Analytics -->
+          <div class="relative">
+            <div class="flex items-center mb-4">
+              <div class="flex-shrink-0">
+                <div class="flex items-center justify-center h-12 w-12 rounded-md bg-blue-600 text-white">
+                  <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                  </svg>
+                </div>
+              </div>
+              <h3 class="ml-4 text-lg font-semibold text-gray-900">Comprehensive Analytics</h3>
+            </div>
+            <p class="text-gray-600">
+              Detailed login, growth, and activity metrics for both individual organizations and the entire platform.
+            </p>
+          </div>
+
+          <!-- Feature 5: Secure Sessions -->
           <div class="relative">
             <div class="flex items-center mb-4">
               <div class="flex-shrink-0">
@@ -271,31 +288,14 @@
                   </svg>
                 </div>
               </div>
-              <h3 class="ml-4 text-lg font-semibold text-gray-900">Session Management</h3>
+              <h3 class="ml-4 text-lg font-semibold text-gray-900">Secure Session Management</h3>
             </div>
             <p class="text-gray-600">
-              JWT-based sessions with revocation tracking. Full control over who's logged in and when.
+              JWT-based sessions with server-side revocation and secure refresh token rotation.
             </p>
           </div>
 
-          <!-- Feature 5 -->
-          <div class="relative">
-            <div class="flex items-center mb-4">
-              <div class="flex-shrink-0">
-                <div class="flex items-center justify-center h-12 w-12 rounded-md bg-blue-600 text-white">
-                  <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                </div>
-              </div>
-              <h3 class="ml-4 text-lg font-semibold text-gray-900">Audit Logs</h3>
-            </div>
-            <p class="text-gray-600">
-              Platform governance with comprehensive audit trails. Track every action across all organizations.
-            </p>
-          </div>
-
-          <!-- Feature 6 -->
+          <!-- Feature 6: SDK -->
           <div class="relative">
             <div class="flex items-center mb-4">
               <div class="flex-shrink-0">
@@ -305,7 +305,7 @@
                   </svg>
                 </div>
               </div>
-              <h3 class="ml-4 text-lg font-semibold text-gray-900">Developer SDK</h3>
+              <h3 class="ml-4 text-lg font-semibold text-gray-900">Developer-First SDK</h3>
             </div>
             <p class="text-gray-600">
               Zero-dependency TypeScript SDK. Strongly typed, framework-agnostic, works everywhere.
@@ -388,7 +388,7 @@
           <div class="bg-gray-50 rounded-lg p-8">
             <h3 class="text-xl font-semibold text-gray-900 mb-4">Open Source Projects</h3>
             <p class="text-gray-600 mb-4">
-              MIT licensed and ready to fork. Build the next self-hosted alternative to major SaaS products with auth that just works.
+              Dual licensed (AGPL API, MIT SDK) and ready to fork. Build the next self-hosted alternative to major SaaS products with auth that just works.
             </p>
             <div class="text-sm text-gray-500">
               Perfect for: Open source apps, self-hosted alternatives, community platforms
@@ -476,7 +476,7 @@
                 </a>
               </li>
               <li>
-                <a href="https://github.com/drmhse/sso#features" target="_blank" rel="noopener noreferrer" class="text-gray-400 hover:text-white text-sm transition-colors">
+                <a href="https://github.com/drmhse/sso#core-features" target="_blank" rel="noopener noreferrer" class="text-gray-400 hover:text-white text-sm transition-colors">
                   Features
                 </a>
               </li>
@@ -491,8 +491,8 @@
             <h4 class="text-sm font-semibold mb-4 uppercase tracking-wider">Legal</h4>
             <ul class="space-y-2">
               <li>
-                <a href="https://github.com/drmhse/sso/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" class="text-gray-400 hover:text-white text-sm transition-colors">
-                  MIT License
+                <a href="https://github.com/drmhse/sso" target="_blank" rel="noopener noreferrer" class="text-gray-400 hover:text-white text-sm transition-colors">
+                  Dual Licensed (AGPL/MIT)
                 </a>
               </li>
             </ul>
