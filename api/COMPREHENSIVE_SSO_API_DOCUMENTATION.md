@@ -130,7 +130,7 @@ Records a successful login for analytics and auditing.
 
 ### 2.2. JWT Structure & Types
 
-The system issues different types of JWTs depending on the authentication context. The JWT payload (`Claims`) includes:
+The system uses **RS256** (RSA with SHA-256) asymmetric signing for JWTs. The JWT header includes a `kid` (Key ID) field for key rotation support. The JWT payload (`Claims`) includes:
 
 ```json
 {
@@ -201,12 +201,33 @@ All successful responses are `2xx`. Error responses follow a standard format (se
 
 These endpoints do not require a JWT.
 
+- `GET /.well-known/jwks.json`: Retrieve the JSON Web Key Set (JWKS) containing the public key(s) used to verify JWT signatures. This endpoint is public and requires no authentication.
 - `POST /api/organizations`: Create a new organization (pending status).
 - `GET /auth/:provider`: Initiate end-user OAuth login.
 - `GET /auth/admin/:provider`: Initiate admin OAuth login.
 - `POST /auth/device/code`: Request codes for Device Flow.
 - `POST /auth/device/verify`: Verify a `user_code` from the web UI to get login context.
 - `POST /auth/token`: Exchange a `device_code` for a JWT.
+
+#### `GET /.well-known/jwks.json`
+Retrieve the JSON Web Key Set (JWKS) containing the public RSA key(s) used to verify JWT signatures. This enables third-party backends to validate JWTs without accessing any shared secrets.
+
+- **Authentication:** None required (public endpoint)
+- **Success Response (`200 OK`):**
+  ```json
+  {
+    "keys": [
+      {
+        "kty": "RSA",
+        "alg": "RS256",
+        "use": "sig",
+        "kid": "sso-key-2025-01-01",
+        "n": "base64url-encoded-modulus",
+        "e": "base64url-encoded-exponent"
+      }
+    ]
+  }
+  ```
 
 ### 3.2. Authenticated User Endpoints
 **Authentication:** Requires any valid JWT.
@@ -355,7 +376,9 @@ The system is configured entirely through environment variables.
 | **Database**                      |          |                                                                                                |
 | `DATABASE_URL`                    | Yes      | Connection string for the SQLite database (e.g., `sqlite:./data/sso.db`).                      |
 | **JWT**                           |          |                                                                                                |
-| `JWT_SECRET`                      | Yes      | A long, random, secret string for signing JWTs.                                                |
+| `JWT_PRIVATE_KEY_BASE64`          | Yes      | Base64-encoded RSA private key for signing JWTs.                                               |
+| `JWT_PUBLIC_KEY_BASE64`           | Yes      | Base64-encoded RSA public key for verifying JWT signatures.                                    |
+| `JWT_KID`                         | Yes      | Unique Key ID for key rotation and JWKS identification.                                        |
 | `JWT_EXPIRATION_HOURS`            | No       | JWT lifetime in hours. Defaults to `24`.                                                       |
 | **Server**                        |          |                                                                                                |
 | `BASE_URL`                        | Yes      | The public base URL of the service (e.g., `http://localhost:3000`).                            |

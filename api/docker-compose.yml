@@ -7,7 +7,9 @@ services:
     environment:
       - DATABASE_URL=sqlite:/app/data/data.db
       - RUST_LOG=info
-      - JWT_SECRET=your-super-secret-jwt-key
+      - JWT_PRIVATE_KEY_BASE64=your-base64-encoded-rsa-private-key
+      - JWT_PUBLIC_KEY_BASE64=your-base64-encoded-rsa-public-key
+      - JWT_KID=your-unique-key-id
       - JWT_EXPIRATION_HOURS=24
       - GITHUB_CLIENT_ID=your-github-client-id
       - GITHUB_CLIENT_SECRET=your-github-client-secret

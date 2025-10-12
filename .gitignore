@@ -1,2 +1,6 @@
 # Ignore etc folder
 etc/
+
+# RSA Keys (never commit these!)
+*.pem
+*_base64.txt

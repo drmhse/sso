@@ -60,6 +60,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use axum::Json;
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::traits::PublicKeyParts;
+use serde::Serialize;
 
 const BATCH_SIZE: usize = 256; // Increase batch size for higher throughput
 const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5); // Decrease timeout
@@ -220,6 +225,53 @@ async fn ensure_platform_owner(pool: &SqlitePool, email: &str) -> anyhow::Result
     }
 }
 
+#[derive(Serialize)]
+struct Jwk {
+    kty: String,
+    alg: String,
+    #[serde(rename = "use")]
+    key_use: String,
+    kid: String,
+    n: String,
+    e: String,
+}
+
+#[derive(Serialize)]
+struct JwksResponse {
+    keys: Vec<Jwk>,
+}
+
+async fn jwks_handler() -> Result<Json<JwksResponse>, axum::http::StatusCode> {
+    let public_key_base64 = env::var("JWT_PUBLIC_KEY_BASE64")
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let key_id = env::var("JWT_KID")
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let public_key_pem = STANDARD
+        .decode(&public_key_base64)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let pem_str = String::from_utf8(public_key_pem)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let rsa_key = rsa::RsaPublicKey::from_pkcs1_pem(&pem_str)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let n = URL_SAFE_NO_PAD.encode(rsa_key.n().to_bytes_be());
+    let e = URL_SAFE_NO_PAD.encode(rsa_key.e().to_bytes_be());
+
+    let jwk = Jwk {
+        kty: "RSA".to_string(),
+        alg: "RS256".to_string(),
+        key_use: "sig".to_string(),
+        kid: key_id,
+        n,
+        e,
+    };
+
+    Ok(Json(JwksResponse { keys: vec![jwk] }))
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -276,10 +328,15 @@ async fn main() -> anyhow::Result<()> {
     // Initialize services
     let oauth_client =
         Arc::new(OAuthClient::new(&config).expect("Failed to initialize OAuth client"));
-    let jwt_service = Arc::new(JwtService::new(
-        &config.jwt_secret,
-        config.jwt_expiration_hours,
-    ));
+    
+    let private_key = env::var("JWT_PRIVATE_KEY_BASE64").expect("JWT_PRIVATE_KEY_BASE64 must be set");
+    let public_key = env::var("JWT_PUBLIC_KEY_BASE64").expect("JWT_PUBLIC_KEY_BASE64 must be set");
+    let key_id = env::var("JWT_KID").expect("JWT_KID must be set");
+    
+    let jwt_service = Arc::new(
+        JwtService::new(&private_key, &public_key, config.jwt_expiration_hours, &key_id)
+            .expect("Failed to initialize JWT service")
+    );
     let stripe_service = Arc::new(StripeService::new(
         config.stripe_secret_key.clone(),
         config.stripe_webhook_secret.clone(),
@@ -479,6 +536,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Build public routes
     let public_routes = Router::new()
+        // JWKS endpoint (for JWT signature verification)
+        .route("/.well-known/jwks.json", get(jwks_handler))
         // SSO routes
         .route("/auth/:provider", get(auth_provider))
         .route("/auth/:provider/callback", get(auth_callback))

@@ -146,6 +146,122 @@ localStorage.removeItem('sso_token');
 localStorage.removeItem('sso_refresh_token');
 ```
 
+## Validating Tokens in Your Backend
+
+The SSO platform uses **RS256** (RSA with SHA-256) asymmetric signing for JWTs. This means your backend services can validate JWT signatures without needing access to any shared secrets.
+
+### How It Works
+
+1. **Fetch the JWKS**: The SSO platform exposes a public JWKS (JSON Web Key Set) endpoint at `/.well-known/jwks.json` containing the public RSA key(s).
+2. **Cache the Keys**: Fetch and cache the JWKS in your backend to avoid repeated requests.
+3. **Verify Tokens**: When a client sends a JWT, extract the `kid` (Key ID) from the token header, find the matching key in your cached JWKS, and verify the signature.
+4. **Validate Claims**: After signature verification, validate token claims like `exp` (expiration), `iss` (issuer), and `aud` (audience).
+
+### Node.js/Express Example
+
+Here's a complete example of JWT validation middleware:
+
+```typescript
+import { expressjwt } from 'express-jwt';
+import jwksRsa from 'jwks-rsa';
+
+// Configure JWKS client to fetch public keys
+const jwksClient = jwksRsa({
+  cache: true,
+  rateLimit: true,
+  jwksRequestsPerMinute: 5,
+  jwksUri: 'https://sso.example.com/.well-known/jwks.json'
+});
+
+// Function to get signing key from JWKS
+function getKey(header, callback) {
+  jwksClient.getSigningKey(header.kid, (err, key) => {
+    if (err) {
+      return callback(err);
+    }
+    const signingKey = key.getPublicKey();
+    callback(null, signingKey);
+  });
+}
+
+// JWT validation middleware
+const requireAuth = expressjwt({
+  secret: getKey,
+  algorithms: ['RS256'],
+  credentialsRequired: true,
+  getToken: (req) => {
+    if (req.headers.authorization?.startsWith('Bearer ')) {
+      return req.headers.authorization.substring(7);
+    }
+    return null;
+  }
+});
+
+// Use in your routes
+app.get('/api/protected', requireAuth, (req, res) => {
+  // req.auth contains the decoded JWT claims
+  const { sub, email, org, service } = req.auth;
+  res.json({ message: `Hello ${email}` });
+});
+```
+
+### Manual Validation (Node.js)
+
+If you prefer to validate manually without middleware:
+
+```typescript
+import jwt from 'jsonwebtoken';
+import jwksRsa from 'jwks-rsa';
+
+const jwksClient = jwksRsa({
+  jwksUri: 'https://sso.example.com/.well-known/jwks.json'
+});
+
+async function validateToken(token: string) {
+  try {
+    // Decode without verifying to get the kid
+    const decoded = jwt.decode(token, { complete: true });
+    if (!decoded || !decoded.header.kid) {
+      throw new Error('Invalid token: missing kid');
+    }
+
+    // Get the public key for this kid
+    const key = await jwksClient.getSigningKey(decoded.header.kid);
+    const publicKey = key.getPublicKey();
+
+    // Verify and decode the token
+    const verified = jwt.verify(token, publicKey, {
+      algorithms: ['RS256']
+    });
+
+    return verified; // Returns the decoded claims
+  } catch (error) {
+    console.error('Token validation failed:', error);
+    throw error;
+  }
+}
+
+// Usage
+const claims = await validateToken(req.headers.authorization.split(' ')[1]);
+console.log(claims.email, claims.org, claims.service);
+```
+
+### Other Languages
+
+The same approach works in any language:
+
+- **Python**: Use `PyJWT` with `python-jose` or `jwcrypto`
+- **Go**: Use `golang-jwt/jwt` with JWKS support
+- **Java**: Use `java-jwt` or Spring Security with JWKS
+- **Ruby**: Use `jwt` gem with `jwks-ruby`
+
+The key steps are always the same:
+1. Fetch JWKS from `/.well-known/jwks.json`
+2. Extract `kid` from JWT header
+3. Find matching key in JWKS
+4. Verify signature using the public key
+5. Validate token claims (especially `exp`)
+
 ## API Reference
 
 ### Analytics (`sso.analytics`)

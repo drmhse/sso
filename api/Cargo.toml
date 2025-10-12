@@ -17,7 +17,7 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# JWT
+# JWT (RSA support is built-in in v9)
 jsonwebtoken = "9"
 
 # OAuth2
@@ -42,7 +42,10 @@ futures = "0.3"
 
 # Encryption
 aes-gcm = "0.10"
-base64 = "0.21"
+base64 = "0.22"
+
+# RSA (for JWKS generation)
+rsa = "0.9"
 
 # HTTP types
 http = "1.0"

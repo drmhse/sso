@@ -3,7 +3,6 @@ use std::env;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
-    pub jwt_secret: String,
     pub jwt_expiration_hours: i64,
 
     // OAuth providers
@@ -44,7 +43,6 @@ impl Config {
         Ok(Config {
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:./data.db".to_string()),
-            jwt_secret: env::var("JWT_SECRET").map_err(|_| "JWT_SECRET must be set")?,
             jwt_expiration_hours: env::var("JWT_EXPIRATION_HOURS")
                 .unwrap_or_else(|_| "24".to_string())
                 .parse()

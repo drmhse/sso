@@ -33,6 +33,7 @@ pub struct InvitationResponse {
 pub struct ListInvitationsQuery {
     pub page: Option<i64>,
     pub limit: Option<i64>,
+    #[allow(dead_code)]
     pub status: Option<String>,
 }
 

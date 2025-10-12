@@ -67,6 +67,7 @@ pub struct ServiceWithDetails {
 
 #[derive(Debug, Deserialize)]
 pub struct ListServicesQuery {
+    #[allow(dead_code)]
     pub status: Option<String>,
     pub service_type: Option<String>,
     pub limit: Option<i64>,

@@ -97,7 +97,9 @@ SQLite database with migrations in `api/migrations/`:
 
 All configuration via environment variables:
 - `DATABASE_URL` - SQLite database path
-- `JWT_SECRET` - JWT signing secret (required)
+- `JWT_PRIVATE_KEY_BASE64` - Base64-encoded RSA private key for JWT signing (required)
+- `JWT_PUBLIC_KEY_BASE64` - Base64-encoded RSA public key for JWT verification (required)
+- `JWT_KID` - Unique Key ID for key rotation and JWKS (required)
 - OAuth provider credentials (GitHub, Google, Microsoft)
 - `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` - Billing integration
 - `PLATFORM_OWNER_EMAIL` - Auto-bootstrap platform owner
