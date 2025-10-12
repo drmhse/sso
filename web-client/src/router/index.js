@@ -30,9 +30,15 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
 
-    // Home / Redirect
+    // Home / Landing / Redirect
     {
       path: '/',
+      name: 'Landing',
+      component: () => import('@/views/Landing.vue'),
+      meta: { layout: 'auth' },
+    },
+    {
+      path: '/home',
       name: 'Home',
       component: () => import('@/views/Home.vue'),
       meta: { requiresAuth: true },
@@ -154,8 +160,8 @@ router.beforeEach(async (to, from, next) => {
     }
   }
 
-  // Redirect authenticated users away from login
-  if (to.name === 'Login' && authStore.isAuthenticated) {
+  // Redirect authenticated users away from login and landing
+  if ((to.name === 'Login' || to.name === 'Landing') && authStore.isAuthenticated) {
     return next({ name: 'Home' });
   }
 

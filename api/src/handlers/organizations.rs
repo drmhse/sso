@@ -16,13 +16,6 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Internal create function, kept for future use
-pub struct CreateOrganizationRequest {
-    pub slug: String,
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct CreateOrganizationPublicRequest {
     pub slug: String,
     pub name: String,
@@ -32,8 +25,6 @@ pub struct CreateOrganizationPublicRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateOrganizationRequest {
     pub name: Option<String>,
-    pub max_services: Option<i64>,
-    pub max_users: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,100 +195,6 @@ async fn find_or_create_user_tx(
     Ok(user)
 }
 
-/// Create a new organization (user becomes owner)
-#[allow(dead_code)] // Internal create function, kept for future use
-pub async fn create_organization(
-    State(state): State<AppState>,
-    auth_user: AuthUser,
-    Json(req): Json<CreateOrganizationRequest>,
-) -> Result<Json<OrganizationResponse>> {
-    let user = &auth_user.user;
-
-    // Validate slug format
-    if req.slug.len() < MIN_SLUG_LENGTH || req.slug.len() > MAX_SLUG_LENGTH {
-        return Err(AppError::BadRequest(
-            format!("Slug must be between {} and {} characters", MIN_SLUG_LENGTH, MAX_SLUG_LENGTH),
-        ));
-    }
-
-    if !req
-        .slug
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(AppError::BadRequest(
-            "Slug can only contain alphanumeric characters, hyphens, and underscores".to_string(),
-        ));
-    }
-
-    let mut tx = state.pool.begin().await.map_err(AppError::Database)?;
-
-    // Check if slug already exists
-    let existing = sqlx::query!("SELECT id FROM organizations WHERE slug = ?", req.slug)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(AppError::Database)?;
-
-    if existing.is_some() {
-        return Err(AppError::BadRequest(
-            "Organization slug already exists".to_string(),
-        ));
-    }
-
-    // Get free tier
-    let free_tier = sqlx::query!("SELECT id FROM organization_tiers WHERE name = ?", DEFAULT_TIER_NAME)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(AppError::Database)?;
-
-    // Create organization
-    let org_id = Uuid::new_v4().to_string();
-    let now = Utc::now();
-
-    sqlx::query!(
-        "INSERT INTO organizations (id, slug, name, owner_user_id, status, tier_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
-        org_id,
-        req.slug,
-        req.name,
-        user.id,
-        free_tier.id,
-        now,
-        now
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(AppError::Database)?;
-
-    // Create owner membership
-    let membership_id = Uuid::new_v4().to_string();
-    sqlx::query!(
-        "INSERT INTO memberships (id, org_id, user_id, role, created_at)
-         VALUES (?, ?, ?, 'owner', ?)",
-        membership_id,
-        org_id,
-        user.id,
-        now
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(AppError::Database)?;
-
-    tx.commit().await.map_err(AppError::Database)?;
-
-    // Fetch created organization with stats
-    let organization = get_organization_by_id(&state.pool, &org_id).await?;
-    let (membership_count, service_count, tier) =
-        get_organization_stats(&state.pool, &org_id).await?;
-
-    Ok(Json(OrganizationResponse {
-        organization,
-        membership_count,
-        service_count,
-        tier,
-    }))
-}
-
 /// Get organization by slug
 pub async fn get_organization(
     State(state): State<AppState>,
@@ -364,34 +261,8 @@ pub async fn update_organization(
         .execute(&state.pool)
         .await
         .map_err(AppError::Database)?;
-    }
-
-    if let Some(max_services) = req.max_services {
-        sqlx::query!(
-            "UPDATE organizations SET max_services = ?, updated_at = ? WHERE id = ?",
-            max_services,
-            now,
-            organization.id
-        )
-        .execute(&state.pool)
-        .await
-        .map_err(AppError::Database)?;
-    }
-
-    if let Some(max_users) = req.max_users {
-        sqlx::query!(
-            "UPDATE organizations SET max_users = ?, updated_at = ? WHERE id = ?",
-            max_users,
-            now,
-            organization.id
-        )
-        .execute(&state.pool)
-        .await
-        .map_err(AppError::Database)?;
-    }
-
-    // If no fields were updated, just update the timestamp
-    if req.name.is_none() && req.max_services.is_none() && req.max_users.is_none() {
+    } else {
+        // If no fields were updated, just update the timestamp
         sqlx::query!(
             "UPDATE organizations SET updated_at = ? WHERE id = ?",
             now,

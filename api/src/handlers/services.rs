@@ -376,12 +376,6 @@ pub async fn list_organization_services(
     // Build query with filters
     let mut sql = "SELECT * FROM services WHERE org_id = ?".to_string();
 
-    if let Some(_status) = &query.status {
-        // Note: status field not in current schema, adding as placeholder for future enhancement
-        // sql.push_str(" AND status = ?");
-        // params.push(status);
-    }
-
     if let Some(_service_type) = &query.service_type {
         sql.push_str(" AND service_type = ?");
     }

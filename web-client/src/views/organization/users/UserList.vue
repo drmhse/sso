@@ -168,6 +168,17 @@
         </div>
       </div>
     </BaseModal>
+
+    <!-- Revoke Sessions Confirmation -->
+    <ConfirmDialog
+      :open="revokeSessionsDialog.isOpen"
+      title="Revoke All Sessions"
+      :message="`Are you sure you want to revoke all sessions for ${selectedUser?.user.email}? They will need to log in again.`"
+      confirm-text="Revoke All Sessions"
+      variant="danger"
+      @confirm="confirmRevokeAllSessions"
+      @cancel="revokeSessionsDialog.isOpen = false"
+    />
   </div>
 </template>
 
@@ -182,6 +193,7 @@ import BaseModal from '@/components/BaseModal.vue';
 import BaseButton from '@/components/BaseButton.vue';
 import LoadingSpinner from '@/components/LoadingSpinner.vue';
 import EmptyState from '@/components/EmptyState.vue';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -196,6 +208,10 @@ const orgSlug = computed(() => route.params.orgSlug);
 const users = computed(() => endUsersStore.users);
 
 const detailsModal = ref({
+  isOpen: false,
+});
+
+const revokeSessionsDialog = ref({
   isOpen: false,
 });
 
@@ -222,12 +238,15 @@ const closeDetailsModal = () => {
   selectedUser.value = null;
 };
 
-const handleRevokeAllSessions = async () => {
+const handleRevokeAllSessions = () => {
   if (!selectedUser.value) return;
+  revokeSessionsDialog.value.isOpen = true;
+};
 
-  if (!confirm(`Are you sure you want to revoke all sessions for ${selectedUser.value.user.email}? They will need to log in again.`)) {
-    return;
-  }
+const confirmRevokeAllSessions = async () => {
+  revokeSessionsDialog.value.isOpen = false;
+
+  if (!selectedUser.value) return;
 
   try {
     const result = await endUsersStore.revokeUserSessions(

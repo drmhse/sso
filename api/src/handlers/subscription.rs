@@ -1,15 +1,9 @@
-use crate::auth::jwt::{Claims, JwtService};
+use crate::auth::jwt::Claims;
 use crate::constants::DEFAULT_TIER_NAME;
 use crate::db::models::User;
 use crate::error::{AppError, Result};
 use crate::handlers::auth::AppState;
-use axum::{
-    extract::{Request, State},
-    http::header,
-    middleware::Next,
-    response::Response,
-    Json,
-};
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -32,49 +26,6 @@ pub struct SubscriptionResponse {
     pub features: Vec<String>,
     pub status: String,
     pub current_period_end: String,
-}
-
-/// Extract and validate JWT from request
-#[allow(dead_code)] // Alternative JWT extraction implementation, kept for reference
-pub async fn extract_claims(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response> {
-    // Get Authorization header
-    let auth_header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized("Missing authorization header".to_string()))?;
-
-    // Extract Bearer token
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| AppError::Unauthorized("Invalid authorization header".to_string()))?;
-
-    // Validate token
-    let claims = state.jwt_service.validate_token(token)?;
-
-    // Check if token is in sessions (not revoked)
-    let token_hash = JwtService::hash_token(token);
-    let session_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND expires_at > datetime('now')",
-    )
-    .bind(&token_hash)
-    .fetch_one(&state.pool)
-    .await?;
-
-    if session_exists == 0 {
-        return Err(AppError::Unauthorized(
-            "Token revoked or expired".to_string(),
-        ));
-    }
-
-    // Store claims in request extensions for handlers to access
-    req.extensions_mut().insert(claims);
-
-    Ok(next.run(req).await)
 }
 
 /// Get current user info

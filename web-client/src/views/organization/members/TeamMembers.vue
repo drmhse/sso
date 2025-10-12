@@ -189,6 +189,28 @@
         </div>
       </div>
     </BaseModal>
+
+    <!-- Remove Member Confirmation -->
+    <ConfirmDialog
+      :open="removeMemberDialog.isOpen"
+      title="Remove Team Member"
+      :message="`Are you sure you want to remove ${removeMemberDialog.member?.email} from this organization? This action cannot be undone.`"
+      confirm-text="Remove Member"
+      variant="danger"
+      @confirm="confirmRemoveMember"
+      @cancel="removeMemberDialog = { isOpen: false, member: null }"
+    />
+
+    <!-- Cancel Invitation Confirmation -->
+    <ConfirmDialog
+      :open="cancelInvitationDialog.isOpen"
+      title="Cancel Invitation"
+      :message="`Are you sure you want to cancel the invitation to ${cancelInvitationDialog.invitation?.invitee_email}?`"
+      confirm-text="Cancel Invitation"
+      variant="danger"
+      @confirm="confirmCancelInvitation"
+      @cancel="cancelInvitationDialog = { isOpen: false, invitation: null }"
+    />
   </div>
 </template>
 
@@ -204,6 +226,7 @@ import BaseInput from '@/components/BaseInput.vue';
 import BaseButton from '@/components/BaseButton.vue';
 import LoadingSpinner from '@/components/LoadingSpinner.vue';
 import EmptyState from '@/components/EmptyState.vue';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
 
 const route = useRoute();
 const membersStore = useMembersStore();
@@ -227,6 +250,16 @@ const roleModal = ref({
   isOpen: false,
   member: null,
   role: 'member',
+});
+
+const removeMemberDialog = ref({
+  isOpen: false,
+  member: null,
+});
+
+const cancelInvitationDialog = ref({
+  isOpen: false,
+  invitation: null,
 });
 
 const roleClass = (role) => {
@@ -304,10 +337,16 @@ const handleUpdateRole = async () => {
   }
 };
 
-const handleRemoveMember = async (member) => {
-  if (!confirm(`Are you sure you want to remove ${member.email} from this organization?`)) {
-    return;
-  }
+const handleRemoveMember = (member) => {
+  removeMemberDialog.value = {
+    isOpen: true,
+    member,
+  };
+};
+
+const confirmRemoveMember = async () => {
+  const member = removeMemberDialog.value.member;
+  removeMemberDialog.value = { isOpen: false, member: null };
 
   try {
     await membersStore.removeMember(orgSlug.value, member.user_id);
@@ -317,10 +356,16 @@ const handleRemoveMember = async (member) => {
   }
 };
 
-const handleCancelInvitation = async (invitation) => {
-  if (!confirm(`Are you sure you want to cancel the invitation to ${invitation.invitee_email}?`)) {
-    return;
-  }
+const handleCancelInvitation = (invitation) => {
+  cancelInvitationDialog.value = {
+    isOpen: true,
+    invitation,
+  };
+};
+
+const confirmCancelInvitation = async () => {
+  const invitation = cancelInvitationDialog.value.invitation;
+  cancelInvitationDialog.value = { isOpen: false, invitation: null };
 
   try {
     await membersStore.cancelInvitation(orgSlug.value, invitation.id);

@@ -112,6 +112,13 @@
               >
                 Activate
               </button>
+              <button
+                v-if="org.status === 'active' || org.status === 'suspended'"
+                @click="openTierModal(org)"
+                class="text-blue-600 hover:text-blue-900"
+              >
+                Edit Tier
+              </button>
             </td>
           </tr>
         </tbody>
@@ -179,6 +186,88 @@
         </div>
       </div>
     </BaseModal>
+
+    <!-- Edit Tier Modal -->
+    <BaseModal
+      :is-open="tierModal.isOpen"
+      title="Edit Organization Tier & Limits"
+      confirm-text="Update"
+      confirm-variant="primary"
+      @close="closeTierModal"
+      @confirm="handleUpdateTier"
+    >
+      <div class="space-y-4">
+        <p class="text-sm text-gray-500">
+          Update tier and custom limits for <strong>{{ tierModal.organization?.name }}</strong>
+        </p>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">
+            Tier <span class="text-red-500">*</span>
+          </label>
+          <select
+            v-model="tierModal.tierId"
+            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+            required
+          >
+            <option v-for="tier in tiers" :key="tier.id" :value="tier.id">
+              {{ tier.display_name }} - ${{ (tier.price_cents / 100).toFixed(2) }}/{{ tier.currency }} ({{ tier.default_max_services }} services, {{ tier.default_max_users }} users)
+            </option>
+          </select>
+          <p class="mt-1 text-sm text-gray-500">Base tier determines default limits and pricing</p>
+        </div>
+
+        <div class="border-t border-gray-200 pt-4">
+          <h4 class="text-sm font-medium text-gray-900 mb-3">Custom Limit Overrides</h4>
+          <p class="text-xs text-gray-500 mb-3">Leave empty to use tier defaults. Custom limits override the tier's default values.</p>
+
+          <div class="space-y-3">
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">
+                Max Services (Override)
+              </label>
+              <input
+                v-model.number="tierModal.maxServices"
+                type="number"
+                min="0"
+                placeholder="Leave empty for tier default"
+                class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+              />
+              <p class="mt-1 text-xs text-gray-500">
+                Current: {{ tierModal.organization?.max_services ?? 'Using tier default' }}
+              </p>
+            </div>
+
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">
+                Max Users (Override)
+              </label>
+              <input
+                v-model.number="tierModal.maxUsers"
+                type="number"
+                min="0"
+                placeholder="Leave empty for tier default"
+                class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+              />
+              <p class="mt-1 text-xs text-gray-500">
+                Current: {{ tierModal.organization?.max_users ?? 'Using tier default' }}
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </BaseModal>
+
+    <!-- Suspend Organization Confirmation -->
+    <ConfirmDialog
+      :open="suspendDialog.isOpen"
+      title="Suspend Organization"
+      :message="`Are you sure you want to suspend ${suspendDialog.organization?.name}? This will prevent the organization from accessing the platform.`"
+      confirm-text="Suspend Organization"
+      variant="danger"
+      @confirm="confirmSuspend"
+      @cancel="suspendDialog = { isOpen: false, organization: null }"
+    />
   </div>
 </template>
 
@@ -190,6 +279,7 @@ import { formatDate } from '@/utils/formatters';
 import BaseModal from '@/components/BaseModal.vue';
 import LoadingSpinner from '@/components/LoadingSpinner.vue';
 import EmptyState from '@/components/EmptyState.vue';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
 
 const platformStore = usePlatformStore();
 const { success, error } = useNotifications();
@@ -209,6 +299,19 @@ const rejectionModal = ref({
   isOpen: false,
   organization: null,
   reason: '',
+});
+
+const tierModal = ref({
+  isOpen: false,
+  organization: null,
+  tierId: '',
+  maxServices: null,
+  maxUsers: null,
+});
+
+const suspendDialog = ref({
+  isOpen: false,
+  organization: null,
 });
 
 const statusClass = (status) => {
@@ -310,10 +413,16 @@ const handleReject = async () => {
   }
 };
 
-const handleSuspend = async (org) => {
-  if (!confirm(`Are you sure you want to suspend ${org.name}?`)) {
-    return;
-  }
+const handleSuspend = (org) => {
+  suspendDialog.value = {
+    isOpen: true,
+    organization: org,
+  };
+};
+
+const confirmSuspend = async () => {
+  const org = suspendDialog.value.organization;
+  suspendDialog.value = { isOpen: false, organization: null };
 
   try {
     await platformStore.suspendOrganization(org.id);
@@ -329,6 +438,48 @@ const handleActivate = async (org) => {
     success('Activated', `Organization ${org.name} has been activated`);
   } catch (err) {
     error('Activation Failed', err.message || 'Failed to activate organization');
+  }
+};
+
+const openTierModal = (org) => {
+  tierModal.value = {
+    isOpen: true,
+    organization: org,
+    tierId: org.tier_id || 'tier_starter',
+    maxServices: org.max_services,
+    maxUsers: org.max_users,
+  };
+};
+
+const closeTierModal = () => {
+  tierModal.value = {
+    isOpen: false,
+    organization: null,
+    tierId: '',
+    maxServices: null,
+    maxUsers: null,
+  };
+};
+
+const handleUpdateTier = async () => {
+  if (!tierModal.value.tierId) {
+    error('Validation Error', 'Please select a tier');
+    return;
+  }
+
+  try {
+    await platformStore.updateOrganizationTier(
+      tierModal.value.organization.id,
+      {
+        tier_id: tierModal.value.tierId,
+        max_services: tierModal.value.maxServices || undefined,
+        max_users: tierModal.value.maxUsers || undefined,
+      }
+    );
+    success('Updated', `Organization ${tierModal.value.organization.name} tier and limits have been updated`);
+    closeTierModal();
+  } catch (err) {
+    error('Update Failed', err.message || 'Failed to update organization tier');
   }
 };
 

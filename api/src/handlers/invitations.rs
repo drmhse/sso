@@ -30,7 +30,6 @@ pub struct InvitationResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Query parameters kept for future pagination implementation
 pub struct ListInvitationsQuery {
     pub page: Option<i64>,
     pub limit: Option<i64>,
@@ -368,12 +367,12 @@ pub async fn cancel_invitation(
     Ok(Json(()))
 }
 
-/// List organization invitations (owner/admin only) - simplified version
+/// List organization invitations (owner/admin only)
 pub async fn list_invitations(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(org_slug): Path<String>,
-    _query: Query<ListInvitationsQuery>,
+    query: Query<ListInvitationsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>> {
     let user = &auth_user.user;
 
@@ -390,7 +389,12 @@ pub async fn list_invitations(
     let _membership =
         crate::middleware::check_org_admin(&state.pool, &user.id, &organization.id).await?;
 
-    // Get all invitations for this organization (simplified - no pagination for now)
+    // Extract pagination parameters with defaults
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    // Get invitations for this organization with pagination
     let rows = sqlx::query!(
         r#"
         SELECT
@@ -400,9 +404,11 @@ pub async fn list_invitations(
         JOIN users u ON i.invited_by = u.id
         WHERE i.org_id = ?
         ORDER BY i.created_at DESC
-        LIMIT 50
+        LIMIT ? OFFSET ?
         "#,
-        organization.id
+        organization.id,
+        limit,
+        offset
     )
     .fetch_all(&state.pool)
     .await

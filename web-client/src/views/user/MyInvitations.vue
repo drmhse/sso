@@ -55,6 +55,17 @@
         </div>
       </div>
     </div>
+
+    <!-- Decline Invitation Confirmation -->
+    <ConfirmDialog
+      :open="declineDialog.isOpen"
+      title="Decline Invitation"
+      :message="`Are you sure you want to decline the invitation from ${declineDialog.invitation?.organization_name}?`"
+      confirm-text="Decline Invitation"
+      variant="danger"
+      @confirm="confirmDecline"
+      @cancel="declineDialog = { isOpen: false, invitation: null }"
+    />
   </div>
 </template>
 
@@ -68,6 +79,7 @@ import { useAuthStore } from '@/stores/auth';
 import BaseButton from '@/components/BaseButton.vue';
 import LoadingSpinner from '@/components/LoadingSpinner.vue';
 import EmptyState from '@/components/EmptyState.vue';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -77,6 +89,11 @@ const loading = ref(false);
 const invitations = ref([]);
 const accepting = ref(null);
 const declining = ref(null);
+
+const declineDialog = ref({
+  isOpen: false,
+  invitation: null,
+});
 
 const fetchInvitations = async () => {
   loading.value = true;
@@ -119,10 +136,16 @@ const handleAccept = async (invitation) => {
   }
 };
 
-const handleDecline = async (invitation) => {
-  if (!confirm(`Are you sure you want to decline the invitation from ${invitation.organization_name}?`)) {
-    return;
-  }
+const handleDecline = (invitation) => {
+  declineDialog.value = {
+    isOpen: true,
+    invitation,
+  };
+};
+
+const confirmDecline = async () => {
+  const invitation = declineDialog.value.invitation;
+  declineDialog.value = { isOpen: false, invitation: null };
 
   declining.value = invitation.id;
 
