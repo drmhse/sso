@@ -73,18 +73,36 @@ The application is configured entirely via environment variables. Create a `.env
 | :-------------------------------- | :-------: | :--------------------------------------------------------------------------------------------- |
 | **Core**                          |           |                                                                                                |
 | `DATABASE_URL`                    |    Yes    | Connection string for SQLite (e.g., `sqlite:/app/data/data.db` in Docker).                     |
-| `JWT_SECRET`                      |    Yes    | A long, random, secure string for signing JWTs.                                                |
-| `ENCRYPTION_KEY`                  |  **Yes**  | **Critical for security.** 32-byte (64-hex-char) key for encrypting organization secrets.        |
+| `JWT_PRIVATE_KEY_BASE64`          |    Yes    | Base64-encoded RSA private key for signing JWTs (RS256). Generate with OpenSSL.               |
+| `JWT_PUBLIC_KEY_BASE64`           |    Yes    | Base64-encoded RSA public key for verifying JWTs (RS256).                                      |
+| `JWT_KID`                         |    Yes    | Key ID for JWKS endpoint (e.g., `sso-key-2025-01-01`).                                        |
+| `JWT_EXPIRATION_HOURS`            |    Yes    | JWT token expiration time in hours (e.g., `24`).                                               |
+| `ENCRYPTION_KEY`                  |  **Yes**  | **Critical for security.** 32-byte (64-hex-char) key for encrypting organization secrets. Generate with `openssl rand -hex 32`. |
 | **Server**                        |           |                                                                                                |
+| `SERVER_HOST`                     |    No     | Server bind address (default: `0.0.0.0`).                                                     |
+| `SERVER_PORT`                     |    No     | Server port (default: `3000`).                                                                |
 | `BASE_URL`                        |    Yes    | The public base URL of the service (e.g., `http://localhost:3000`).                            |
 | `PLATFORM_ADMIN_REDIRECT_URI`     |    Yes    | The callback URL for your separate admin dashboard frontend (e.g., `http://localhost:5173/callback`). |
 | `PLATFORM_DEVICE_ACTIVATION_URI`  |    Yes    | The URL for the platform-level device activation page (e.g., `http://localhost:5173/activate`).  |
 | **Platform Owner**                |           |                                                                                                |
 | `PLATFORM_OWNER_EMAIL`            |    Yes    | Email of the user to be automatically bootstrapped as the super-admin.                         |
-| **Default OAuth Apps (for BYOO fallback)** |    Yes    | Credentials for the platform's default apps, used when an organization doesn't bring their own.  |
-| `GITHUB_CLIENT_ID` / `_SECRET`... |    Yes    | ...and so on for Google and Microsoft.                                                         |
-| **Admin OAuth Apps (for Admin Login)** |    Yes    | Credentials for the **dedicated** apps used **only for the admin login flow**.               |
-| `PLATFORM_GITHUB_CLIENT_ID`...    |    Yes    | ...and so on for Google and Microsoft.                                                         |
+| **Default OAuth Apps (for BYOO fallback)** |           | Credentials for the platform's default apps, used when an organization doesn't bring their own. |
+| `GITHUB_CLIENT_ID`                |    Yes    | GitHub OAuth app client ID (platform default).                                                 |
+| `GITHUB_CLIENT_SECRET`            |    Yes    | GitHub OAuth app client secret (platform default).                                             |
+| `GITHUB_REDIRECT_URI`             |    Yes    | GitHub OAuth callback URL (e.g., `http://localhost:3000/auth/github/callback`).               |
+| `GOOGLE_CLIENT_ID`                |    Yes    | Google OAuth app client ID (platform default).                                                 |
+| `GOOGLE_CLIENT_SECRET`            |    Yes    | Google OAuth app client secret (platform default).                                             |
+| `GOOGLE_REDIRECT_URI`             |    Yes    | Google OAuth callback URL (e.g., `http://localhost:3000/auth/google/callback`).               |
+| `MICROSOFT_CLIENT_ID`             |    Yes    | Microsoft OAuth app client ID (platform default).                                              |
+| `MICROSOFT_CLIENT_SECRET`         |    Yes    | Microsoft OAuth app client secret (platform default).                                          |
+| `MICROSOFT_REDIRECT_URI`          |    Yes    | Microsoft OAuth callback URL (e.g., `http://localhost:3000/auth/microsoft/callback`).         |
+| **Admin OAuth Apps (for Admin Login)** |     | Credentials for the **dedicated** apps used **only for the admin login flow**.                |
+| `PLATFORM_GITHUB_CLIENT_ID`       |    Yes    | GitHub OAuth app client ID (admin dashboard login).                                            |
+| `PLATFORM_GITHUB_CLIENT_SECRET`   |    Yes    | GitHub OAuth app client secret (admin dashboard login).                                        |
+| `PLATFORM_GOOGLE_CLIENT_ID`       |    Yes    | Google OAuth app client ID (admin dashboard login).                                            |
+| `PLATFORM_GOOGLE_CLIENT_SECRET`   |    Yes    | Google OAuth app client secret (admin dashboard login).                                        |
+| `PLATFORM_MICROSOFT_CLIENT_ID`    |    Yes    | Microsoft OAuth app client ID (admin dashboard login).                                         |
+| `PLATFORM_MICROSOFT_CLIENT_SECRET`|    Yes    | Microsoft OAuth app client secret (admin dashboard login).                                     |
 | **Billing**                       |           |                                                                                                |
 | `STRIPE_SECRET_KEY`               |    Yes    | Your Stripe API secret key.                                                                    |
 | `STRIPE_WEBHOOK_SECRET`           |    Yes    | The signing secret for your Stripe webhook endpoint.                                           |

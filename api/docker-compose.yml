@@ -20,12 +20,21 @@ services:
       - MICROSOFT_CLIENT_ID=your-microsoft-client-id
       - MICROSOFT_CLIENT_SECRET=your-microsoft-client-secret
       - MICROSOFT_REDIRECT_URI=http://localhost:3000/auth/microsoft/callback
+      - PLATFORM_GITHUB_CLIENT_ID=your-platform-admin-github-client-id
+      - PLATFORM_GITHUB_CLIENT_SECRET=your-platform-admin-github-client-secret
+      - PLATFORM_GOOGLE_CLIENT_ID=your-platform-admin-google-client-id
+      - PLATFORM_GOOGLE_CLIENT_SECRET=your-platform-admin-google-client-secret
+      - PLATFORM_MICROSOFT_CLIENT_ID=your-platform-admin-microsoft-client-id
+      - PLATFORM_MICROSOFT_CLIENT_SECRET=your-platform-admin-microsoft-client-secret
       - STRIPE_SECRET_KEY=sk_test_your-stripe-secret-key
       - STRIPE_WEBHOOK_SECRET=whsec_your-stripe-webhook-secret
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=3000
       - BASE_URL=http://localhost:3000
+      - PLATFORM_ADMIN_REDIRECT_URI=http://localhost:5173/callback
+      - PLATFORM_DEVICE_ACTIVATION_URI=http://localhost:5173/activate
       - PLATFORM_OWNER_EMAIL=admin@example.com
+      - ENCRYPTION_KEY=your-64-character-hex-encryption-key
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env:ro
