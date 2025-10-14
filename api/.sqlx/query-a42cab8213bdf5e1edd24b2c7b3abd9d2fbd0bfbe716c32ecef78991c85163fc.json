@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM memberships WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "a42cab8213bdf5e1edd24b2c7b3abd9d2fbd0bfbe716c32ecef78991c85163fc"
+}

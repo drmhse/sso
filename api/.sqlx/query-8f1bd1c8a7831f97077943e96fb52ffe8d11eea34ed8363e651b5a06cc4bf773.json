@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE device_codes SET user_id = ?, status = 'authorized' WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "8f1bd1c8a7831f97077943e96fb52ffe8d11eea34ed8363e651b5a06cc4bf773"
+}

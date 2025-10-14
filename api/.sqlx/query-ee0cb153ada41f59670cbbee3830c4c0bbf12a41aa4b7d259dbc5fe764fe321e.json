@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            i.id, i.email, i.role, i.status, i.token, i.expires_at, i.created_at,\n            u.email as inviter_email, u.id as inviter_id, u.created_at as inviter_created_at\n        FROM organization_invitations i\n        JOIN users u ON i.invited_by = u.id\n        WHERE i.org_id = ?\n        ORDER BY i.created_at DESC\n        LIMIT ? OFFSET ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "email",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "role",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "token",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 5,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 6,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "inviter_email",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "inviter_id",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "inviter_created_at",
+        "ordinal": 9,
+        "type_info": "Datetime"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "ee0cb153ada41f59670cbbee3830c4c0bbf12a41aa4b7d259dbc5fe764fe321e"
+}

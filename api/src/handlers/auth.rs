@@ -890,7 +890,7 @@ pub async fn token_exchange(
     .await?;
 
     // Record login event - get provider from most recent identity
-    if let Some(ref service_id) = result.service_id {
+    if let Some(service_id) = result.service_id.as_ref() {
         if let Ok(provider_str) = sqlx::query_scalar::<_, String>(
             "SELECT provider FROM identities WHERE user_id = ? ORDER BY last_refreshed_at DESC LIMIT 1"
         )

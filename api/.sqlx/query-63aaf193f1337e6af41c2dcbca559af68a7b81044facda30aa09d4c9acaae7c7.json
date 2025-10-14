@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) as count FROM organization_invitations\n         WHERE org_id = ? AND email = ? AND status = 'pending'",
+  "describe": {
+    "columns": [
+      {
+        "name": "count",
+        "ordinal": 0,
+        "type_info": "Int"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "63aaf193f1337e6af41c2dcbca559af68a7b81044facda30aa09d4c9acaae7c7"
+}

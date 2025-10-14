@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            s.id as service_id,\n            s.slug as service_slug,\n            o.slug as org_slug,\n            p.name as plan_name,\n            p.features as features\n        FROM services s\n        JOIN organizations o ON s.org_id = o.id\n        LEFT JOIN subscriptions sub ON sub.service_id = s.id AND sub.user_id = ?\n        LEFT JOIN plans p ON sub.plan_id = p.id\n        WHERE o.slug = ? AND s.slug = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "service_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "service_slug",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "org_slug",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "plan_name",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "features",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "df72cc4121dd81bacd1918bc4897e2e87bcfe2c5c98f8a164be40aad3c6c8ed7"
+}

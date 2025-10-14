@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) as count FROM memberships m\n         JOIN users u ON m.user_id = u.id\n         WHERE m.org_id = ? AND u.email = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "count",
+        "ordinal": 0,
+        "type_info": "Int"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "10719d9a45560364625b4ff7ecaccba5dd930a691c5f05f50a9b3a83e33095a1"
+}

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            i.id, i.email, i.role, i.token, i.expires_at, i.created_at,\n            o.slug as org_slug, o.name as org_name\n        FROM organization_invitations i\n        JOIN organizations o ON i.org_id = o.id\n        WHERE i.email = ? AND i.status = 'pending'\n        ORDER BY i.created_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "email",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "role",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "token",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 4,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 5,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "org_slug",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "org_name",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "41fac31a7089738dcfdf13e4d6c14d0ce754a88ec6471a3ff9e9b7848322d26b"
+}

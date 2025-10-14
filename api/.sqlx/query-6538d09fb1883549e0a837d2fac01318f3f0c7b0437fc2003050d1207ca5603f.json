@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memberships SET role = 'admin' WHERE org_id = ? AND user_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "6538d09fb1883549e0a837d2fac01318f3f0c7b0437fc2003050d1207ca5603f"
+}

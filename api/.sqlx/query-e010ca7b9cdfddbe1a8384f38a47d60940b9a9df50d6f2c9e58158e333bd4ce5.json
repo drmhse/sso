@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT default_max_users FROM organization_tiers WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "default_max_users",
+        "ordinal": 0,
+        "type_info": "Int64"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e010ca7b9cdfddbe1a8384f38a47d60940b9a9df50d6f2c9e58158e333bd4ce5"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE organizations SET owner_user_id = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "3268ab26d61212658b8b1ee0e91da50b6304f02e343c4d70c064af9d4ea1e1d7"
+}

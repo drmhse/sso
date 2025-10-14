@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE organization_invitations SET status = 'cancelled'\n         WHERE id = ? AND org_id = ? AND status = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "aedd6af2c71091282c7dee04b01d165f773e0759239e3113221a2408fde4b570"
+}

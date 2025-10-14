@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                        SELECT p.name as plan_name, p.features\n                        FROM subscriptions sub\n                        JOIN plans p ON sub.plan_id = p.id\n                        WHERE sub.user_id = ? AND sub.service_id = ? AND sub.status = 'active'\n                        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "plan_name",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "features",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "d6d0e5c0c0f2fa4ce0c5f4711b6ca216fad1f7763d0703fbad04611739fc91f4"
+}

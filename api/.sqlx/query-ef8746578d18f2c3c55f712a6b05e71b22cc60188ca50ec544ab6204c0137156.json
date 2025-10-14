@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT client_id, client_secret_encrypted, encryption_key_id \n         FROM organization_oauth_credentials \n         WHERE org_id = ? AND provider = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "client_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "client_secret_encrypted",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "encryption_key_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ef8746578d18f2c3c55f712a6b05e71b22cc60188ca50ec544ab6204c0137156"
+}

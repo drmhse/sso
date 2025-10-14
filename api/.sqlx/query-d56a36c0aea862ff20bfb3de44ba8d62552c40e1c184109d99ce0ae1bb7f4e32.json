@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT client_id FROM organization_oauth_credentials WHERE org_id = ? AND provider = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "client_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d56a36c0aea862ff20bfb3de44ba8d62552c40e1c184109d99ce0ae1bb7f4e32"
+}

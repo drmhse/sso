@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT is_platform_owner FROM users WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "is_platform_owner",
+        "ordinal": 0,
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3d1fad2495d78e2d831078b0c6682bfb19c74461ebb648d2f162ece70fb0ccb4"
+}

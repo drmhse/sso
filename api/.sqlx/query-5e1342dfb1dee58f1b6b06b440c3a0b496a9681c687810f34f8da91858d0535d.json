@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id FROM sessions WHERE token_hash = ? AND expires_at > datetime('now')",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "5e1342dfb1dee58f1b6b06b440c3a0b496a9681c687810f34f8da91858d0535d"
+}

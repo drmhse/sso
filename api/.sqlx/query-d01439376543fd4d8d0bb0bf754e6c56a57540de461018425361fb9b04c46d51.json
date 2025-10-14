@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            s.slug as service_slug,\n            p.name as plan_name,\n            p.features as features,\n            sub.status as status,\n            sub.current_period_end as current_period_end\n        FROM subscriptions sub\n        JOIN services s ON sub.service_id = s.id\n        JOIN plans p ON sub.plan_id = p.id\n        JOIN organizations o ON s.org_id = o.id\n        WHERE sub.user_id = ? AND o.slug = ? AND s.slug = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "service_slug",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "plan_name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "features",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "current_period_end",
+        "ordinal": 4,
+        "type_info": "Datetime"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "d01439376543fd4d8d0bb0bf754e6c56a57540de461018425361fb9b04c46d51"
+}

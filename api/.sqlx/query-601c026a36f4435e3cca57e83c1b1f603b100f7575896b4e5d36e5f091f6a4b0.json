@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT o.slug\n            FROM memberships m\n            JOIN organizations o ON m.org_id = o.id\n            WHERE m.user_id = ?\n            ORDER BY m.created_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "slug",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "601c026a36f4435e3cca57e83c1b1f603b100f7575896b4e5d36e5f091f6a4b0"
+}
