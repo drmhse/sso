@@ -256,7 +256,7 @@ pub async fn auth_provider(
     Ok(Redirect::to(&auth_url).into_response())
 }
 
-fn get_provider_scopes(service: &crate::db::models::Service, provider: Provider) -> Vec<String> {
+pub fn get_provider_scopes(service: &crate::db::models::Service, provider: Provider) -> Vec<String> {
     let scopes_json = match provider {
         Provider::Github => &service.github_scopes,
         Provider::Microsoft => &service.microsoft_scopes,
@@ -461,9 +461,13 @@ async fn auth_callback_impl(
             )
             .await?;
 
-            // Redirect to frontend callback URL with success status
-            let redirect_url = format!("{}/settings/connections?status=success", state.base_url);
-            return Ok(Redirect::to(&redirect_url).into_response());
+            // Redirect to frontend callback URL
+            // redirect_uri already contains query params: ?status=success&provider=X&action=link
+            let redirect_url = oauth_ctx.redirect_uri.as_ref()
+                .ok_or_else(|| AppError::InternalServerError(
+                    "No redirect_uri in oauth state for linking flow".to_string()
+                ))?;
+            return Ok(Redirect::to(redirect_url).into_response());
         }
     }
 
@@ -1791,7 +1795,7 @@ fn validate_redirect_uri(redirect_uri: &str, service: &crate::db::models::Servic
     Ok(())
 }
 
-fn create_custom_oauth_client(
+pub fn create_custom_oauth_client(
     config: &crate::config::Config,
     provider: Provider,
     client_id: &str,
@@ -1806,7 +1810,7 @@ fn create_custom_oauth_client(
     )
 }
 
-fn get_authorization_url_for_client(
+pub fn get_authorization_url_for_client(
     client: &oauth2::basic::BasicClient,
     provider: Provider,
     scopes: Vec<String>,

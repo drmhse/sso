@@ -180,15 +180,6 @@ pub struct UserWithContext {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct ProviderTokenGrant {
-    pub id: String,
-    pub service_id: String,
-    pub provider: String,
-    pub required: bool,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct OAuthState {
     pub state: String,
     pub pkce_verifier: Option<String>,

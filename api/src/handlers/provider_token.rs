@@ -1,12 +1,12 @@
-use crate::auth::jwt::Claims;
 use crate::auth::sso::Provider;
 use crate::auth::token_refresher;
 use crate::constants::TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS;
 use crate::db::models::Identity;
 use crate::error::{AppError, Result};
 use crate::handlers::auth::AppState;
+use crate::middleware::AuthUser;
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Path, State},
     Json,
 };
 use chrono::{Duration, Utc};
@@ -25,24 +25,32 @@ pub struct ProviderTokenResponse {
 pub async fn get_provider_token(
     State(state): State<AppState>,
     Path(provider_str): Path<String>,
-    Extension(claims): Extension<Claims>,
+    auth_user: AuthUser,
 ) -> Result<Json<ProviderTokenResponse>> {
     let provider = Provider::from_str(&provider_str)?;
 
-    // 1. Verify service is authorized to access this provider
-    let grant_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM provider_token_grants
-         WHERE service_id = (SELECT id FROM services WHERE client_id = ?)
-         AND provider = ?",
+    // 1. Verify service has scopes configured for this provider
+    let service = sqlx::query_as::<_, crate::db::models::Service>(
+        "SELECT s.* FROM services s
+         JOIN organizations o ON s.org_id = o.id
+         WHERE s.slug = ? AND o.slug = ?",
     )
-    .bind(&claims.service)
-    .bind(provider.as_str())
-    .fetch_one(&state.pool)
-    .await?;
+    .bind(&auth_user.claims.service)
+    .bind(&auth_user.claims.org)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
-    if grant_count == 0 {
+    // Check if service has scopes configured for the requested provider
+    let has_scopes = match provider {
+        Provider::Github => service.github_scopes.is_some(),
+        Provider::Microsoft => service.microsoft_scopes.is_some(),
+        Provider::Google => service.google_scopes.is_some(),
+    };
+
+    if !has_scopes {
         return Err(AppError::Forbidden(format!(
-            "Service not authorized to access {} tokens",
+            "Service does not have {} scopes configured",
             provider.as_str()
         )));
     }
@@ -51,7 +59,7 @@ pub async fn get_provider_token(
     let identity = sqlx::query_as::<_, Identity>(
         "SELECT * FROM identities WHERE user_id = ? AND provider = ?",
     )
-    .bind(&claims.sub)
+    .bind(&auth_user.claims.sub)
     .bind(provider.as_str())
     .fetch_optional(&state.pool)
     .await?
@@ -68,9 +76,11 @@ pub async fn get_provider_token(
         if *expires_at < now + Duration::minutes(5) {
             // Token expired or expiring soon - refresh it
             let refreshed_identity = refresh_provider_token_with_lock(&state, &identity).await?;
+            let access_token = decrypt_token(&state, &refreshed_identity.access_token, &refreshed_identity.access_token_encrypted)?;
+            let refresh_token = decrypt_token(&state, &refreshed_identity.refresh_token, &refreshed_identity.refresh_token_encrypted)?;
             return Ok(Json(ProviderTokenResponse {
-                access_token: refreshed_identity.access_token.unwrap_or_default(),
-                refresh_token: refreshed_identity.refresh_token,
+                access_token: access_token.unwrap_or_default(),
+                refresh_token,
                 expires_at: refreshed_identity.expires_at.map(|dt| dt.to_rfc3339()),
                 scopes: parse_scopes(&refreshed_identity.scopes),
                 provider: provider.as_str().to_string(),
@@ -78,10 +88,13 @@ pub async fn get_provider_token(
         }
     }
 
-    // 4. Return existing token
+    // 4. Decrypt and return existing token
+    let access_token = decrypt_token(&state, &identity.access_token, &identity.access_token_encrypted)?;
+    let refresh_token = decrypt_token(&state, &identity.refresh_token, &identity.refresh_token_encrypted)?;
+
     Ok(Json(ProviderTokenResponse {
-        access_token: identity.access_token.unwrap_or_default(),
-        refresh_token: identity.refresh_token.clone(),
+        access_token: access_token.unwrap_or_default(),
+        refresh_token,
         expires_at: identity.expires_at.map(|dt| dt.to_rfc3339()),
         scopes: parse_scopes(&identity.scopes),
         provider: provider.as_str().to_string(),
@@ -206,6 +219,30 @@ async fn refresh_provider_token(state: &AppState, identity: &Identity) -> Result
     .await?;
 
     Ok(updated_identity)
+}
+
+fn decrypt_token(
+    state: &AppState,
+    plaintext: &Option<String>,
+    encrypted: &Option<Vec<u8>>,
+) -> Result<Option<String>> {
+    // If plaintext exists, use it (backwards compatibility)
+    if let Some(token) = plaintext {
+        return Ok(Some(token.clone()));
+    }
+
+    // Otherwise, decrypt the encrypted version
+    if let Some(encrypted_token) = encrypted {
+        if let Some(encryption) = &state.encryption {
+            let decrypted = encryption
+                .decrypt(encrypted_token)
+                .map_err(|e| AppError::InternalServerError(format!("Failed to decrypt token: {}", e)))?;
+            return Ok(Some(decrypted));
+        }
+    }
+
+    // No token available
+    Ok(None)
 }
 
 fn parse_scopes(scopes_json: &Option<String>) -> Vec<String> {

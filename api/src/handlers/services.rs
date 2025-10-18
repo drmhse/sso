@@ -1,5 +1,5 @@
 use crate::constants::{DEFAULT_MAX_SERVICES, DEFAULT_TIER_NAME, VALID_SERVICE_TYPES};
-use crate::db::models::{Membership, Organization, Plan, ProviderTokenGrant, Service, ServiceResponse};
+use crate::db::models::{Membership, Organization, Plan, Service, ServiceResponse};
 use crate::error::Result;
 use crate::handlers::auth::AppState;
 use crate::middleware::AuthUser;
@@ -39,7 +39,6 @@ pub struct UpdateServiceRequest {
 #[derive(Debug, Serialize)]
 pub struct ServiceWithGrantsResponse {
     pub service: ServiceResponse,
-    pub provider_grants: Vec<ProviderTokenGrant>,
     pub default_plan: Plan,
     pub usage: ServiceUsageInfo,
 }
@@ -251,67 +250,7 @@ pub async fn create_service(
     .fetch_one(&mut *tx)
     .await?;
 
-    // 8. AUTO-CREATE provider_token_grants
-    let mut provider_grants = Vec::new();
-
-    if req.github_scopes.is_some() {
-        let grant_id = Uuid::new_v4().to_string();
-        let grant = sqlx::query_as::<_, ProviderTokenGrant>(
-            r#"
-            INSERT INTO provider_token_grants (id, service_id, provider, required, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            RETURNING *
-            "#,
-        )
-        .bind(&grant_id)
-        .bind(&service_id)
-        .bind("github")
-        .bind(false)
-        .bind(Utc::now())
-        .fetch_one(&mut *tx)
-        .await?;
-        provider_grants.push(grant);
-    }
-
-    if req.microsoft_scopes.is_some() {
-        let grant_id = Uuid::new_v4().to_string();
-        let grant = sqlx::query_as::<_, ProviderTokenGrant>(
-            r#"
-            INSERT INTO provider_token_grants (id, service_id, provider, required, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            RETURNING *
-            "#,
-        )
-        .bind(&grant_id)
-        .bind(&service_id)
-        .bind("microsoft")
-        .bind(false)
-        .bind(Utc::now())
-        .fetch_one(&mut *tx)
-        .await?;
-        provider_grants.push(grant);
-    }
-
-    if req.google_scopes.is_some() {
-        let grant_id = Uuid::new_v4().to_string();
-        let grant = sqlx::query_as::<_, ProviderTokenGrant>(
-            r#"
-            INSERT INTO provider_token_grants (id, service_id, provider, required, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            RETURNING *
-            "#,
-        )
-        .bind(&grant_id)
-        .bind(&service_id)
-        .bind("google")
-        .bind(false)
-        .bind(Utc::now())
-        .fetch_one(&mut *tx)
-        .await?;
-        provider_grants.push(grant);
-    }
-
-    // 9. AUTO-CREATE default plan
+    // 8. AUTO-CREATE default plan
     let plan_id = Uuid::new_v4().to_string();
     let default_plan = sqlx::query_as::<_, Plan>(
         r#"
@@ -330,10 +269,10 @@ pub async fn create_service(
     .fetch_one(&mut *tx)
     .await?;
 
-    // 10. COMMIT
+    // 9. COMMIT
     tx.commit().await?;
 
-    // 11. RETURN response matching architecture document
+    // 10. RETURN response matching architecture document
     let usage = ServiceUsageInfo {
         current_services: current_service_count + 1,
         max_services,
@@ -342,7 +281,6 @@ pub async fn create_service(
 
     Ok(Json(ServiceWithGrantsResponse {
         service: ServiceResponse::from(service),
-        provider_grants,
         default_plan,
         usage,
     }))
