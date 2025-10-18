@@ -48,6 +48,7 @@ use crate::handlers::services::{
 };
 use crate::handlers::subscription::{get_subscription, get_user, update_user};
 use crate::handlers::webhook::{stripe_webhook, WebhookState};
+use crate::jobs::oauth_state_cleanup::OAuthStateCleanupJob;
 use crate::jobs::token_refresh::TokenRefreshJob;
 use axum::{
     middleware as axum_middleware,
@@ -62,10 +63,14 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use axum::Json;
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
-use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
 use serde::Serialize;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{
+    governor::GovernorConfigBuilder,
+    key_extractor::SmartIpKeyExtractor,
+    GovernorLayer,
+};
 
 const BATCH_SIZE: usize = 256; // Increase batch size for higher throughput
 const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5); // Decrease timeout
@@ -255,7 +260,7 @@ async fn jwks_handler() -> Result<Json<JwksResponse>, axum::http::StatusCode> {
     let pem_str = String::from_utf8(public_key_pem)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let rsa_key = rsa::RsaPublicKey::from_pkcs1_pem(&pem_str)
+    let rsa_key = rsa::RsaPublicKey::from_public_key_pem(&pem_str)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let n = URL_SAFE_NO_PAD.encode(rsa_key.n().to_bytes_be());
@@ -324,6 +329,16 @@ async fn main() -> anyhow::Result<()> {
             job.start().await;
         });
         tracing::info!("Token refresh job started");
+    }
+
+    // Start background OAuth state cleanup job
+    {
+        let cleanup_pool = pool.clone();
+        tokio::spawn(async move {
+            let job = OAuthStateCleanupJob::new(cleanup_pool);
+            job.start().await;
+        });
+        tracing::info!("OAuth state cleanup job started");
     }
 
     // Initialize services
@@ -535,28 +550,24 @@ async fn main() -> anyhow::Result<()> {
             crate::middleware::extract_user_from_jwt,
         ));
 
-    // Create rate limiters
-    let auth_rate_limiter = GovernorLayer {
-        config: Box::leak(Box::new(
-            GovernorConfigBuilder::default()
-                .per_second(60)
-                .burst_size(20)
-                .use_headers()
-                .finish()
-                .expect("Failed to build auth rate limiter"),
-        )),
-    };
+    // Create rate limiters with SmartIpKeyExtractor
+    let auth_rate_limiter_config = Box::leak(Box::new(
+        GovernorConfigBuilder::default()
+            .per_second(60)
+            .burst_size(20)
+            .key_extractor(SmartIpKeyExtractor)
+            .finish()
+            .expect("Failed to build auth rate limiter"),
+    ));
 
-    let device_rate_limiter = GovernorLayer {
-        config: Box::leak(Box::new(
-            GovernorConfigBuilder::default()
-                .per_second(60)
-                .burst_size(10)
-                .use_headers()
-                .finish()
-                .expect("Failed to build device rate limiter"),
-        )),
-    };
+    let device_rate_limiter_config = Box::leak(Box::new(
+        GovernorConfigBuilder::default()
+            .per_second(60)
+            .burst_size(10)
+            .key_extractor(SmartIpKeyExtractor)
+            .finish()
+            .expect("Failed to build device rate limiter"),
+    ));
 
     // Build authentication routes with rate limiting
     let auth_routes = Router::new()
@@ -568,14 +579,18 @@ async fn main() -> anyhow::Result<()> {
         // Admin authentication routes
         .route("/auth/admin/:provider", get(auth_admin_provider))
         .route("/auth/admin/:provider/callback", get(auth_admin_callback))
-        .layer(auth_rate_limiter);
+        .layer(GovernorLayer {
+            config: auth_rate_limiter_config,
+        });
 
     // Build device flow routes with stricter rate limiting
     let device_routes = Router::new()
         .route("/auth/device/code", post(device_code))
         .route("/auth/device/verify", post(device_verify))
         .route("/auth/token", post(token_exchange))
-        .layer(device_rate_limiter);
+        .layer(GovernorLayer {
+            config: device_rate_limiter_config,
+        });
 
     // Build public routes
     let public_routes = Router::new()
@@ -644,7 +659,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Webhook endpoints:");
     tracing::info!("  - POST /webhooks/stripe");
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

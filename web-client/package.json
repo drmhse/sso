@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@drmhse/sso-sdk": "^0.1.1",
+    "@drmhse/sso-sdk": "^0.2.3",
     "@headlessui/vue": "^1.7.23",
     "pinia": "^3.0.3",
     "vue": "^3.5.22",

@@ -184,7 +184,7 @@ impl OAuthClient {
         let client = self.get_client(provider);
         let token = client
             .exchange_code(AuthorizationCode::new(code.to_string()))
-            .request_async(oauth2::reqwest::async_http_client)
+            .request_async(Self::oauth_http_client)
             .await
             .map_err(|e| AppError::OAuth(format!("Token exchange failed: {}", e)))?;
 
@@ -207,7 +207,7 @@ impl OAuthClient {
         }
 
         let token = token_request
-            .request_async(oauth2::reqwest::async_http_client)
+            .request_async(Self::oauth_http_client)
             .await
             .map_err(|e| AppError::OAuth(format!("Token exchange failed: {}", e)))?;
 
@@ -228,4 +228,51 @@ impl OAuthClient {
         })
     }
 
+    // Custom HTTP client wrapper for better OAuth error logging and GitHub error detection
+    async fn oauth_http_client(
+        request: oauth2::HttpRequest,
+    ) -> std::result::Result<oauth2::HttpResponse, oauth2::reqwest::Error<reqwest::Error>> {
+        tracing::debug!("OAuth request: {:?} {}", request.method, request.url);
+
+        let mut result = oauth2::reqwest::async_http_client(request).await;
+
+        // GitHub returns errors with 200 OK status but with JSON containing "error" field
+        // We need to detect this and convert it to a proper error response
+        if let Ok(ref response) = result {
+            tracing::debug!("OAuth response: status={}, body_len={}",
+                response.status_code, response.body.len());
+
+            let body_str = String::from_utf8_lossy(&response.body);
+
+            if response.status_code.is_success() {
+                tracing::debug!("OAuth success response body: {}", body_str);
+
+                // Check if the response body contains an error (GitHub's quirk)
+                if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                    if let Some(error) = json_value.get("error").and_then(|e| e.as_str()) {
+                        let error_description = json_value.get("error_description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or(error);
+
+                        tracing::error!("OAuth provider returned error in success response: error={}, description={}",
+                            error, error_description);
+
+                        // Convert to a proper error by returning a 400 status
+                        result = Ok(oauth2::HttpResponse {
+                            status_code: oauth2::http::StatusCode::BAD_REQUEST,
+                            headers: response.headers.clone(),
+                            body: response.body.clone(),
+                        });
+                    }
+                }
+            } else {
+                tracing::error!("OAuth error response: status={}, body={}",
+                    response.status_code, body_str);
+            }
+        } else if let Err(e) = &result {
+            tracing::error!("OAuth HTTP client error: {:?}", e);
+        }
+
+        result
+    }
 }
