@@ -307,16 +307,27 @@ await sso.organizations.oauthCredentials.set('acme-corp', 'github', {
 
 #### End-User Management (`sso.organizations.endUsers`)
 
-Manage your organization's customers (end-users with subscriptions).
+Manage your organization's customers (end-users who have logged in or have subscriptions).
 
 ```typescript
-// List all end-users for an organization
-const endUsers = await sso.organizations.endUsers.list('acme-corp', {
+// List all end-users across all services
+const allUsers = await sso.organizations.endUsers.list('acme-corp', {
   page: 1,
   limit: 20
 });
 
-// Revoke all active sessions for a specific end-user
+// Filter end-users by a specific service
+const serviceUsers = await sso.organizations.endUsers.list('acme-corp', {
+  service_slug: 'main-app',
+  page: 1,
+  limit: 20
+});
+
+// Get detailed information about a specific end-user
+const user = await sso.organizations.endUsers.get('acme-corp', 'user-id-123');
+console.log(`Active sessions: ${user.session_count}`);
+
+// Revoke all active sessions for a specific end-user (force logout)
 await sso.organizations.endUsers.revokeSessions('acme-corp', 'user-id-123');
 ```
 

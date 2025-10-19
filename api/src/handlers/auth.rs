@@ -266,11 +266,15 @@ pub fn get_provider_scopes(service: &crate::db::models::Service, provider: Provi
     scopes_json
         .as_ref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(default_scopes)
+        .unwrap_or_else(|| default_scopes_for_provider(provider))
 }
 
-fn default_scopes() -> Vec<String> {
-    vec!["user:email".to_string()]
+fn default_scopes_for_provider(provider: Provider) -> Vec<String> {
+    match provider {
+        Provider::Github => vec!["user:email".to_string()],
+        Provider::Microsoft => vec!["User.Read".to_string(), "email".to_string(), "openid".to_string(), "profile".to_string()],
+        Provider::Google => vec!["openid".to_string(), "email".to_string(), "profile".to_string()],
+    }
 }
 
 /// SSO: Handle OAuth callback
@@ -1118,7 +1122,7 @@ async fn upsert_identity_with_details(
                 r#"
                 INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, access_token_encrypted, refresh_token_encrypted, encryption_key_id, expires_at, scopes, issuing_org_id, issuing_service_id)
                 VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, provider, issuing_org_id, issuing_service_id)
+                ON CONFLICT(user_id, provider, issuing_org_id, issuing_service_id) WHERE issuing_org_id IS NOT NULL AND issuing_service_id IS NOT NULL
                 DO UPDATE SET
                     access_token = NULL,
                     refresh_token = NULL,
@@ -1187,7 +1191,7 @@ async fn upsert_identity_with_details(
                 r#"
                 INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes, issuing_org_id, issuing_service_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, provider, issuing_org_id, issuing_service_id)
+                ON CONFLICT(user_id, provider, issuing_org_id, issuing_service_id) WHERE issuing_org_id IS NOT NULL AND issuing_service_id IS NOT NULL
                 DO UPDATE SET
                     access_token = excluded.access_token,
                     refresh_token = COALESCE(excluded.refresh_token, refresh_token),
@@ -1417,8 +1421,8 @@ pub async fn auth_admin_provider(
 
     let admin_oauth_client = create_admin_oauth_client(&config, provider)?;
 
-    // Use default admin scopes
-    let scopes = vec!["user:email".to_string()];
+    // Use default admin scopes based on provider
+    let scopes = default_scopes_for_provider(provider);
 
     // Generate authorization URL with PKCE (for Microsoft)
     let (auth_url, csrf_token, pkce_verifier) =

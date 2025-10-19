@@ -41,13 +41,21 @@ export const useEndUsersStore = defineStore('endUsers', {
   actions: {
     /**
      * Fetch end-users for an organization
+     * @param {string} orgSlug - Organization slug
+     * @param {number} page - Page number (default: 1)
+     * @param {number} limit - Items per page (default: 50)
+     * @param {string} serviceSlug - Optional service slug to filter by
      */
-    async fetchEndUsers(orgSlug, page = 1, limit = 50) {
+    async fetchEndUsers(orgSlug, page = 1, limit = 50, serviceSlug = null) {
       this.loading = true;
       this.error = null;
 
       try {
-        const response = await sso.organizations.endUsers.list(orgSlug, { page, limit });
+        const params = { page, limit };
+        if (serviceSlug) {
+          params.service_slug = serviceSlug;
+        }
+        const response = await sso.organizations.endUsers.list(orgSlug, params);
         this.users = response.users;
         this.total = response.total;
         this.currentPage = response.page;
@@ -101,18 +109,24 @@ export const useEndUsersStore = defineStore('endUsers', {
 
     /**
      * Load next page of users
+     * @param {string} orgSlug - Organization slug
+     * @param {string} serviceSlug - Optional service slug to filter by
      */
-    async loadMore(orgSlug) {
+    async loadMore(orgSlug, serviceSlug = null) {
       if (!this.hasMore) return;
 
       const nextPage = this.currentPage + 1;
       this.loading = true;
 
       try {
-        const response = await sso.organizations.endUsers.list(orgSlug, {
+        const params = {
           page: nextPage,
           limit: this.limit,
-        });
+        };
+        if (serviceSlug) {
+          params.service_slug = serviceSlug;
+        }
+        const response = await sso.organizations.endUsers.list(orgSlug, params);
 
         // Append new users to existing list
         this.users = [...this.users, ...response.users];

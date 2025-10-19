@@ -65,7 +65,12 @@ export interface EndUserDetailResponse {
 /**
  * List end-users query params
  */
-export interface ListEndUsersParams extends PaginationParams {}
+export interface ListEndUsersParams extends PaginationParams {
+  /**
+   * Optional service slug to filter users by a specific service
+   */
+  service_slug?: string;
+}
 
 /**
  * Revoke sessions response

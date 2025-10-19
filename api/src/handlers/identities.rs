@@ -202,7 +202,7 @@ pub async fn start_link(
         // Platform-level linking: Use provider default scopes
         let default_scopes = match provider {
             Provider::Github => vec!["user:email".to_string()],
-            Provider::Microsoft => vec!["User.Read".to_string(), "offline_access".to_string()],
+            Provider::Microsoft => vec!["User.Read".to_string(), "email".to_string(), "openid".to_string(), "profile".to_string()],
             Provider::Google => vec!["openid".to_string(), "email".to_string(), "profile".to_string()],
         };
 

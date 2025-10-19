@@ -9,6 +9,24 @@
       </div>
     </div>
 
+    <!-- Service Filter -->
+    <div class="mb-6">
+      <label for="service-filter" class="block text-sm font-medium text-gray-700 mb-2">
+        Filter by Service
+      </label>
+      <select
+        id="service-filter"
+        v-model="selectedServiceSlug"
+        @change="handleServiceFilterChange"
+        class="block w-full sm:w-64 rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+      >
+        <option :value="null">All Services</option>
+        <option v-for="service in services" :key="service.id" :value="service.slug">
+          {{ service.name }}
+        </option>
+      </select>
+    </div>
+
     <LoadingSpinner v-if="loading" text="Loading end users..." />
 
     <div v-else class="space-y-6">
@@ -186,6 +204,7 @@
 import { ref, computed, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useEndUsersStore } from '@/stores/endUsers';
+import { useServicesStore } from '@/stores/services';
 import { usePermissions } from '@/composables/usePermissions';
 import { useNotifications } from '@/composables/useNotifications';
 import { formatDate } from '@/utils/formatters';
@@ -198,14 +217,17 @@ import ConfirmDialog from '@/components/ConfirmDialog.vue';
 const route = useRoute();
 const router = useRouter();
 const endUsersStore = useEndUsersStore();
+const servicesStore = useServicesStore();
 const { canManageTeam } = usePermissions();
 const { success, error } = useNotifications();
 
 const loading = ref(false);
 const selectedUser = ref(null);
+const selectedServiceSlug = ref(null);
 
 const orgSlug = computed(() => route.params.orgSlug);
 const users = computed(() => endUsersStore.users);
+const services = computed(() => servicesStore.services);
 
 const detailsModal = ref({
   isOpen: false,
@@ -262,9 +284,13 @@ const confirmRevokeAllSessions = async () => {
   }
 };
 
+const handleServiceFilterChange = async () => {
+  await loadData();
+};
+
 const loadMore = async () => {
   try {
-    await endUsersStore.loadMore(orgSlug.value);
+    await endUsersStore.loadMore(orgSlug.value, selectedServiceSlug.value);
   } catch (err) {
     error('Load Error', err.message || 'Failed to load more users');
   }
@@ -273,7 +299,7 @@ const loadMore = async () => {
 const loadData = async () => {
   loading.value = true;
   try {
-    await endUsersStore.fetchEndUsers(orgSlug.value);
+    await endUsersStore.fetchEndUsers(orgSlug.value, 1, 50, selectedServiceSlug.value);
   } catch (err) {
     error('Load Error', 'Failed to load end users');
   } finally {
@@ -281,7 +307,16 @@ const loadData = async () => {
   }
 };
 
-onMounted(() => {
-  loadData();
+onMounted(async () => {
+  // Fetch services for the filter dropdown
+  try {
+    await servicesStore.fetchServices(orgSlug.value);
+  } catch (err) {
+    // Services load error is not critical, just log it
+    console.error('Failed to load services for filter:', err);
+  }
+  
+  // Load end users
+  await loadData();
 });
 </script>

@@ -201,19 +201,28 @@ export class OrganizationsModule {
   public endUsers = {
     /**
      * List all end-users for an organization.
-     * End-users are customers who have subscriptions to the organization's services.
+     * Returns users who have identities (logged in) or subscriptions for the organization's services.
      *
      * @param orgSlug Organization slug
-     * @param params Optional query parameters for pagination
-     * @returns Paginated list of end-users with their subscriptions
+     * @param params Optional query parameters for pagination and filtering
+     * @param params.service_slug Optional service slug to filter users by a specific service
+     * @returns Paginated list of end-users with their subscriptions and identities
      *
      * @example
      * ```typescript
-     * const endUsers = await sso.organizations.endUsers.list('acme-corp', {
+     * // List all end-users across all services
+     * const allUsers = await sso.organizations.endUsers.list('acme-corp', {
      *   page: 1,
      *   limit: 20
      * });
-     * console.log(`Total end-users: ${endUsers.total}`);
+     * 
+     * // Filter by specific service
+     * const serviceUsers = await sso.organizations.endUsers.list('acme-corp', {
+     *   service_slug: 'my-app',
+     *   page: 1,
+     *   limit: 20
+     * });
+     * console.log(`Total end-users: ${allUsers.total}`);
      * ```
      */
     list: async (

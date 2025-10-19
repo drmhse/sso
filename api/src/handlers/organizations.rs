@@ -957,6 +957,7 @@ fn validate_email(email: &str) -> Result<()> {
 pub struct ListEndUsersQuery {
     pub page: Option<i64>,
     pub limit: Option<i64>,
+    pub service_slug: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1027,22 +1028,65 @@ pub async fn list_end_users(
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * limit;
 
-    // Get distinct users who have subscriptions to services owned by this organization
-    let end_user_rows = sqlx::query(
-        "SELECT DISTINCT u.id, u.email, u.is_platform_owner, u.created_at
-         FROM users u
-         INNER JOIN subscriptions sub ON u.id = sub.user_id
-         INNER JOIN services s ON sub.service_id = s.id
-         WHERE s.org_id = ?
-         ORDER BY u.created_at DESC
-         LIMIT ? OFFSET ?",
-    )
-    .bind(&organization.id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(AppError::Database)?;
+    // Build query to get users who have identities or subscriptions for this organization
+    // This includes users who logged in (have identities) even if they don't have subscriptions yet
+    let (users_query, service_id) = if let Some(ref service_slug) = query.service_slug {
+        // Filter by specific service
+        let service = sqlx::query_as::<_, crate::db::models::Service>(
+            "SELECT * FROM services WHERE slug = ? AND org_id = ?",
+        )
+        .bind(service_slug)
+        .bind(&organization.id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(AppError::Database)?
+        .ok_or_else(|| AppError::NotFound(format!("Service '{}' not found", service_slug)))?;
+
+        (
+            "SELECT DISTINCT u.id, u.email, u.is_platform_owner, u.created_at
+             FROM users u
+             LEFT JOIN identities i ON u.id = i.user_id AND i.issuing_org_id = ? AND i.issuing_service_id = ?
+             LEFT JOIN subscriptions sub ON u.id = sub.user_id AND sub.service_id = ?
+             WHERE (i.user_id IS NOT NULL OR sub.user_id IS NOT NULL)
+             ORDER BY u.created_at DESC
+             LIMIT ? OFFSET ?".to_string(),
+            Some(service.id.clone())
+        )
+    } else {
+        // Show all users across all services in the organization
+        (
+            "SELECT DISTINCT u.id, u.email, u.is_platform_owner, u.created_at
+             FROM users u
+             LEFT JOIN identities i ON u.id = i.user_id AND i.issuing_org_id = ?
+             LEFT JOIN subscriptions sub ON u.id = sub.user_id
+             LEFT JOIN services s ON sub.service_id = s.id AND s.org_id = ?
+             WHERE (i.user_id IS NOT NULL OR (sub.user_id IS NOT NULL AND s.org_id IS NOT NULL))
+             ORDER BY u.created_at DESC
+             LIMIT ? OFFSET ?".to_string(),
+            None
+        )
+    };
+
+    let end_user_rows = if let Some(ref svc_id) = service_id {
+        sqlx::query(&users_query)
+            .bind(&organization.id)
+            .bind(svc_id)
+            .bind(svc_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(AppError::Database)?
+    } else {
+        sqlx::query(&users_query)
+            .bind(&organization.id)
+            .bind(&organization.id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(AppError::Database)?
+    };
 
     // Build user objects and collect their IDs
     let users: Vec<User> = end_user_rows
@@ -1074,24 +1118,42 @@ pub async fn list_end_users(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Fetch ALL subscriptions for these users in one query
-    let subscription_query = format!(
-        "SELECT sub.user_id, sub.service_id, s.slug as service_slug, s.name as service_name,
-                sub.plan_id, p.name as plan_name, sub.status,
-                sub.current_period_end, sub.created_at
-         FROM subscriptions sub
-         INNER JOIN services s ON sub.service_id = s.id
-         INNER JOIN plans p ON sub.plan_id = p.id
-         WHERE sub.user_id IN ({}) AND s.org_id = ?
-         ORDER BY sub.created_at DESC",
-        placeholders
-    );
+    // Fetch subscriptions for these users (optionally filtered by service)
+    let subscription_query = if service_id.is_some() {
+        format!(
+            "SELECT sub.user_id, sub.service_id, s.slug as service_slug, s.name as service_name,
+                    sub.plan_id, p.name as plan_name, sub.status,
+                    sub.current_period_end, sub.created_at as subscription_created_at
+             FROM subscriptions sub
+             INNER JOIN services s ON sub.service_id = s.id
+             INNER JOIN plans p ON sub.plan_id = p.id
+             WHERE sub.user_id IN ({}) AND sub.service_id = ?
+             ORDER BY sub.created_at DESC",
+            placeholders
+        )
+    } else {
+        format!(
+            "SELECT sub.user_id, sub.service_id, s.slug as service_slug, s.name as service_name,
+                    sub.plan_id, p.name as plan_name, sub.status,
+                    sub.current_period_end, sub.created_at as subscription_created_at
+             FROM subscriptions sub
+             INNER JOIN services s ON sub.service_id = s.id
+             INNER JOIN plans p ON sub.plan_id = p.id
+             WHERE sub.user_id IN ({}) AND s.org_id = ?
+             ORDER BY sub.created_at DESC",
+            placeholders
+        )
+    };
 
     let mut subscription_query_builder = sqlx::query(&subscription_query);
     for user_id in &user_ids {
         subscription_query_builder = subscription_query_builder.bind(user_id);
     }
-    subscription_query_builder = subscription_query_builder.bind(&organization.id);
+    if let Some(ref svc_id) = service_id {
+        subscription_query_builder = subscription_query_builder.bind(svc_id);
+    } else {
+        subscription_query_builder = subscription_query_builder.bind(&organization.id);
+    }
 
     let all_subscription_rows = subscription_query_builder
         .fetch_all(&state.pool)
@@ -1110,7 +1172,7 @@ pub async fn list_end_users(
             plan_name: sub_row.get("plan_name"),
             status: sub_row.get("status"),
             current_period_end: sub_row.get("current_period_end"),
-            created_at: sub_row.get("created_at"),
+            created_at: sub_row.get("subscription_created_at"),
         };
         subscriptions_by_user
             .entry(user_id)
@@ -1118,21 +1180,33 @@ pub async fn list_end_users(
             .push(subscription);
     }
 
-    // Fetch identities for these users that were created via this organization's services
-    // Only show identities where issuing_org_id matches this organization
-    let identity_query = format!(
-        "SELECT user_id, provider, provider_user_id, created_at
-         FROM identities
-         WHERE user_id IN ({}) AND issuing_org_id = ?
-         ORDER BY created_at ASC",
-        placeholders
-    );
+    // Fetch identities for these users (optionally filtered by service)
+    let identity_query = if service_id.is_some() {
+        format!(
+            "SELECT user_id, provider, provider_user_id, created_at
+             FROM identities
+             WHERE user_id IN ({}) AND issuing_org_id = ? AND issuing_service_id = ?
+             ORDER BY created_at ASC",
+            placeholders
+        )
+    } else {
+        format!(
+            "SELECT user_id, provider, provider_user_id, created_at
+             FROM identities
+             WHERE user_id IN ({}) AND issuing_org_id = ?
+             ORDER BY created_at ASC",
+            placeholders
+        )
+    };
 
     let mut identity_query_builder = sqlx::query(&identity_query);
     for user_id in &user_ids {
         identity_query_builder = identity_query_builder.bind(user_id);
     }
     identity_query_builder = identity_query_builder.bind(&organization.id);
+    if let Some(ref svc_id) = service_id {
+        identity_query_builder = identity_query_builder.bind(svc_id);
+    }
 
     let all_identity_rows = identity_query_builder
         .fetch_all(&state.pool)
@@ -1171,18 +1245,36 @@ pub async fn list_end_users(
         })
         .collect();
 
-    // Get total count
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT u.id)
-         FROM users u
-         INNER JOIN subscriptions sub ON u.id = sub.user_id
-         INNER JOIN services s ON sub.service_id = s.id
-         WHERE s.org_id = ?",
-    )
-    .bind(&organization.id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(AppError::Database)?;
+    // Get total count (matching the filter logic above)
+    let total: i64 = if let Some(ref svc_id) = service_id {
+        sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT u.id)
+             FROM users u
+             LEFT JOIN identities i ON u.id = i.user_id AND i.issuing_org_id = ? AND i.issuing_service_id = ?
+             LEFT JOIN subscriptions sub ON u.id = sub.user_id AND sub.service_id = ?
+             WHERE (i.user_id IS NOT NULL OR sub.user_id IS NOT NULL)",
+        )
+        .bind(&organization.id)
+        .bind(svc_id)
+        .bind(svc_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::Database)?
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT u.id)
+             FROM users u
+             LEFT JOIN identities i ON u.id = i.user_id AND i.issuing_org_id = ?
+             LEFT JOIN subscriptions sub ON u.id = sub.user_id
+             LEFT JOIN services s ON sub.service_id = s.id AND s.org_id = ?
+             WHERE (i.user_id IS NOT NULL OR (sub.user_id IS NOT NULL AND s.org_id IS NOT NULL))",
+        )
+        .bind(&organization.id)
+        .bind(&organization.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::Database)?
+    };
 
     Ok(Json(EndUserListResponse {
         users: end_users,
@@ -1243,7 +1335,7 @@ pub async fn get_end_user(
     let subscription_rows = sqlx::query(
         "SELECT sub.service_id, s.slug as service_slug, s.name as service_name,
                 sub.plan_id, p.name as plan_name, sub.status,
-                sub.current_period_end, sub.created_at
+                sub.current_period_end, sub.created_at as subscription_created_at
          FROM subscriptions sub
          INNER JOIN services s ON sub.service_id = s.id
          INNER JOIN plans p ON sub.plan_id = p.id
@@ -1266,7 +1358,7 @@ pub async fn get_end_user(
             plan_name: sub_row.get("plan_name"),
             status: sub_row.get("status"),
             current_period_end: sub_row.get("current_period_end"),
-            created_at: sub_row.get("created_at"),
+            created_at: sub_row.get("subscription_created_at"),
         })
         .collect();
 
