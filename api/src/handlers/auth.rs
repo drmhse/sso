@@ -357,14 +357,21 @@ async fn auth_callback_impl(
         .as_ref()
         .and_then(|s| s.pkce_verifier.as_deref());
 
-    let (token_details, issuing_org_id) = if let Some(ref oauth_ctx) = oauth_state {
-        if let Some(ref org_slug) = oauth_ctx.org_slug {
-            // Get org_id and check for custom OAuth credentials
-            let org_id = sqlx::query_scalar::<_, String>("SELECT id FROM organizations WHERE slug = ?")
-                .bind(org_slug)
-                .fetch_one(&state.pool)
-                .await?;
+    // Determine issuing context (org_id and service_id) for proper identity isolation
+    let (token_details, issuing_org_id, issuing_service_id) = if let Some(ref oauth_ctx) = oauth_state {
+        // Check if this is a service flow (has service_id)
+        if let Some(ref service_id) = oauth_ctx.service_id {
+            // Service flow - get org_id from service and use service credentials
+            let service = sqlx::query_as::<_, crate::db::models::Service>(
+                "SELECT * FROM services WHERE id = ?"
+            )
+            .bind(service_id)
+            .fetch_one(&state.pool)
+            .await?;
 
+            let org_id = service.org_id.clone();
+
+            // Check for BYOO credentials for this organization
             let provider_str = provider.as_str();
             let org_credentials = sqlx::query!(
                 "SELECT client_id, client_secret_encrypted, encryption_key_id
@@ -376,7 +383,7 @@ async fn auth_callback_impl(
             .fetch_optional(&state.pool)
             .await?;
 
-            if let Some(creds) = org_credentials {
+            let details = if let Some(creds) = org_credentials {
                 // Use organization's custom OAuth credentials for token exchange
                 let encryption = crate::encryption::EncryptionService::new()
                     .map_err(|e| AppError::InternalServerError(format!("Encryption unavailable: {}", e)))?;
@@ -393,31 +400,76 @@ async fn auth_callback_impl(
                 let custom_client =
                     create_custom_oauth_client(&config, provider, &creds.client_id, &client_secret)?;
 
-                let details = exchange_custom_code(&custom_client, provider, &callback.code, pkce_verifier).await?;
-                (details, Some(org_id))
+                exchange_custom_code(&custom_client, provider, &callback.code, pkce_verifier).await?
             } else {
-                // Fall back to platform credentials
-                let details = state
+                // Fall back to platform credentials for this service
+                state
                     .oauth_client
                     .exchange_code_with_details(provider, &callback.code, pkce_verifier)
-                    .await?;
-                (details, None)
-            }
+                    .await?
+            };
+
+            (details, Some(org_id), Some(service_id.clone()))
+        } else if let Some(ref org_slug) = oauth_ctx.org_slug {
+            // Legacy org-based flow (no service_id) - use org credentials but no service isolation
+            let org_id = sqlx::query_scalar::<_, String>("SELECT id FROM organizations WHERE slug = ?")
+                .bind(org_slug)
+                .fetch_one(&state.pool)
+                .await?;
+
+            let provider_str = provider.as_str();
+            let org_credentials = sqlx::query!(
+                "SELECT client_id, client_secret_encrypted, encryption_key_id
+                 FROM organization_oauth_credentials
+                 WHERE org_id = ? AND provider = ?",
+                org_id,
+                provider_str
+            )
+            .fetch_optional(&state.pool)
+            .await?;
+
+            let details = if let Some(creds) = org_credentials {
+                // Use organization's custom OAuth credentials for token exchange
+                let encryption = crate::encryption::EncryptionService::new()
+                    .map_err(|e| AppError::InternalServerError(format!("Encryption unavailable: {}", e)))?;
+
+                let client_secret = encryption
+                    .decrypt(&creds.client_secret_encrypted)
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!("Failed to decrypt secret: {}", e))
+                    })?;
+
+                let config = crate::config::Config::from_env()
+                    .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+                let custom_client =
+                    create_custom_oauth_client(&config, provider, &creds.client_id, &client_secret)?;
+
+                exchange_custom_code(&custom_client, provider, &callback.code, pkce_verifier).await?
+            } else {
+                // Fall back to platform credentials
+                state
+                    .oauth_client
+                    .exchange_code_with_details(provider, &callback.code, pkce_verifier)
+                    .await?
+            };
+
+            (details, Some(org_id), None)
         } else {
-            // No org context, use platform credentials
+            // No service or org context - platform credentials
             let details = state
                 .oauth_client
                 .exchange_code_with_details(provider, &callback.code, pkce_verifier)
                 .await?;
-            (details, None)
+            (details, None, None)
         }
     } else {
-        // No oauth state, use platform credentials
+        // No oauth state - platform credentials
         let details = state
             .oauth_client
             .exchange_code_with_details(provider, &callback.code, pkce_verifier)
             .await?;
-        (details, None)
+        (details, None, None)
     };
 
     // Get user info from provider (standalone, not using OAuth client)
@@ -458,6 +510,7 @@ async fn auth_callback_impl(
                 token_details.expires_at,
                 &token_details.scopes,
                 issuing_org_id.as_deref(),
+                issuing_service_id.as_deref(),
             )
             .await?;
 
@@ -486,6 +539,7 @@ async fn auth_callback_impl(
         token_details.expires_at,
         &token_details.scopes,
         issuing_org_id.as_deref(),
+        issuing_service_id.as_deref(),
     )
     .await?;
 
@@ -1039,6 +1093,7 @@ async fn upsert_identity_with_details(
     expires_at: Option<chrono::DateTime<Utc>>,
     scopes: &[String],
     issuing_org_id: Option<&str>,
+    issuing_service_id: Option<&str>,
 ) -> Result<Identity> {
     let id = Uuid::new_v4().to_string();
     let provider_str = provider.as_str();
@@ -1046,6 +1101,7 @@ async fn upsert_identity_with_details(
         serde_json::to_string(scopes).map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
     // Encrypt tokens if encryption service is available
+    // Use different queries for platform vs service context due to different partial unique indexes
     let identity = if let Some(enc) = encryption {
         let access_token_encrypted = enc
             .encrypt(access_token)
@@ -1056,66 +1112,134 @@ async fn upsert_identity_with_details(
             .transpose()
             .map_err(|e| AppError::InternalServerError(format!("Failed to encrypt refresh token: {}", e)))?;
 
-        sqlx::query_as::<_, Identity>(
-            r#"
-            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, access_token_encrypted, refresh_token_encrypted, encryption_key_id, expires_at, scopes, issuing_org_id)
-            VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, provider)
-            DO UPDATE SET
-                access_token = NULL,
-                refresh_token = NULL,
-                access_token_encrypted = excluded.access_token_encrypted,
-                refresh_token_encrypted = COALESCE(excluded.refresh_token_encrypted, refresh_token_encrypted),
-                encryption_key_id = excluded.encryption_key_id,
-                expires_at = excluded.expires_at,
-                provider_user_id = excluded.provider_user_id,
-                scopes = excluded.scopes,
-                issuing_org_id = excluded.issuing_org_id,
-                last_refreshed_at = datetime('now')
-            RETURNING *
-            "#,
-        )
-        .bind(&id)
-        .bind(user_id)
-        .bind(provider_str)
-        .bind(provider_user_id)
-        .bind(&access_token_encrypted)
-        .bind(&refresh_token_encrypted)
-        .bind(enc.key_id())
-        .bind(expires_at)
-        .bind(scopes_json)
-        .bind(issuing_org_id)
-        .fetch_one(pool)
-        .await?
+        if issuing_service_id.is_some() {
+            // Service context: use service-level partial unique index
+            sqlx::query_as::<_, Identity>(
+                r#"
+                INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, access_token_encrypted, refresh_token_encrypted, encryption_key_id, expires_at, scopes, issuing_org_id, issuing_service_id)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, provider, issuing_org_id, issuing_service_id)
+                DO UPDATE SET
+                    access_token = NULL,
+                    refresh_token = NULL,
+                    access_token_encrypted = excluded.access_token_encrypted,
+                    refresh_token_encrypted = COALESCE(excluded.refresh_token_encrypted, refresh_token_encrypted),
+                    encryption_key_id = excluded.encryption_key_id,
+                    expires_at = excluded.expires_at,
+                    provider_user_id = excluded.provider_user_id,
+                    scopes = excluded.scopes,
+                    last_refreshed_at = datetime('now')
+                RETURNING *
+                "#,
+            )
+            .bind(&id)
+            .bind(user_id)
+            .bind(provider_str)
+            .bind(provider_user_id)
+            .bind(&access_token_encrypted)
+            .bind(&refresh_token_encrypted)
+            .bind(enc.key_id())
+            .bind(expires_at)
+            .bind(scopes_json)
+            .bind(issuing_org_id)
+            .bind(issuing_service_id)
+            .fetch_one(pool)
+            .await?
+        } else {
+            // Platform context: use platform-level partial unique index
+            sqlx::query_as::<_, Identity>(
+                r#"
+                INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, access_token_encrypted, refresh_token_encrypted, encryption_key_id, expires_at, scopes, issuing_org_id, issuing_service_id)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, provider) WHERE issuing_org_id IS NULL AND issuing_service_id IS NULL
+                DO UPDATE SET
+                    access_token = NULL,
+                    refresh_token = NULL,
+                    access_token_encrypted = excluded.access_token_encrypted,
+                    refresh_token_encrypted = COALESCE(excluded.refresh_token_encrypted, refresh_token_encrypted),
+                    encryption_key_id = excluded.encryption_key_id,
+                    expires_at = excluded.expires_at,
+                    provider_user_id = excluded.provider_user_id,
+                    scopes = excluded.scopes,
+                    last_refreshed_at = datetime('now')
+                RETURNING *
+                "#,
+            )
+            .bind(&id)
+            .bind(user_id)
+            .bind(provider_str)
+            .bind(provider_user_id)
+            .bind(&access_token_encrypted)
+            .bind(&refresh_token_encrypted)
+            .bind(enc.key_id())
+            .bind(expires_at)
+            .bind(scopes_json)
+            .bind(issuing_org_id)
+            .bind(issuing_service_id)
+            .fetch_one(pool)
+            .await?
+        }
     } else {
         // No encryption - store in plaintext (fallback for backward compatibility)
-        sqlx::query_as::<_, Identity>(
-            r#"
-            INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes, issuing_org_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, provider)
-            DO UPDATE SET
-                access_token = excluded.access_token,
-                refresh_token = COALESCE(excluded.refresh_token, refresh_token),
-                expires_at = excluded.expires_at,
-                provider_user_id = excluded.provider_user_id,
-                scopes = excluded.scopes,
-                issuing_org_id = excluded.issuing_org_id,
-                last_refreshed_at = datetime('now')
-            RETURNING *
-            "#,
-        )
-        .bind(&id)
-        .bind(user_id)
-        .bind(provider_str)
-        .bind(provider_user_id)
-        .bind(access_token)
-        .bind(refresh_token)
-        .bind(expires_at)
-        .bind(scopes_json)
-        .bind(issuing_org_id)
-        .fetch_one(pool)
-        .await?
+        if issuing_service_id.is_some() {
+            // Service context: use service-level partial unique index
+            sqlx::query_as::<_, Identity>(
+                r#"
+                INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes, issuing_org_id, issuing_service_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, provider, issuing_org_id, issuing_service_id)
+                DO UPDATE SET
+                    access_token = excluded.access_token,
+                    refresh_token = COALESCE(excluded.refresh_token, refresh_token),
+                    expires_at = excluded.expires_at,
+                    provider_user_id = excluded.provider_user_id,
+                    scopes = excluded.scopes,
+                    last_refreshed_at = datetime('now')
+                RETURNING *
+                "#,
+            )
+            .bind(&id)
+            .bind(user_id)
+            .bind(provider_str)
+            .bind(provider_user_id)
+            .bind(access_token)
+            .bind(refresh_token)
+            .bind(expires_at)
+            .bind(scopes_json)
+            .bind(issuing_org_id)
+            .bind(issuing_service_id)
+            .fetch_one(pool)
+            .await?
+        } else {
+            // Platform context: use platform-level partial unique index
+            sqlx::query_as::<_, Identity>(
+                r#"
+                INSERT INTO identities (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes, issuing_org_id, issuing_service_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, provider) WHERE issuing_org_id IS NULL AND issuing_service_id IS NULL
+                DO UPDATE SET
+                    access_token = excluded.access_token,
+                    refresh_token = COALESCE(excluded.refresh_token, refresh_token),
+                    expires_at = excluded.expires_at,
+                    provider_user_id = excluded.provider_user_id,
+                    scopes = excluded.scopes,
+                    last_refreshed_at = datetime('now')
+                RETURNING *
+                "#,
+            )
+            .bind(&id)
+            .bind(user_id)
+            .bind(provider_str)
+            .bind(provider_user_id)
+            .bind(access_token)
+            .bind(refresh_token)
+            .bind(expires_at)
+            .bind(scopes_json)
+            .bind(issuing_org_id)
+            .bind(issuing_service_id)
+            .fetch_one(pool)
+            .await?
+        }
     };
 
     Ok(identity)
@@ -1418,7 +1542,7 @@ async fn auth_admin_callback_impl(
     // Find or create user
     let user = find_or_create_user(&state.pool, &user_info.email).await?;
 
-    // Update identity (admin flow always uses platform credentials, so issuing_org_id is None)
+    // Update identity (admin flow always uses platform credentials, so issuing_org_id and issuing_service_id are None)
     upsert_identity_with_details(
         &state.pool,
         state.encryption.as_ref(),
@@ -1429,6 +1553,7 @@ async fn auth_admin_callback_impl(
         token_details.refresh_token.as_deref(),
         token_details.expires_at,
         &token_details.scopes,
+        None,
         None,
     )
     .await?;

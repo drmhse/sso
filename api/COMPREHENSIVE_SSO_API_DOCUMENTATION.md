@@ -277,13 +277,14 @@ Get the current user's subscription details for the service specified in the JWT
 #### `GET /api/provider-token/:provider`
 Retrieve a fresh, valid OAuth access token for an external provider on behalf of the user.
 
-- **Headers:** `Authorization: Bearer {jwt}`
+- **Headers:** `Authorization: Bearer {jwt}` (must be a **Service Context JWT** - obtained via service login)
 - **Success Response (`200 OK`):** `{ "access_token": "...", "refresh_token": "...", "expires_at": "...", "scopes": [], "provider": "..." }`
+- **Note:** This endpoint requires the JWT to have service context (org and service claims). It returns tokens that were obtained through that specific service's OAuth flow, ensuring proper token isolation between services.
 
 ### 3.3. Identity Management Endpoints
 **Authentication:** Requires any valid JWT.
 
-- `GET /api/user/identities`: List all social accounts linked to the authenticated user.
+- `GET /api/user/identities`: List all social accounts linked to the authenticated user in the current authentication context (platform or specific service).
 - `POST /api/user/identities/:provider/link`: Start the flow to link a new social account. Returns an `authorization_url` to redirect the user to.
 - `DELETE /api/user/identities/:provider`: Unlink a social account.
 

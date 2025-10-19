@@ -29,6 +29,13 @@ pub async fn get_provider_token(
 ) -> Result<Json<ProviderTokenResponse>> {
     let provider = Provider::from_str(&provider_str)?;
 
+    // This endpoint should only be called from service context
+    if auth_user.claims.service.is_none() {
+        return Err(AppError::BadRequest(
+            "Provider tokens can only be requested in service context".to_string()
+        ));
+    }
+
     // 1. Verify service has scopes configured for this provider
     let service = sqlx::query_as::<_, crate::db::models::Service>(
         "SELECT s.* FROM services s
@@ -55,17 +62,29 @@ pub async fn get_provider_token(
         )));
     }
 
-    // 2. Get user's identity for this provider
+    // Get organization ID and service ID for proper service-level isolation
+    let org_id = service.org_id.clone();
+    let service_id = service.id.clone();
+
+    // 2. Get user's identity for this provider, scoped to this specific service
+    // This ensures we only access tokens that were obtained via this service's OAuth credentials
+    // and provides full service-level isolation
     let identity = sqlx::query_as::<_, Identity>(
-        "SELECT * FROM identities WHERE user_id = ? AND provider = ?",
+        "SELECT * FROM identities
+         WHERE user_id = ?
+         AND provider = ?
+         AND issuing_org_id = ?
+         AND issuing_service_id = ?",
     )
     .bind(&auth_user.claims.sub)
     .bind(provider.as_str())
+    .bind(&org_id)
+    .bind(&service_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| {
         AppError::NotFound(format!(
-            "User has not authenticated with {}",
+            "User has not authenticated with {} for this service",
             provider.as_str()
         ))
     })?;

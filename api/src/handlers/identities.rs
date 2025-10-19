@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 
 #[derive(Debug, Serialize)]
 pub struct IdentityResponse {
@@ -24,6 +25,31 @@ pub struct UnlinkRequest {
     pub provider: String,
 }
 
+/// Helper function to determine the identity context (org_id and service_id) from auth user claims
+/// Returns (issuing_org_id, issuing_service_id) based on the authentication context
+async fn get_identity_context(
+    pool: &SqlitePool,
+    auth_user: &crate::middleware::AuthUser,
+) -> Result<(Option<String>, Option<String>)> {
+    if let (Some(org_slug), Some(service_slug)) = (&auth_user.claims.org, &auth_user.claims.service) {
+        // Service context - get org_id and service_id
+        let service = sqlx::query_as::<_, crate::db::models::Service>(
+            "SELECT s.* FROM services s
+             JOIN organizations o ON s.org_id = o.id
+             WHERE o.slug = ? AND s.slug = ?",
+        )
+        .bind(org_slug)
+        .bind(service_slug)
+        .fetch_one(pool)
+        .await?;
+
+        Ok((Some(service.org_id), Some(service.id)))
+    } else {
+        // Platform context
+        Ok((None, None))
+    }
+}
+
 /// GET /api/user/identities - List all linked identities for the authenticated user
 pub async fn list_identities(
     State(state): State<AppState>,
@@ -33,12 +59,35 @@ pub async fn list_identities(
         .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
         .0;
 
-    let identities = sqlx::query_as::<_, crate::db::models::Identity>(
-        "SELECT * FROM identities WHERE user_id = ?",
-    )
-    .bind(&auth_user.user.id)
-    .fetch_all(&state.pool)
-    .await?;
+    // Get identity context (org_id and service_id) for proper isolation
+    let (issuing_org_id, issuing_service_id) = get_identity_context(&state.pool, &auth_user).await?;
+
+    // Fetch identities filtered by context
+    let identities = if issuing_service_id.is_some() {
+        // Service context: filter by both org_id and service_id
+        sqlx::query_as::<_, crate::db::models::Identity>(
+            "SELECT * FROM identities
+             WHERE user_id = ?
+             AND issuing_org_id = ?
+             AND issuing_service_id = ?",
+        )
+        .bind(&auth_user.user.id)
+        .bind(&issuing_org_id)
+        .bind(&issuing_service_id)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        // Platform context: filter by both NULL
+        sqlx::query_as::<_, crate::db::models::Identity>(
+            "SELECT * FROM identities
+             WHERE user_id = ?
+             AND issuing_org_id IS NULL
+             AND issuing_service_id IS NULL",
+        )
+        .bind(&auth_user.user.id)
+        .fetch_all(&state.pool)
+        .await?
+    };
 
     let response: Vec<IdentityResponse> = identities
         .into_iter()
@@ -73,7 +122,7 @@ pub async fn start_link(
         (Some(org), Some(service)) if !(org == "platform" && service == "admin-cli")
     );
 
-    let (_scopes, is_admin_flow, org_slug, service_slug, redirect_uri, auth_url, csrf_token, pkce_verifier) = if is_service_level {
+    let (_scopes, is_admin_flow, org_slug, service_slug, service_id, redirect_uri, auth_url, csrf_token, pkce_verifier) = if is_service_level {
         // Service-level linking: Read scopes and redirect_uris from service configuration
         let org = auth_user.claims.org.as_ref().unwrap();
         let service_slug = auth_user.claims.service.as_ref().unwrap();
@@ -88,6 +137,7 @@ pub async fn start_link(
         .fetch_one(&state.pool)
         .await?;
 
+        let service_id = service.id.clone();
         let scopes = get_provider_scopes(&service, provider);
 
         // Parse redirect_uris to get the primary redirect
@@ -147,7 +197,7 @@ pub async fn start_link(
             state.oauth_client.get_authorization_url_with_pkce(provider, scopes.clone())
         };
 
-        (scopes, false, Some(org.clone()), Some(service_slug.clone()), redirect_uri, auth_url, csrf_token, pkce_verifier)
+        (scopes, false, Some(org.clone()), Some(service_slug.clone()), Some(service_id), redirect_uri, auth_url, csrf_token, pkce_verifier)
     } else {
         // Platform-level linking: Use provider default scopes
         let default_scopes = match provider {
@@ -168,7 +218,7 @@ pub async fn start_link(
             provider.as_str()
         );
 
-        (default_scopes, true, None, None, redirect_uri, auth_url, csrf_token, pkce_verifier)
+        (default_scopes, true, None, None, None, redirect_uri, auth_url, csrf_token, pkce_verifier)
     };
 
     // Store OAuth state with user_id_for_linking set
@@ -185,7 +235,7 @@ pub async fn start_link(
     )
     .bind(csrf_token.secret())
     .bind(pkce_value)
-    .bind(Option::<String>::None) // service_id (not used for linking)
+    .bind(service_id) // service_id for proper service-level isolation during linking
     .bind(&redirect_uri) // Use service redirect_uri with query params
     .bind(org_slug)
     .bind(service_slug)
@@ -212,29 +262,79 @@ pub async fn unlink_identity(
 
     let provider = Provider::from_str(&provider_str)?;
 
-    // Check how many identities the user has
-    let identity_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM identities WHERE user_id = ?",
-    )
-    .bind(&auth_user.user.id)
-    .fetch_one(&state.pool)
-    .await?;
+    // Get identity context (org_id and service_id) for proper isolation
+    let (issuing_org_id, issuing_service_id) = get_identity_context(&state.pool, &auth_user).await?;
 
-    // Prevent account lockout by ensuring at least one identity remains
-    if identity_count <= 1 {
-        return Err(AppError::BadRequest(
-            "Cannot unlink last identity. At least one identity must remain.".to_string(),
-        ));
-    }
+    // Count and delete identities filtered by context
+    let (_identity_count, result) = if issuing_service_id.is_some() {
+        // Service context: count and delete service-scoped identities
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM identities
+             WHERE user_id = ?
+             AND issuing_org_id = ?
+             AND issuing_service_id = ?",
+        )
+        .bind(&auth_user.user.id)
+        .bind(&issuing_org_id)
+        .bind(&issuing_service_id)
+        .fetch_one(&state.pool)
+        .await?;
 
-    // Delete the identity
-    let result = sqlx::query(
-        "DELETE FROM identities WHERE user_id = ? AND provider = ?",
-    )
-    .bind(&auth_user.user.id)
-    .bind(provider.as_str())
-    .execute(&state.pool)
-    .await?;
+        // Prevent account lockout by ensuring at least one identity remains in this context
+        if count <= 1 {
+            return Err(AppError::BadRequest(
+                "Cannot unlink last identity. At least one identity must remain.".to_string(),
+            ));
+        }
+
+        let delete_result = sqlx::query(
+            "DELETE FROM identities
+             WHERE user_id = ?
+             AND provider = ?
+             AND issuing_org_id = ?
+             AND issuing_service_id = ?",
+        )
+        .bind(&auth_user.user.id)
+        .bind(provider.as_str())
+        .bind(&issuing_org_id)
+        .bind(&issuing_service_id)
+        .execute(&state.pool)
+        .await?;
+
+        (count, delete_result)
+    } else {
+        // Platform context: count and delete platform-scoped identities
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM identities
+             WHERE user_id = ?
+             AND issuing_org_id IS NULL
+             AND issuing_service_id IS NULL",
+        )
+        .bind(&auth_user.user.id)
+        .fetch_one(&state.pool)
+        .await?;
+
+        // Prevent account lockout by ensuring at least one identity remains in this context
+        if count <= 1 {
+            return Err(AppError::BadRequest(
+                "Cannot unlink last identity. At least one identity must remain.".to_string(),
+            ));
+        }
+
+        let delete_result = sqlx::query(
+            "DELETE FROM identities
+             WHERE user_id = ?
+             AND provider = ?
+             AND issuing_org_id IS NULL
+             AND issuing_service_id IS NULL",
+        )
+        .bind(&auth_user.user.id)
+        .bind(provider.as_str())
+        .execute(&state.pool)
+        .await?;
+
+        (count, delete_result)
+    };
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!(

@@ -29,6 +29,8 @@ pub struct Identity {
     pub encryption_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issuing_org_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuing_service_id: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

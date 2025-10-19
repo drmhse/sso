@@ -1118,11 +1118,12 @@ pub async fn list_end_users(
             .push(subscription);
     }
 
-    // Fetch ALL identities for these users in one query
+    // Fetch identities for these users that were created via this organization's services
+    // Only show identities where issuing_org_id matches this organization
     let identity_query = format!(
         "SELECT user_id, provider, provider_user_id, created_at
          FROM identities
-         WHERE user_id IN ({})
+         WHERE user_id IN ({}) AND issuing_org_id = ?
          ORDER BY created_at ASC",
         placeholders
     );
@@ -1131,6 +1132,7 @@ pub async fn list_end_users(
     for user_id in &user_ids {
         identity_query_builder = identity_query_builder.bind(user_id);
     }
+    identity_query_builder = identity_query_builder.bind(&organization.id);
 
     let all_identity_rows = identity_query_builder
         .fetch_all(&state.pool)
@@ -1268,14 +1270,16 @@ pub async fn get_end_user(
         })
         .collect();
 
-    // Get identities
+    // Get identities that were created via this organization's services
+    // Only show identities where issuing_org_id matches this organization
     let identity_rows = sqlx::query(
         "SELECT provider, provider_user_id, created_at
          FROM identities
-         WHERE user_id = ?
+         WHERE user_id = ? AND issuing_org_id = ?
          ORDER BY created_at ASC",
     )
     .bind(&end_user_id)
+    .bind(&organization.id)
     .fetch_all(&state.pool)
     .await
     .map_err(AppError::Database)?;
