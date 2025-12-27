@@ -77,7 +77,7 @@ hickory-resolver = "0.24"
 regex = "1.10"
 
 # GeoIP and location services for risk engine
-maxminddb = "0.24"
+maxminddb = "0.27"
 geoutils = "0.5"
 
 # Audit logging

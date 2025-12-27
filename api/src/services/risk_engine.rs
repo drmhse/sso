@@ -55,7 +55,7 @@ impl GeoIpReader {
 
     fn load_database(
         path: &str,
-    ) -> std::result::Result<maxminddb::Reader<Vec<u8>>, maxminddb::MaxMindDBError> {
+    ) -> std::result::Result<maxminddb::Reader<Vec<u8>>, maxminddb::MaxMindDbError> {
         maxminddb::Reader::open_readfile(path)
     }
 
@@ -66,12 +66,15 @@ impl GeoIpReader {
         let ip_addr: std::net::IpAddr = ip.parse().ok()?;
 
         // Query the database for city data
-        let city: maxminddb::geoip2::City = reader.lookup(ip_addr).ok()?;
+        let city: maxminddb::geoip2::City = reader.lookup(ip_addr).ok()?.decode().ok()??;
 
         // Extract location data
-        let country = city.country?.iso_code?.to_string();
-        let city_name = city.city?.names?.get("en").map(|s| s.to_string());
-        let location = city.location?;
+        // Country, City, and Location structs are now directly present (not Option),
+        // but their internal fields are still Options.
+        let country = city.country.iso_code?.to_string();
+        let city_name = city.city.names.english.map(|s| s.to_string());
+        
+        let location = city.location;
         let latitude = location.latitude?;
         let longitude = location.longitude?;
 
