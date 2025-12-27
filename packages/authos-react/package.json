@@ -1,0 +1,73 @@
+{
+  "name": "@drmhse/authos-react",
+  "version": "0.1.3",
+  "description": "React and Next.js adapter for AuthOS authentication",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./nextjs": {
+      "import": {
+        "types": "./dist/nextjs.d.mts",
+        "default": "./dist/nextjs.mjs"
+      },
+      "require": {
+        "types": "./dist/nextjs.d.ts",
+        "default": "./dist/nextjs.js"
+      }
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts,.tsx",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "authos",
+    "auth",
+    "authentication",
+    "react",
+    "nextjs",
+    "oauth",
+    "sso"
+  ],
+  "author": "DRM HSE <info@drmhse.com>",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/drmhse/sso.git",
+    "directory": "packages/authos-react"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@drmhse/sso-sdk": "^0.3.4"
+  }
+}

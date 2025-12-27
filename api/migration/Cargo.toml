@@ -1,0 +1,24 @@
+[package]
+name = "migration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "migration"
+path = "src/lib.rs"
+
+[[bin]]
+name = "migration"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1.80"
+sea-orm-migration = { version = "1.1", default-features = false, features = ["runtime-tokio-rustls", "cli"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = ["db_sqlite"]
+db_sqlite = ["sea-orm-migration/sqlx-sqlite"]
+db_psql = ["sea-orm-migration/sqlx-postgres"]
+db_mysql = ["sea-orm-migration/sqlx-mysql"]

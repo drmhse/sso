@@ -1,0 +1,385 @@
+use crate::auth::sso::Provider;
+use crate::error::{AppError, Result};
+use crate::handlers::auth::get_authorization_url_for_client;
+use crate::state::AppState;
+use crate::store::{
+    identities::IdentityStore, oauth_states::OAuthStateStore,
+    organization_oauth_credentials::OrganizationOAuthCredentialsStore,
+    organizations::OrganizationStore, services::ServiceStore, DB,
+};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
+use chrono::Utc;
+use sea_orm::DatabaseConnection;
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
+pub struct IdentityResponse {
+    pub provider: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StartLinkResponse {
+    pub authorization_url: String,
+}
+
+/// Helper function to determine the identity context (org_id and service_id) from auth user claims
+/// Returns (issuing_org_id, issuing_service_id) based on the authentication context
+async fn get_identity_context(
+    db: &DatabaseConnection,
+    auth_user: &crate::middleware::AuthUser,
+) -> Result<(Option<String>, Option<String>)> {
+    // Extract org and service from claims, treating empty strings as None
+    let org_slug =
+        auth_user
+            .claims
+            .org
+            .as_ref()
+            .and_then(|s| if s.is_empty() { None } else { Some(s.as_str()) });
+    let service_slug = auth_user.claims.service.as_ref().and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.as_str())
+        }
+    });
+
+    if let (Some(org_slug), Some(service_slug)) = (org_slug, service_slug) {
+        // Service context - get org_id and service_id
+        // First get organization by slug
+        let org = OrganizationStore::find_by_slug(DB::Conn(db), org_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Organization '{}' not found", org_slug)))?;
+
+        // Then get service by org_id and slug
+        let service = ServiceStore::find_by_org_and_slug(DB::Conn(db), &org.id, service_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Service '{}' not found", service_slug)))?;
+
+        Ok((Some(service.org_id.clone()), Some(service.id.clone())))
+    } else {
+        // Platform context - either None values or empty strings
+        Ok((None, None))
+    }
+}
+
+/// GET /api/user/identities - List all linked identities for the authenticated user
+pub async fn list_identities(
+    State(state): State<AppState>,
+    auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
+) -> Result<Json<Vec<IdentityResponse>>> {
+    let auth_user = auth_user
+        .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
+        .0;
+
+    // Get identity context (org_id and service_id) for proper isolation
+    let (issuing_org_id, issuing_service_id) = get_identity_context(&state.db, &auth_user).await?;
+
+    // Fetch identities filtered by context
+    let identities = IdentityStore::list_by_user_with_context(
+        DB::Conn(&state.db),
+        &auth_user.user.id,
+        issuing_org_id.as_deref(),
+        issuing_service_id.as_deref(),
+    )
+    .await?;
+
+    let response: Vec<IdentityResponse> = identities
+        .into_iter()
+        .map(|identity| IdentityResponse {
+            provider: identity.provider,
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+/// POST /api/user/identities/:provider/link - Start linking a new social account
+///
+/// This endpoint initiates OAuth flow to link a provider account to the authenticated user.
+/// After OAuth completes, the user will be redirected to the service's redirect_uri with:
+/// - ?status=success&provider={provider}&action=link (on success)
+/// - ?status=error&error={message}&action=link (on failure)
+pub async fn start_link(
+    State(state): State<AppState>,
+    Path(provider_str): Path<String>,
+    auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
+) -> Result<Json<StartLinkResponse>> {
+    let auth_user = auth_user
+        .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
+        .0;
+
+    let provider = Provider::from_str(&provider_str)?;
+
+    // Detect authentication context to determine linking strategy
+    let is_service_level = matches!(
+        (&auth_user.claims.org, &auth_user.claims.service),
+        (Some(org), Some(service)) if !(org == "platform" && service == "admin-cli")
+    );
+
+    let (
+        _scopes,
+        is_admin_flow,
+        org_slug,
+        service_slug,
+        service_id,
+        redirect_uri,
+        auth_url,
+        csrf_token,
+        pkce_verifier,
+    ) = if is_service_level {
+        // Service-level linking: Read scopes and redirect_uris from service configuration
+        let org_slug = auth_user.claims.org.as_ref().unwrap();
+        let service_slug = auth_user.claims.service.as_ref().unwrap();
+
+        // Get organization by slug
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Organization '{}' not found", org_slug)))?;
+
+        // Get service by org_id and slug
+        let service =
+            ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("Service '{}' not found", service_slug))
+                })?;
+
+        let service_id = service.id.clone();
+
+        // Get scopes for this provider from service entity
+        let scopes_json = match provider {
+            Provider::Github => &service.github_scopes,
+            Provider::Microsoft => &service.microsoft_scopes,
+            Provider::Google => &service.google_scopes,
+            Provider::Oidc => &None, // OIDC scopes are dynamically managed
+        };
+
+        let scopes = scopes_json
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| {
+                // Default scopes if not configured
+                match provider {
+                    Provider::Github => vec!["user:email".to_string()],
+                    Provider::Microsoft => vec![
+                        "User.Read".to_string(),
+                        "email".to_string(),
+                        "openid".to_string(),
+                        "profile".to_string(),
+                    ],
+                    Provider::Google => vec![
+                        "openid".to_string(),
+                        "email".to_string(),
+                        "profile".to_string(),
+                    ],
+                    Provider::Oidc => vec![
+                        "openid".to_string(),
+                        "email".to_string(),
+                        "profile".to_string(),
+                    ],
+                }
+            });
+
+        // Parse redirect_uris to get the primary redirect
+        let redirect_uris: Vec<String> = service
+            .redirect_uris
+            .as_ref()
+            .and_then(|uris| serde_json::from_str(uris).ok())
+            .unwrap_or_default();
+
+        let base_redirect = redirect_uris.first().ok_or_else(|| {
+            AppError::InternalServerError("Service has no redirect_uris configured".to_string())
+        })?;
+
+        // Build redirect URL with query params for linking flow
+        let redirect_uri = format!(
+            "{}?status=success&provider={}&action=link",
+            base_redirect,
+            provider.as_str()
+        );
+
+        // Check if org has BYOO credentials for this provider
+        let provider_str = provider.as_str();
+
+        let org_credentials = OrganizationOAuthCredentialsStore::find_by_org_and_provider(
+            DB::Conn(&state.db),
+            &service.org_id,
+            provider_str,
+        )
+        .await?;
+
+        let (auth_url, csrf_token, pkce_verifier) = if let Some(_creds) = org_credentials {
+            // Use BYOO credentials
+            let encryption = crate::encryption::EncryptionService::new().map_err(|e| {
+                AppError::InternalServerError(format!("Encryption unavailable: {}", e))
+            })?;
+
+            let custom_client =
+                crate::store::organizations::OrganizationStore::get_oauth_client_for_org(
+                    DB::Conn(&state.db),
+                    &service.org_id,
+                    provider,
+                    &encryption,
+                )
+                .await?;
+
+            get_authorization_url_for_client(&custom_client, provider, scopes.clone())
+        } else {
+            // Use platform credentials
+            state
+                .oauth_client
+                .get_authorization_url_with_pkce(provider, scopes.clone())?
+        };
+
+        (
+            scopes,
+            false,
+            Some(org_slug.clone()),
+            Some(service_slug.clone()),
+            Some(service_id),
+            redirect_uri,
+            auth_url,
+            csrf_token,
+            pkce_verifier,
+        )
+    } else {
+        // Platform-level linking: Use provider default scopes
+        let default_scopes = match provider {
+            Provider::Github => vec!["user:email".to_string()],
+            Provider::Microsoft => vec![
+                "User.Read".to_string(),
+                "email".to_string(),
+                "openid".to_string(),
+                "profile".to_string(),
+            ],
+            Provider::Google => vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string(),
+            ],
+            Provider::Oidc => vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string(),
+            ],
+        };
+
+        // Generate OAuth authorization URL with platform credentials
+        let (auth_url, csrf_token, pkce_verifier) = state
+            .oauth_client
+            .get_authorization_url_with_pkce(provider, default_scopes.clone())?;
+
+        // For platform-level linking, use base_url + settings page
+        let redirect_uri = format!(
+            "{}/settings/connections?status=success&provider={}&action=link",
+            state.base_url,
+            provider.as_str()
+        );
+
+        (
+            default_scopes,
+            true,
+            None,
+            None,
+            None,
+            redirect_uri,
+            auth_url,
+            csrf_token,
+            pkce_verifier,
+        )
+    };
+
+    // Store OAuth state with user_id_for_linking set
+    let expires_at = (Utc::now() + chrono::Duration::minutes(10)).naive_utc();
+    let pkce_value = if provider == Provider::Microsoft && !pkce_verifier.is_empty() {
+        Some(pkce_verifier.as_str())
+    } else {
+        None
+    };
+
+    OAuthStateStore::create(
+        DB::Conn(&state.db),
+        csrf_token.secret(),
+        pkce_value,
+        service_id.as_deref(),
+        Some(&redirect_uri),
+        org_slug.as_deref(),
+        service_slug.as_deref(),
+        is_admin_flow,
+        Some(&auth_user.user.id),
+        None, // device_user_code
+        None, // saml_state_id
+        None, // upstream_connection_id
+        &expires_at,
+    )
+    .await?;
+
+    Ok(Json(StartLinkResponse {
+        authorization_url: auth_url,
+    }))
+}
+
+/// DELETE /api/user/identities/:provider - Unlink a social account
+pub async fn unlink_identity(
+    State(state): State<AppState>,
+    Path(provider_str): Path<String>,
+    auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
+) -> Result<axum::http::StatusCode> {
+    let auth_user = auth_user
+        .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
+        .0;
+
+    let provider = Provider::from_str(&provider_str)?;
+
+    // Get identity context (org_id and service_id) for proper isolation
+    let (issuing_org_id, issuing_service_id) = get_identity_context(&state.db, &auth_user).await?;
+
+    // Count identities to prevent account lockout
+    let count = IdentityStore::count_by_user_with_context(
+        DB::Conn(&state.db),
+        &auth_user.user.id,
+        issuing_org_id.as_deref(),
+        issuing_service_id.as_deref(),
+    )
+    .await?;
+
+    // Prevent account lockout by ensuring at least one identity remains in this context
+    if count <= 1 {
+        return Err(AppError::BadRequest(
+            "Cannot unlink last identity. At least one identity must remain.".to_string(),
+        ));
+    }
+
+    // Check if identity exists before attempting to delete
+    let identity_exists = IdentityStore::find_by_user_and_provider(
+        DB::Conn(&state.db),
+        &auth_user.user.id,
+        provider.as_str(),
+        issuing_org_id.as_deref(),
+        issuing_service_id.as_deref(),
+    )
+    .await?
+    .is_some();
+
+    if !identity_exists {
+        return Err(AppError::NotFound(format!(
+            "Identity for provider '{}' not found",
+            provider.as_str()
+        )));
+    }
+
+    // Delete the identity
+    IdentityStore::delete_by_user_and_provider(
+        DB::Conn(&state.db),
+        &auth_user.user.id,
+        provider.as_str(),
+        issuing_org_id.as_deref(),
+        issuing_service_id.as_deref(),
+    )
+    .await?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}

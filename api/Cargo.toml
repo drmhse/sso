@@ -1,0 +1,150 @@
+[package]
+name = "sso"
+version = "0.1.7"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout"] }
+tower_governor = "0.3"
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "chrono", "migrate"] }
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono"] }
+migration = { path = "migration" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# JWT (RSA support is built-in in v9)
+jsonwebtoken = "9"
+
+# OAuth2
+oauth2 = "4.4"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "rustls-tls-webpki-roots"] }
+
+# Stripe
+async-stripe = { version = "0.36", default-features = false, features = ["billing", "checkout", "connect", "runtime-tokio-hyper-rustls-webpki", "webhook-events"] }
+
+# Utilities
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+hmac = "0.12"
+futures = "0.3"
+async-trait = "0.1"
+num_cpus = "1.16"
+
+# Encryption
+aes-gcm = "0.10"
+base64 = "0.22"
+subtle = "2.5"
+
+# RSA (for JWKS generation and SAML signing)
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+
+# HTTP types
+http = "1.0"
+
+# Password hashing
+argon2 = "0.5"
+
+# Email
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname"] }
+
+# TOTP/MFA
+totp-rs = { version = "5.5", features = ["gen_secret", "qr"] }
+qrcode = "0.14"
+
+# WebAuthn/Passkeys (FIDO2)
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+
+# DNS resolution for domain verification
+hickory-resolver = "0.24"
+
+# Regex for validation
+regex = "1.10"
+
+# GeoIP and location services for risk engine
+maxminddb = "0.24"
+geoutils = "0.5"
+
+# Audit logging
+strum = { version = "0.25", features = ["derive"] }
+
+# In-memory caching
+moka = { version = "0.12", features = ["future"] }
+
+# Log streaming and observability
+aws-sdk-s3 = "1.0"
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
+axum-prometheus = "0.4"
+
+# SAML 2.0 Identity Provider
+samael = "0.0.15"
+quick-xml = "0.31"
+rcgen = { version = "0.12", features = ["pem", "x509-parser"] }
+x509-parser = "0.16"
+flate2 = "1.0"
+pkcs1 = "0.7.5"
+pkcs8 = "0.10"
+
+[[bin]]
+name = "sso_sqlite"
+path = "src/main.rs"
+required-features = ["db_sqlite"]
+
+
+
+
+[[bin]]
+name = "sso_psql"
+path = "src/main.rs"
+required-features = ["db_psql"]
+
+[[bin]]
+name = "sso_mysql"
+path = "src/main.rs"
+required-features = ["db_mysql"]
+
+[features]
+default = ["db_sqlite"]
+db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite"]
+db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres"]
+db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql"]
+
+# =============================================================================
+# Release Profile - Optimized for small binary + reasonable build time
+# =============================================================================
+[profile.release]
+# LTO (Link-Time Optimization): "thin" = good balance of size reduction vs build time
+# Use "fat" for smallest binary but slower builds
+lto = "thin"
+
+# Reduce codegen units for better optimization (default is 16)
+# Lower = smaller binary, slower compile; 1 = smallest, 4-8 = balanced
+codegen-units = 4
+
+# Optimization level: 3 = speed, "s" = size, "z" = smallest size
+opt-level = 3
+
+# Strip symbols in Cargo (Rust 1.77+) - alternative to post-build strip
+strip = true
+
+# Panic behavior: "abort" = smaller binary, no unwinding
+panic = "abort"
+
+# Enable debug info for profiling (set to 0 for smallest binary)
+debug = false

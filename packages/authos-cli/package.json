@@ -1,0 +1,55 @@
+{
+  "name": "@drmhse/authos-cli",
+  "version": "0.1.3",
+  "description": "CLI tool for scaffolding AuthOS integrations",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "authos": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "authos",
+    "auth",
+    "authentication",
+    "cli",
+    "scaffold",
+    "react",
+    "vue",
+    "nextjs",
+    "nuxt"
+  ],
+  "author": "DRM HSE <info@drmhse.com>",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.1.0",
+    "picocolors": "^1.1.1",
+    "prompts": "^2.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/prompts": "^2.4.9",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/drmhse/sso.git",
+    "directory": "packages/authos-cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

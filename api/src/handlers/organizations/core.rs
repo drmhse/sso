@@ -1,0 +1,746 @@
+use crate::auth::jwt::JwtService;
+use crate::constants::{
+    DEFAULT_MAX_ORGS_PER_USER, DEFAULT_TIER_NAME, MAX_NAME_LENGTH, MAX_SLUG_LENGTH,
+    MIN_NAME_LENGTH, MIN_SLUG_LENGTH, RESERVED_SLUGS,
+};
+use crate::entities::{memberships, organization_tiers, organizations, users};
+use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::middleware::AuthUser;
+use crate::state::AppState;
+use crate::store::{
+    memberships::MembershipStore, organization_tiers::OrganizationTierStore,
+    organizations::OrganizationStore, risk_rules::RiskRulesStore, services::ServiceStore,
+    sessions::SessionStore, DB,
+};
+use axum::{
+    extract::{Extension, Path, Query, State},
+    Json,
+};
+use chrono::Utc;
+use sea_orm::DatabaseConnection;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+pub struct CreateOrganizationRequest {
+    pub slug: String,
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateOrganizationRequest {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrganizationResponse {
+    pub organization: organizations::Model,
+    pub membership_count: i64,
+    pub service_count: i64,
+    pub tier: Option<organization_tiers::Model>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateOrganizationResponse {
+    pub organization: organizations::Model,
+    pub owner: users::Model,
+    pub membership: memberships::Model,
+    pub access_token: String,
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListOrganizationsQuery {
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+    pub status: Option<String>,
+}
+
+/// Create a new organization (requires authentication)
+/// Uses with_retrying_transaction for automatic retry on SQLite busy errors
+pub async fn create_organization(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(req): Json<CreateOrganizationRequest>,
+) -> Result<Json<CreateOrganizationResponse>> {
+    // Validate input
+    validate_organization_slug(&req.slug)?;
+    validate_organization_name(&req.name)?;
+
+    // Use authenticated user as owner
+    let owner = auth_user.user.clone();
+
+    // Check organization creation rate limit (configurable via env var)
+    let max_orgs_per_user = std::env::var("MAX_ORGS_PER_USER")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_ORGS_PER_USER);
+    
+    let current_org_count = OrganizationStore::count_by_owner(DB::Conn(&state.db), &owner.id).await?;
+    if current_org_count >= max_orgs_per_user {
+        return Err(AppError::BadRequest(format!(
+            "You have reached the maximum number of organizations ({}) you can create. Please contact support if you need more.",
+            max_orgs_per_user
+        )));
+    }
+
+    // Clone values needed inside the closure
+    let slug = req.slug.clone();
+    let name = req.name.clone();
+    let owner_id = owner.id.clone();
+
+    // Execute transaction with automatic retry on database contention
+    let (organization, membership) =
+        with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "create_organization", |db| {
+            let slug = slug.clone();
+            let name = name.clone();
+            let owner_id = owner_id.clone();
+            Box::pin(async move {
+                // Check if slug already exists
+                let existing = OrganizationStore::find_by_slug(db.clone(), &slug).await?;
+                if existing.is_some() {
+                    return Err(AppError::BadRequest(
+                        "Unable to create organization with the provided information".to_string(),
+                    ));
+                }
+
+                // Get free tier
+                let free_tier = OrganizationTierStore::find_by_name(db.clone(), DEFAULT_TIER_NAME)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Free tier not found".to_string()))?;
+
+                // Create organization
+                let organization = OrganizationStore::create(
+                    db.clone(),
+                    &slug,
+                    &name,
+                    &owner_id,
+                    Some(&free_tier.id),
+                )
+                .await
+                .map_err(|e| {
+                    // Convert unique constraint violations to user-friendly errors
+                    let error_msg = e.to_string().to_lowercase();
+                    if error_msg.contains("unique")
+                        || error_msg.contains("duplicate")
+                        || error_msg.contains("constraint")
+                    {
+                        AppError::BadRequest(
+                            "Unable to create organization with the provided information"
+                                .to_string(),
+                        )
+                    } else {
+                        e
+                    }
+                })?;
+
+                // Create owner membership
+                let membership =
+                    MembershipStore::create(db.clone(), &organization.id, &owner_id, "owner")
+                        .await?;
+
+                // Grant organization owner permission
+                use crate::entities::permissions::RelationTuple;
+                use crate::store::permissions::PermissionsStore;
+                PermissionsStore::grant(
+                    db.clone(),
+                    RelationTuple::user(
+                        "organization".to_string(),
+                        organization.id.clone(),
+                        "owner".to_string(),
+                        owner_id.clone(),
+                    ),
+                )
+                .await?;
+
+                // Create default risk rules for the organization
+                use crate::store::risk_rules::RiskRulesStore;
+                RiskRulesStore::create_default(db.clone(), &organization.id).await?;
+
+                Ok((organization, membership))
+            })
+        })
+        .await?;
+
+    // Create billing customer
+    // We ignore errors here as we don't want to fail org creation if billing setup fails
+    // The user can try accessing the billing portal later which should trigger creation on demand (TODO)
+    // or they can contact support.
+    if let Err(e) = super::billing::create_billing_customer(&state, &organization.id, &organization.name).await {
+        tracing::error!("Failed to create billing customer for org {}: {}", organization.id, e);
+    }
+
+    // Generate JWT with organization context
+    let access_token = state
+        .jwt_service
+        .create_token(
+            &owner.id,
+            &owner.email,
+            owner.is_platform_owner,
+            Some(&organization.slug),
+            None, // service_slug
+        )
+        .map_err(|e| AppError::InternalServerError(format!("Failed to create JWT: {}", e)))?;
+
+    // Generate refresh token
+    let refresh_token = Uuid::new_v4().to_string();
+
+    // Store session with refresh token
+    let token_hash = JwtService::hash_token(&access_token);
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
+    let refresh_expires_at = now + chrono::Duration::days(30);
+
+    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "create_org_session", |db| {
+        let user_id = owner.id.clone();
+        let token_hash = token_hash.clone();
+        let refresh_token = refresh_token.clone();
+        let org_slug = organization.slug.clone();
+        Box::pin(async move {
+            SessionStore::create(
+                db.clone(),
+                &user_id,
+                &token_hash,
+                expires_at.naive_utc(),
+                Some(&refresh_token),
+                Some(refresh_expires_at.naive_utc()),
+                Some(&org_slug),
+                None, // service_id
+                None, // user_agent
+                None, // ip_address
+            )
+            .await
+        })
+    })
+    .await?;
+
+    Ok(Json(CreateOrganizationResponse {
+        organization,
+        owner,
+        membership,
+        access_token,
+        refresh_token,
+    }))
+}
+
+/// Get organization by slug
+pub async fn get_organization(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(org_slug): Path<String>,
+) -> Result<Json<OrganizationResponse>> {
+    let user = &auth_user.user;
+
+    // Find organization
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Check if user is member
+    crate::middleware::check_org_membership(&state.db, &user.id, &organization.id, &[]).await?;
+
+    let (membership_count, service_count, tier) =
+        get_organization_stats(&state.db, &organization.id).await?;
+
+    Ok(Json(OrganizationResponse {
+        organization,
+        membership_count,
+        service_count,
+        tier,
+    }))
+}
+
+/// Update organization (owner/admin only)
+pub async fn update_organization(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(org_slug): Path<String>,
+    Json(req): Json<UpdateOrganizationRequest>,
+) -> Result<Json<OrganizationResponse>> {
+    let user = &auth_user.user;
+
+    // Find organization
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Check if user is owner or admin
+    let _membership =
+        crate::middleware::check_org_admin(&state.db, &user.id, &organization.id).await?;
+
+    // Verify changes
+    let updated_org = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "update_organization", |db| {
+        let org_id = organization.id.clone();
+        let name = req.name.clone();
+        Box::pin(async move {
+            if let Some(name) = &name {
+                 // Validate name length
+                 validate_organization_name(name)?;
+                 OrganizationStore::update_name(db.clone(), &org_id, name).await
+            } else {
+                 // If no fields were updated, just update the timestamp
+                 OrganizationStore::update_timestamp(db.clone(), &org_id).await
+            }
+        })
+    })
+    .await?;
+
+    let (membership_count, service_count, tier) =
+        get_organization_stats(&state.db, &organization.id).await?;
+
+    Ok(Json(OrganizationResponse {
+        organization: updated_org,
+        membership_count,
+        service_count,
+        tier,
+    }))
+}
+
+/// Delete organization (owner only)
+pub async fn delete_organization(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(org_slug): Path<String>,
+) -> Result<Json<()>> {
+    let user = &auth_user.user;
+
+    // Find organization
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Check if user is owner (only owners can delete)
+    crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
+
+    // Delete organization
+    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "delete_organization", |db| {
+        let org_id = organization.id.clone();
+        Box::pin(async move {
+            OrganizationStore::delete(db.clone(), &org_id).await
+        })
+    })
+    .await?;
+
+    // Non-blocking audit via actor (fire and forget since org is already deleted)
+    use crate::services::audit_builder::OrgAuditBuilder;
+    let event = OrgAuditBuilder::new(&organization.id, Some(&user.id), "org.deleted")
+        .target("organization", &organization.id)
+        .success(true)
+        .details_json(Some(serde_json::json!({
+            "org_slug": org_slug,
+            "org_name": organization.name
+        })))
+        .build();
+    state.audit_actor.log_org(event).await;
+
+    Ok(Json(()))
+}
+
+/// List user's organizations
+pub async fn list_user_organizations(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Query(query): Query<ListOrganizationsQuery>,
+) -> Result<Json<Vec<OrganizationResponse>>> {
+    let user = &auth_user.user;
+
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    // Get user's organizations with optional status filter
+    let organizations = OrganizationStore::list_by_user_with_status(
+        DB::Conn(&state.db),
+        &user.id,
+        query.status.as_deref(),
+        limit as u64,
+        offset as u64,
+    )
+    .await?;
+
+    let mut results = Vec::new();
+    for org in organizations {
+        let (membership_count, service_count, tier) =
+            get_organization_stats(&state.db, &org.id).await?;
+        results.push(OrganizationResponse {
+            organization: org,
+            membership_count,
+            service_count,
+            tier,
+        });
+    }
+
+    Ok(Json(results))
+}
+
+// Helper functions
+
+pub async fn get_organization_by_id(
+    pool: &DatabaseConnection,
+    org_id: &str,
+) -> Result<organizations::Model> {
+    OrganizationStore::find_by_id(DB::Conn(pool), org_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))
+}
+
+pub async fn get_organization_stats(
+    pool: &DatabaseConnection,
+    org_id: &str,
+) -> Result<(i64, i64, Option<organization_tiers::Model>)> {
+    let membership_count =
+        MembershipStore::count_by_org(DB::Conn(pool), org_id, None).await? as i64;
+
+    let service_count = ServiceStore::count_by_org(DB::Conn(pool), org_id).await? as i64;
+
+    let tier = OrganizationTierStore::find_by_org_id(DB::Conn(pool), org_id).await?;
+
+    Ok((membership_count, service_count, tier))
+}
+
+pub async fn ensure_organization_active(
+    pool: &DatabaseConnection,
+    org_id: &str,
+) -> Result<organizations::Model> {
+    let org = OrganizationStore::find_by_id(DB::Conn(pool), org_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    if org.status != "active" {
+        return Err(AppError::Forbidden(format!(
+            "Organization is not active. Current status: {}",
+            org.status
+        )));
+    }
+
+    Ok(org)
+}
+
+// Validation helper functions
+
+pub fn validate_organization_slug(slug: &str) -> Result<()> {
+    if slug.len() < MIN_SLUG_LENGTH || slug.len() > MAX_SLUG_LENGTH {
+        return Err(AppError::BadRequest(format!(
+            "Slug must be between {} and {} characters",
+            MIN_SLUG_LENGTH, MAX_SLUG_LENGTH
+        )));
+    }
+
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(AppError::BadRequest(
+            "Slug can only contain lowercase alphanumeric characters, hyphens, and underscores"
+                .to_string(),
+        ));
+    }
+
+    // Check for reserved slugs
+    if RESERVED_SLUGS.contains(&slug) {
+        return Err(AppError::BadRequest("Slug is reserved".to_string()));
+    }
+
+    Ok(())
+}
+
+pub fn validate_organization_name(name: &str) -> Result<()> {
+    if name.len() < MIN_NAME_LENGTH || name.len() > MAX_NAME_LENGTH {
+        return Err(AppError::BadRequest(format!(
+            "Name must be between {} and {} characters",
+            MIN_NAME_LENGTH, MAX_NAME_LENGTH
+        )));
+    }
+
+    if name.trim().is_empty() {
+        return Err(AppError::BadRequest("Name cannot be empty".to_string()));
+    }
+
+    Ok(())
+}
+
+pub fn validate_email(email: &str) -> Result<()> {
+    if !email.contains('@') || email.len() < 5 {
+        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    }
+
+    let parts: Vec<&str> = email.split('@').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    }
+
+    Ok(())
+}
+
+// Risk Settings Request/Response Types
+#[derive(Debug, Serialize)]
+pub struct GetRiskSettingsResponse {
+    pub enforcement_mode: String,
+    pub low_threshold: i32,
+    pub medium_threshold: i32,
+    pub new_device_score: i32,
+    pub impossible_travel_score: i32,
+    pub velocity_threshold: i32,
+    pub velocity_score: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRiskSettingsRequest {
+    pub enforcement_mode: Option<String>,
+    pub low_threshold: Option<i32>,
+    pub medium_threshold: Option<i32>,
+    pub new_device_score: Option<i32>,
+    pub impossible_travel_score: Option<i32>,
+    pub velocity_threshold: Option<i32>,
+    pub velocity_score: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateRiskSettingsResponse {
+    pub message: String,
+    pub settings: GetRiskSettingsResponse,
+}
+
+/// GET /api/organizations/:org_slug/risk-settings - Get organization risk settings
+pub async fn get_risk_settings(
+    State(state): State<AppState>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(org_slug): Path<String>,
+) -> Result<Json<GetRiskSettingsResponse>> {
+    // Find organization
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Check user has permission to access risk settings (org admin or platform owner)
+    if !_auth_user.user.is_platform_owner {
+        let membership = MembershipStore::find_by_org_slug_and_user(
+            DB::Conn(&state.db),
+            &org_slug,
+            &_auth_user.user.id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::Forbidden("You are not a member of this organization".to_string())
+        })?;
+
+        if !["admin", "owner"].contains(&membership.role.as_str()) {
+            return Err(AppError::Forbidden(
+                "You do not have permission to manage risk settings".to_string(),
+            ));
+        }
+    }
+
+    // Get risk rules
+    let risk_rules = RiskRulesStore::find_by_org(DB::Conn(&state.db), &org.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Risk settings not found".to_string()))?;
+
+    Ok(Json(GetRiskSettingsResponse {
+        enforcement_mode: risk_rules.enforcement_mode,
+        low_threshold: risk_rules.low_threshold,
+        medium_threshold: risk_rules.medium_threshold,
+        new_device_score: risk_rules.new_device_score,
+        impossible_travel_score: risk_rules.impossible_travel_score,
+        velocity_threshold: risk_rules.velocity_threshold,
+        velocity_score: risk_rules.velocity_score,
+    }))
+}
+
+/// PUT /api/organizations/:org_slug/risk-settings - Update organization risk settings
+pub async fn update_risk_settings(
+    State(state): State<AppState>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(org_slug): Path<String>,
+    Json(req): Json<UpdateRiskSettingsRequest>,
+) -> Result<Json<UpdateRiskSettingsResponse>> {
+    // Find organization
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Check user has permission (org admin or platform owner)
+    if !_auth_user.user.is_platform_owner {
+        let membership = MembershipStore::find_by_org_slug_and_user(
+            DB::Conn(&state.db),
+            &org_slug,
+            &_auth_user.user.id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::Forbidden("You are not a member of this organization".to_string())
+        })?;
+
+        if !["admin", "owner"].contains(&membership.role.as_str()) {
+            return Err(AppError::Forbidden(
+                "You do not have permission to manage risk settings".to_string(),
+            ));
+        }
+    }
+
+    // Validate enforcement mode if provided
+    if let Some(ref mode) = req.enforcement_mode {
+        match mode.as_str() {
+            "log_only" | "monitor" | "challenge" | "block" => (),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "Invalid enforcement mode. Must be one of: log_only, monitor, challenge, block"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    // Validate thresholds if provided
+    if let Some(low) = req.low_threshold {
+        if low < 0 || low > 100 {
+            return Err(AppError::BadRequest(
+                "Low threshold must be between 0 and 100".to_string(),
+            ));
+        }
+    }
+
+    if let Some(medium) = req.medium_threshold {
+        if medium < 0 || medium > 100 {
+            return Err(AppError::BadRequest(
+                "Medium threshold must be between 0 and 100".to_string(),
+            ));
+        }
+    }
+
+    if let (Some(low), Some(medium)) = (req.low_threshold, req.medium_threshold) {
+        if low >= medium {
+            return Err(AppError::BadRequest(
+                "Low threshold must be less than medium threshold".to_string(),
+            ));
+        }
+    }
+
+    // Validate scores if provided
+    if let Some(score) = req.new_device_score {
+        if score < 0 || score > 100 {
+            return Err(AppError::BadRequest(
+                "New device score must be between 0 and 100".to_string(),
+            ));
+        }
+    }
+
+    if let Some(score) = req.impossible_travel_score {
+        if score < 0 || score > 100 {
+            return Err(AppError::BadRequest(
+                "Impossible travel score must be between 0 and 100".to_string(),
+            ));
+        }
+    }
+
+    if let Some(score) = req.velocity_score {
+        if score < 0 || score > 100 {
+            return Err(AppError::BadRequest(
+                "Velocity score must be between 0 and 100".to_string(),
+            ));
+        }
+    }
+
+    // Update risk rules
+    let enforcement_mode = req.enforcement_mode.clone();
+    let updated_rules = RiskRulesStore::update(
+        DB::Conn(&state.db),
+        &org.id,
+        enforcement_mode.clone(),
+        req.low_threshold,
+        req.medium_threshold,
+        req.new_device_score,
+        req.impossible_travel_score,
+        req.velocity_threshold,
+        req.velocity_score,
+    )
+    .await?;
+
+    // Log the change
+    tracing::info!(
+        org_id = %org.id,
+        org_slug = %org_slug,
+        user_id = %_auth_user.user.id,
+        enforcement_mode = ?enforcement_mode,
+        "Organization risk settings updated"
+    );
+
+    Ok(Json(UpdateRiskSettingsResponse {
+        message: "Risk settings updated successfully".to_string(),
+        settings: GetRiskSettingsResponse {
+            enforcement_mode: updated_rules.enforcement_mode,
+            low_threshold: updated_rules.low_threshold,
+            medium_threshold: updated_rules.medium_threshold,
+            new_device_score: updated_rules.new_device_score,
+            impossible_travel_score: updated_rules.impossible_travel_score,
+            velocity_threshold: updated_rules.velocity_threshold,
+            velocity_score: updated_rules.velocity_score,
+        },
+    }))
+}
+
+/// POST /api/organizations/:org_slug/risk-settings/reset - Reset risk settings to defaults
+pub async fn reset_risk_settings(
+    State(state): State<AppState>,
+    Extension(_auth_user): Extension<AuthUser>,
+    Path(org_slug): Path<String>,
+) -> Result<Json<UpdateRiskSettingsResponse>> {
+    // Find organization
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Check user has permission (org admin or platform owner)
+    if !_auth_user.user.is_platform_owner {
+        let membership = MembershipStore::find_by_org_slug_and_user(
+            DB::Conn(&state.db),
+            &org_slug,
+            &_auth_user.user.id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::Forbidden("You are not a member of this organization".to_string())
+        })?;
+
+        if !["admin", "owner"].contains(&membership.role.as_str()) {
+            return Err(AppError::Forbidden(
+                "You do not have permission to manage risk settings".to_string(),
+            ));
+        }
+    }
+
+    // Reset to defaults
+    let reset_rules = RiskRulesStore::update(
+        DB::Conn(&state.db),
+        &org.id,
+        Some("log_only".to_string()),
+        Some(30),
+        Some(70),
+        Some(20),
+        Some(50),
+        Some(10),
+        Some(30),
+    )
+    .await?;
+
+    // Log the reset
+    tracing::info!(
+        org_id = %org.id,
+        org_slug = %org_slug,
+        user_id = %_auth_user.user.id,
+        "Organization risk settings reset to defaults"
+    );
+
+    Ok(Json(UpdateRiskSettingsResponse {
+        message: "Risk settings reset to default values".to_string(),
+        settings: GetRiskSettingsResponse {
+            enforcement_mode: reset_rules.enforcement_mode,
+            low_threshold: reset_rules.low_threshold,
+            medium_threshold: reset_rules.medium_threshold,
+            new_device_score: reset_rules.new_device_score,
+            impossible_travel_score: reset_rules.impossible_travel_score,
+            velocity_threshold: reset_rules.velocity_threshold,
+            velocity_score: reset_rules.velocity_score,
+        },
+    }))
+}

@@ -1,0 +1,124 @@
+import { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { SsoClient, UserProfile, Organization } from '@drmhse/sso-sdk';
+import type { AuthOSContextState, AuthOSProviderProps } from './types';
+
+const AuthOSContext = createContext<AuthOSContextState | null>(null);
+
+/**
+ * Provider component that wraps your app and provides AuthOS context.
+ *
+ * @example
+ * ```tsx
+ * import { AuthOSProvider } from '@drmhse/authos-react';
+ *
+ * function App() {
+ *   return (
+ *     <AuthOSProvider config={{ baseURL: 'https://auth.example.com' }}>
+ *       <YourApp />
+ *     </AuthOSProvider>
+ *   );
+ * }
+ * ```
+ *
+ * @example With SSR token (Next.js App Router)
+ * ```tsx
+ * import { cookies } from 'next/headers';
+ * import { AuthOSProvider } from '@drmhse/authos-react';
+ *
+ * export default async function RootLayout({ children }) {
+ *   const cookieStore = cookies();
+ *   const token = cookieStore.get('authos_token')?.value;
+ *
+ *   return (
+ *     <AuthOSProvider
+ *       config={{ baseURL: 'https://auth.example.com' }}
+ *       initialSessionToken={token}
+ *     >
+ *       {children}
+ *     </AuthOSProvider>
+ *   );
+ * }
+ * ```
+ */
+export function AuthOSProvider({ config, children, client: externalClient, initialSessionToken }: AuthOSProviderProps) {
+  const clientRef = useRef<SsoClient | null>(null);
+
+  // Create or use the provided client
+  if (!clientRef.current) {
+    clientRef.current = externalClient ?? new SsoClient(config);
+  }
+  const client = clientRef.current;
+
+  // If we have an initial token from SSR, set it on the client immediately
+  // This prevents the loading flash and enables immediate auth state
+  const hasInitialToken = useRef(!!initialSessionToken);
+  useEffect(() => {
+    if (initialSessionToken && hasInitialToken.current) {
+      client.setSession({ access_token: initialSessionToken });
+      hasInitialToken.current = false; // Only set once
+    }
+  }, [client, initialSessionToken]);
+
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [organization, setOrganization] = useState<Organization | null>(null);
+  const [isLoading, setIsLoading] = useState(!initialSessionToken);
+
+  const refreshUser = useCallback(async () => {
+    try {
+      const profile = await client.user.getProfile();
+      setUser(profile);
+    } catch {
+      setUser(null);
+    }
+  }, [client]);
+
+  useEffect(() => {
+    // Subscribe to auth state changes
+    const unsubscribe = client.onAuthStateChange(async (isAuthenticated) => {
+      if (isAuthenticated) {
+        try {
+          const profile = await client.user.getProfile();
+          setUser(profile);
+        } catch {
+          setUser(null);
+        }
+      } else {
+        setUser(null);
+        setOrganization(null);
+      }
+      setIsLoading(false);
+    });
+
+    return unsubscribe;
+  }, [client]);
+
+  const contextValue = useMemo<AuthOSContextState>(
+    () => ({
+      client,
+      user,
+      isAuthenticated: !!user,
+      isLoading,
+      organization,
+      setUser,
+      setOrganization,
+      refreshUser,
+    }),
+    [client, user, isLoading, organization, refreshUser]
+  );
+
+  return <AuthOSContext.Provider value={contextValue}>{children}</AuthOSContext.Provider>;
+}
+
+/**
+ * Hook to access the AuthOS context.
+ * Must be used within an AuthOSProvider.
+ *
+ * @throws Error if used outside of AuthOSProvider
+ */
+export function useAuthOSContext(): AuthOSContextState {
+  const context = useContext(AuthOSContext);
+  if (!context) {
+    throw new Error('useAuthOSContext must be used within an AuthOSProvider');
+  }
+  return context;
+}
