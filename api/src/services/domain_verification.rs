@@ -55,18 +55,21 @@ pub fn normalize_verifiable_domain(domain: &str) -> Result<String> {
 }
 
 pub async fn verify_dns_txt_record(domain: &str, expected_token: &str) -> bool {
-    use hickory_resolver::TokioAsyncResolver;
+    use hickory_resolver::TokioResolver;
 
-    let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
+    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
         Ok(r) => r,
         Err(_) => return false,
     };
 
     let record_name = format!("_sso-verification.{}", domain);
     match resolver.txt_lookup(&record_name).await {
-        Ok(records) => records.iter().any(|record| {
-            let txt_value = record
-                .txt_data()
+        Ok(records) => records.answers().iter().any(|record| {
+            let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data else {
+                return false;
+            };
+            let txt_value = txt
+                .txt_data
                 .iter()
                 .map(|data| String::from_utf8_lossy(data.as_ref()))
                 .collect::<Vec<_>>()

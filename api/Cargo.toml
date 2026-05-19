@@ -23,15 +23,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # JWT
-jsonwebtoken = "9"
+jsonwebtoken = "10.3"
 
 # OAuth2 - Rustls only
-oauth2 = { version = "4.4", default-features = false, features = ["reqwest", "rustls-tls"] }
+oauth2 = { version = "4.4", default-features = false }
 # Reqwest - Rustls only, NO native-tls
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "rustls-tls-webpki-roots"] }
-
-# Stripe - Rustls only
-async-stripe = { version = "0.36", default-features = false, features = ["billing", "checkout", "connect", "runtime-tokio-hyper-rustls-webpki", "webhook-events"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls"] }
 
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }
@@ -44,7 +41,7 @@ dotenvy = "0.15"
 time = { version = "0.3", features = ["serde", "formatting"] }
 sha2 = "0.10"
 hex = "0.4"
-rand = "0.8"
+rand = "0.8.6"
 hmac = "0.12"
 futures = "0.3"
 async-trait = "0.1"
@@ -75,7 +72,7 @@ qrcode = "0.14"
 webauthn-rs = { version = "0.5", default-features = false, features = ["danger-allow-state-serialisation"] }
 
 # DNS
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # Regex
 regex = "1.10"

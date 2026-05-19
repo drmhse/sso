@@ -70,5 +70,8 @@
   },
   "dependencies": {
     "@drmhse/sso-sdk": "*"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
   }
 }

@@ -387,10 +387,39 @@ impl OAuthClient {
 // Custom HTTP client wrapper for better OAuth error logging and GitHub error detection
 pub async fn oauth_http_client(
     request: oauth2::HttpRequest,
-) -> std::result::Result<oauth2::HttpResponse, oauth2::reqwest::Error<reqwest::Error>> {
+) -> std::result::Result<oauth2::HttpResponse, reqwest::Error> {
     tracing::debug!("OAuth request: {:?} {}", request.method, request.url);
 
-    let mut result = oauth2::reqwest::async_http_client(request).await;
+    let client = reqwest::Client::new();
+    let mut builder = client.request(
+        reqwest::Method::from_bytes(request.method.as_str().as_bytes())
+            .unwrap_or(reqwest::Method::GET),
+        request.url.as_str(),
+    );
+
+    for (name, value) in request.headers.iter() {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+
+    let response = builder.body(request.body).send().await?;
+    let status_code = oauth2::http::StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(oauth2::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let mut headers = oauth2::http::HeaderMap::new();
+    for (name, value) in response.headers().iter() {
+        if let (Ok(name), Ok(value)) = (
+            oauth2::http::HeaderName::from_bytes(name.as_str().as_bytes()),
+            oauth2::http::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    let body = response.bytes().await?.to_vec();
+
+    let mut result = Ok(oauth2::HttpResponse {
+        status_code,
+        headers,
+        body,
+    });
 
     // GitHub returns errors with 200 OK status but with JSON containing "error" field
     // We need to detect this and convert it to a proper error response
