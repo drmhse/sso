@@ -10,6 +10,11 @@ pub struct Model {
     pub id: String,
     #[sea_orm(column_type = "Text", unique)]
     pub email: String,
+    /// Security Audit Item 1: Organization ID for multi-tenant isolation
+    /// NULL = platform-level user (backward compatible)
+    /// Some(id) = tenant-scoped user belonging to specific organization
+    #[sea_orm(column_type = "Text", nullable)]
+    pub org_id: Option<String>,
     pub is_platform_owner: bool,
     #[sea_orm(column_type = "Text", nullable)]
     pub password_hash: Option<String>,

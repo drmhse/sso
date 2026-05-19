@@ -4,10 +4,13 @@ use crate::entities::{organizations, plans};
 use crate::error::{with_retrying_transaction, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
+use crate::services::permission_service::{
+    PermissionService, CAP_SERVICES_CREATE, CAP_SERVICES_MANAGE, CAP_SERVICES_VIEW,
+};
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, organizations::OrganizationStore, plans::PlanStore,
-    services::ServiceStore, subscriptions::SubscriptionStore, DB,
+    memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
+    plans::PlanStore, services::ServiceStore, subscriptions::SubscriptionStore, DB,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -31,6 +34,16 @@ fn hash_client_secret(client_secret: &str) -> String {
     general_purpose::STANDARD.encode(hash)
 }
 
+fn validate_redirect_uris_input(redirect_uris: &[String]) -> Result<()> {
+    if redirect_uris.is_empty() {
+        return Err(crate::error::AppError::BadRequest(
+            "At least one redirect URI is required".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateServiceRequest {
     pub slug: String,
@@ -52,6 +65,12 @@ pub struct UpdateServiceRequest {
     pub google_scopes: Option<Vec<String>>,
     pub redirect_uris: Option<Vec<String>>,
     pub device_activation_uri: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateServiceSecretResponse {
+    pub service: ServiceResponse,
+    pub client_secret: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,19 +113,25 @@ pub struct ListServicesQuery {
 #[derive(Debug, Deserialize)]
 pub struct CreatePlanRequest {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub price_cents: i64,
     pub currency: String,
     pub features: Option<Vec<String>>,
     pub stripe_price_id: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdatePlanRequest {
     pub name: Option<String>,
+    pub description: Option<String>,
     pub price_cents: Option<i64>,
     pub currency: Option<String>,
     pub features: Option<Vec<String>>,
     pub stripe_price_id: Option<Option<String>>,
+    pub is_default: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,12 +142,84 @@ pub struct PlanResponse {
 
 // Helper function to check if user has permission to manage services
 async fn can_manage_service(state: &AppState, user_id: &str, org_id: &str) -> Result<bool> {
-    let membership =
-        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), org_id, user_id).await?;
+    PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_SERVICES_MANAGE).await
+}
 
-    Ok(membership
-        .map(|m| m.role == "owner" || m.role == "admin")
-        .unwrap_or(false))
+async fn can_manage_specific_service(
+    state: &AppState,
+    user_id: &str,
+    org_id: &str,
+    service_id: &str,
+) -> Result<bool> {
+    if can_manage_service(state, user_id, org_id).await? {
+        return Ok(true);
+    }
+
+    if MembershipStore::find_by_org_and_user(DB::Conn(&state.db), org_id, user_id)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+
+    PermissionsStore::check(
+        DB::Conn(&state.db),
+        "service",
+        service_id,
+        "manager",
+        user_id,
+    )
+    .await
+}
+
+async fn can_create_service(state: &AppState, user_id: &str, org_id: &str) -> Result<bool> {
+    PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_SERVICES_CREATE).await
+}
+
+async fn can_view_service(
+    state: &AppState,
+    user_id: &str,
+    org_id: &str,
+    service_id: &str,
+) -> Result<bool> {
+    if PermissionService::check_any(
+        DB::Conn(&state.db),
+        org_id,
+        user_id,
+        &[CAP_SERVICES_VIEW, CAP_SERVICES_MANAGE],
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+
+    if MembershipStore::find_by_org_and_user(DB::Conn(&state.db), org_id, user_id)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+
+    if PermissionsStore::check(
+        DB::Conn(&state.db),
+        "service",
+        service_id,
+        "manager",
+        user_id,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+
+    PermissionsStore::check(
+        DB::Conn(&state.db),
+        "service",
+        service_id,
+        "viewer",
+        user_id,
+    )
+    .await
 }
 
 // Helper function to calculate service limits
@@ -167,6 +264,10 @@ pub async fn create_service(
     auth_user: axum::Extension<AuthUser>,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<Json<ServiceWithGrantsResponse>> {
+    if let Some(redirect_uris) = &req.redirect_uris {
+        validate_redirect_uris_input(redirect_uris)?;
+    }
+
     // Validate service type
     if !VALID_SERVICE_TYPES.contains(&req.service_type.as_str()) {
         return Err(crate::error::AppError::BadRequest(format!(
@@ -186,7 +287,7 @@ pub async fn create_service(
         crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // 4. AUTHORIZE: user is member with role in ('owner', 'admin')
-    if !can_manage_service(&state, &auth_user.user.id, &org.id).await? {
+    if !can_create_service(&state, &auth_user.user.id, &org.id).await? {
         return Err(crate::error::AppError::Forbidden(
             "Insufficient permissions to create services".to_string(),
         ));
@@ -246,82 +347,94 @@ pub async fn create_service(
     let org_id = org.id.clone();
 
     // 8. Execute transaction with automatic retry on database contention
-    let (service, default_plan) = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "create_service", |db| {
-        let service_id = service_id.clone();
-        let org_id = org_id.clone();
-        let slug = slug.clone();
-        let name = name.clone();
-        let service_type = service_type.clone();
-        let client_id = client_id.clone();
-        let client_secret_hash = client_secret_hash.clone();
-        let github_scopes_json = github_scopes_json.clone();
-        let microsoft_scopes_json = microsoft_scopes_json.clone();
-        let google_scopes_json = google_scopes_json.clone();
-        let redirect_uris_json = redirect_uris_json.clone();
-        let device_activation_uri = device_activation_uri.clone();
-        let plan_id = plan_id.clone();
-        Box::pin(async move {
-            // Create service using ServiceStore
-            let service = ServiceStore::create_with_options(
-                db.clone(),
-                &service_id,
-                &org_id,
-                &slug,
-                &name,
-                &service_type,
-                &client_id,
-                &client_secret_hash,
-                github_scopes_json.as_deref(),
-                microsoft_scopes_json.as_deref(),
-                google_scopes_json.as_deref(),
-                redirect_uris_json.as_deref(),
-                device_activation_uri.as_deref(),
-            )
-            .await?;
+    let (service, default_plan) = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_service",
+        |db| {
+            let service_id = service_id.clone();
+            let org_id = org_id.clone();
+            let slug = slug.clone();
+            let name = name.clone();
+            let service_type = service_type.clone();
+            let client_id = client_id.clone();
+            let client_secret_hash = client_secret_hash.clone();
+            let github_scopes_json = github_scopes_json.clone();
+            let microsoft_scopes_json = microsoft_scopes_json.clone();
+            let google_scopes_json = google_scopes_json.clone();
+            let redirect_uris_json = redirect_uris_json.clone();
+            let device_activation_uri = device_activation_uri.clone();
+            let plan_id = plan_id.clone();
+            Box::pin(async move {
+                // Create service using ServiceStore
+                let service = ServiceStore::create_with_options(
+                    db.clone(),
+                    &service_id,
+                    &org_id,
+                    &slug,
+                    &name,
+                    &service_type,
+                    &client_id,
+                    &client_secret_hash,
+                    github_scopes_json.as_deref(),
+                    microsoft_scopes_json.as_deref(),
+                    google_scopes_json.as_deref(),
+                    redirect_uris_json.as_deref(),
+                    device_activation_uri.as_deref(),
+                )
+                .await?;
 
-            // AUTO-CREATE default plan
-            let now = Utc::now().naive_utc();
-            let features_json = serde_json::to_string::<Vec<String>>(&vec![]).unwrap();
+                // AUTO-CREATE default plan
+                let now = Utc::now().naive_utc();
+                let features_json = serde_json::to_string::<Vec<String>>(&vec![]).unwrap();
 
-            PlanStore::create(
-                db.clone(),
-                &plan_id,
-                &service_id,
-                DEFAULT_TIER_NAME,
-                0,
-                "usd",
-                &features_json,
-                None, // No Stripe price ID for default free plan
-                now,
-            )
-            .await?;
+                PlanStore::create(
+                    db.clone(),
+                    &plan_id,
+                    &service_id,
+                    DEFAULT_TIER_NAME,
+                    None, // No description for default plan
+                    0,
+                    "usd",
+                    &features_json,
+                    None, // No Stripe price ID for default free plan
+                    true, // Default plan is_default = true
+                    now,
+                )
+                .await?;
 
-            // Fetch the created plan
-            let default_plan_entity = plans::Entity::find_by_id(plan_id.clone())
-                .one(&db)
-                .await?
-                .ok_or_else(|| {
-                    crate::error::AppError::InternalServerError("Failed to create plan".to_string())
-                })?;
+                // Fetch the created plan
+                let default_plan_entity = plans::Entity::find_by_id(plan_id.clone())
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::error::AppError::InternalServerError(
+                            "Failed to create plan".to_string(),
+                        )
+                    })?;
 
-            // Convert plan entity to Plan model
-            let default_plan = Plan {
-                id: default_plan_entity.id,
-                service_id: default_plan_entity.service_id,
-                name: default_plan_entity.name,
-                price_cents: default_plan_entity.price_cents as i64,
-                currency: default_plan_entity.currency,
-                features: default_plan_entity.features,
-                stripe_price_id: default_plan_entity.stripe_price_id,
-                created_at: chrono::DateTime::from_naive_utc_and_offset(
-                    default_plan_entity.created_at,
-                    Utc,
-                ),
-            };
+                // Convert plan entity to Plan model
+                let default_plan = Plan {
+                    id: default_plan_entity.id,
+                    service_id: default_plan_entity.service_id,
+                    name: default_plan_entity.name,
+                    description: default_plan_entity.description,
+                    price_cents: default_plan_entity.price_cents as i64,
+                    currency: default_plan_entity.currency,
+                    features: default_plan_entity.features,
+                    stripe_price_id: default_plan_entity.stripe_price_id,
+                    is_default: default_plan_entity.is_default,
+                    created_at: chrono::DateTime::from_naive_utc_and_offset(
+                        default_plan_entity.created_at,
+                        Utc,
+                    ),
+                };
 
-            Ok((service, default_plan))
-        })
-    })
+                Ok((service, default_plan))
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -371,15 +484,58 @@ pub async fn list_organization_services(
                 crate::error::AppError::Forbidden("Not a member of this organization".to_string())
             })?;
 
-    // Get services with filters using ServiceStore
-    let services = ServiceStore::list_with_filters(
+    // Fetch all filtered services first; per-service grants must be applied before pagination.
+    let all_services = ServiceStore::list_with_filters(
         DB::Conn(&state.db),
         &org.id,
         query.service_type.as_deref(),
-        query.limit,
-        query.offset,
+        None,
+        None,
     )
     .await?;
+    let can_view_all = PermissionService::check_any(
+        DB::Conn(&state.db),
+        &org.id,
+        &auth_user.user.id,
+        &[CAP_SERVICES_VIEW, CAP_SERVICES_MANAGE],
+    )
+    .await?;
+
+    let mut services = Vec::new();
+    for service in all_services {
+        if can_view_all
+            || PermissionsStore::check(
+                DB::Conn(&state.db),
+                "service",
+                &service.id,
+                "manager",
+                &auth_user.user.id,
+            )
+            .await?
+            || PermissionsStore::check(
+                DB::Conn(&state.db),
+                "service",
+                &service.id,
+                "viewer",
+                &auth_user.user.id,
+            )
+            .await?
+        {
+            services.push(service);
+        }
+    }
+
+    let accessible_total = services.len() as i64;
+    let offset = query.offset.unwrap_or(0).max(0) as usize;
+    let limit = query
+        .limit
+        .map(|value| value.max(0) as usize)
+        .unwrap_or(services.len());
+    let services = services
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
 
     // Get detailed information for each service
     let mut join_set = JoinSet::new();
@@ -407,7 +563,7 @@ pub async fn list_organization_services(
     let services_with_details: Vec<ServiceWithDetails> = join_set.join_all().await;
 
     // Get usage information
-    let current_services = services_with_details.len() as i64;
+    let current_services = accessible_total;
     let (max_services, tier_name) = get_service_limits(&state, &org).await?;
 
     Ok(Json(ServiceListResponse {
@@ -443,6 +599,12 @@ pub async fn get_service(
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
 
+    if !can_view_service(&state, &auth_user.user.id, &org.id, &service.id).await? {
+        return Err(crate::error::AppError::Forbidden(
+            "Insufficient permissions to view this service".to_string(),
+        ));
+    }
+
     Ok(Json(ServiceResponse::from(service)))
 }
 
@@ -453,17 +615,14 @@ pub async fn update_service(
     auth_user: axum::Extension<AuthUser>,
     Json(req): Json<UpdateServiceRequest>,
 ) -> Result<Json<ServiceResponse>> {
+    if let Some(redirect_uris) = &req.redirect_uris {
+        validate_redirect_uris_input(redirect_uris)?;
+    }
+
     // Get organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
-
-    // Check if user has permission
-    if !can_manage_service(&state, &auth_user.user.id, &org.id).await? {
-        return Err(crate::error::AppError::Forbidden(
-            "Insufficient permissions to update services".to_string(),
-        ));
-    }
 
     // Validate service type if provided
     if let Some(service_type) = &req.service_type {
@@ -486,6 +645,16 @@ pub async fn update_service(
     {
         return Err(crate::error::AppError::BadRequest(
             "No fields to update".to_string(),
+        ));
+    }
+
+    let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
+        .await?
+        .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
+
+    if !can_manage_specific_service(&state, &auth_user.user.id, &org.id, &service.id).await? {
+        return Err(crate::error::AppError::Forbidden(
+            "Insufficient permissions to update this service".to_string(),
         ));
     }
 
@@ -523,6 +692,53 @@ pub async fn update_service(
     .await?;
 
     Ok(Json(ServiceResponse::from(updated_service)))
+}
+
+// Rotate service client secret
+pub async fn rotate_service_secret(
+    State(state): State<AppState>,
+    Path((org_slug, service_slug)): Path<(String, String)>,
+    auth_user: axum::Extension<AuthUser>,
+) -> Result<Json<RotateServiceSecretResponse>> {
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+
+    let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
+        .await?
+        .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
+
+    if !can_manage_specific_service(&state, &auth_user.user.id, &org.id, &service.id).await? {
+        return Err(crate::error::AppError::Forbidden(
+            "Insufficient permissions to rotate service secrets".to_string(),
+        ));
+    }
+
+    let client_secret = Uuid::new_v4().to_string();
+    let client_secret_hash = hash_client_secret(&client_secret);
+    let service = ServiceStore::update_client_secret_hash(
+        DB::Conn(&state.db),
+        &org.id,
+        &service_slug,
+        &client_secret_hash,
+    )
+    .await?;
+
+    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.user.id), "service.secret_rotated")
+        .target("service", &service.id)
+        .success(true)
+        .details_json(Some(json!({
+            "service_slug": service_slug,
+            "service_name": service.name,
+            "client_id": service.client_id
+        })))
+        .build();
+    state.audit_actor.log_org(event).await;
+
+    Ok(Json(RotateServiceSecretResponse {
+        service: ServiceResponse::from(service),
+        client_secret,
+    }))
 }
 
 // Delete service
@@ -586,17 +802,16 @@ pub async fn create_plan(
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user has permission
-    if !can_manage_service(&state, &auth_user.user.id, &org.id).await? {
-        return Err(crate::error::AppError::Forbidden(
-            "Insufficient permissions to create plans".to_string(),
-        ));
-    }
-
     // Get service
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
+
+    if !can_manage_specific_service(&state, &auth_user.user.id, &org.id, &service.id).await? {
+        return Err(crate::error::AppError::Forbidden(
+            "Insufficient permissions to create plans for this service".to_string(),
+        ));
+    }
 
     let id = Uuid::new_v4().to_string();
     let features_json = req
@@ -611,10 +826,12 @@ pub async fn create_plan(
         &id,
         &service.id,
         &req.name,
+        req.description.as_deref(),
         req.price_cents,
         &req.currency,
         &features_json,
         req.stripe_price_id.as_deref(),
+        req.is_default,
         now,
     )
     .await?;
@@ -632,10 +849,12 @@ pub async fn create_plan(
         id: plan_entity.id.clone(),
         service_id: plan_entity.service_id,
         name: plan_entity.name,
+        description: plan_entity.description,
         price_cents: plan_entity.price_cents as i64,
         currency: plan_entity.currency,
         features: plan_entity.features,
         stripe_price_id: plan_entity.stripe_price_id,
+        is_default: plan_entity.is_default,
         created_at: chrono::DateTime::from_naive_utc_and_offset(plan_entity.created_at, Utc),
     };
 
@@ -673,6 +892,12 @@ pub async fn list_service_plans(
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
 
+    if !can_view_service(&state, &auth_user.user.id, &org.id, &service.id).await? {
+        return Err(crate::error::AppError::Forbidden(
+            "Insufficient permissions to view plans for this service".to_string(),
+        ));
+    }
+
     // Get all plans for this service using PlanStore
     let plan_entities = PlanStore::find_by_service(DB::Conn(&state.db), &service.id).await?;
 
@@ -687,10 +912,12 @@ pub async fn list_service_plans(
             id: plan_entity.id,
             service_id: plan_entity.service_id,
             name: plan_entity.name,
+            description: plan_entity.description,
             price_cents: plan_entity.price_cents as i64,
             currency: plan_entity.currency,
             features: plan_entity.features,
             stripe_price_id: plan_entity.stripe_price_id,
+            is_default: plan_entity.is_default,
             created_at: chrono::DateTime::from_naive_utc_and_offset(plan_entity.created_at, Utc),
         };
 
@@ -715,17 +942,16 @@ pub async fn update_plan(
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user has permission (admin or owner)
-    if !can_manage_service(&state, &auth_user.user.id, &org.id).await? {
-        return Err(crate::error::AppError::Forbidden(
-            "Insufficient permissions to update plans".to_string(),
-        ));
-    }
-
     // Get service to verify it belongs to the organization
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
+
+    if !can_manage_specific_service(&state, &auth_user.user.id, &org.id, &service.id).await? {
+        return Err(crate::error::AppError::Forbidden(
+            "Insufficient permissions to update plans for this service".to_string(),
+        ));
+    }
 
     // Verify the plan belongs to this service
     let existing_plan = PlanStore::find_by_id(DB::Conn(&state.db), &plan_id)
@@ -758,15 +984,20 @@ pub async fn update_plan(
     // Convert stripe_price_id Option<Option<String>> to Option<Option<&str>>
     let stripe_price_id_update = req.stripe_price_id.as_ref().map(|opt| opt.as_deref());
 
+    // Convert description Option<String> to Option<Option<&str>>
+    let description_update = req.description.as_ref().map(|s| Some(s.as_str()));
+
     // Update plan using PlanStore
     let updated_plan_entity = PlanStore::update(
         DB::Conn(&state.db),
         &plan_id,
         req.name.as_deref(),
+        description_update,
         req.price_cents,
         req.currency.as_deref(),
         features_json.as_deref(),
         stripe_price_id_update,
+        req.is_default,
     )
     .await?;
 
@@ -775,10 +1006,12 @@ pub async fn update_plan(
         id: updated_plan_entity.id.clone(),
         service_id: updated_plan_entity.service_id,
         name: updated_plan_entity.name,
+        description: updated_plan_entity.description,
         price_cents: updated_plan_entity.price_cents as i64,
         currency: updated_plan_entity.currency,
         features: updated_plan_entity.features,
         stripe_price_id: updated_plan_entity.stripe_price_id,
+        is_default: updated_plan_entity.is_default,
         created_at: chrono::DateTime::from_naive_utc_and_offset(
             updated_plan_entity.created_at,
             Utc,
@@ -806,17 +1039,16 @@ pub async fn delete_plan(
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user has permission (admin or owner)
-    if !can_manage_service(&state, &auth_user.user.id, &org.id).await? {
-        return Err(crate::error::AppError::Forbidden(
-            "Insufficient permissions to delete plans".to_string(),
-        ));
-    }
-
     // Get service to verify it belongs to the organization
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Service not found".to_string()))?;
+
+    if !can_manage_specific_service(&state, &auth_user.user.id, &org.id, &service.id).await? {
+        return Err(crate::error::AppError::Forbidden(
+            "Insufficient permissions to delete plans for this service".to_string(),
+        ));
+    }
 
     // Verify the plan exists and belongs to this service
     let existing_plan = PlanStore::find_by_id(DB::Conn(&state.db), &plan_id)

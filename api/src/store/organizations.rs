@@ -4,7 +4,7 @@ use crate::entities::prelude::{LoginEvents, Memberships, Organizations, Services
 use crate::entities::{login_events, memberships, organizations, services, users};
 use crate::error::{AppError, Result};
 use crate::store::DB;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, JoinType, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
@@ -606,6 +606,7 @@ impl OrganizationStore {
             .column(organizations::Column::DomainVerificationToken)
             .column(organizations::Column::BrandLogoUrl)
             .column(organizations::Column::BrandPrimaryColor)
+            .column(organizations::Column::FeatureOverrides)
             .column(organizations::Column::CreatedAt)
             .column(organizations::Column::UpdatedAt)
             .column_as(users::Column::Id, "owner_id")
@@ -722,14 +723,11 @@ impl OrganizationStore {
         start_date: chrono::NaiveDateTime,
         end_date: chrono::NaiveDateTime,
     ) -> Result<Vec<GrowthTrendData>> {
-        use sea_orm::sea_query::{Alias, Expr, Func, SimpleExpr};
+        use sea_orm::sea_query::{Alias, Expr, SimpleExpr};
 
-        // Use CAST(created_at AS DATE) which is standard SQL
-        let date_expr: SimpleExpr = Func::cast_as(
-            Expr::col(organizations::Column::CreatedAt),
-            Alias::new("DATE"),
-        )
-        .into();
+        // Use DATE() function - works in SQLite, MySQL, PostgreSQL
+        let date_expr: SimpleExpr =
+            Expr::cust_with_expr("DATE($1)", Expr::col(organizations::Column::CreatedAt));
 
         let trends = Organizations::find()
             .select_only()
@@ -918,6 +916,11 @@ fn build_oauth_client(
                 "OIDC not supported in organizations::build_oauth_client".to_string(),
             ))
         }
+        Provider::Password => {
+            return Err(AppError::InternalServerError(
+                "Password provider not supported in organizations::build_oauth_client".to_string(),
+            ))
+        }
     };
 
     Ok(
@@ -947,12 +950,13 @@ pub struct OrgWithOwner {
     pub domain_verification_token: Option<String>,
     pub brand_logo_url: Option<String>,
     pub brand_primary_color: Option<String>,
+    pub feature_overrides: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
-    pub owner_id: String,
-    pub owner_email: String,
-    pub owner_is_platform_owner: bool,
-    pub owner_created_at: NaiveDateTime,
+    pub owner_id: Option<String>,
+    pub owner_email: Option<String>,
+    pub owner_is_platform_owner: Option<bool>,
+    pub owner_created_at: Option<NaiveDateTime>,
 }
 
 /// Recent organization data
@@ -979,6 +983,6 @@ pub struct TopOrganizationData {
 /// Growth trend data point
 #[derive(Debug, FromQueryResult)]
 pub struct GrowthTrendData {
-    pub date: NaiveDate,
+    pub date: String,
     pub count: i64,
 }

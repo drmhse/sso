@@ -214,4 +214,25 @@ export class WebhooksModule {
     );
     return response.data;
   }
+
+  /**
+   * Trigger a test event for a specific webhook (owner/admin only).
+   * Generates a "webhook.test.ping" event to verify connectivity.
+   *
+   * @param orgSlug Organization slug
+   * @param webhookId Webhook ID
+   * @returns Result including delivery ID
+   *
+   * @example
+   * ```typescript
+   * const result = await sso.organizations.webhooks.test('acme-corp', 'webhook-123');
+   * console.log('Test event sent, delivery ID:', result.delivery_id);
+   * ```
+   */
+  public async test(orgSlug: string, webhookId: string): Promise<{ success: boolean; job_id: string; delivery_id: string }> {
+    const response = await this.http.post<{ success: boolean; job_id: string; delivery_id: string }>(
+      `/api/organizations/${orgSlug}/webhooks/${webhookId}/test`
+    );
+    return response.data;
+  }
 }

@@ -336,6 +336,42 @@ impl SubscriptionStore {
         Ok(unique_user_ids.len() as i64)
     }
 
+    /// Check if a specific user is an end-user of an organization
+    /// Uses the same query logic as list_end_users_by_org for consistency
+    pub async fn is_end_user_of_org(db: DB<'_>, user_id: &str, org_id: &str) -> Result<bool> {
+        use crate::entities::{identities, services, subscriptions};
+        use sea_orm::{JoinType, QuerySelect, RelationTrait};
+
+        // Check if user has any identity for this org
+        let identity_exists = identities::Entity::find()
+            .filter(identities::Column::UserId.eq(user_id))
+            .filter(identities::Column::IssuingOrgId.eq(org_id))
+            .select_only()
+            .column(identities::Column::Id)
+            .into_tuple::<String>()
+            .one(&db)
+            .await?
+            .is_some();
+
+        if identity_exists {
+            return Ok(true);
+        }
+
+        // Check if user has any subscription for a service in this org
+        let subscription_exists = subscriptions::Entity::find()
+            .join(JoinType::InnerJoin, subscriptions::Relation::Services.def())
+            .filter(subscriptions::Column::UserId.eq(user_id))
+            .filter(services::Column::OrgId.eq(org_id))
+            .select_only()
+            .column(subscriptions::Column::Id)
+            .into_tuple::<String>()
+            .one(&db)
+            .await?
+            .is_some();
+
+        Ok(subscription_exists)
+    }
+
     /// List subscriptions for multiple users in an organization (for end-user management)
     /// Returns subscriptions with service and plan details
     pub async fn list_subscriptions_for_users_in_org(

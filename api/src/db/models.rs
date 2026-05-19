@@ -78,6 +78,54 @@ impl From<crate::entities::identities::Model> for Identity {
 }
 
 #[derive(Debug, Clone, FromQueryResult, Serialize, Deserialize)]
+pub struct UpstreamProvider {
+    pub id: String,
+    pub org_id: String,
+    pub connection_id: String,
+    pub name: String,
+    pub provider_type: String,
+    pub client_id: String,
+    #[serde(skip_serializing)]
+    pub client_secret_encrypted: Vec<u8>,
+    pub encryption_key_id: String,
+    pub authorization_url: Option<String>,
+    pub token_url: Option<String>,
+    pub userinfo_url: Option<String>,
+    pub discovery_url: Option<String>,
+    pub scopes: Option<String>,
+    pub issuer: Option<String>,
+    pub metadata: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<crate::entities::upstream_providers::Model> for UpstreamProvider {
+    fn from(model: crate::entities::upstream_providers::Model) -> Self {
+        Self {
+            id: model.id,
+            org_id: model.org_id,
+            connection_id: model.connection_id,
+            name: model.name,
+            provider_type: model.provider_type,
+            client_id: model.client_id,
+            client_secret_encrypted: model.client_secret_encrypted,
+            encryption_key_id: model.encryption_key_id,
+            authorization_url: model.authorization_url,
+            token_url: model.token_url,
+            userinfo_url: model.userinfo_url,
+            discovery_url: model.discovery_url,
+            scopes: model.scopes,
+            issuer: model.issuer,
+            metadata: model.metadata,
+            enabled: model.enabled,
+            created_at: naive_to_utc(model.created_at),
+            updated_at: naive_to_utc(model.updated_at),
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromQueryResult, Serialize, Deserialize)]
 pub struct Organization {
     pub id: String,
     pub slug: String,
@@ -97,6 +145,7 @@ pub struct Organization {
     pub domain_verification_token: Option<String>,
     pub brand_logo_url: Option<String>,
     pub brand_primary_color: Option<String>,
+    pub feature_overrides: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -122,6 +171,7 @@ impl From<crate::entities::organizations::Model> for Organization {
             domain_verification_token: model.domain_verification_token,
             brand_logo_url: model.brand_logo_url,
             brand_primary_color: model.brand_primary_color,
+            feature_overrides: model.feature_overrides,
             created_at: naive_to_utc(model.created_at),
             updated_at: naive_to_utc(model.updated_at),
         }
@@ -310,10 +360,12 @@ pub struct Plan {
     pub id: String,
     pub service_id: String,
     pub name: String,
+    pub description: Option<String>,
     pub price_cents: i64,
     pub currency: String,
     pub features: Option<String>, // JSON string
     pub stripe_price_id: Option<String>,
+    pub is_default: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -422,6 +474,8 @@ pub struct OAuthState {
     pub device_user_code: Option<String>,
     pub saml_state_id: Option<String>,
     pub upstream_connection_id: Option<String>,
+    pub requested_scopes: Option<String>,
+    pub provider_token_request_state: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -440,6 +494,8 @@ impl From<crate::entities::oauth_states::Model> for OAuthState {
             device_user_code: model.device_user_code,
             saml_state_id: model.saml_state_id,
             upstream_connection_id: model.upstream_connection_id,
+            requested_scopes: model.requested_scopes,
+            provider_token_request_state: model.provider_token_request_state,
             created_at: naive_to_utc(model.created_at),
             expires_at: naive_to_utc(model.expires_at),
         }

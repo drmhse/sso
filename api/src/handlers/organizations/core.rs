@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::auth::jwt::JwtService;
 use crate::constants::{
     DEFAULT_MAX_ORGS_PER_USER, DEFAULT_TIER_NAME, MAX_NAME_LENGTH, MAX_SLUG_LENGTH,
@@ -6,6 +8,9 @@ use crate::constants::{
 use crate::entities::{memberships, organization_tiers, organizations, users};
 use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::permission_service::{
+    PermissionService, CAP_ORG_SETTINGS_MANAGE, CAP_RISK_EVENTS_VIEW, CAP_RISK_POLICIES_MANAGE,
+};
 use crate::state::AppState;
 use crate::store::{
     memberships::MembershipStore, organization_tiers::OrganizationTierStore,
@@ -38,6 +43,38 @@ pub struct OrganizationResponse {
     pub membership_count: i64,
     pub service_count: i64,
     pub tier: Option<organization_tiers::Model>,
+}
+
+async fn require_capability(
+    state: &AppState,
+    org_id: &str,
+    user: &crate::entities::users::Model,
+    capability: &str,
+    message: &str,
+) -> Result<()> {
+    if user.is_platform_owner
+        || PermissionService::check(DB::Conn(&state.db), org_id, &user.id, capability).await?
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(message.to_string()))
+}
+
+async fn require_any_capability(
+    state: &AppState,
+    org_id: &str,
+    user: &crate::entities::users::Model,
+    capabilities: &[&str],
+    message: &str,
+) -> Result<()> {
+    if user.is_platform_owner
+        || PermissionService::check_any(DB::Conn(&state.db), org_id, &user.id, capabilities).await?
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(message.to_string()))
 }
 
 #[derive(Debug, Serialize)]
@@ -75,8 +112,9 @@ pub async fn create_organization(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_ORGS_PER_USER);
-    
-    let current_org_count = OrganizationStore::count_by_owner(DB::Conn(&state.db), &owner.id).await?;
+
+    let current_org_count =
+        OrganizationStore::count_by_owner(DB::Conn(&state.db), &owner.id).await?;
     if current_org_count >= max_orgs_per_user {
         return Err(AppError::BadRequest(format!(
             "You have reached the maximum number of organizations ({}) you can create. Please contact support if you need more.",
@@ -90,8 +128,12 @@ pub async fn create_organization(
     let owner_id = owner.id.clone();
 
     // Execute transaction with automatic retry on database contention
-    let (organization, membership) =
-        with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "create_organization", |db| {
+    let (organization, membership) = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_organization",
+        |db| {
             let slug = slug.clone();
             let name = name.clone();
             let owner_id = owner_id.clone();
@@ -159,15 +201,22 @@ pub async fn create_organization(
 
                 Ok((organization, membership))
             })
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     // Create billing customer
     // We ignore errors here as we don't want to fail org creation if billing setup fails
     // The user can try accessing the billing portal later which should trigger creation on demand (TODO)
     // or they can contact support.
-    if let Err(e) = super::billing::create_billing_customer(&state, &organization.id, &organization.name).await {
-        tracing::error!("Failed to create billing customer for org {}: {}", organization.id, e);
+    if let Err(e) =
+        super::billing::create_billing_customer(&state, &organization.id, &organization.name).await
+    {
+        tracing::error!(
+            "Failed to create billing customer for org {}: {}",
+            organization.id,
+            e
+        );
     }
 
     // Generate JWT with organization context
@@ -191,27 +240,33 @@ pub async fn create_organization(
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
 
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "create_org_session", |db| {
-        let user_id = owner.id.clone();
-        let token_hash = token_hash.clone();
-        let refresh_token = refresh_token.clone();
-        let org_slug = organization.slug.clone();
-        Box::pin(async move {
-            SessionStore::create(
-                db.clone(),
-                &user_id,
-                &token_hash,
-                expires_at.naive_utc(),
-                Some(&refresh_token),
-                Some(refresh_expires_at.naive_utc()),
-                Some(&org_slug),
-                None, // service_id
-                None, // user_agent
-                None, // ip_address
-            )
-            .await
-        })
-    })
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_org_session",
+        |db| {
+            let user_id = owner.id.clone();
+            let token_hash = token_hash.clone();
+            let refresh_token = refresh_token.clone();
+            let org_slug = organization.slug.clone();
+            Box::pin(async move {
+                SessionStore::create(
+                    db.clone(),
+                    &user_id,
+                    &token_hash,
+                    expires_at.naive_utc(),
+                    Some(&refresh_token),
+                    Some(refresh_expires_at.naive_utc()),
+                    Some(&org_slug),
+                    None, // service_id
+                    None, // user_agent
+                    None, // ip_address
+                )
+                .await
+            })
+        },
+    )
     .await?;
 
     Ok(Json(CreateOrganizationResponse {
@@ -250,7 +305,7 @@ pub async fn get_organization(
     }))
 }
 
-/// Update organization (owner/admin only)
+/// Update organization settings.
 pub async fn update_organization(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -264,25 +319,36 @@ pub async fn update_organization(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner or admin
-    let _membership =
-        crate::middleware::check_org_admin(&state.db, &user.id, &organization.id).await?;
+    require_capability(
+        &state,
+        &organization.id,
+        user,
+        CAP_ORG_SETTINGS_MANAGE,
+        "Insufficient permissions to manage organization settings",
+    )
+    .await?;
 
     // Verify changes
-    let updated_org = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "update_organization", |db| {
-        let org_id = organization.id.clone();
-        let name = req.name.clone();
-        Box::pin(async move {
-            if let Some(name) = &name {
-                 // Validate name length
-                 validate_organization_name(name)?;
-                 OrganizationStore::update_name(db.clone(), &org_id, name).await
-            } else {
-                 // If no fields were updated, just update the timestamp
-                 OrganizationStore::update_timestamp(db.clone(), &org_id).await
-            }
-        })
-    })
+    let updated_org = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "update_organization",
+        |db| {
+            let org_id = organization.id.clone();
+            let name = req.name.clone();
+            Box::pin(async move {
+                if let Some(name) = &name {
+                    // Validate name length
+                    validate_organization_name(name)?;
+                    OrganizationStore::update_name(db.clone(), &org_id, name).await
+                } else {
+                    // If no fields were updated, just update the timestamp
+                    OrganizationStore::update_timestamp(db.clone(), &org_id).await
+                }
+            })
+        },
+    )
     .await?;
 
     let (membership_count, service_count, tier) =
@@ -313,12 +379,16 @@ pub async fn delete_organization(
     crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
 
     // Delete organization
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "delete_organization", |db| {
-        let org_id = organization.id.clone();
-        Box::pin(async move {
-            OrganizationStore::delete(db.clone(), &org_id).await
-        })
-    })
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "delete_organization",
+        |db| {
+            let org_id = organization.id.clone();
+            Box::pin(async move { OrganizationStore::delete(db.clone(), &org_id).await })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor (fire and forget since org is already deleted)
@@ -371,6 +441,128 @@ pub async fn list_user_organizations(
     }
 
     Ok(Json(results))
+}
+
+/// Response for selecting an organization
+#[derive(Debug, Serialize)]
+pub struct SelectOrganizationResponse {
+    pub organization: organizations::Model,
+    pub membership: memberships::Model,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: i64,
+}
+
+/// POST /api/organizations/:org_slug/select - Switch to a different organization context
+///
+/// This endpoint allows an authenticated user to switch their session to a different
+/// organization they are a member of. It issues a new JWT with the organization context
+/// and creates a new session, enabling seamless organization switching without re-authentication.
+pub async fn select_organization(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(org_slug): Path<String>,
+) -> Result<Json<SelectOrganizationResponse>> {
+    let user = &auth_user.user;
+
+    // Find organization
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Verify the organization is active
+    if organization.status != "active" {
+        return Err(AppError::Forbidden(format!(
+            "Organization is not active. Current status: {}",
+            organization.status
+        )));
+    }
+
+    // Verify user is a member of this organization
+    let membership =
+        MembershipStore::find_by_org_slug_and_user(DB::Conn(&state.db), &org_slug, &user.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Forbidden("You are not a member of this organization".to_string())
+            })?;
+
+    // Check MAU limit (billing enforcement)
+    crate::services::tier_enforcement::TierService::check_mau_limit(
+        DB::Conn(&state.db),
+        &organization.id,
+    )
+    .await?;
+
+    // Generate new JWT with organization context
+    let access_token = state
+        .jwt_service
+        .create_token(
+            &user.id,
+            &user.email,
+            user.is_platform_owner,
+            Some(&org_slug),
+            None, // service_slug
+        )
+        .map_err(|e| AppError::InternalServerError(format!("Failed to create JWT: {}", e)))?;
+
+    // Generate refresh token
+    let refresh_token = Uuid::new_v4().to_string();
+
+    // Store session with refresh token
+    let token_hash = JwtService::hash_token(&access_token);
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
+    let refresh_expires_at = now + chrono::Duration::days(30);
+
+    // Clone values for transaction
+    let user_id = user.id.clone();
+    let token_hash_clone = token_hash.clone();
+    let refresh_token_clone = refresh_token.clone();
+    let org_slug_clone = org_slug.clone();
+
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "select_org_session",
+        |db| {
+            let user_id = user_id.clone();
+            let token_hash = token_hash_clone.clone();
+            let refresh_token = refresh_token_clone.clone();
+            let org_slug = org_slug_clone.clone();
+            Box::pin(async move {
+                SessionStore::create(
+                    db.clone(),
+                    &user_id,
+                    &token_hash,
+                    expires_at.naive_utc(),
+                    Some(&refresh_token),
+                    Some(refresh_expires_at.naive_utc()),
+                    Some(&org_slug),
+                    None, // service_id
+                    None, // user_agent
+                    None, // ip_address
+                )
+                .await
+            })
+        },
+    )
+    .await?;
+
+    tracing::info!(
+        user_id = %user.id,
+        email = %user.email,
+        org_slug = %org_slug,
+        "User switched organization context"
+    );
+
+    Ok(Json(SelectOrganizationResponse {
+        organization,
+        membership,
+        access_token,
+        refresh_token,
+        expires_in: state.config.jwt_expiration_hours * 3600,
+    }))
 }
 
 // Helper functions
@@ -512,24 +704,14 @@ pub async fn get_risk_settings(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check user has permission to access risk settings (org admin or platform owner)
-    if !_auth_user.user.is_platform_owner {
-        let membership = MembershipStore::find_by_org_slug_and_user(
-            DB::Conn(&state.db),
-            &org_slug,
-            &_auth_user.user.id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::Forbidden("You are not a member of this organization".to_string())
-        })?;
-
-        if !["admin", "owner"].contains(&membership.role.as_str()) {
-            return Err(AppError::Forbidden(
-                "You do not have permission to manage risk settings".to_string(),
-            ));
-        }
-    }
+    require_any_capability(
+        &state,
+        &org.id,
+        &_auth_user.user,
+        &[CAP_RISK_EVENTS_VIEW, CAP_RISK_POLICIES_MANAGE],
+        "Insufficient permissions to view risk settings",
+    )
+    .await?;
 
     // Get risk rules
     let risk_rules = RiskRulesStore::find_by_org(DB::Conn(&state.db), &org.id)
@@ -559,24 +741,14 @@ pub async fn update_risk_settings(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check user has permission (org admin or platform owner)
-    if !_auth_user.user.is_platform_owner {
-        let membership = MembershipStore::find_by_org_slug_and_user(
-            DB::Conn(&state.db),
-            &org_slug,
-            &_auth_user.user.id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::Forbidden("You are not a member of this organization".to_string())
-        })?;
-
-        if !["admin", "owner"].contains(&membership.role.as_str()) {
-            return Err(AppError::Forbidden(
-                "You do not have permission to manage risk settings".to_string(),
-            ));
-        }
-    }
+    require_capability(
+        &state,
+        &org.id,
+        &_auth_user.user,
+        CAP_RISK_POLICIES_MANAGE,
+        "Insufficient permissions to manage risk settings",
+    )
+    .await?;
 
     // Validate enforcement mode if provided
     if let Some(ref mode) = req.enforcement_mode {
@@ -690,24 +862,14 @@ pub async fn reset_risk_settings(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check user has permission (org admin or platform owner)
-    if !_auth_user.user.is_platform_owner {
-        let membership = MembershipStore::find_by_org_slug_and_user(
-            DB::Conn(&state.db),
-            &org_slug,
-            &_auth_user.user.id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::Forbidden("You are not a member of this organization".to_string())
-        })?;
-
-        if !["admin", "owner"].contains(&membership.role.as_str()) {
-            return Err(AppError::Forbidden(
-                "You do not have permission to manage risk settings".to_string(),
-            ));
-        }
-    }
+    require_capability(
+        &state,
+        &org.id,
+        &_auth_user.user,
+        CAP_RISK_POLICIES_MANAGE,
+        "Insufficient permissions to manage risk settings",
+    )
+    .await?;
 
     // Reset to defaults
     let reset_rules = RiskRulesStore::update(

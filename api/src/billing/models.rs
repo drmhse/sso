@@ -1,5 +1,7 @@
 //! Unified billing models for provider-agnostic billing operations.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -104,9 +106,7 @@ pub enum BillingEvent {
         external_subscription_id: String,
     },
     /// Payment succeeded
-    PaymentSucceeded {
-        external_customer_id: String,
-    },
+    PaymentSucceeded { external_customer_id: String },
     /// Payment failed
     PaymentFailed {
         external_customer_id: String,
@@ -118,9 +118,7 @@ pub enum BillingEvent {
         external_subscription_id: Option<String>,
     },
     /// Event type not handled
-    Unhandled {
-        event_type: String,
-    },
+    Unhandled { event_type: String },
 }
 
 /// Result of creating a checkout session

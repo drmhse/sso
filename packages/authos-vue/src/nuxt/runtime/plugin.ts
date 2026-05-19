@@ -5,7 +5,7 @@ import { CookieStorage } from '@drmhse/sso-sdk';
 export default defineNuxtPlugin((nuxtApp) => {
   const config = useRuntimeConfig();
   const authOSConfig = config.public.authOS as {
-    baseUrl: string;
+    baseURL: string;
     tokenCookie?: string;
     domain?: string;
     path?: string;
@@ -22,7 +22,7 @@ export default defineNuxtPlugin((nuxtApp) => {
   });
 
   const authOS = createAuthOS({
-    baseUrl: authOSConfig.baseUrl,
+    baseURL: authOSConfig.baseURL,
     storage,
   });
 

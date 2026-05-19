@@ -30,6 +30,62 @@ export interface StartLinkResponse {
   authorization_url: string;
 }
 
+export interface ProviderDefinition {
+  provider: string;
+  display_name: string;
+  provider_type: string;
+  scopes: string[];
+  connect_supported: boolean;
+}
+
+export interface LinkedAccountGrant {
+  id: string;
+  service_id: string;
+  scopes: string[];
+  granted_at: string;
+  last_used_at?: string;
+}
+
+export interface LinkedAccount {
+  id: string;
+  provider: string;
+  provider_user_id: string;
+  email?: string;
+  display_name?: string;
+  scopes: string[];
+  expires_at?: string;
+  status: string;
+  grants: LinkedAccountGrant[];
+}
+
+export interface LinkedAccountsResponse {
+  accounts: LinkedAccount[];
+  available_providers: ProviderDefinition[];
+}
+
+export interface GrantLinkedAccountRequest {
+  service_id?: string;
+  scopes: string[];
+}
+
+export interface ProviderTokenRequestDetails {
+  state: string;
+  provider: string;
+  requested_scopes: string[];
+  service_id: string;
+  service_name: string;
+  expires_at: string;
+  accounts: LinkedAccount[];
+}
+
+export interface CompleteProviderTokenRequestPayload {
+  connected_account_id?: string;
+}
+
+export interface CompleteProviderTokenRequestResponse {
+  redirect_url: string;
+}
+
 /**
  * Change password request payload
  */

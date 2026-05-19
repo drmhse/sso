@@ -1,6 +1,6 @@
 # Rust build artifacts
 /target/
-Cargo.lock
+# Note: Cargo.lock is intentionally NOT ignored for binary apps (reproducible builds)
 **/*.rs.bk
 *.pdb
 *.rlib

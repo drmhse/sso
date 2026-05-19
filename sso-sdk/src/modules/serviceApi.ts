@@ -96,6 +96,38 @@ export interface ServiceAnalytics {
   [key: string]: any;
 }
 
+export interface ProviderTokenRequest {
+  user_id: string;
+  provider: string;
+  scopes?: string[];
+  redirect_uri?: string;
+  state?: string;
+}
+
+export interface ProviderTokenAccount {
+  id: string;
+  provider_user_id: string;
+  email?: string;
+  display_name?: string;
+}
+
+export type ProviderTokenResult =
+  | {
+      status: 'ok';
+      access_token: string;
+      expires_at?: string;
+      scopes: string[];
+      provider: string;
+      account: ProviderTokenAccount;
+    }
+  | {
+      status: 'action_required';
+      code: 'PROVIDER_LINK_REQUIRED' | 'PROVIDER_GRANT_REQUIRED' | 'PROVIDER_SCOPE_CONSENT_REQUIRED' | 'PROVIDER_REAUTH_REQUIRED' | string;
+      reauth_url: string;
+      missing_scopes: string[];
+      provider: string;
+    };
+
 /**
  * Service API module for API key-based service-to-service operations.
  * Provides operations for managing users, subscriptions, and service configuration.
@@ -204,6 +236,18 @@ export class ServiceApiModule {
    */
   async getServiceInfo(): Promise<ServiceApiInfo> {
     const response = await this.http.get<ServiceApiInfo>('/api/service/info');
+    return response.data;
+  }
+
+  /**
+   * Request a backend-only third-party provider access token for an AuthOS user.
+   * Requires `read:provider_tokens` or `read:provider_tokens:{provider}` on the API key.
+   */
+  async requestProviderToken(request: ProviderTokenRequest): Promise<ProviderTokenResult> {
+    const response = await this.http.post<ProviderTokenResult>('/api/service/provider-tokens', {
+      ...request,
+      scopes: request.scopes ?? [],
+    });
     return response.data;
   }
 

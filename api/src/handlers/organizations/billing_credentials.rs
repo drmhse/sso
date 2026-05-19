@@ -9,8 +9,7 @@ use crate::state::AppState;
 use crate::store::{
     memberships::MembershipStore,
     organization_billing_credentials::OrganizationBillingCredentialsStore,
-    organizations::OrganizationStore,
-    DB,
+    organizations::OrganizationStore, DB,
 };
 use axum::{
     extract::{Path, State},
@@ -137,11 +136,9 @@ pub async fn set_billing_credentials(
         .map_err(|e| AppError::InternalServerError(format!("Failed to encrypt API key: {}", e)))?;
 
     // Encrypt webhook secret
-    let webhook_secret_encrypted = encryption
-        .encrypt(&req.webhook_secret)
-        .map_err(|e| {
-            AppError::InternalServerError(format!("Failed to encrypt webhook secret: {}", e))
-        })?;
+    let webhook_secret_encrypted = encryption.encrypt(&req.webhook_secret).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to encrypt webhook secret: {}", e))
+    })?;
 
     let encryption_key_id = encryption.key_id().to_string();
 

@@ -68,7 +68,7 @@ impl ApiKeyStore {
     }
 
     /// Update last_used_at timestamp
-    /// 
+    ///
     /// OPTIMIZATION: Only writes to DB if >5 minutes since last update.
     /// This dramatically reduces write pressure for frequently-used API keys.
     pub async fn update_last_used(db: DB<'_>, api_key_id: &str) -> Result<api_keys::Model> {

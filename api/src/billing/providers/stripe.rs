@@ -219,7 +219,12 @@ impl BillingProvider for StripeProvider {
         let mut metadata: HashMap<String, String> = request.metadata;
         metadata.insert("org_id".to_string(), request.org_id.clone());
 
-        params.metadata = Some(metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        params.metadata = Some(
+            metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
 
         if let Some(ref email) = request.email {
             params.email = Some(email);
@@ -312,9 +317,8 @@ impl BillingProvider for StripeProvider {
                     AppError::BadRequest("Missing stripe-signature header".to_string())
                 })?;
 
-            Webhook::construct_event(&payload, signature, &self.webhook_secret).map_err(|e| {
-                AppError::Billing(format!("Webhook verification failed: {}", e))
-            })?
+            Webhook::construct_event(&payload, signature, &self.webhook_secret)
+                .map_err(|e| AppError::Billing(format!("Webhook verification failed: {}", e)))?
         };
 
         Ok(self.parse_stripe_event(event))

@@ -79,6 +79,18 @@ pub enum AppError {
 
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Generic error: {0}")]
+    Generic(String),
+}
+
+impl From<Box<dyn std::error::Error>> for AppError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        AppError::Generic(err.to_string())
+    }
 }
 
 impl IntoResponse for AppError {
@@ -132,6 +144,14 @@ impl IntoResponse for AppError {
                 (StatusCode::FORBIDDEN, "Organization is not active")
             }
             AppError::TooManyRequests(ref msg) => (StatusCode::TOO_MANY_REQUESTS, msg.as_str()),
+            AppError::Io(ref e) => {
+                tracing::error!("IO error: {:?}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal IO error")
+            }
+            AppError::Generic(ref msg) => {
+                tracing::error!("Generic error: {}", msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, msg.as_str())
+            }
         };
 
         let body = Json(json!({
@@ -159,6 +179,8 @@ impl IntoResponse for AppError {
                 AppError::Billing(_) => "BILLING_ERROR",
                 AppError::Audit(_) => "AUDIT_ERROR",
                 AppError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
+                AppError::Io(_) => "IO_ERROR",
+                AppError::Generic(_) => "GENERIC_ERROR",
             },
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }));
@@ -224,6 +246,8 @@ pub fn handle_sea_orm_error(e: sea_orm::DbErr) -> AppError {
             "User is already a member of this organization".to_string()
         } else if err_str.contains("services") && err_str.contains("slug") {
             "Service with this slug already exists in this organization".to_string()
+        } else if err_str.contains("plans") && err_str.contains("name") {
+            "A plan with this name already exists for this service".to_string()
         } else if err_str.contains("users") && err_str.contains("email") {
             "Email is already taken".to_string()
         } else {
@@ -298,8 +322,8 @@ where
         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
     T: Send,
 {
-    use sea_orm::TransactionTrait;
     use crate::store::DB;
+    use sea_orm::TransactionTrait;
 
     let max_retries = 25u32;
     let mut attempts = 0u32;
@@ -385,7 +409,6 @@ where
         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
     T: Send,
 {
-    use sea_orm::TransactionTrait;
     use crate::store::DB;
 
     let max_retries = 25u32;
@@ -394,13 +417,11 @@ where
     loop {
         attempts += 1;
 
-
-
         // ===== PostgreSQL/MySQL: Use standard SeaORM transactions =====
         #[cfg(not(feature = "db_sqlite"))]
         {
             use sea_orm::TransactionTrait;
-            
+
             let tx = match db.begin().await {
                 Ok(tx) => tx,
                 Err(e) => {
@@ -425,7 +446,7 @@ where
                 Err(e) => {
                     // Rollback is manual here since we want to handle retry logic
                     let _ = tx.rollback().await;
-                    
+
                     if is_deadlock_app_error(&e) && attempts <= max_retries {
                         let delay_ms = calculate_retry_delay(attempts);
                         tracing::warn!(

@@ -206,12 +206,17 @@ export class PlatformModule {
       orgId: string,
       payload: {
         allow_saml?: boolean;
+        allow_saml_idp?: boolean;
         allow_scim?: boolean;
         allow_custom_domain?: boolean;
         allow_custom_branding?: boolean;
+        allow_branding?: boolean;
         allow_advanced_risk_engine?: boolean;
         allow_siem_integration?: boolean;
+        allow_siem?: boolean;
         allow_webhooks?: boolean;
+        allow_passkeys?: boolean;
+        allow_overage?: boolean;
       }
     ): Promise<Organization> => {
       const response = await this.http.patch<Organization>(
@@ -298,6 +303,41 @@ export class PlatformModule {
      */
     getMfaStatus: async (userId: string): Promise<{ enabled: boolean, has_backup_codes: boolean }> => {
       const response = await this.http.get<{ enabled: boolean, has_backup_codes: boolean }>(`/api/platform/users/${userId}/mfa/status`);
+      return response.data;
+    },
+
+    /**
+     * List all users on the platform with pagination.
+     *
+     * @param options Pagination options
+     * @returns List of users and total count
+     *
+     * @example
+     * ```typescript
+     * const result = await sso.platform.users.list({ limit: 10, offset: 0 });
+     * console.log(result.users);
+     * ```
+     */
+    list: async (options?: { limit?: number; offset?: number }): Promise<import('../types/platform').PlatformUserListResponse> => {
+      const response = await this.http.get<import('../types/platform').PlatformUserListResponse>('/api/platform/users', { params: options });
+      return response.data;
+    },
+
+    /**
+     * Get a single platform user by ID.
+     */
+    get: async (userId: string): Promise<{
+      id: string;
+      email: string;
+      is_platform_owner: boolean;
+      created_at: string;
+    }> => {
+      const response = await this.http.get<{
+        id: string;
+        email: string;
+        is_platform_owner: boolean;
+        created_at: string;
+      }>(`/api/platform/users/${userId}`);
       return response.data;
     },
 
@@ -534,6 +574,28 @@ export class PlatformModule {
    */
   public async impersonateUser(payload: ImpersonateRequest): Promise<ImpersonateResponse> {
     const response = await this.http.post<ImpersonateResponse>('/api/platform/impersonate', payload);
+    return response.data;
+  }
+
+  /**
+   * Get platform operational counters for jobs, webhooks, and SIEM delivery.
+   */
+  public async getOperationsStatus(): Promise<{
+    jobs_pending: number;
+    jobs_running: number;
+    jobs_failed: number;
+    webhook_deliveries_failed: number;
+    siem_configs_enabled: number;
+    siem_configs_with_failures: number;
+  }> {
+    const response = await this.http.get<{
+      jobs_pending: number;
+      jobs_running: number;
+      jobs_failed: number;
+      webhook_deliveries_failed: number;
+      siem_configs_enabled: number;
+      siem_configs_with_failures: number;
+    }>('/api/platform/operations/status');
     return response.data;
   }
 }

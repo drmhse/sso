@@ -2,8 +2,10 @@ use crate::entities::identities;
 use crate::entities::prelude::Identities;
 use crate::error::{AppError, Result};
 use crate::store::DB;
+use crate::utils::scopes::scopes_to_json;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use uuid::Uuid;
 
@@ -98,17 +100,17 @@ impl IdentityStore {
         Ok(result)
     }
 
-    /// Find ANY identity by provider and provider_user_id (ignoring context)
-    /// Used for security checks to ensure provider accounts aren't linked to multiple users
-    pub async fn find_any_by_provider_and_provider_user_id(
+    /// Find all identities by provider and provider_user_id across contexts.
+    pub async fn list_any_by_provider_and_provider_user_id(
         db: DB<'_>,
         provider: &str,
         provider_user_id: &str,
-    ) -> Result<Option<identities::Model>> {
+    ) -> Result<Vec<identities::Model>> {
         let result = Identities::find()
             .filter(identities::Column::Provider.eq(provider))
             .filter(identities::Column::ProviderUserId.eq(provider_user_id))
-            .one(&db)
+            .order_by_desc(identities::Column::CreatedAt)
+            .all(&db)
             .await?;
         Ok(result)
     }
@@ -150,7 +152,9 @@ impl IdentityStore {
         Ok(identity)
     }
 
-    /// Update identity tokens (plaintext)
+    /// Update refreshed identity tokens (plaintext).
+    /// Providers such as Google usually do not return a refresh token on refresh,
+    /// so a missing refresh_token means "keep the existing one".
     pub async fn update_tokens(
         db: DB<'_>,
         identity_id: &str,
@@ -164,7 +168,9 @@ impl IdentityStore {
 
         let mut identity_active: identities::ActiveModel = identity.into();
         identity_active.access_token = Set(access_token.map(|s| s.to_string()));
-        identity_active.refresh_token = Set(refresh_token.map(|s| s.to_string()));
+        if let Some(refresh_token) = refresh_token {
+            identity_active.refresh_token = Set(Some(refresh_token.to_string()));
+        }
         identity_active.expires_at = Set(expires_at);
         identity_active.last_refreshed_at = Set(Some(chrono::Utc::now().naive_utc()));
 
@@ -172,7 +178,9 @@ impl IdentityStore {
         Ok(updated_identity)
     }
 
-    /// Update identity tokens (encrypted)
+    /// Update refreshed identity tokens (encrypted).
+    /// Providers such as Google usually do not return a refresh token on refresh,
+    /// so a missing refresh_token_encrypted means "keep the existing one".
     pub async fn update_tokens_encrypted(
         db: DB<'_>,
         identity_id: &str,
@@ -187,7 +195,9 @@ impl IdentityStore {
 
         let mut identity_active: identities::ActiveModel = identity.into();
         identity_active.access_token_encrypted = Set(access_token_encrypted);
-        identity_active.refresh_token_encrypted = Set(refresh_token_encrypted);
+        if let Some(refresh_token_encrypted) = refresh_token_encrypted {
+            identity_active.refresh_token_encrypted = Set(Some(refresh_token_encrypted));
+        }
         identity_active.encryption_key_id = Set(Some(encryption_key_id.to_string()));
         identity_active.expires_at = Set(expires_at);
         identity_active.last_refreshed_at = Set(Some(chrono::Utc::now().naive_utc()));
@@ -228,6 +238,22 @@ impl IdentityStore {
             let identity_active: identities::ActiveModel = identity.into();
             identity_active.delete(&db).await?;
         }
+
+        Ok(())
+    }
+
+    /// Delete identity by user and service (Security Audit Item 2)
+    /// Used by Service API to remove user's link to a service without affecting other services
+    pub async fn delete_by_user_and_service(
+        db: DB<'_>,
+        user_id: &str,
+        service_id: &str,
+    ) -> Result<()> {
+        Identities::delete_many()
+            .filter(identities::Column::UserId.eq(user_id))
+            .filter(identities::Column::IssuingServiceId.eq(Some(service_id)))
+            .exec(&db)
+            .await?;
 
         Ok(())
     }
@@ -366,8 +392,8 @@ impl IdentityStore {
         issuing_org_id: Option<&str>,
         issuing_service_id: Option<&str>,
     ) -> Result<identities::Model> {
-        let scopes_json = serde_json::to_string(scopes)
-            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        let scopes_json =
+            scopes_to_json(scopes).map_err(|e| AppError::InternalServerError(e.to_string()))?;
         let last_refreshed = chrono::Utc::now().naive_utc();
         let expires_naive = expires_at.map(|dt| dt.naive_utc());
 
@@ -726,6 +752,19 @@ impl IdentityStore {
             .collect();
 
         Ok(results)
+    }
+
+    /// Count identities for a user in an organization
+    pub async fn count_by_user_and_org(db: DB<'_>, user_id: &str, org_id: &str) -> Result<u64> {
+        use sea_orm::PaginatorTrait;
+
+        let count = Identities::find()
+            .filter(identities::Column::UserId.eq(user_id))
+            .filter(identities::Column::IssuingOrgId.eq(org_id))
+            .count(&db)
+            .await?;
+
+        Ok(count)
     }
 
     /// Count distinct users who have authenticated with a service

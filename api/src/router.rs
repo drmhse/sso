@@ -16,7 +16,9 @@ use crate::handlers::branding::*;
 use crate::handlers::health::*;
 use crate::handlers::identities::*;
 use crate::handlers::invitations::*;
+use crate::handlers::linked_accounts::*;
 use crate::handlers::organization_audit::*;
+use crate::handlers::organizations::roles::*;
 use crate::handlers::organizations::*;
 use crate::handlers::platform::*;
 use crate::handlers::privacy::*;
@@ -34,13 +36,14 @@ use crate::handlers::service_api::{
     list_service_subscriptions, list_service_users, update_service_info, update_subscription,
     update_user as update_service_user,
 };
+use crate::handlers::service_provider_tokens::*;
 use crate::handlers::services::*;
 use crate::handlers::siem_configs::*;
-use crate::handlers::subscription::{change_password, create_checkout, get_subscription};
+use crate::handlers::subscription::{create_checkout, get_subscription};
 use crate::handlers::user::{
-    disable_mfa, get_device, get_mfa_status, get_user, list_devices, regenerate_backup_codes,
-    revoke_all_devices, revoke_device, set_password, setup_mfa, trust_device, update_device_name,
-    update_user, verify_and_enable_mfa,
+    change_password, disable_mfa, get_device, get_mfa_status, get_user, list_devices,
+    regenerate_backup_codes, revoke_all_devices, revoke_device, set_password, setup_mfa,
+    trust_device, update_device_name, update_user, verify_and_enable_mfa,
 };
 use crate::handlers::webhooks::*;
 use crate::middleware;
@@ -100,6 +103,10 @@ pub fn active_org_routes(state: &AppState) -> Router<AppState> {
                 .delete(delete_service),
         )
         .route(
+            "/api/organizations/:org_slug/services/:service_slug/secret/rotate",
+            post(rotate_service_secret),
+        )
+        .route(
             "/api/organizations/:org_slug/services",
             get(list_organization_services).post(create_service),
         )
@@ -144,6 +151,36 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/user/identities", get(list_identities))
         .route("/api/user/identities/:provider/link", post(start_link))
         .route("/api/user/identities/:provider", delete(unlink_identity))
+        // User-owned connected account and grant routes
+        .route("/api/user/linked-accounts", get(list_linked_accounts))
+        .route(
+            "/api/user/linked-accounts/:provider/link",
+            post(start_linked_account),
+        )
+        .route(
+            "/api/user/linked-accounts/:account_id/grants",
+            post(grant_linked_account),
+        )
+        .route(
+            "/api/user/linked-accounts/:account_id",
+            delete(revoke_linked_account),
+        )
+        .route(
+            "/api/user/linked-accounts/:account_id/grants/:service_id",
+            delete(revoke_linked_account_grant),
+        )
+        .route(
+            "/api/user/provider-token-requests/:state",
+            get(get_provider_token_request),
+        )
+        .route(
+            "/api/user/provider-token-requests/:state/complete",
+            post(complete_provider_token_request),
+        )
+        .route(
+            "/api/user/provider-token-requests/:state/link",
+            post(start_provider_token_request_link),
+        )
         // Device management routes
         .route("/api/user/devices", get(list_devices))
         .route("/api/user/devices/:device_id", get(get_device))
@@ -155,8 +192,13 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/api/privacy/export/:user_id", get(export_user_data))
         .route("/api/privacy/forget/:user_id", delete(forget_user))
         // Passkey registration routes (require JWT)
+        .route("/api/auth/passkeys", get(list_passkeys))
         .route("/api/auth/passkeys/register/start", post(register_start))
         .route("/api/auth/passkeys/register/finish", post(register_finish))
+        .route(
+            "/api/auth/passkeys/:passkey_id",
+            patch(update_passkey_name).delete(delete_passkey),
+        )
         // Organization routes
         .route(
             "/api/organizations",
@@ -168,10 +210,18 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
                 .patch(update_organization)
                 .delete(delete_organization),
         )
+        .route(
+            "/api/organizations/:org_slug/select",
+            post(select_organization),
+        )
         .route("/api/organizations/:org_slug/members", get(list_members))
         .route(
             "/api/organizations/:org_slug/members/:user_id",
             patch(update_member_role),
+        )
+        .route(
+            "/api/organizations/:org_slug/members/:user_id/service-access",
+            get(list_member_service_access).put(update_member_service_access),
         )
         .route(
             "/api/organizations/:org_slug/members/:user_id",
@@ -211,6 +261,10 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
             "/api/organizations/:org_slug/risk-settings/reset",
             post(reset_risk_settings),
         )
+        .route(
+            "/api/organizations/:org_slug/risk-events",
+            get(crate::handlers::organizations::risk::get_risk_events),
+        )
         // SCIM token management routes
         .route(
             "/api/organizations/:org_slug/scim-tokens",
@@ -237,7 +291,20 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
             "/api/organizations/:org_slug/invitations/:invitation_id",
             post(cancel_invitation),
         )
+        .route(
+            "/api/organizations/:org_slug/invitations/:invitation_id/accept",
+            post(accept_invitation_as_admin),
+        )
         .route("/api/invitations", get(list_user_invitations))
+        .route("/api/invitations/accept", post(accept_invitation))
+        .route(
+            "/api/invitations/:invitation_id/accept",
+            post(accept_invitation_by_id),
+        )
+        .route(
+            "/api/invitations/:invitation_id/decline",
+            post(decline_invitation_by_id),
+        )
         // Organization audit log routes
         .route(
             "/api/organizations/:org_slug/audit-log",
@@ -246,6 +313,15 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
         .route(
             "/api/organizations/:org_slug/audit-log/event-types",
             get(get_audit_event_types),
+        )
+        // Role management routes
+        .route(
+            "/api/organizations/:org_slug/roles",
+            get(list_roles).post(create_role),
+        )
+        .route(
+            "/api/organizations/:org_slug/roles/:role_id",
+            get(get_role).put(update_role).delete(delete_role),
         )
         // Webhook management routes
         .route(
@@ -261,6 +337,10 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
         .route(
             "/api/organizations/:org_slug/webhooks/:webhook_id/deliveries",
             get(get_webhook_deliveries),
+        )
+        .route(
+            "/api/organizations/:org_slug/webhooks/:webhook_id/test",
+            post(test_webhook),
         )
         .route(
             "/api/organizations/:org_slug/webhooks/event-types",
@@ -280,6 +360,27 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
         .route(
             "/api/organizations/:org_slug/siem-configs/:config_id/test",
             post(test_siem_connection),
+        )
+        // Upstream Provider (Enterprise SSO) routes
+        .route(
+            "/api/organizations/:org_slug/upstream-providers",
+            get(list_upstream_providers).post(create_upstream_provider),
+        )
+        .route(
+            "/api/organizations/:org_slug/upstream-providers/:provider_id",
+            delete(delete_upstream_provider),
+        )
+        .route(
+            "/api/organizations/:org_slug/domain-routes",
+            get(list_domain_routes).post(create_domain_route),
+        )
+        .route(
+            "/api/organizations/:org_slug/domain-routes/:domain_id",
+            patch(update_domain_route).delete(delete_domain_route),
+        )
+        .route(
+            "/api/organizations/:org_slug/domain-routes/:domain_id/verify",
+            post(verify_domain_route),
         )
         // Custom domain and branding routes
         .route(
@@ -470,9 +571,18 @@ pub fn platform_routes(state: &AppState) -> Router<AppState> {
             delete(force_disable_user_mfa),
         )
         .route("/api/platform/users/search", get(search_users))
+        .route("/api/platform/users", get(list_users))
+        .route("/api/platform/users/:user_id", get(get_platform_user))
         .route("/api/platform/impersonate", post(impersonate_user))
+        .route(
+            "/api/platform/operations/status",
+            get(get_operations_status),
+        )
         .route("/api/platform/mfa/metrics", get(get_mfa_metrics))
-        .route("/api/platform/mfa/suspicious", get(get_suspicious_activity))
+        .route(
+            "/api/platform/mfa/suspicious-activity",
+            get(get_suspicious_activity),
+        )
         .route(
             "/api/platform/mfa/metrics/generate",
             get(generate_daily_metrics),
@@ -510,6 +620,7 @@ pub fn auth_routes(config: &Config) -> Router<AppState> {
         // SSO routes
         .route("/auth/:provider", get(auth_provider))
         .route("/auth/:provider/callback", get(auth_callback))
+        .route("/auth/saml/callback", post(auth_saml_callback))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/refresh", post(refresh_token))
         .route("/auth/revoke", post(revoke_token))
@@ -525,6 +636,7 @@ pub fn auth_routes(config: &Config) -> Router<AppState> {
         .route("/api/auth/resend-verification", post(resend_verification))
         // Home Realm Discovery
         .route("/api/auth/lookup-email", post(lookup_email))
+        .route("/api/auth/context", get(get_auth_context))
         // Passkey authentication routes (public)
         .route(
             "/api/auth/passkeys/authenticate/start",
@@ -600,6 +712,11 @@ pub fn service_api_routes(state: &AppState) -> Router<AppState> {
         )
         // Analytics (read only)
         .route("/api/service/analytics", get(get_service_analytics))
+        // Backend-only provider token exchange
+        .route(
+            "/api/service/provider-tokens",
+            post(request_service_provider_token),
+        )
         // Service info
         .route(
             "/api/service/info",
@@ -676,13 +793,17 @@ pub fn public_routes(config: &Config) -> Router<AppState> {
         // Health check endpoints
         .route("/health", get(health))
         .route("/health/live", get(liveness))
+        // Hosted provider-token reauth/link flow for service integrations.
+        .route(
+            "/connect/provider-token/:state",
+            get(start_provider_token_request_reauth),
+        )
         // Public branding endpoint
         .route(
             "/api/organizations/:org_slug/branding/public",
             get(get_public_branding),
         )
         // Public invitation endpoints
-        .route("/api/invitations/accept", post(accept_invitation))
         .route("/api/invitations/decline", post(decline_invitation))
         .route(
             "/invitations/accept/:token",

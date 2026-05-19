@@ -64,6 +64,16 @@ impl ScimTokenStore {
         Ok(token)
     }
 
+    /// Find a SCIM token by ID.
+    pub async fn find_by_id(db: DB<'_>, token_id: &str) -> Result<Option<scim_tokens::Model>> {
+        let token = ScimTokens::find()
+            .filter(scim_tokens::Column::Id.eq(token_id))
+            .one(&db)
+            .await?;
+
+        Ok(token)
+    }
+
     /// List all SCIM tokens for an organization
     pub async fn list_by_org(db: DB<'_>, org_id: &str) -> Result<Vec<scim_tokens::Model>> {
         let tokens = ScimTokens::find()

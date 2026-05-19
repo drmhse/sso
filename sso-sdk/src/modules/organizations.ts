@@ -4,11 +4,14 @@ import {
   OrganizationResponse,
   CreateOrganizationPayload,
   CreateOrganizationResponse,
+  SelectOrganizationResponse,
   UpdateOrganizationPayload,
   ListOrganizationsParams,
   OrganizationMember,
   MemberListResponse,
+  MemberServiceAccess,
   UpdateMemberRolePayload,
+  UpdateMemberServiceAccessPayload,
   TransferOwnershipPayload,
   SetOAuthCredentialsPayload,
   OAuthCredentials,
@@ -37,9 +40,15 @@ import {
   ListScimTokensResponse,
   Invitation,
   CreateInvitationPayload,
+  RiskEventResponse,
+  RiskEventsQuery,
+  RoleResponse,
+  CreateRoleRequest,
+  UpdateRoleRequest,
 } from '../types';
 import { AuditLogsModule } from './organizations/audit';
 import { WebhooksModule } from './organizations/webhooks';
+import { UpstreamProvidersModule } from './organizations/upstream-providers';
 
 /**
  * Organization management methods
@@ -48,6 +57,7 @@ export class OrganizationsModule {
   constructor(private http: HttpClient) {
     this.auditLogs = new AuditLogsModule(http);
     this.webhooks = new WebhooksModule(http);
+    this.upstreamProviders = new UpstreamProvidersModule(http);
   }
 
   /**
@@ -59,6 +69,11 @@ export class OrganizationsModule {
    * Webhooks management
    */
   public webhooks: WebhooksModule;
+
+  /**
+   * Upstream provider (Enterprise SSO) management
+   */
+  public upstreamProviders: UpstreamProvidersModule;
 
   /**
    * Create a new organization (requires authentication).
@@ -117,6 +132,32 @@ export class OrganizationsModule {
    */
   public async get(orgSlug: string): Promise<OrganizationResponse> {
     const response = await this.http.get<OrganizationResponse>(`/api/organizations/${orgSlug}`);
+    return response.data;
+  }
+
+  /**
+   * Select/switch to a different organization context.
+   * Issues a new JWT token with the organization context.
+   *
+   * This allows users to seamlessly switch between organizations
+   * they are members of without re-authenticating.
+   *
+   * @param orgSlug Organization slug to switch to
+   * @returns New tokens with organization context
+   *
+   * @example
+   * ```typescript
+   * // Switch to a different organization
+   * const result = await sso.organizations.select('acme-corp');
+   *
+   * // The SDK automatically updates the session with new tokens
+   * // API calls will now be made in the context of 'acme-corp'
+   * ```
+   */
+  public async select(orgSlug: string): Promise<SelectOrganizationResponse> {
+    const response = await this.http.post<SelectOrganizationResponse>(
+      `/api/organizations/${orgSlug}/select`
+    );
     return response.data;
   }
 
@@ -257,7 +298,9 @@ export class OrganizationsModule {
       const invitation = response.data;
 
       // 2. Accept invitation
-      await this.http.post('/api/invitations/accept', { token: invitation.token });
+      await this.http.post(
+        `/api/organizations/${orgSlug}/invitations/${invitation.id}/accept`
+      );
 
       return invitation;
     },
@@ -307,6 +350,34 @@ export class OrganizationsModule {
     },
 
     /**
+     * List a member's direct per-service access grants.
+     */
+    listServiceAccess: async (
+      orgSlug: string,
+      userId: string
+    ): Promise<MemberServiceAccess[]> => {
+      const response = await this.http.get<MemberServiceAccess[]>(
+        `/api/organizations/${orgSlug}/members/${userId}/service-access`
+      );
+      return response.data;
+    },
+
+    /**
+     * Replace a member's direct per-service access grants.
+     */
+    updateServiceAccess: async (
+      orgSlug: string,
+      userId: string,
+      payload: UpdateMemberServiceAccessPayload
+    ): Promise<MemberServiceAccess[]> => {
+      const response = await this.http.put<MemberServiceAccess[]>(
+        `/api/organizations/${orgSlug}/members/${userId}/service-access`,
+        payload
+      );
+      return response.data;
+    },
+
+    /**
      * Transfer organization ownership to another member.
      * Requires 'owner' role.
      *
@@ -346,7 +417,7 @@ export class OrganizationsModule {
      *   page: 1,
      *   limit: 20
      * });
-     * 
+     *
      * // Filter by specific service
      * const serviceUsers = await sso.organizations.endUsers.list('acme-corp', {
      *   service_slug: 'my-app',
@@ -1009,6 +1080,87 @@ export class OrganizationsModule {
         payload
       );
       return response.data;
+    },
+  };
+
+  /**
+   * Security & Risk insights
+   */
+  public security = {
+    /**
+     * Get risk events for an organization.
+     * Requires 'owner' or 'admin' role.
+     *
+     * @param orgSlug Organization slug
+     * @param params Query parameters
+     */
+    getRiskEvents: async (
+      orgSlug: string,
+      params?: RiskEventsQuery
+    ): Promise<RiskEventResponse[]> => {
+      const response = await this.http.get<RiskEventResponse[]>(
+        `/api/organizations/${orgSlug}/risk-events`,
+        { params }
+      );
+      return response.data;
+    },
+  };
+
+  /**
+   * Role management methods
+   */
+  public roles = {
+    /**
+     * List all custom roles for an organization.
+     */
+    list: async (orgSlug: string): Promise<RoleResponse[]> => {
+      const response = await this.http.get<RoleResponse[]>(
+        `/api/organizations/${orgSlug}/roles`
+      );
+      return response.data;
+    },
+
+    /**
+     * Get details of a specific role.
+     */
+    get: async (orgSlug: string, roleId: string): Promise<RoleResponse> => {
+      const response = await this.http.get<RoleResponse>(
+        `/api/organizations/${orgSlug}/roles/${roleId}`
+      );
+      return response.data;
+    },
+
+    /**
+     * Create a new custom role.
+     */
+    create: async (orgSlug: string, payload: CreateRoleRequest): Promise<RoleResponse> => {
+      const response = await this.http.post<RoleResponse>(
+        `/api/organizations/${orgSlug}/roles`,
+        payload
+      );
+      return response.data;
+    },
+
+    /**
+     * Update an existing role.
+     */
+    update: async (
+      orgSlug: string,
+      roleId: string,
+      payload: UpdateRoleRequest
+    ): Promise<RoleResponse> => {
+      const response = await this.http.put<RoleResponse>(
+        `/api/organizations/${orgSlug}/roles/${roleId}`,
+        payload
+      );
+      return response.data;
+    },
+
+    /**
+     * Delete a role.
+     */
+    delete: async (orgSlug: string, roleId: string): Promise<void> => {
+      await this.http.delete(`/api/organizations/${orgSlug}/roles/${roleId}`);
     },
   };
 

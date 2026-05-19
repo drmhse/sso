@@ -34,9 +34,15 @@ impl OAuthStateStore {
         device_user_code: Option<&str>,
         saml_state_id: Option<&str>,
         upstream_connection_id: Option<&str>,
+        requested_scopes: Option<&[String]>,
+        provider_token_request_state: Option<&str>,
         expires_at: &chrono::NaiveDateTime,
     ) -> Result<oauth_states::Model> {
         let now = chrono::Utc::now().naive_utc();
+        let requested_scopes_json = requested_scopes
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
         let new_state = oauth_states::ActiveModel {
             state: Set(state.to_string()),
@@ -50,6 +56,8 @@ impl OAuthStateStore {
             device_user_code: Set(device_user_code.map(|s| s.to_string())),
             saml_state_id: Set(saml_state_id.map(|s| s.to_string())),
             upstream_connection_id: Set(upstream_connection_id.map(|s| s.to_string())),
+            requested_scopes: Set(requested_scopes_json),
+            provider_token_request_state: Set(provider_token_request_state.map(|s| s.to_string())),
             created_at: Set(now),
             expires_at: Set(*expires_at),
             ..Default::default()

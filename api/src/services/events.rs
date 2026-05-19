@@ -4,6 +4,8 @@
 //! from webhook delivery, supporting both organizational audit events and
 //! end-user events (logins, signups, MFA changes, etc.)
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use chrono::Utc;
 use sea_orm::DatabaseConnection;

@@ -7,7 +7,7 @@
 use crate::email::EmailService;
 use crate::error::Result;
 use crate::services::job_queue::{EmailJobPayload, JobType, WebhookJobPayload};
-use crate::services::log_streamer::LogDeliveryWorker;
+use crate::services::safe_http::SafeHttpClient;
 use crate::store::system_jobs::SystemJobStore;
 use crate::store::webhook_deliveries::WebhookDeliveryStore;
 use crate::store::webhooks::WebhookStore;
@@ -28,8 +28,6 @@ pub struct JobProcessor {
     #[cfg(feature = "db_sqlite")]
     db_writer: Arc<DatabaseConnection>,
     worker_id: String,
-    client: reqwest::Client,
-    log_delivery_worker: Arc<LogDeliveryWorker>,
     email_service: Option<Arc<EmailService>>,
     max_concurrent_jobs: usize,
 }
@@ -37,8 +35,7 @@ pub struct JobProcessor {
 impl JobProcessor {
     pub fn new(
         db: DatabaseConnection,
-        #[cfg(feature = "db_sqlite")]
-        db_writer: DatabaseConnection,
+        #[cfg(feature = "db_sqlite")] db_writer: DatabaseConnection,
         email_service: Option<Arc<EmailService>>,
         batch_size: usize, // Now used as max_concurrent_jobs
     ) -> Self {
@@ -47,17 +44,6 @@ impl JobProcessor {
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "unknown".to_string());
         let worker_id = format!("{}-{}", hostname, Uuid::new_v4());
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("SSO-Platform-Jobs/1.0")
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
-        let log_delivery_worker = Arc::new(LogDeliveryWorker::new(
-            crate::encryption::EncryptionService::new()
-                .expect("Failed to create encryption service"),
-        ));
 
         let max_concurrent_jobs = if batch_size > 0 {
             batch_size
@@ -76,8 +62,6 @@ impl JobProcessor {
             #[cfg(feature = "db_sqlite")]
             db_writer: Arc::new(db_writer),
             worker_id,
-            client,
-            log_delivery_worker,
             email_service,
             max_concurrent_jobs,
         }
@@ -131,8 +115,10 @@ impl JobProcessor {
                 &processor.db,
                 #[cfg(feature = "db_sqlite")]
                 &processor.db_writer,
-                &processor.worker_id
-            ).await {
+                &processor.worker_id,
+            )
+            .await
+            {
                 Ok(Some(job)) => {
                     // Reset backoff since we found work
                     consecutive_empty_polls = 0;
@@ -264,7 +250,6 @@ impl JobProcessor {
         match job_type {
             JobType::SendEmail => self.process_email_job(&job.id, &job.payload).await,
             JobType::DeliverWebhook => self.process_webhook_job(&job.payload).await,
-            JobType::StreamAuditLogs => self.process_audit_log_stream_job(&job.payload).await,
             JobType::Custom(ref custom_type) => {
                 tracing::debug!(
                     worker_id = %self.worker_id,
@@ -290,54 +275,60 @@ impl JobProcessor {
                     &email_payload.body,
                 )
                 .await;
-            
-        match result {
-            Ok(_) => {
-                tracing::info!(
-                    worker_id = %self.worker_id,
-                    to = %email_payload.to,
-                    subject = %email_payload.subject,
-                    "Email sent successfully"
-                );
-                // Success
-            }
-            Err(e) => {
-                // Check if this is a permanent SMTP error
-                let err_str = format!("{:?}", e);
-                let is_permanent = err_str.contains("permanent error") || 
-                    err_str.contains("Message rejected") || 
-                    err_str.contains("Email address is not verified") ||
-                    err_str.contains("554");
 
-                if is_permanent {
-                    tracing::warn!(
+            match result {
+                Ok(_) => {
+                    tracing::info!(
                         worker_id = %self.worker_id,
                         to = %email_payload.to,
-                        error = %e,
-                        "Permanent SMTP error detected, marking job as failed permanently"
+                        subject = %email_payload.subject,
+                        "Email sent successfully"
                     );
-                    
-                    if let Err(mark_err) = crate::services::job_queue::JobQueueService::mark_failed_permanently(
-                        &self.db,
-                        job_id,
-                        &format!("Permanent SMTP Error: {}", e),
-                    ).await {
-                         tracing::error!("Failed to mark job as failed permanently: {}", mark_err);
+                    // Success
+                }
+                Err(e) => {
+                    // Check if this is a permanent SMTP error
+                    let err_str = format!("{:?}", e);
+                    let is_permanent = err_str.contains("permanent error")
+                        || err_str.contains("Message rejected")
+                        || err_str.contains("Email address is not verified")
+                        || err_str.contains("554");
+
+                    if is_permanent {
+                        tracing::warn!(
+                            worker_id = %self.worker_id,
+                            to = %email_payload.to,
+                            error = %e,
+                            "Permanent SMTP error detected, marking job as failed permanently"
+                        );
+
+                        if let Err(mark_err) =
+                            crate::services::job_queue::JobQueueService::mark_failed_permanently(
+                                &self.db,
+                                job_id,
+                                &format!("Permanent SMTP Error: {}", e),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                "Failed to mark job as failed permanently: {}",
+                                mark_err
+                            );
+                        }
+
+                        return Err(crate::error::AppError::InternalServerError(format!(
+                            "Permanent SMTP Error: {}",
+                            e
+                        )));
                     }
 
                     return Err(crate::error::AppError::InternalServerError(format!(
-                        "Permanent SMTP Error: {}",
+                        "Failed to send email: {}",
                         e
                     )));
                 }
-
-                return Err(crate::error::AppError::InternalServerError(format!(
-                    "Failed to send email: {}",
-                    e
-                )));
             }
-        }
-    } else {
+        } else {
             tracing::warn!(
                 worker_id = %self.worker_id,
                 to = %email_payload.to,
@@ -375,21 +366,26 @@ impl JobProcessor {
             return Ok(());
         }
 
-        // Generate signature
-        let signature = self.generate_signature(&webhook_payload.payload, &webhook.secret);
+        let payload_body = serde_json::to_string(&webhook_payload.payload).map_err(|e| {
+            crate::error::AppError::InternalServerError(format!(
+                "Failed to serialize webhook payload: {}",
+                e
+            ))
+        })?;
+        let signature = self.generate_signature(payload_body.as_bytes(), &webhook.secret);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let safe_client = SafeHttpClient::new()?;
 
-        // Send the webhook
-        let response_result = self
-            .client
-            .post(&webhook.url)
-            .header("Content-Type", "application/json")
-            .header("X-Webhook-Signature", signature)
-            .header(
-                "X-Webhook-Timestamp",
-                chrono::Utc::now().timestamp().to_string(),
+        let response_result = safe_client
+            .post_with_owned_headers(
+                &webhook.url,
+                payload_body,
+                vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("X-Webhook-Signature".to_string(), signature),
+                    ("X-Webhook-Timestamp".to_string(), timestamp),
+                ],
             )
-            .json(&webhook_payload.payload)
-            .send()
             .await;
 
         match response_result {
@@ -534,31 +530,17 @@ impl JobProcessor {
     }
 
     /// Generate HMAC signature for webhook payload
-    fn generate_signature(&self, payload: &serde_json::Value, secret: &str) -> String {
+    fn generate_signature(&self, payload: &[u8], secret: &str) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
 
         type HmacSha256 = Hmac<Sha256>;
 
-        let payload_str = serde_json::to_string(payload).unwrap_or_default();
         let mut mac =
             HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-        mac.update(payload_str.as_bytes());
+        mac.update(payload);
 
         let result = mac.finalize();
         format!("sha256={:x}", result.into_bytes())
-    }
-
-    /// Process an audit log streaming job
-    async fn process_audit_log_stream_job(&self, payload: &str) -> Result<()> {
-        let job_payload: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
-            crate::error::AppError::BadRequest(format!("Invalid audit log stream payload: {}", e))
-        })?;
-
-        self.log_delivery_worker
-            .process_job(&self.db, &job_payload)
-            .await?;
-
-        Ok(())
     }
 }

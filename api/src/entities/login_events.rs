@@ -12,6 +12,8 @@ pub struct Model {
     pub user_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub service_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub org_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub provider: String,
     #[sea_orm(column_type = "Text", nullable)]
@@ -41,6 +43,14 @@ pub enum Relation {
     )]
     Services,
     #[sea_orm(
+        belongs_to = "super::organizations::Entity",
+        from = "Column::OrgId",
+        to = "super::organizations::Column::Id",
+        on_update = "NoAction",
+        on_delete = "Cascade"
+    )]
+    Organizations,
+    #[sea_orm(
         belongs_to = "super::users::Entity",
         from = "Column::UserId",
         to = "super::users::Column::Id",
@@ -48,6 +58,12 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Users,
+}
+
+impl Related<super::organizations::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Organizations.def()
+    }
 }
 
 impl Related<super::services::Entity> for Entity {

@@ -273,11 +273,19 @@ export class HttpClient {
    */
   public async delete<T = any>(
     path: string,
+    data?: any,
     config?: { headers?: Record<string, string> }
   ): Promise<HttpResponse<T>> {
+    const requestConfig =
+      data && typeof data === 'object' && 'headers' in data && !config
+        ? data
+        : config;
+    const body = requestConfig === data ? undefined : data;
+
     return this.request<T>(path, {
       method: 'DELETE',
-      headers: config?.headers,
+      body,
+      headers: requestConfig?.headers,
     });
   }
 }

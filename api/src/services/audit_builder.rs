@@ -3,6 +3,8 @@
 //! These helpers provide an ergonomic API for creating audit events
 //! that can be sent to the AuditActor for non-blocking persistence.
 
+#![allow(dead_code)]
+
 use crate::entities::{mfa_audit_log, organization_audit_log};
 use sea_orm::Set;
 use uuid::Uuid;

@@ -16,3 +16,6 @@ export * from './passkeys';
 export * from './risk';
 export * from './privacy';
 export * from './siem';
+export * from './risk';
+export * from './roles';
+export * from './upstream-provider';

@@ -1,5 +1,8 @@
 use crate::error::{AppError, Result};
-use crate::store::{organizations::OrganizationStore, organization_tiers::OrganizationTierStore, login_events::LoginEventStore, DB};
+use crate::store::{
+    login_events::LoginEventStore, organization_tiers::OrganizationTierStore,
+    organizations::OrganizationStore, DB,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,15 +36,16 @@ impl TierService {
         db: DB<'_>,
         org_id: &str,
         check: impl Fn(&TierFeatures) -> bool,
-        feature_name: &str
+        feature_name: &str,
     ) -> Result<()> {
         // 1. Fetch Org
-        let org = OrganizationStore::find_by_id(db.clone(), org_id).await?
+        let org = OrganizationStore::find_by_id(db.clone(), org_id)
+            .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-            
+
         // 2. Check Org-specific overrides FIRST
         if let Some(overrides) = &org.feature_overrides {
-            // If parsing fails, we log/ignore and fall back to tier defaults? 
+            // If parsing fails, we log/ignore and fall back to tier defaults?
             // Better to fail safe or log error. For now let's try to parse.
             if let Ok(org_features) = serde_json::from_str::<TierFeatures>(overrides) {
                 if check(&org_features) {
@@ -51,10 +55,15 @@ impl TierService {
         }
 
         // 3. Fallback to Tier defaults
-        let tier_id = org.tier_id.ok_or_else(|| AppError::InternalServerError("Organization has no tier assigned".to_string()))?;
+        let tier_id = org.tier_id.ok_or_else(|| {
+            AppError::InternalServerError("Organization has no tier assigned".to_string())
+        })?;
 
-        let tier = OrganizationTierStore::find_by_id(db, &tier_id).await?
-            .ok_or_else(|| AppError::InternalServerError("Tier configuration missing".to_string()))?;
+        let tier = OrganizationTierStore::find_by_id(db, &tier_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::InternalServerError("Tier configuration missing".to_string())
+            })?;
 
         // 4. Parse Features JSON
         let features: TierFeatures = serde_json::from_str(&tier.features.unwrap_or_default())
@@ -70,13 +79,14 @@ impl TierService {
 
         Ok(())
     }
-    
+
     /// Check MAU Limits (Billing Control)
     /// Returns Ok(()) if the organization is within its MAU limit or has allow_overage enabled.
     /// Returns Err(ServiceLimitExceeded) if the limit is exceeded and overage is not allowed.
     pub async fn check_mau_limit(db: DB<'_>, org_id: &str) -> Result<()> {
         // 1. Fetch organization
-        let org = OrganizationStore::find_by_id(db.clone(), org_id).await?
+        let org = OrganizationStore::find_by_id(db.clone(), org_id)
+            .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
         // 2. Determine MAU limit and allow_overage from org overrides or tier
@@ -128,11 +138,15 @@ impl TierService {
 
     /// Helper to get MAU limit from tier
     async fn get_tier_mau_limit(db: DB<'_>, tier_id: &Option<String>) -> Result<(i64, bool)> {
-        let tier_id = tier_id.as_ref()
-            .ok_or_else(|| AppError::InternalServerError("Organization has no tier assigned".to_string()))?;
+        let tier_id = tier_id.as_ref().ok_or_else(|| {
+            AppError::InternalServerError("Organization has no tier assigned".to_string())
+        })?;
 
-        let tier = OrganizationTierStore::find_by_id(db, tier_id).await?
-            .ok_or_else(|| AppError::InternalServerError("Tier configuration missing".to_string()))?;
+        let tier = OrganizationTierStore::find_by_id(db, tier_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::InternalServerError("Tier configuration missing".to_string())
+            })?;
 
         let features: TierFeatures = serde_json::from_str(&tier.features.unwrap_or_default())
             .unwrap_or_else(|_| TierFeatures {
@@ -150,4 +164,3 @@ impl TierService {
         Ok((features.max_mau, features.allow_overage))
     }
 }
-

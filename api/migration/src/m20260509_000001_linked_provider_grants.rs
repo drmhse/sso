@@ -1,0 +1,404 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(ConnectedAccounts::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::Id)
+                            .string_len(36)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(ConnectedAccounts::UserId).string_len(36).not_null())
+                    .col(ColumnDef::new(ConnectedAccounts::Provider).string_len(100).not_null())
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::ProviderUserId)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ConnectedAccounts::Email).string_len(254))
+                    .col(ColumnDef::new(ConnectedAccounts::DisplayName).string())
+                    .col(ColumnDef::new(ConnectedAccounts::AccessToken).text())
+                    .col(ColumnDef::new(ConnectedAccounts::RefreshToken).text())
+                    .col(ColumnDef::new(ConnectedAccounts::AccessTokenEncrypted).blob())
+                    .col(ColumnDef::new(ConnectedAccounts::RefreshTokenEncrypted).blob())
+                    .col(ColumnDef::new(ConnectedAccounts::EncryptionKeyId).string())
+                    .col(ColumnDef::new(ConnectedAccounts::ExpiresAt).date_time().null())
+                    .col(ColumnDef::new(ConnectedAccounts::Scopes).text())
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::LastRefreshedAt)
+                            .date_time()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::Status)
+                            .string_len(50)
+                            .not_null()
+                            .default("active"),
+                    )
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::LinkedAt)
+                            .date_time()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::UpdatedAt)
+                            .date_time()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(ColumnDef::new(ConnectedAccounts::RevokedAt).date_time().null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_connected_accounts_user")
+                            .from(ConnectedAccounts::Table, ConnectedAccounts::UserId)
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_connected_accounts_user")
+                    .table(ConnectedAccounts::Table)
+                    .col(ConnectedAccounts::UserId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_connected_accounts_provider_user")
+                    .table(ConnectedAccounts::Table)
+                    .col(ConnectedAccounts::Provider)
+                    .col(ConnectedAccounts::ProviderUserId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_connected_accounts_user_provider")
+                    .table(ConnectedAccounts::Table)
+                    .col(ConnectedAccounts::UserId)
+                    .col(ConnectedAccounts::Provider)
+                    .col(ConnectedAccounts::ProviderUserId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ServiceProviderGrants::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::Id)
+                            .string_len(36)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::UserId)
+                            .string_len(36)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::ServiceId)
+                            .string_len(36)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::ConnectedAccountId)
+                            .string_len(36)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::Provider)
+                            .string_len(100)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ServiceProviderGrants::Scopes).text().not_null())
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::Status)
+                            .string_len(50)
+                            .not_null()
+                            .default("active"),
+                    )
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::GrantedAt)
+                            .date_time()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::LastUsedAt)
+                            .date_time()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::RevokedAt)
+                            .date_time()
+                            .null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_service_provider_grants_user")
+                            .from(ServiceProviderGrants::Table, ServiceProviderGrants::UserId)
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_service_provider_grants_service")
+                            .from(ServiceProviderGrants::Table, ServiceProviderGrants::ServiceId)
+                            .to(Services::Table, Services::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_service_provider_grants_account")
+                            .from(
+                                ServiceProviderGrants::Table,
+                                ServiceProviderGrants::ConnectedAccountId,
+                            )
+                            .to(ConnectedAccounts::Table, ConnectedAccounts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_service_provider_grants_user_service")
+                    .table(ServiceProviderGrants::Table)
+                    .col(ServiceProviderGrants::UserId)
+                    .col(ServiceProviderGrants::ServiceId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_service_provider_grants_unique_account")
+                    .table(ServiceProviderGrants::Table)
+                    .col(ServiceProviderGrants::UserId)
+                    .col(ServiceProviderGrants::ServiceId)
+                    .col(ServiceProviderGrants::ConnectedAccountId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ProviderTokenRequests::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::State)
+                            .string_len(191)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::UserId)
+                            .string_len(36)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::ServiceId)
+                            .string_len(36)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::Provider)
+                            .string_len(100)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::ConnectedAccountId)
+                            .string_len(36)
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::RequestedScopes)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ProviderTokenRequests::RedirectUri).text().not_null())
+                    .col(ColumnDef::new(ProviderTokenRequests::ClientState).text())
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::Status)
+                            .string_len(50)
+                            .not_null()
+                            .default("pending"),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::CreatedAt)
+                            .date_time()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::ExpiresAt)
+                            .date_time()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::CompletedAt)
+                            .date_time()
+                            .null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_provider_token_requests_user")
+                            .from(ProviderTokenRequests::Table, ProviderTokenRequests::UserId)
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_provider_token_requests_service")
+                            .from(ProviderTokenRequests::Table, ProviderTokenRequests::ServiceId)
+                            .to(Services::Table, Services::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_provider_token_requests_user_state")
+                    .table(ProviderTokenRequests::Table)
+                    .col(ProviderTokenRequests::UserId)
+                    .col(ProviderTokenRequests::State)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_provider_token_requests_expires")
+                    .table(ProviderTokenRequests::Table)
+                    .col(ProviderTokenRequests::ExpiresAt)
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(ProviderTokenRequests::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(ServiceProviderGrants::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(ConnectedAccounts::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(DeriveIden)]
+enum Users {
+    Table,
+    Id,
+}
+
+#[derive(DeriveIden)]
+enum Services {
+    Table,
+    Id,
+}
+
+#[derive(DeriveIden)]
+enum ConnectedAccounts {
+    Table,
+    Id,
+    UserId,
+    Provider,
+    ProviderUserId,
+    Email,
+    DisplayName,
+    AccessToken,
+    RefreshToken,
+    AccessTokenEncrypted,
+    RefreshTokenEncrypted,
+    EncryptionKeyId,
+    ExpiresAt,
+    Scopes,
+    LastRefreshedAt,
+    Status,
+    LinkedAt,
+    UpdatedAt,
+    RevokedAt,
+}
+
+#[derive(DeriveIden)]
+enum ServiceProviderGrants {
+    Table,
+    Id,
+    UserId,
+    ServiceId,
+    ConnectedAccountId,
+    Provider,
+    Scopes,
+    Status,
+    GrantedAt,
+    LastUsedAt,
+    RevokedAt,
+}
+
+#[derive(DeriveIden)]
+enum ProviderTokenRequests {
+    Table,
+    State,
+    UserId,
+    ServiceId,
+    Provider,
+    ConnectedAccountId,
+    RequestedScopes,
+    RedirectUri,
+    ClientState,
+    Status,
+    CreatedAt,
+    ExpiresAt,
+    CompletedAt,
+}

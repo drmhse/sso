@@ -10,6 +10,7 @@ export interface Service {
   name: string;
   service_type: ServiceType;
   client_id: string;
+  client_secret?: string | null; // Returned on creation, otherwise often null/omitted
   github_scopes: string[];
   microsoft_scopes: string[];
   google_scopes: string[];
@@ -27,27 +28,18 @@ export interface Service {
 }
 
 /**
- * Provider token grant configuration
- */
-export interface ProviderTokenGrant {
-  id: string;
-  service_id: string;
-  provider: string;
-  scopes: string[];
-  created_at: string;
-}
-
-/**
  * Subscription plan
  */
 export interface Plan {
   id: string;
   service_id: string;
   name: string;
+  description?: string;
   price_cents: number;
   currency: string;
-  features: string;
+  features: string; // JSON string from API
   stripe_price_id?: string;
+  is_default?: boolean;
   created_at: string;
 }
 
@@ -57,6 +49,32 @@ export interface Plan {
 export interface PlanResponse {
   plan: Plan;
   subscription_count: number;
+}
+
+/**
+ * Create plan payload
+ */
+export interface CreatePlanPayload {
+  name: string;
+  description?: string;
+  price_cents: number;
+  currency: string;
+  features?: string[];
+  stripe_price_id?: string;
+  is_default?: boolean;
+}
+
+/**
+ * Update plan payload
+ */
+export interface UpdatePlanPayload {
+  name?: string;
+  description?: string;
+  price_cents?: number;
+  currency?: string;
+  features?: string[];
+  stripe_price_id?: string | null;
+  is_default?: boolean;
 }
 
 /**
@@ -78,13 +96,17 @@ export interface CreateServicePayload {
  */
 export interface CreateServiceResponse {
   service: Service;
-  provider_grants: ProviderTokenGrant[];
   default_plan: Plan;
   usage: {
     current_services: number;
     max_services: number;
     tier: string;
   };
+}
+
+export interface RotateServiceSecretResponse {
+  service: Service;
+  client_secret: string;
 }
 
 /**
@@ -101,40 +123,10 @@ export interface UpdateServicePayload {
 }
 
 /**
- * Service response with details
+ * Service with aggregated details (for listing)
  */
-export interface ServiceResponse {
+export interface ServiceWithDetails {
   service: Service;
-  provider_grants: ProviderTokenGrant[];
-  plans: Plan[];
-}
-
-/**
- * Create plan payload
- */
-export interface CreatePlanPayload {
-  name: string;
-  price_cents: number;
-  currency: string;
-  features?: string[];
-  stripe_price_id?: string;
-}
-
-/**
- * Update plan payload
- */
-export interface UpdatePlanPayload {
-  name?: string;
-  price_cents?: number;
-  currency?: string;
-  features?: string[];
-  stripe_price_id?: string | null;
-}
-
-/**
- * Service with aggregated details
- */
-export interface ServiceWithDetails extends Service {
   plan_count: number;
   subscription_count: number;
 }

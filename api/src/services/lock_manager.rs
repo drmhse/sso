@@ -1,5 +1,7 @@
 //! Distributed Locking Service - Database-native locks without Redis
 
+#![allow(dead_code)]
+
 use crate::error::Result;
 use crate::store::distributed_locks::DistributedLockStore;
 use crate::store::DB;

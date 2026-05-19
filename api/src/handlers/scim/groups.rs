@@ -6,13 +6,12 @@ use crate::store::{memberships::MembershipStore, organizations::OrganizationStor
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
     Json,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Deserialize;
-use uuid::Uuid;
 
 use super::schemas::*;
 
@@ -70,18 +69,52 @@ async fn org_to_scim_group(
     })
 }
 
+async fn current_scim_org(state: &AppState, scim_auth: &ScimAuth) -> Result<organizations::Model> {
+    OrganizationStore::find_by_id(DB::Conn(&state.db), &scim_auth.org_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))
+}
+
+async fn current_scim_org_by_group_id(
+    state: &AppState,
+    scim_auth: &ScimAuth,
+    group_id: &str,
+) -> Result<organizations::Model> {
+    if group_id != scim_auth.org_id {
+        return Err(AppError::NotFound("Group not found".to_string()));
+    }
+
+    current_scim_org(state, scim_auth).await
+}
+
+async fn ensure_user_belongs_to_scim_org(
+    state: &AppState,
+    org_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let user = crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    if user.org_id.as_deref() != Some(org_id) {
+        return Err(AppError::NotFound("User not found".to_string()));
+    }
+
+    Ok(())
+}
+
 /// List Groups - GET /scim/v2/Groups
 pub async fn list_groups(
     State(state): State<AppState>,
+    Extension(scim_auth): Extension<ScimAuth>,
     Query(params): Query<ScimListParams>,
 ) -> Result<Json<ScimListResponse<ScimGroup>>> {
     let start_index = params.start_index.unwrap_or(1);
     let count = params.count.unwrap_or(100).min(1000);
 
-    let offset = if start_index > 0 { start_index - 1 } else { 0 };
+    let org = current_scim_org(&state, &scim_auth).await?;
 
-    // Handle filters
-    let orgs = if let Some(filter) = params.filter {
+    let matches_filter = if let Some(filter) = params.filter {
         // Parse simple filters like: displayName eq "Acme Corp"
         if filter.contains("displayName eq") {
             let name = filter
@@ -91,35 +124,28 @@ pub async fn list_groups(
                 .unwrap_or("");
 
             if !name.is_empty() {
-                Organizations::find()
-                    .filter(organizations::Column::Name.eq(name))
-                    .all(&state.db)
-                    .await?
+                org.name == name
             } else {
-                vec![]
+                false
             }
         } else {
-            vec![]
+            false
         }
     } else {
-        Organizations::find()
-            .paginate(&state.db, count)
-            .fetch_page(offset / count.max(1))
-            .await?
+        true
     };
 
-    let total_results = Organizations::find().count(&state.db).await?;
-
     let base_url = &state.base_url;
-    let mut scim_groups = Vec::new();
-
-    for org in orgs {
-        scim_groups.push(org_to_scim_group(&state.db, org, &base_url).await?);
-    }
+    let include_resource = matches_filter && start_index <= 1 && count > 0;
+    let scim_groups = if include_resource {
+        vec![org_to_scim_group(&state.db, org, &base_url).await?]
+    } else {
+        vec![]
+    };
 
     Ok(Json(ScimListResponse::new(
         scim_groups,
-        total_results,
+        if matches_filter { 1 } else { 0 },
         start_index,
         count,
     )))
@@ -128,11 +154,10 @@ pub async fn list_groups(
 /// Get Group by ID - GET /scim/v2/Groups/:id
 pub async fn get_group(
     State(state): State<AppState>,
+    Extension(scim_auth): Extension<ScimAuth>,
     Path(group_id): Path<String>,
 ) -> Result<Json<ScimGroup>> {
-    let org = OrganizationStore::find_by_id(DB::Conn(&state.db), &group_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
+    let org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     let base_url = &state.base_url;
     let scim_group = org_to_scim_group(&state.db, org, &base_url).await?;
@@ -142,78 +167,23 @@ pub async fn get_group(
 
 /// Create Group - POST /scim/v2/Groups
 pub async fn create_group(
-    State(state): State<AppState>,
-    Extension(scim_auth): Extension<ScimAuth>,
-    Json(req): Json<ScimGroupRequest>,
+    State(_state): State<AppState>,
+    Extension(_scim_auth): Extension<ScimAuth>,
+    Json(_req): Json<ScimGroupRequest>,
 ) -> Result<Response> {
-    // Create organization from SCIM Group request
-    // Generate slug from display_name
-    let slug = req
-        .display_name
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>();
-
-    // Ensure slug is unique by appending random suffix if needed (simple approach)
-    let slug = format!(
-        "{}-{}",
-        slug,
-        Uuid::new_v4()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>()
-    );
-
-    // Create organization
-    // Use the user who created the SCIM token as the owner of the new organization
-    let org = OrganizationStore::create(
-        DB::Conn(&state.db),
-        &slug,
-        &req.display_name,
-        &scim_auth.token.created_by,
-        None, // Default tier
-    )
-    .await?;
-
-    // Add members if provided
-    if let Some(members) = req.members {
-        for member in members {
-            // Add member with default role "member"
-            MembershipStore::create(DB::Conn(&state.db), &org.id, &member.value, "member").await?;
-
-            // Grant permission
-            use crate::entities::permissions::RelationTuple;
-            use crate::store::permissions::PermissionsStore;
-            PermissionsStore::grant(
-                DB::Conn(&state.db),
-                RelationTuple::user(
-                    "organization".to_string(),
-                    org.id.clone(),
-                    "member".to_string(),
-                    member.value.clone(),
-                ),
-            )
-            .await?;
-        }
-    }
-
-    let base_url = &state.base_url;
-    let scim_group = org_to_scim_group(&state.db, org, base_url).await?;
-
-    Ok((StatusCode::CREATED, Json(scim_group)).into_response())
+    Err(AppError::Forbidden(
+        "SCIM group creation is not supported for organization-scoped tokens".to_string(),
+    ))
 }
 
 /// Update Group (PUT) - PUT /scim/v2/Groups/:id
 pub async fn update_group(
     State(state): State<AppState>,
+    Extension(scim_auth): Extension<ScimAuth>,
     Path(group_id): Path<String>,
     Json(req): Json<ScimGroupRequest>,
 ) -> Result<Json<ScimGroup>> {
-    let org = OrganizationStore::find_by_id(DB::Conn(&state.db), &group_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
+    let org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     // Note: Organization name updates would need to be implemented in OrganizationStore
     // For now, we'll skip this as it's not a critical SCIM feature
@@ -229,6 +199,8 @@ pub async fn update_group(
         // Add new members
         for member in &members {
             if !current_user_ids.contains(&member.value) {
+                ensure_user_belongs_to_scim_org(&state, &org.id, &member.value).await?;
+
                 // Add member with default role "member"
                 MembershipStore::create(DB::Conn(&state.db), &org.id, &member.value, "member")
                     .await?;
@@ -285,12 +257,11 @@ pub async fn update_group(
 /// Patch Group (PATCH) - PATCH /scim/v2/Groups/:id
 pub async fn patch_group(
     State(state): State<AppState>,
+    Extension(scim_auth): Extension<ScimAuth>,
     Path(group_id): Path<String>,
     Json(req): Json<ScimPatchRequest>,
 ) -> Result<Json<ScimGroup>> {
-    let org = OrganizationStore::find_by_id(DB::Conn(&state.db), &group_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
+    let org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     // Process each operation
     for op in req.operations {
@@ -304,6 +275,9 @@ pub async fn patch_group(
                                 if let Some(user_id) =
                                     member_value.get("value").and_then(|v| v.as_str())
                                 {
+                                    ensure_user_belongs_to_scim_org(&state, &org.id, user_id)
+                                        .await?;
+
                                     // Add member
                                     MembershipStore::create(
                                         DB::Conn(&state.db),
@@ -390,12 +364,11 @@ pub async fn patch_group(
 /// Delete Group - DELETE /scim/v2/Groups/:id
 pub async fn delete_group(
     State(state): State<AppState>,
+    Extension(scim_auth): Extension<ScimAuth>,
     Path(group_id): Path<String>,
 ) -> Result<StatusCode> {
     // For now, return an error as we don't want SCIM to delete organizations
-    let _org = OrganizationStore::find_by_id(DB::Conn(&state.db), &group_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
+    let _org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     Err(AppError::Forbidden(
         "Group deletion via SCIM is not supported. Please use the Organizations API.".to_string(),

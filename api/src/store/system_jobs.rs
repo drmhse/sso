@@ -58,8 +58,7 @@ impl SystemJobStore {
     /// Returns `None` if no jobs are available.
     pub async fn claim_next_job(
         db: &DatabaseConnection,
-        #[cfg(feature = "db_sqlite")]
-        db_writer: &DatabaseConnection,
+        #[cfg(feature = "db_sqlite")] db_writer: &DatabaseConnection,
         worker_id: &str,
     ) -> Result<Option<system_jobs::Model>> {
         use sea_orm::{
@@ -85,9 +84,13 @@ impl SystemJobStore {
             // For others: Use db (shared pool)
             let txn = match if is_sqlite {
                 #[cfg(feature = "db_sqlite")]
-                { db_writer.begin().await }
+                {
+                    db_writer.begin().await
+                }
                 #[cfg(not(feature = "db_sqlite"))]
-                { unreachable!("SQLite feature not enabled") }
+                {
+                    unreachable!("SQLite feature not enabled")
+                }
             } else {
                 db.begin().await
             } {
@@ -119,9 +122,13 @@ impl SystemJobStore {
             // SQLite will use optimistic locking via status check in update
             let job = match if is_sqlite {
                 #[cfg(feature = "db_sqlite")]
-                { query.one(&txn).await }
+                {
+                    query.one(&txn).await
+                }
                 #[cfg(not(feature = "db_sqlite"))]
-                { unreachable!("SQLite feature not enabled") }
+                {
+                    unreachable!("SQLite feature not enabled")
+                }
             } else {
                 // Use lock_with_behavior for FOR UPDATE SKIP LOCKED
                 query
@@ -186,7 +193,6 @@ impl SystemJobStore {
                     )
                     .filter(system_jobs::Column::Id.eq(&job.id))
                     .filter(system_jobs::Column::Status.eq("pending")) // Optimistic lock
-
                     .exec(&txn)
                     .await
             } else {
@@ -247,9 +253,13 @@ impl SystemJobStore {
             let updated_job = match if is_sqlite {
                 #[cfg(feature = "db_sqlite")]
                 #[cfg(feature = "db_sqlite")]
-                { SystemJobs::find_by_id(&job.id).one(&txn).await }
+                {
+                    SystemJobs::find_by_id(&job.id).one(&txn).await
+                }
                 #[cfg(not(feature = "db_sqlite"))]
-                { unreachable!("SQLite feature not enabled") }
+                {
+                    unreachable!("SQLite feature not enabled")
+                }
             } else {
                 SystemJobs::find_by_id(&job.id).one(&txn).await
             } {
@@ -274,7 +284,7 @@ impl SystemJobStore {
 
             // Commit transaction
             let commit_result = txn.commit().await;
-            
+
             match commit_result {
                 Ok(_) => {
                     if let Some(ref j) = updated_job {
@@ -397,7 +407,7 @@ impl SystemJobStore {
                 return Ok(());
             }
         } else if let sea_orm::ActiveValue::Set(status) = &job.status {
-             if status == "failed" || status == "completed" {
+            if status == "failed" || status == "completed" {
                 return Ok(());
             }
         }

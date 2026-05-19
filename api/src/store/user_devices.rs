@@ -68,7 +68,7 @@ impl UserDevicesStore {
     }
 
     /// Update last seen information
-    /// 
+    ///
     /// OPTIMIZATION: Only writes to DB if >5 minutes since last update.
     /// This dramatically reduces write pressure for frequently-used devices.
     pub async fn update_last_seen(db: DB<'_>, device_id: &str, ip: Option<String>) -> Result<()> {

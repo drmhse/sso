@@ -1,3 +1,8 @@
+//! Store layer - comprehensive database access functions.
+//! Many functions are intentionally kept for API completeness,
+//! even if not currently used by handlers.
+#![allow(dead_code)]
+
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, ExecResult, QueryResult,
     Statement,
@@ -6,12 +11,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub mod api_keys;
+pub mod connected_accounts;
 pub mod device_codes;
 pub mod distributed_locks;
 pub mod email_verification;
 pub mod identities;
 pub mod invitations;
-pub mod log_streams;
 pub mod login_events;
 pub mod magic_links;
 pub mod memberships;
@@ -24,10 +29,12 @@ pub mod password_reset;
 pub mod permissions;
 pub mod plans;
 pub mod platform_audit_log;
+pub mod provider_token_requests;
 pub mod risk_rules;
 pub mod saml_signing_keys;
 pub mod saml_states;
 pub mod scim_tokens;
+pub mod service_provider_grants;
 pub mod services;
 pub mod sessions;
 pub mod siem_configs;
@@ -119,3 +126,4 @@ impl<'a> ConnectionTrait for DB<'a> {
         }
     }
 }
+pub mod organization_roles;

@@ -1,16 +1,24 @@
 import { defineConfig } from 'tsup';
 
-export default defineConfig({
-  entry: {
-    index: 'src/index.ts',
-    bin: 'src/bin.ts',
+export default defineConfig([
+  // Library entry (no shebang)
+  {
+    entry: { index: 'src/index.ts' },
+    format: ['cjs'],
+    dts: true,
+    clean: true,
+    treeshake: true,
+    splitting: false,
   },
-  format: ['cjs'],
-  dts: true,
-  clean: true,
-  treeshake: true,
-  splitting: false,
-  banner: {
-    js: '#!/usr/bin/env node',
+  // CLI binary entry (with shebang)
+  {
+    entry: { bin: 'src/bin.ts' },
+    format: ['cjs'],
+    dts: true,
+    treeshake: true,
+    splitting: false,
+    banner: {
+      js: '#!/usr/bin/env node',
+    },
   },
-});
+]);

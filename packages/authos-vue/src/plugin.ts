@@ -3,6 +3,7 @@ import { reactive, nextTick } from 'vue';
 import { SsoClient, BrowserStorage, MemoryStorage } from '@drmhse/sso-sdk';
 import type { AuthOSPluginOptions, AuthOSState, AuthOSContext } from './types';
 import { AUTH_OS_INJECTION_KEY } from './types';
+import { injectStyles, applyVariables } from './styles';
 
 export function createAuthOS(options: AuthOSPluginOptions) {
   // Use provided storage, or fallback to BrowserStorage (with MemoryStorage fallback for SSR/tests)
@@ -19,7 +20,7 @@ export function createAuthOS(options: AuthOSPluginOptions) {
   };
 
   const client = new SsoClient({
-    baseURL: options.baseUrl,
+    baseURL: options.baseURL,
     storage: getStorage(),
     token: options.initialToken, // Pass initial token if provided
   });
@@ -44,10 +45,31 @@ export function createAuthOS(options: AuthOSPluginOptions) {
   const context: AuthOSContext = {
     client,
     state,
+    options,
   };
 
   return {
     install(app: App) {
+      // Inject default styles
+      injectStyles();
+
+      // Apply custom appearance variables if provided
+      if (options.appearance?.variables) {
+        applyVariables(options.appearance.variables as Record<string, string>);
+      }
+
+      // Runtime validation for OAuth configuration
+      if (options.org && !options.service) {
+        console.warn(
+          '[AuthOS] You provided "org" but not "service". OAuth flows may not work correctly.'
+        );
+      }
+      if (!options.org && options.service) {
+        console.warn(
+          '[AuthOS] You provided "service" but not "org". OAuth flows may not work correctly.'
+        );
+      }
+
       // Set initial token after plugin is installed
       nextTick(() => {
         setInitialToken();

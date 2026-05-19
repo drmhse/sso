@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::auth::jwt::{Actor, Claims, JwtService};
 use crate::entities::{memberships, organizations, users};
 use crate::error::{AppError, Result};
@@ -17,6 +19,38 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+// ============================================================================
+// Security Audit Item 2: Regex DoS Prevention
+// ============================================================================
+
+use std::sync::LazyLock;
+
+/// Static email regex compiled once at startup to prevent Regex DoS attacks
+/// from per-request regex compilation overhead
+static EMAIL_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+        .expect("Invalid email regex")
+});
+
+/// Validate email format using statically compiled regex
+/// This prevents Regex DoS by reusing a single compiled regex instance
+pub fn validate_email_format_static(email: &str) -> Result<()> {
+    if email.is_empty() {
+        return Err(AppError::BadRequest("Email cannot be empty".to_string()));
+    }
+
+    if !EMAIL_REGEX.is_match(email) {
+        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    }
+
+    // Additional checks for specific invalid patterns
+    if email.starts_with('.') || email.ends_with('.') || email.contains("..") {
+        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    }
+
+    Ok(())
+}
+
 /// Extension type for storing authenticated user claims
 #[derive(Clone, Debug)]
 pub struct AuthUser {
@@ -25,6 +59,7 @@ pub struct AuthUser {
     pub permissions: Vec<String>, // Cached permissions from database
     pub ip_address: String,
     pub user_agent: String,
+    pub current_session_id: Option<String>,
 }
 
 /// Extension type for storing impersonation context
@@ -83,8 +118,43 @@ async fn fetch_and_cache_permissions(
     Ok(perms_strings)
 }
 
+/// Security Audit Item 8: Fetch permissions with tenant context
+/// Uses compound cache key 'org_id:user_id' to prevent cross-tenant cache pollution
+pub async fn fetch_and_cache_permissions_with_context(
+    db: &DatabaseConnection,
+    cache: &Cache<String, Vec<String>>,
+    user_id: &str,
+    org_id: Option<&str>,
+) -> Result<Vec<String>> {
+    use crate::store::{permissions::PermissionsStore, DB};
+
+    // Create compound key for tenant-scoped cache
+    let cache_key = match org_id {
+        Some(org) => format!("{}:{}", org, user_id),
+        None => format!("platform:{}", user_id),
+    };
+
+    // 1. Try cache first (O(1) lookup)
+    if let Some(cached_perms) = cache.get(&cache_key).await {
+        return Ok(cached_perms);
+    }
+
+    // 2. Cache miss: Fetch from database
+    let perms_models = PermissionsStore::list_user_permissions(DB::Conn(db), user_id).await?;
+
+    let perms_strings: Vec<String> = perms_models
+        .into_iter()
+        .map(|p| format!("{}:{}#{}", p.namespace, p.object_id, p.relation))
+        .collect();
+
+    // 3. Store in cache for future requests
+    cache.insert(cache_key, perms_strings.clone()).await;
+
+    Ok(perms_strings)
+}
+
 /// Fetch user model from cache, or from DB on cache miss
-/// 
+///
 /// This reduces database load on authenticated requests by caching User models
 /// with a 30-second TTL. Cache is invalidated when user is updated.
 async fn fetch_and_cache_user(
@@ -153,7 +223,8 @@ pub async fn extract_user_from_jwt(
         );
 
         // Load the target user from cache or database
-        let user = fetch_and_cache_user(db, user_cache, &claims.sub).await
+        let user = fetch_and_cache_user(db, user_cache, &claims.sub)
+            .await
             .map_err(|_| AppError::Unauthorized("Target user not found".to_string()))?;
 
         // Fetch permissions for impersonated user
@@ -173,6 +244,7 @@ pub async fn extract_user_from_jwt(
             permissions,
             ip_address,
             user_agent,
+            current_session_id: None,
         });
     } else {
         // Normal authentication flow
@@ -185,6 +257,7 @@ pub async fn extract_user_from_jwt(
                 "Session revoked or expired".to_string(),
             ));
         }
+        let current_session_id = session.as_ref().map(|session| session.id.clone());
 
         // Load user from cache or database
         let user = fetch_and_cache_user(db, user_cache, &claims.sub).await?;
@@ -199,6 +272,7 @@ pub async fn extract_user_from_jwt(
             permissions,
             ip_address,
             user_agent,
+            current_session_id,
         });
     }
 
@@ -207,24 +281,68 @@ pub async fn extract_user_from_jwt(
 
 /// Extract IP address from request
 fn extract_ip(req: &Request) -> String {
+    extract_client_ip(req)
+}
+
+fn extract_client_ip(req: &Request) -> String {
+    let socket_ip = req
+        .extensions()
+        .get::<std::net::SocketAddr>()
+        .map(|socket_addr| socket_addr.ip());
+
+    if let Some(remote_ip) = socket_ip {
+        if proxy_headers_are_trusted(&remote_ip) {
+            if let Some(forwarded_ip) = extract_forwarded_ip(req) {
+                return forwarded_ip.to_string();
+            }
+        }
+
+        return remote_ip.to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn proxy_headers_are_trusted(remote_ip: &IpAddr) -> bool {
+    static TRUST_PROXY_HEADERS: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("TRUST_PROXY_HEADERS")
+            .map(|value| matches!(value.as_str(), "true" | "1" | "yes" | "on"))
+            .unwrap_or(false)
+    });
+
+    static TRUSTED_PROXY_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(|| {
+        std::env::var("TRUSTED_PROXY_IPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.trim().parse::<IpAddr>().ok())
+            .collect()
+    });
+
+    *TRUST_PROXY_HEADERS && TRUSTED_PROXY_IPS.iter().any(|trusted| trusted == remote_ip)
+}
+
+fn extract_forwarded_ip(req: &Request) -> Option<IpAddr> {
     req.headers()
         .get("X-Forwarded-For")
         .and_then(|header| header.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find_map(|candidate| candidate.parse::<IpAddr>().ok())
+        })
         .or_else(|| {
             req.headers()
                 .get("X-Real-IP")
                 .and_then(|header| header.to_str().ok())
-                .map(|s| s.to_string())
+                .and_then(|value| value.trim().parse::<IpAddr>().ok())
         })
         .or_else(|| {
             req.headers()
                 .get("CF-Connecting-IP")
                 .and_then(|header| header.to_str().ok())
-                .map(|s| s.to_string())
+                .and_then(|value| value.trim().parse::<IpAddr>().ok())
         })
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Extract User-Agent from request
@@ -351,12 +469,26 @@ impl EmailRateLimiter {
 
     /// Check if email address is rate limited for sending emails
     pub async fn is_rate_limited_email(&self, email: &str) -> bool {
+        self.is_rate_limited_email_with_context(email, None).await
+    }
+
+    /// Security Audit Item 9: Tenant-aware email rate limiting
+    /// Uses compound key 'org_id:email' to partition rate limits by tenant
+    pub async fn is_rate_limited_email_with_context(
+        &self,
+        email: &str,
+        org_id: Option<&str>,
+    ) -> bool {
         let mut attempts = self.email_attempts.write().await;
         let now = Instant::now();
 
-        let entry = attempts
-            .entry(email.to_lowercase())
-            .or_insert_with(Vec::new);
+        // Create compound key for tenant-partitioned rate limiting
+        let key = match org_id {
+            Some(org) => format!("{}:{}", org, email.to_lowercase()),
+            None => format!("platform:{}", email.to_lowercase()),
+        };
+
+        let entry = attempts.entry(key).or_insert_with(Vec::new);
 
         // Remove expired attempts (older than 1 hour)
         entry.retain(|&timestamp| now.duration_since(timestamp) < self.window);
@@ -435,10 +567,27 @@ impl MfaRateLimiter {
     /// Check if user is rate limited for MFA attempts
     #[allow(dead_code)]
     pub async fn is_rate_limited_user(&self, user_id: &str) -> bool {
+        self.is_rate_limited_user_with_context(user_id, None).await
+    }
+
+    /// Security Audit Item 9: Tenant-aware MFA rate limiting
+    /// Uses compound key 'org_id:user_id' to partition rate limits by tenant
+    #[allow(dead_code)]
+    pub async fn is_rate_limited_user_with_context(
+        &self,
+        user_id: &str,
+        org_id: Option<&str>,
+    ) -> bool {
         let mut attempts = self.user_attempts.write().await;
         let now = Instant::now();
 
-        let entry = attempts.entry(user_id.to_string()).or_insert_with(Vec::new);
+        // Create compound key for tenant-partitioned rate limiting
+        let key = match org_id {
+            Some(org) => format!("{}:{}", org, user_id),
+            None => format!("platform:{}", user_id),
+        };
+
+        let entry = attempts.entry(key).or_insert_with(Vec::new);
 
         // Remove expired attempts
         entry.retain(|&timestamp| now.duration_since(timestamp) < self.window);
@@ -542,19 +691,7 @@ pub struct RequestInfo {
 
 /// Middleware to extract request information and add it to extensions
 pub async fn extract_request_info_middleware(mut request: Request, next: Next) -> Response {
-    // Extract IP address - prioritize X-Forwarded-For for proxy-aware detection
-    let ip_address = if let Some(forwarded) = request.headers().get("x-forwarded-for") {
-        forwarded
-            .to_str()
-            .ok()
-            .and_then(|s| s.split(',').next())
-            .unwrap_or("unknown")
-            .to_string()
-    } else if let Some(socket_addr) = request.extensions().get::<std::net::SocketAddr>() {
-        socket_addr.ip().to_string()
-    } else {
-        "unknown".to_string()
-    };
+    let ip_address = extract_client_ip(&request);
 
     let user_agent = request
         .headers()
@@ -636,6 +773,150 @@ pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
         "status" => status_class.to_string()
     );
 
+    response
+}
+
+// ============================================================================
+// Security Audit Item 3: Dynamic Efficient CORS
+// ============================================================================
+
+use axum::http::{header, HeaderValue, Method};
+
+/// Middleware to handle CORS dynamically based on organization domains AND service redirect URIs.
+///
+/// This replaces the permissive `CorsLayer::new().allow_origin(Any)` with
+/// a secure, domain-aware CORS policy:
+///
+/// 1. Platform dashboard URL is always allowed
+/// 2. Checks domain_cache (L1) for previously validated origins
+/// 3. Falls back to database lookup for organization custom domains (L2)
+/// 4. Falls back to service redirect URI origin check (L2)
+/// 5. Caches results for 5 minutes to reduce database load
+pub async fn dynamic_cors_middleware(
+    State(state): State<crate::state::AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use crate::store::{organizations::OrganizationStore, services::ServiceStore, DB};
+
+    // 1. Check Origin Header - clone to avoid borrow issues
+    let origin_header = match request.headers().get(header::ORIGIN).cloned() {
+        Some(h) => h,
+        None => return next.run(request).await, // Not a CORS request
+    };
+
+    let origin_str = match origin_header.to_str() {
+        Ok(s) => s.to_string(), // Clone to owned string
+        Err(_) => return next.run(request).await,
+    };
+
+    // 2. Check Platform Dashboard URL (Always allowed)
+    // Trim trailing slash to match origin format
+    let platform_url = state
+        .config
+        .platform_dashboard_base_url
+        .trim_end_matches('/');
+    if origin_str == platform_url {
+        return allow_cors(request, next, origin_header).await;
+    }
+
+    // Also allow the API base URL itself
+    let api_base = state.base_url.trim_end_matches('/');
+    if origin_str == api_base {
+        return allow_cors(request, next, origin_header).await;
+    }
+
+    // Parse domain from origin (remove protocol and port)
+    // e.g. https://custom.org.com:3000 -> custom.org.com
+    let domain = origin_str
+        .split("://")
+        .nth(1)
+        .unwrap_or(&origin_str)
+        .split(':')
+        .next()
+        .unwrap_or(&origin_str)
+        .to_string();
+
+    // Skip strict CORS for localhost during development
+    if domain == "localhost" || domain.starts_with("127.") || domain.starts_with("192.168.") {
+        return allow_cors(request, next, origin_header).await;
+    }
+
+    // 3. Check Cache (L1)
+    // The cache is keyed by the full origin string (covers both custom domains and redirect URIs)
+    if let Some(is_allowed) = state.domain_cache.get(&origin_str).await {
+        if is_allowed {
+            return allow_cors(request, next, origin_header).await;
+        } else {
+            // Explicitly denied in cache, proceed without CORS headers (browser will block)
+            return next.run(request).await;
+        }
+    }
+
+    // 4. Check Database (L2)
+    let db = DB::Conn(&state.db);
+    let mut is_allowed = false;
+
+    // Check A: Is it an Organization Custom Domain?
+    if let Ok(Some(org)) = OrganizationStore::find_by_custom_domain(db.clone(), &domain).await {
+        if org.status == "active" && org.domain_verified {
+            is_allowed = true;
+        }
+    }
+
+    // Check B: Is it a Service Redirect URI origin?
+    // Only check if not already found to save DB calls
+    if !is_allowed {
+        if let Ok(allowed) = ServiceStore::is_origin_allowed(db, &origin_str).await {
+            is_allowed = allowed;
+        }
+    }
+
+    // 5. Update Cache
+    // Cache the full origin string result (unified for both sources)
+    state.domain_cache.insert(origin_str, is_allowed).await;
+
+    if is_allowed {
+        allow_cors(request, next, origin_header).await
+    } else {
+        next.run(request).await
+    }
+}
+
+/// Helper to attach CORS headers to the response
+async fn allow_cors(req: Request, next: Next, origin: HeaderValue) -> Response {
+    // Handle Preflight OPTIONS
+    if req.method() == Method::OPTIONS {
+        let mut response = Response::new(axum::body::Body::empty());
+        let headers = response.headers_mut();
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, PATCH, OPTIONS"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Authorization, Content-Type, X-Api-Key, X-Organization-ID"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("86400"), // 24 hours
+        );
+        return response;
+    }
+
+    // Handle standard request
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
     response
 }
 

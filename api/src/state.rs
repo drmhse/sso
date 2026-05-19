@@ -38,6 +38,11 @@ pub struct AppState {
     // IMPORTANT: Invalidate cache on user updates (password change, role change, etc.)
     pub user_cache: Cache<String, crate::entities::users::Model>,
 
+    // Security Audit Item 3: CORS Domain Cache for dynamic CORS validation
+    // Key = domain string, Value = is_allowed bool
+    // TTL: 5 minutes, Max capacity: 10,000 domains
+    pub domain_cache: Cache<String, bool>,
+
     // Buffered audit actor: removes 66% of write pressure from login critical path
     // Batches audit events and writes them asynchronously with retry on DB locks
     pub audit_actor: crate::services::audit_actor::AuditHandle,

@@ -12,6 +12,8 @@ pub struct Model {
     pub service_id: String,
     #[sea_orm(column_type = "Text")]
     pub name: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub description: Option<String>,
     pub price_cents: i32,
     #[sea_orm(column_type = "Text")]
     pub currency: String,
@@ -19,6 +21,7 @@ pub struct Model {
     pub features: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub stripe_price_id: Option<String>,
+    pub is_default: bool,
     pub created_at: DateTime,
 }
 

@@ -56,35 +56,35 @@ export function UserButton({ className, showEmail = false, onLogout }: UserButto
     .join('');
 
   return (
-    <div className={className} data-authos-userbutton data-state={isOpen ? 'open' : 'closed'}>
+    <div className={className} data-authos-userbutton="" data-state={isOpen ? 'open' : 'closed'}>
       <button
         type="button"
         onClick={() => setIsOpen(!isOpen)}
         disabled={isLoggingOut}
-        data-authos-user-trigger
+        data-authos-user-trigger=""
       >
-        <span data-authos-user-avatar aria-hidden="true">
+        <span data-authos-avatar="" aria-hidden="true">
           {initials}
         </span>
-        {showEmail && <span data-authos-user-email>{user.email}</span>}
+        {showEmail && <span data-authos-email="">{user.email}</span>}
       </button>
 
       {isOpen && (
-        <div data-authos-user-menu>
-          <div data-authos-user-info>
-            <span data-authos-user-email>{user.email}</span>
+        <div data-authos-user-menu="">
+          <div data-authos-user-info="">
+            <span data-authos-email="">{user.email}</span>
             {user.is_platform_owner && (
-              <span data-authos-user-badge>Platform Owner</span>
+              <span data-authos-badge="">Platform Owner</span>
             )}
           </div>
 
-          <hr data-authos-divider />
+          <div data-authos-divider=""></div>
 
           <button
             type="button"
             onClick={handleLogout}
             disabled={isLoggingOut}
-            data-authos-logout
+            data-authos-logout=""
           >
             {isLoggingOut ? 'Signing out...' : 'Sign out'}
           </button>

@@ -5,16 +5,16 @@ import type { Organization } from '@drmhse/sso-sdk';
 interface UseOrganizationReturn {
   /** The current active organization */
   organization: Organization | null;
-  /** Switch to a different organization by slug */
+  /** Switch to a different organization by slug - issues new org-scoped tokens */
   switchOrganization: (slug: string) => Promise<void>;
 }
 
 /**
  * Hook to access the current organization context and switch between organizations.
  *
- * Note: Organization switching sets the local context. For full token-scoped
- * organization switching, users should re-authenticate through the OAuth flow
- * with the organization parameter.
+ * When switching organizations, this hook calls the backend to issue new JWT tokens
+ * with the organization context, enabling seamless organization switching without
+ * requiring re-authentication.
  *
  * @returns The current organization and a function to switch organizations
  *
@@ -39,9 +39,17 @@ export function useOrganization(): UseOrganizationReturn {
 
   const switchOrganization = useCallback(
     async (slug: string) => {
-      // Get the organization details
-      const orgResponse = await client.organizations.get(slug);
-      setOrganization(orgResponse.organization);
+      // Call the backend to issue new org-scoped tokens
+      const result = await client.organizations.select(slug);
+
+      // Update the SDK session with the new tokens
+      await client.setSession({
+        access_token: result.access_token,
+        refresh_token: result.refresh_token,
+      });
+
+      // Update the local organization state
+      setOrganization(result.organization);
 
       // Refresh user to get context for the new org
       await refreshUser();

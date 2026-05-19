@@ -4,7 +4,7 @@ use crate::entities::services;
 use crate::error::Result;
 use crate::store::DB;
 use chrono::NaiveDateTime;
-use sea_orm::sea_query::{Alias, Expr, Func, SimpleExpr};
+use sea_orm::sea_query::{Alias, Expr, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, JoinType, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// Login trend data point (date, count)
 #[derive(Debug, FromQueryResult, Serialize)]
 pub struct LoginTrendPoint {
-    pub date: String,
+    pub date: Option<String>,
     pub count: i64,
 }
 
@@ -111,11 +111,10 @@ impl LoginEventStore {
         start_date: NaiveDateTime,
         end_date: NaiveDateTime,
     ) -> Result<Vec<LoginTrendPoint>> {
-        let date_expr: SimpleExpr = Func::cast_as(
-            Expr::col((login_events::Entity, login_events::Column::CreatedAt)),
-            Alias::new("DATE"),
-        )
-        .into();
+        // Use DATE() function - works in SQLite, MySQL, PostgreSQL
+        // DATE() returns text string in YYYY-MM-DD format across all databases
+        let date_expr: SimpleExpr =
+            Expr::cust_with_expr("DATE($1)", Expr::col(login_events::Column::CreatedAt));
 
         let trends = LoginEvents::find()
             .filter(login_events::Column::ServiceId.is_not_null())
@@ -272,11 +271,9 @@ impl LoginEventStore {
         start_date: NaiveDateTime,
         end_date: NaiveDateTime,
     ) -> Result<Vec<LoginTrendPoint>> {
-        let date_expr: SimpleExpr = Func::cast_as(
-            Expr::col(login_events::Column::CreatedAt),
-            Alias::new("DATE"),
-        )
-        .into();
+        // Use DATE() function - works in SQLite, MySQL, PostgreSQL
+        let date_expr: SimpleExpr =
+            Expr::cust_with_expr("DATE($1)", Expr::col(login_events::Column::CreatedAt));
 
         let trends = LoginEvents::find()
             .filter(login_events::Column::CreatedAt.gte(start_date))

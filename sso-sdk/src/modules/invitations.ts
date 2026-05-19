@@ -107,6 +107,15 @@ export class InvitationsModule {
   }
 
   /**
+   * Accept one of the current user's invitations by invitation ID.
+   *
+   * @param invitationId Invitation ID
+   */
+  public async acceptById(invitationId: string): Promise<void> {
+    await this.http.post(`/api/invitations/${invitationId}/accept`);
+  }
+
+  /**
    * Decline an invitation using its token.
    *
    * @param token Invitation token
@@ -119,5 +128,14 @@ export class InvitationsModule {
   public async decline(token: string): Promise<void> {
     const payload: DeclineInvitationPayload = { token };
     await this.http.post('/api/invitations/decline', payload);
+  }
+
+  /**
+   * Decline one of the current user's invitations by invitation ID.
+   *
+   * @param invitationId Invitation ID
+   */
+  public async declineById(invitationId: string): Promise<void> {
+    await this.http.post(`/api/invitations/${invitationId}/decline`);
   }
 }

@@ -107,11 +107,7 @@ impl OrganizationBillingCredentialsStore {
     }
 
     /// Delete billing credentials for an organization and provider
-    pub async fn delete(
-        db: DB<'_>,
-        org_id: &str,
-        provider: &str,
-    ) -> Result<u64> {
+    pub async fn delete(db: DB<'_>, org_id: &str, provider: &str) -> Result<u64> {
         let result = OrganizationBillingCredentials::delete_many()
             .filter(organization_billing_credentials::Column::OrgId.eq(org_id))
             .filter(organization_billing_credentials::Column::Provider.eq(provider))
@@ -122,11 +118,7 @@ impl OrganizationBillingCredentialsStore {
     }
 
     /// Disable billing credentials (soft delete)
-    pub async fn disable(
-        db: DB<'_>,
-        org_id: &str,
-        provider: &str,
-    ) -> Result<u64> {
+    pub async fn disable(db: DB<'_>, org_id: &str, provider: &str) -> Result<u64> {
         // Find and update all matching credentials
         let credentials = OrganizationBillingCredentials::find()
             .filter(organization_billing_credentials::Column::OrgId.eq(org_id))

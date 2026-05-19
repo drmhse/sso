@@ -54,11 +54,19 @@ export const UserButton = defineComponent({
         return h('div', { 'data-authos-userbutton': '', 'data-state': 'signed-out' }, 'Not signed in');
       }
 
-      return h('div', { 'data-authos-userbutton': '', 'data-state': 'signed-in', style: 'display: flex; align-items: center; gap: 8px;' }, [
-        h('span', user.value.email),
+      // Get user initials for avatar
+      const getInitials = (email: string): string => {
+        const name = email.split('@')[0];
+        return name.substring(0, 2).toUpperCase();
+      };
+
+      return h('div', { 'data-authos-userbutton': '', 'data-state': 'signed-in' }, [
+        h('div', { 'data-authos-avatar': '' }, getInitials(user.value.email)),
+        h('span', { 'data-authos-email': '' }, user.value.email),
         h(
           'button',
           {
+            'data-authos-logout': '',
             onClick: logout,
             disabled: isLoggingOut.value,
           },

@@ -5,10 +5,13 @@ use crate::entities::{totp_backup_codes, user_devices, user_totp_secrets, users}
 use crate::error::{with_deadlock_retry, with_retrying_transaction, AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::services::audit_builder::MfaAuditBuilder;
+use crate::services::permission_service::PermissionService;
 use crate::state::AppState;
-use crate::store::{user_devices::UserDevicesStore, users::UserStore, DB};
+use crate::store::{
+    organizations::OrganizationStore, user_devices::UserDevicesStore, users::UserStore, DB,
+};
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use axum::{
@@ -21,6 +24,7 @@ use sea_orm::{
     QueryOrder, QuerySelect, Set,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +57,8 @@ pub struct UserResponse {
     pub is_platform_owner: bool,
     pub email_verified_at: Option<String>,
     pub created_at: String,
+    pub org: String,                   // Organization slug from JWT
+    pub service: String,               // Service slug from JWT
     pub permissions: Vec<String>,      // User permissions from cache
     pub plan: Option<String>,          // Current plan name (if in org/service context)
     pub features: Option<Vec<String>>, // Plan features (if in org/service context)
@@ -97,6 +103,31 @@ pub struct UserDeviceResponse {
     pub registration_ip: Option<String>,
     pub risk_score: i32,
     pub is_trusted: bool,
+}
+
+async fn effective_user_permissions(
+    state: &AppState,
+    auth_user: &crate::middleware::AuthUser,
+) -> Result<Vec<String>> {
+    let mut permissions: HashSet<String> = auth_user.permissions.iter().cloned().collect();
+
+    if let Some(org_slug) = &auth_user.claims.org {
+        if let Some(org) = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug).await? {
+            for capability in PermissionService::get_user_capabilities(
+                DB::Conn(&state.db),
+                &org.id,
+                &auth_user.user.id,
+            )
+            .await?
+            {
+                permissions.insert(capability);
+            }
+        }
+    }
+
+    let mut permissions = permissions.into_iter().collect::<Vec<_>>();
+    permissions.sort();
+    Ok(permissions)
 }
 
 #[derive(Debug, Serialize)]
@@ -347,45 +378,53 @@ pub async fn verify_and_enable_mfa(
     let helper_totp_secret_id = totp_secret.id.clone();
     let helper_backup_hashes = backup_code_hashes.clone();
 
-    with_retrying_transaction(db, #[cfg(feature = "db_sqlite")] &state.db_writer, "verify_and_enable_mfa", |db| {
-        let user_id = helper_user_id.clone();
-        let totp_secret_id = helper_totp_secret_id.clone();
-        let backup_hashes = helper_backup_hashes.clone();
-        
-        Box::pin(async move {
-            // Re-fetch the totp_secret inside the transaction to get fresh data
-            let current_secret = UserTotpSecrets::find_by_id(&totp_secret_id)
-                .one(&db)
-                .await?
-                .ok_or_else(|| AppError::BadRequest("MFA setup expired, please retry".to_string()))?;
+    with_retrying_transaction(
+        db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "verify_and_enable_mfa",
+        |db| {
+            let user_id = helper_user_id.clone();
+            let totp_secret_id = helper_totp_secret_id.clone();
+            let backup_hashes = helper_backup_hashes.clone();
 
-            // Update user_totp_secrets
-            let mut totp_active: user_totp_secrets::ActiveModel = current_secret.into();
-            totp_active.enabled = Set(true);
-            totp_active.enabled_at = Set(Some(Utc::now().naive_utc()));
-            totp_active.update(&db).await?;
+            Box::pin(async move {
+                // Re-fetch the totp_secret inside the transaction to get fresh data
+                let current_secret = UserTotpSecrets::find_by_id(&totp_secret_id)
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::BadRequest("MFA setup expired, please retry".to_string())
+                    })?;
 
-            // Delete existing backup codes
-            TotpBackupCodes::delete_many()
-                .filter(totp_backup_codes::Column::UserId.eq(&user_id))
-                .exec(&db)
-                .await?;
+                // Update user_totp_secrets
+                let mut totp_active: user_totp_secrets::ActiveModel = current_secret.into();
+                totp_active.enabled = Set(true);
+                totp_active.enabled_at = Set(Some(Utc::now().naive_utc()));
+                totp_active.update(&db).await?;
 
-            // Insert new backup codes
-            for (id, code_hash) in backup_hashes {
-                let new_backup_code = totp_backup_codes::ActiveModel {
-                    id: Set(id),
-                    user_id: Set(user_id.clone()),
-                    code_hash: Set(code_hash),
-                    used: Set(false),
-                    ..Default::default()
-                };
-                new_backup_code.insert(&db).await?;
-            }
+                // Delete existing backup codes
+                TotpBackupCodes::delete_many()
+                    .filter(totp_backup_codes::Column::UserId.eq(&user_id))
+                    .exec(&db)
+                    .await?;
 
-            Ok(())
-        })
-    })
+                // Insert new backup codes
+                for (id, code_hash) in backup_hashes {
+                    let new_backup_code = totp_backup_codes::ActiveModel {
+                        id: Set(id),
+                        user_id: Set(user_id.clone()),
+                        code_hash: Set(code_hash),
+                        used: Set(false),
+                        ..Default::default()
+                    };
+                    new_backup_code.insert(&db).await?;
+                }
+
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -455,22 +494,28 @@ pub async fn disable_mfa(
     let user_id = auth_user.user.id.clone();
 
     // Execute transaction with automatic retry on database contention
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "disable_mfa", |db| {
-        let user_id = user_id.clone();
-        Box::pin(async move {
-            UserTotpSecrets::delete_many()
-                .filter(user_totp_secrets::Column::UserId.eq(&user_id))
-                .exec(&db)
-                .await?;
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "disable_mfa",
+        |db| {
+            let user_id = user_id.clone();
+            Box::pin(async move {
+                UserTotpSecrets::delete_many()
+                    .filter(user_totp_secrets::Column::UserId.eq(&user_id))
+                    .exec(&db)
+                    .await?;
 
-            TotpBackupCodes::delete_many()
-                .filter(totp_backup_codes::Column::UserId.eq(&user_id))
-                .exec(&db)
-                .await?;
+                TotpBackupCodes::delete_many()
+                    .filter(totp_backup_codes::Column::UserId.eq(&user_id))
+                    .exec(&db)
+                    .await?;
 
-            Ok(())
-        })
-    })
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -521,29 +566,35 @@ pub async fn regenerate_backup_codes(
     }
 
     // Execute transaction with automatic retry on database contention
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "regenerate_backup_codes", |db| {
-        let user_id = user_id.clone();
-        let backup_code_hashes = backup_code_hashes.clone();
-        Box::pin(async move {
-            TotpBackupCodes::delete_many()
-                .filter(totp_backup_codes::Column::UserId.eq(&user_id))
-                .exec(&db)
-                .await?;
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "regenerate_backup_codes",
+        |db| {
+            let user_id = user_id.clone();
+            let backup_code_hashes = backup_code_hashes.clone();
+            Box::pin(async move {
+                TotpBackupCodes::delete_many()
+                    .filter(totp_backup_codes::Column::UserId.eq(&user_id))
+                    .exec(&db)
+                    .await?;
 
-            for (id, code_hash) in &backup_code_hashes {
-                let new_backup_code = totp_backup_codes::ActiveModel {
-                    id: Set(id.clone()),
-                    user_id: Set(user_id.clone()),
-                    code_hash: Set(code_hash.clone()),
-                    used: Set(false),
-                    ..Default::default()
-                };
-                new_backup_code.insert(&db).await?;
-            }
+                for (id, code_hash) in &backup_code_hashes {
+                    let new_backup_code = totp_backup_codes::ActiveModel {
+                        id: Set(id.clone()),
+                        user_id: Set(user_id.clone()),
+                        code_hash: Set(code_hash.clone()),
+                        used: Set(false),
+                        ..Default::default()
+                    };
+                    new_backup_code.insert(&db).await?;
+                }
 
-            Ok(())
-        })
-    })
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -672,6 +723,107 @@ pub struct SetPasswordResponse {
     pub message: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangePasswordResponse {
+    pub message: String,
+}
+
+/// POST /api/user/change-password - Change user's password
+pub async fn change_password(
+    State(state): State<AppState>,
+    auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<ChangePasswordResponse>> {
+    let auth_user = auth_user
+        .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
+        .0;
+
+    // Validate new password strength
+    if req.new_password.len() < 8 {
+        return Err(AppError::BadRequest(
+            "New password must be at least 8 characters long".to_string(),
+        ));
+    }
+
+    // Get current user
+    let user = UserStore::find_by_id(DB::Conn(&state.db), &auth_user.claims.sub)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    // Check if user has a password set
+    let current_password_hash = user.password_hash.as_ref().ok_or_else(|| {
+        AppError::BadRequest(
+            "Cannot change password for OAuth-only accounts. Please set a password first."
+                .to_string(),
+        )
+    })?;
+
+    // Verify current password using spawn_blocking to avoid blocking the async runtime
+    use crate::services::concurrency::ARGON2_SEMAPHORE;
+
+    let password_hash_clone = current_password_hash.clone();
+    let password_input = req.current_password.clone();
+
+    // Acquire semaphore permit to limit concurrent hash operations
+    let _permit = ARGON2_SEMAPHORE.acquire().await.map_err(|_| {
+        AppError::InternalServerError("Password verification unavailable".to_string())
+    })?;
+
+    // Offload to blocking thread pool
+    let is_valid = tokio::task::spawn_blocking(move || {
+        let parsed_hash = match PasswordHash::new(&password_hash_clone) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Corrupted password hash in database: {}", e);
+                return false;
+            }
+        };
+        Argon2::default()
+            .verify_password(password_input.as_bytes(), &parsed_hash)
+            .is_ok()
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Password verification failed: {}", e)))?;
+
+    if !is_valid {
+        return Err(AppError::Unauthorized(
+            "Current password is incorrect".to_string(),
+        ));
+    }
+
+    // Hash new password
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let new_password_hash = argon2
+        .hash_password(req.new_password.as_bytes(), &salt)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to hash password: {}", e)))?
+        .to_string();
+
+    // Update password
+    UserStore::update_password_hash(DB::Conn(&state.db), &user.id, &new_password_hash).await?;
+
+    // Optionally revoke all other sessions for security
+    use crate::store::sessions::SessionStore;
+    if let Some(session_id) = &auth_user.current_session_id {
+        SessionStore::delete_all_except_current(DB::Conn(&state.db), &user.id, session_id).await?;
+    } else {
+        tracing::warn!(
+            user_id = %user.id,
+            "Password changed without a bound current session; skipping session revocation"
+        );
+    }
+
+    Ok(Json(ChangePasswordResponse {
+        message: "Password changed successfully".to_string(),
+    }))
+}
+
 /// POST /api/user/set-password - Set password for OAuth users
 /// This endpoint allows OAuth users (who don't have a password) to set one.
 /// If the user already has a password, this endpoint will return an error.
@@ -761,6 +913,8 @@ pub async fn get_user(
         (None, None)
     };
 
+    let permissions = effective_user_permissions(&state, &auth_user).await?;
+
     Ok(Json(UserResponse {
         id: user.id,
         email: user.email,
@@ -770,7 +924,9 @@ pub async fn get_user(
             .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
         created_at: chrono::DateTime::<Utc>::from_naive_utc_and_offset(user.created_at, Utc)
             .to_rfc3339(),
-        permissions: auth_user.permissions.clone(), // From middleware cache
+        org: auth_user.claims.org.clone().unwrap_or_default(),
+        service: auth_user.claims.service.clone().unwrap_or_default(),
+        permissions,
         plan,
         features,
     }))
@@ -838,6 +994,8 @@ pub async fn update_user(
         (None, None)
     };
 
+    let permissions = effective_user_permissions(&state, &auth_user).await?;
+
     Ok(Json(UserResponse {
         id: updated_user.id,
         email: updated_user.email,
@@ -850,7 +1008,9 @@ pub async fn update_user(
             Utc,
         )
         .to_rfc3339(),
-        permissions: auth_user.permissions.clone(), // From middleware cache
+        org: auth_user.claims.org.clone().unwrap_or_default(),
+        service: auth_user.claims.service.clone().unwrap_or_default(),
+        permissions,
         plan,
         features,
     }))
@@ -1202,24 +1362,7 @@ pub async fn trust_device(
     }))
 }
 
-/// Validate email format
+/// Validate email format - delegates to middleware's statically compiled regex
 fn validate_email_format(email: &str) -> Result<()> {
-    if email.is_empty() {
-        return Err(AppError::BadRequest("Email cannot be empty".to_string()));
-    }
-
-    // Basic email validation regex
-    let email_regex = regex::Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
-        .map_err(|_| AppError::InternalServerError("Invalid email validation regex".to_string()))?;
-
-    if !email_regex.is_match(email) {
-        return Err(AppError::BadRequest("Invalid email format".to_string()));
-    }
-
-    // Additional checks for specific invalid patterns
-    if email.starts_with('.') || email.ends_with('.') || email.contains("..") {
-        return Err(AppError::BadRequest("Invalid email format".to_string()));
-    }
-
-    Ok(())
+    crate::middleware::validate_email_format_static(email)
 }

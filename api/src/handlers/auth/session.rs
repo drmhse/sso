@@ -1,5 +1,4 @@
 use crate::auth::jwt::JwtService;
-use crate::constants::JWT_EXPIRE_HOURS;
 use crate::db::models::User;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
@@ -91,7 +90,8 @@ pub async fn refresh_token(
     // Implement token rotation: generate new refresh token
     let new_refresh_token = Uuid::new_v4().to_string();
     let new_token_hash = JwtService::hash_token(&new_access_token);
-    let new_access_expires_at = Utc::now() + chrono::Duration::hours(state.config.jwt_expiration_hours);
+    let new_access_expires_at =
+        Utc::now() + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let new_refresh_expires_at = Utc::now() + chrono::Duration::days(30);
 
     // Update session with new tokens (token rotation)

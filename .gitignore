@@ -6,7 +6,6 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Node
 node_modules/
@@ -50,6 +49,5 @@ temp/
 
 # Build artifacts
 *.tsbuildinfo
-api/scripts
 web-client
 auth-os

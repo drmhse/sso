@@ -1,7 +1,13 @@
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use crate::store::{verified_domains::VerifiedDomainStore, DB};
-use axum::{extract::State, Json};
+use crate::store::{
+    organizations::OrganizationStore, services::ServiceStore,
+    verified_domains::VerifiedDomainStore, DB,
+};
+use axum::{
+    extract::{Query, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +25,39 @@ pub struct LookupEmailResponse {
     pub domain_verified: bool,
     /// The authentication method to use: "upstream", "password", or "oauth"
     pub auth_method: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthContextQuery {
+    pub org: Option<String>,
+    pub service: Option<String>,
+    pub redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthOrganizationContext {
+    pub slug: String,
+    pub name: String,
+    pub logo_url: Option<String>,
+    pub primary_color: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthServiceContext {
+    pub slug: String,
+    pub name: String,
+    pub service_type: String,
+    pub redirect_uri_valid: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthContextResponse {
+    pub organization: Option<AuthOrganizationContext>,
+    pub service: Option<AuthServiceContext>,
+    pub available_providers: Vec<String>,
+    pub auth_methods: Vec<String>,
+    pub support_available: bool,
 }
 
 /// Home Realm Discovery: Lookup an email address to determine which IdP to use
@@ -87,4 +126,101 @@ pub async fn lookup_email(
             }))
         }
     }
+}
+
+/// Public hosted-auth metadata for end-user login surfaces.
+///
+/// This gives the UI enough organization/service context to show the right
+/// name, branding, provider choices, and redirect validation status before a
+/// user commits to a sign-in path.
+pub async fn get_auth_context(
+    State(state): State<AppState>,
+    Query(query): Query<AuthContextQuery>,
+) -> Result<Json<AuthContextResponse>> {
+    let mut available_providers = vec![
+        "github".to_string(),
+        "google".to_string(),
+        "microsoft".to_string(),
+    ];
+
+    let mut auth_methods = vec![
+        "password".to_string(),
+        "magic_link".to_string(),
+        "passkey".to_string(),
+    ];
+
+    let Some(org_slug) = query
+        .org
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(Json(AuthContextResponse {
+            organization: None,
+            service: None,
+            available_providers,
+            auth_methods,
+            support_available: true,
+        }));
+    };
+
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    let org_provider_list = OrganizationStore::list_oauth_providers(DB::Conn(&state.db), &org.id)
+        .await
+        .unwrap_or_default();
+    if !org_provider_list.is_empty() {
+        available_providers = org_provider_list;
+    }
+
+    let service = if let Some(service_slug) = query
+        .service
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let service =
+            ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+        let redirect_uri_valid = query.redirect_uri.as_deref().map(|redirect_uri| {
+            service
+                .redirect_uris
+                .as_deref()
+                .and_then(|uris| serde_json::from_str::<Vec<String>>(uris).ok())
+                .map(|uris| uris.is_empty() || uris.iter().any(|uri| uri == redirect_uri))
+                .unwrap_or(false)
+        });
+
+        Some(AuthServiceContext {
+            slug: service.slug,
+            name: service.name,
+            service_type: service.service_type,
+            redirect_uri_valid,
+        })
+    } else {
+        None
+    };
+
+    if org.status != "active" {
+        auth_methods.clear();
+        available_providers.clear();
+    }
+
+    Ok(Json(AuthContextResponse {
+        organization: Some(AuthOrganizationContext {
+            slug: org.slug,
+            name: org.name,
+            logo_url: org.brand_logo_url,
+            primary_color: org.brand_primary_color,
+            status: org.status,
+        }),
+        service,
+        available_providers,
+        auth_methods,
+        support_available: true,
+    }))
 }

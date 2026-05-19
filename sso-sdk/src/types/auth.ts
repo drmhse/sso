@@ -131,7 +131,21 @@ export interface RefreshTokenResponse {
 export interface RegisterRequest {
   email: string;
   password: string;
-  org_slug?: string; // Optional: use organization-specific SMTP
+  /**
+   * Organization slug for tenant context.
+   * When provided, the user is attributed to this organization.
+   */
+  org_slug?: string;
+  /**
+   * Service slug for service attribution.
+   * When provided with org_slug, creates a scoped identity.
+   * This ensures password users are tracked the same as OAuth users.
+   */
+  service_slug?: string;
+  /**
+   * Optional service callback URI to preserve the original app return path in the verification link.
+   */
+  redirect_uri?: string;
 }
 
 /**
@@ -147,6 +161,23 @@ export interface RegisterResponse {
 export interface LoginRequest {
   email: string;
   password: string;
+  /**
+   * Organization slug for context.
+   * When provided, scopes the session to this organization.
+   */
+  org_slug?: string;
+  /**
+   * Service slug for service-scoped access.
+   * When provided with org_slug, limits access to this specific service.
+   * Only required for regular members; org owners/admins can omit.
+   */
+  service_slug?: string;
+  /**
+   * Optional service callback URI for hosted password login.
+   * When supplied with org_slug and service_slug, the API validates it
+   * against the service before tokens are returned to the hosted UI.
+   */
+  redirect_uri?: string;
 }
 
 /**
@@ -155,6 +186,8 @@ export interface LoginRequest {
 export interface ForgotPasswordRequest {
   email: string;
   org_slug?: string; // Optional: use organization-specific SMTP
+  service_slug?: string;
+  redirect_uri?: string;
 }
 
 /**
@@ -184,6 +217,9 @@ export interface ResetPasswordResponse {
  */
 export interface ResendVerificationRequest {
   email: string;
+  org_slug?: string;
+  service_slug?: string;
+  redirect_uri?: string;
 }
 
 /**
@@ -250,4 +286,45 @@ export interface LookupEmailResponse {
    * - "oauth": Use default OAuth providers (GitHub, Google, Microsoft)
    */
   auth_method: 'upstream' | 'password' | 'oauth';
+}
+
+/**
+ * Public hosted-auth context request.
+ */
+export interface AuthContextRequest {
+  org?: string;
+  service?: string;
+  redirect_uri?: string;
+}
+
+/**
+ * Public hosted-auth organization context.
+ */
+export interface AuthOrganizationContext {
+  slug: string;
+  name: string;
+  logo_url?: string | null;
+  primary_color?: string | null;
+  status: string;
+}
+
+/**
+ * Public hosted-auth service context.
+ */
+export interface AuthServiceContext {
+  slug: string;
+  name: string;
+  service_type: string;
+  redirect_uri_valid?: boolean | null;
+}
+
+/**
+ * Public hosted-auth context response.
+ */
+export interface AuthContextResponse {
+  organization: AuthOrganizationContext | null;
+  service: AuthServiceContext | null;
+  available_providers: string[];
+  auth_methods: string[];
+  support_available: boolean;
 }

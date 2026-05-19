@@ -3,10 +3,11 @@ use crate::db::models::{ApiKey, ApiKeyCreateResponse, ApiKeyResponse};
 use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
+use crate::services::permission_service::{PermissionService, CAP_SERVICES_MANAGE};
 use crate::state::AppState;
 use crate::store::{
     api_keys::ApiKeyStore, memberships::MembershipStore, organizations::OrganizationStore,
-    services::ServiceStore, DB,
+    permissions::PermissionsStore, services::ServiceStore, DB,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -38,12 +39,61 @@ pub struct ListApiKeysResponse {
 }
 
 async fn can_manage_service(state: &AppState, user_id: &str, org_id: &str) -> Result<bool> {
-    let membership =
-        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), org_id, user_id).await?;
+    PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_SERVICES_MANAGE).await
+}
 
-    Ok(membership
-        .map(|m| m.role == "owner" || m.role == "admin")
-        .unwrap_or(false))
+async fn can_manage_specific_service(
+    state: &AppState,
+    user_id: &str,
+    org_id: &str,
+    service_id: &str,
+) -> Result<bool> {
+    if can_manage_service(state, user_id, org_id).await? {
+        return Ok(true);
+    }
+
+    if MembershipStore::find_by_org_and_user(DB::Conn(&state.db), org_id, user_id)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+
+    PermissionsStore::check(
+        DB::Conn(&state.db),
+        "service",
+        service_id,
+        "manager",
+        user_id,
+    )
+    .await
+}
+
+async fn can_view_specific_service(
+    state: &AppState,
+    user_id: &str,
+    org_id: &str,
+    service_id: &str,
+) -> Result<bool> {
+    if can_manage_specific_service(state, user_id, org_id, service_id).await? {
+        return Ok(true);
+    }
+
+    if MembershipStore::find_by_org_and_user(DB::Conn(&state.db), org_id, user_id)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+
+    PermissionsStore::check(
+        DB::Conn(&state.db),
+        "service",
+        service_id,
+        "viewer",
+        user_id,
+    )
+    .await
 }
 
 pub async fn create_api_key(
@@ -59,18 +109,18 @@ pub async fn create_api_key(
     let org = crate::handlers::organizations::ensure_organization_active(&state.db, &org_model.id)
         .await?;
 
-    if !can_manage_service(&state, &auth_user.user.id, &org.id).await? {
-        return Err(AppError::Forbidden(
-            "Insufficient permissions to manage API keys".to_string(),
-        ));
-    }
-
     let service_model =
         ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
     let service_id = &service_model.id;
+
+    if !can_manage_specific_service(&state, &auth_user.user.id, &org.id, service_id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to manage API keys for this service".to_string(),
+        ));
+    }
 
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest(
@@ -94,12 +144,28 @@ pub async fn create_api_key(
         "read:analytics",
         "read:service",
         "write:service",
+        "read:provider_tokens",
+        "read:provider_tokens:github",
+        "read:provider_tokens:google",
+        "read:provider_tokens:microsoft",
     ];
 
     for permission in &req.permissions {
-        if !valid_permissions.contains(&permission.as_str()) {
+        let is_provider_specific_token_permission = permission
+            .strip_prefix("read:provider_tokens:")
+            .map(|provider| {
+                !provider.is_empty()
+                    && provider
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
+            .unwrap_or(false);
+
+        if !valid_permissions.contains(&permission.as_str())
+            && !is_provider_specific_token_permission
+        {
             return Err(AppError::BadRequest(format!(
-                "Invalid permission: {}. Valid permissions are: {}",
+                "Invalid permission: {}. Valid permissions are: {} or read:provider_tokens:<provider>",
                 permission,
                 valid_permissions.join(", ")
             )));
@@ -122,29 +188,35 @@ pub async fn create_api_key(
     let org_id = org.id.clone();
 
     // Execute transaction with automatic retry on database contention
-    let api_key_id = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "create_api_key", |db| {
-        let service_id = service_id.clone();
-        let name = name.clone();
-        let prefix = prefix.clone();
-        let key_hash = key_hash.clone();
-        let permissions_json = permissions_json.clone();
-        let user_id = user_id.clone();
-        Box::pin(async move {
-            let api_key_entity = ApiKeyStore::create(
-                db.clone(),
-                &service_id,
-                &name,
-                &prefix,
-                &key_hash,
-                &permissions_json,
-                &user_id,
-                expires_at_naive,
-            )
-            .await?;
+    let api_key_id = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_api_key",
+        |db| {
+            let service_id = service_id.clone();
+            let name = name.clone();
+            let prefix = prefix.clone();
+            let key_hash = key_hash.clone();
+            let permissions_json = permissions_json.clone();
+            let user_id = user_id.clone();
+            Box::pin(async move {
+                let api_key_entity = ApiKeyStore::create(
+                    db.clone(),
+                    &service_id,
+                    &name,
+                    &prefix,
+                    &key_hash,
+                    &permissions_json,
+                    &user_id,
+                    expires_at_naive,
+                )
+                .await?;
 
-            Ok(api_key_entity.id.clone())
-        })
-    })
+                Ok(api_key_entity.id.clone())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -191,7 +263,7 @@ pub async fn list_api_keys(
     let _org = crate::handlers::organizations::ensure_organization_active(&state.db, &org_model.id)
         .await?;
 
-    let membership = MembershipStore::find_by_org_and_user(
+    let _membership = MembershipStore::find_by_org_and_user(
         DB::Conn(&state.db),
         &org_model.id,
         &auth_user.user.id,
@@ -199,19 +271,18 @@ pub async fn list_api_keys(
     .await?
     .ok_or_else(|| AppError::Forbidden("Not a member of this organization".to_string()))?;
 
-    let role = &membership.role;
-    if role != "owner" && role != "admin" && role != "member" {
-        return Err(AppError::Forbidden(
-            "Insufficient permissions to view API keys".to_string(),
-        ));
-    }
-
     let service_model =
         ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org_model.id, &service_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
     let service_id = &service_model.id;
+
+    if !can_view_specific_service(&state, &auth_user.user.id, &org_model.id, service_id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to view API keys for this service".to_string(),
+        ));
+    }
 
     let limit = query.limit.unwrap_or(50).min(100) as u64;
     let offset = query.offset.unwrap_or(0).max(0) as u64;
@@ -247,7 +318,7 @@ pub async fn get_api_key(
     let _org = crate::handlers::organizations::ensure_organization_active(&state.db, &org_model.id)
         .await?;
 
-    let membership = MembershipStore::find_by_org_and_user(
+    let _membership = MembershipStore::find_by_org_and_user(
         DB::Conn(&state.db),
         &org_model.id,
         &auth_user.user.id,
@@ -255,19 +326,18 @@ pub async fn get_api_key(
     .await?
     .ok_or_else(|| AppError::Forbidden("Not a member of this organization".to_string()))?;
 
-    let role = &membership.role;
-    if role != "owner" && role != "admin" && role != "member" {
-        return Err(AppError::Forbidden(
-            "Insufficient permissions to view API keys".to_string(),
-        ));
-    }
-
     let service_model =
         ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org_model.id, &service_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
     let service_id = &service_model.id;
+
+    if !can_view_specific_service(&state, &auth_user.user.id, &org_model.id, service_id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to view API keys for this service".to_string(),
+        ));
+    }
 
     let api_key_entity =
         ApiKeyStore::find_by_id_and_service(DB::Conn(&state.db), &api_key_id, service_id)
@@ -291,18 +361,18 @@ pub async fn delete_api_key(
     let org = crate::handlers::organizations::ensure_organization_active(&state.db, &org_model.id)
         .await?;
 
-    if !can_manage_service(&state, &auth_user.user.id, &org.id).await? {
-        return Err(AppError::Forbidden(
-            "Insufficient permissions to delete API keys".to_string(),
-        ));
-    }
-
     let service_model =
         ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
     let service_id = &service_model.id;
+
+    if !can_manage_specific_service(&state, &auth_user.user.id, &org.id, service_id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to delete API keys for this service".to_string(),
+        ));
+    }
 
     let api_key_entity =
         ApiKeyStore::find_by_id_and_service(DB::Conn(&state.db), &api_key_id, service_id)
@@ -312,13 +382,19 @@ pub async fn delete_api_key(
     let api_key_name = api_key_entity.name.clone();
 
     // Execute transaction with automatic retry on database contention
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "delete_api_key", |db| {
-        let api_key_id = api_key_id.clone();
-        Box::pin(async move {
-            ApiKeyStore::delete(db.clone(), &api_key_id).await?;
-            Ok(())
-        })
-    })
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "delete_api_key",
+        |db| {
+            let api_key_id = api_key_id.clone();
+            Box::pin(async move {
+                ApiKeyStore::delete(db.clone(), &api_key_id).await?;
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor

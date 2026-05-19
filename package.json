@@ -1,0 +1,34 @@
+{
+  "name": "authos-public",
+  "version": "0.0.0",
+  "description": "Public AuthOS API, TypeScript SDK, and framework packages",
+  "private": true,
+  "workspaces": [
+    "sso-sdk",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build:sdk": "npm run build -w @drmhse/sso-sdk",
+    "build:packages": "npm run build -w @drmhse/authos-react -w @drmhse/authos-vue -w @drmhse/authos-node -w @drmhse/authos-cli",
+    "typecheck:sdk": "npm run typecheck -w @drmhse/sso-sdk",
+    "typecheck:packages": "npm run typecheck -w @drmhse/authos-react -w @drmhse/authos-vue -w @drmhse/authos-node -w @drmhse/authos-cli"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/drmhse/AuthOS.git"
+  },
+  "keywords": [
+    "authos",
+    "sso",
+    "oauth",
+    "authentication",
+    "multi-tenant"
+  ],
+  "author": "DRM HSE <info@drmhse.com>",
+  "license": "SEE LICENSE IN api/LICENSE AND sso-sdk/LICENSE",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

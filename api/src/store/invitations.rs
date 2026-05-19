@@ -1,14 +1,17 @@
-use crate::entities::prelude::OrganizationInvitations;
-use crate::entities::{memberships, organization_invitations};
+use crate::constants::DEFAULT_MAX_USERS;
+use crate::entities::permissions::RelationTuple;
+use crate::entities::prelude::{OrganizationInvitations, Organizations};
+use crate::entities::{organization_invitations, organizations};
 use crate::error::Result;
-use crate::store::DB;
+use crate::store::{
+    memberships::MembershipStore, organization_tiers::OrganizationTierStore,
+    permissions::PermissionsStore, DB,
+};
 use chrono::NaiveDateTime;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
     QuerySelect, Set,
 };
-use uuid::Uuid;
-
 /// Invitation with organization details
 #[derive(Debug, FromQueryResult)]
 pub struct InvitationWithOrg {
@@ -170,15 +173,59 @@ impl InvitationStore {
         for invitation in pending_invitations {
             let org_id_clone = invitation.org_id.clone();
 
-            // Create membership
-            let new_membership = memberships::ActiveModel {
-                id: Set(Uuid::new_v4().to_string()),
-                org_id: Set(invitation.org_id.clone()),
-                user_id: Set(user_id.to_string()),
-                role: Set(invitation.role.clone()),
-                ..Default::default()
-            };
-            new_membership.insert(&db).await?;
+            let membership_exists =
+                MembershipStore::find_by_org_and_user(db.clone(), &invitation.org_id, user_id)
+                    .await?
+                    .is_some();
+
+            if !membership_exists {
+                let member_count =
+                    MembershipStore::count_by_org(db.clone(), &invitation.org_id, None).await?;
+
+                let org = Organizations::find()
+                    .filter(organizations::Column::Id.eq(&invitation.org_id))
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::error::AppError::NotFound("Organization not found".to_string())
+                    })?;
+
+                let tier_limit = if let (Some(max_users), Some(_tier_id)) =
+                    (org.max_users, org.tier_id.as_ref())
+                {
+                    max_users as i64
+                } else if let Some(tier_id) = org.tier_id.as_ref() {
+                    let tier = OrganizationTierStore::find_by_id(db.clone(), tier_id)
+                        .await?
+                        .ok_or_else(|| {
+                            crate::error::AppError::NotFound("Tier not found".to_string())
+                        })?;
+
+                    tier.default_max_users as i64
+                } else {
+                    DEFAULT_MAX_USERS
+                };
+
+                if member_count >= tier_limit as u64 {
+                    return Err(crate::error::AppError::BadRequest(
+                        "Team limit reached".to_string(),
+                    ));
+                }
+
+                MembershipStore::create(db.clone(), &invitation.org_id, user_id, &invitation.role)
+                    .await?;
+
+                PermissionsStore::grant(
+                    db.clone(),
+                    RelationTuple::user(
+                        "organization".to_string(),
+                        invitation.org_id.clone(),
+                        invitation.role.clone(),
+                        user_id.to_string(),
+                    ),
+                )
+                .await?;
+            }
 
             // Update invitation status
             let mut invitation_active: organization_invitations::ActiveModel = invitation.into();

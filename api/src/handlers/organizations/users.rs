@@ -1,6 +1,9 @@
 use crate::entities::users;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::permission_service::{
+    PermissionService, CAP_END_USERS_MANAGE, CAP_END_USERS_VIEW,
+};
 use crate::state::AppState;
 use crate::store::{
     identities::IdentityStore, organizations::OrganizationStore, services::ServiceStore,
@@ -11,8 +14,36 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+async fn require_end_user_viewer(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    if PermissionService::check_any(
+        DB::Conn(&state.db),
+        org_id,
+        user_id,
+        &[CAP_END_USERS_VIEW, CAP_END_USERS_MANAGE],
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "Insufficient permissions to view end users".to_string(),
+    ))
+}
+
+async fn require_end_user_manager(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    if PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_END_USERS_MANAGE).await? {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "Insufficient permissions to manage end users".to_string(),
+    ))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ListEndUsersQuery {
@@ -61,6 +92,36 @@ pub struct EndUserDetailResponse {
     pub subscriptions: Vec<EndUserSubscription>,
     pub identities: Vec<EndUserIdentity>,
     pub session_count: i64,
+    pub sessions: Vec<EndUserSession>,
+    pub recent_logins: Vec<EndUserLoginEvent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndUserSession {
+    pub id: String,
+    pub service_id: Option<String>,
+    pub service_name: Option<String>,
+    pub org_slug: Option<String>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub refresh_token_expires_at: Option<chrono::DateTime<Utc>>,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndUserLoginEvent {
+    pub id: String,
+    pub service_id: Option<String>,
+    pub service_name: Option<String>,
+    pub provider: String,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub risk_score: Option<i32>,
+    pub risk_factors: Vec<String>,
+    pub geo_country: Option<String>,
+    pub geo_city: Option<String>,
+    pub created_at: chrono::DateTime<Utc>,
 }
 
 /// List all end-users for an organization
@@ -78,8 +139,7 @@ pub async fn list_end_users(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is member (any role can view end-users)
-    crate::middleware::check_org_membership(&state.db, &user.id, &organization.id, &[]).await?;
+    require_end_user_viewer(&state, &organization.id, &user.id).await?;
 
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
@@ -124,6 +184,7 @@ pub async fn list_end_users(
         .map(|row| users::Model {
             id: row.id.clone(),
             email: row.email,
+            org_id: None,
             is_platform_owner: row.is_platform_owner,
             password_hash: None,
             email_verified_at: None,
@@ -252,23 +313,25 @@ pub async fn get_end_user(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is member (any role can view end-users)
-    crate::middleware::check_org_membership(&state.db, &user.id, &organization.id, &[]).await?;
+    require_end_user_viewer(&state, &organization.id, &user.id).await?;
 
     // Get end-user
     let end_user_obj = UserStore::find_by_id(DB::Conn(&state.db), &end_user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("End-user not found".to_string()))?;
 
-    // Verify this user has subscriptions to this organization's services
-    let subscription_count = SubscriptionStore::count_by_user_and_org(
-        DB::Conn(&state.db),
-        &end_user_id,
-        &organization.id,
-    )
-    .await? as i64;
+    // Verify this user is an end-user of this organization
+    // Uses the same query logic as list_end_users_by_org for consistency
+    let is_end_user =
+        SubscriptionStore::is_end_user_of_org(DB::Conn(&state.db), &end_user_id, &organization.id)
+            .await?;
 
-    if subscription_count == 0 {
+    if !is_end_user {
+        tracing::warn!(
+            user_id = %end_user_id,
+            org_id = %organization.id,
+            "End-user validation failed: user is not an end-user of this organization"
+        );
         return Err(AppError::NotFound(
             "User is not an end-user of this organization".to_string(),
         ));
@@ -323,15 +386,92 @@ pub async fn get_end_user(
         })
         .collect();
 
-    // Get active session count
-    let session_count =
-        SessionStore::count_active_by_user(DB::Conn(&state.db), &end_user_id).await? as i64;
+    // Get scoped sessions and recent login events to support admin troubleshooting.
+    let org_services = ServiceStore::list_by_org(DB::Conn(&state.db), &organization.id).await?;
+    let service_ids: HashSet<String> = org_services
+        .iter()
+        .map(|service| service.id.clone())
+        .collect();
+    let service_names: HashMap<String, String> = org_services
+        .into_iter()
+        .map(|service| (service.id, service.name))
+        .collect();
+
+    let now = Utc::now().naive_utc();
+    let sessions = SessionStore::list_by_user(DB::Conn(&state.db), &end_user_id)
+        .await?
+        .into_iter()
+        .filter(|session| {
+            session.org_slug.as_deref() == Some(&org_slug)
+                || session
+                    .service_id
+                    .as_ref()
+                    .map(|id| service_ids.contains(id))
+                    .unwrap_or(false)
+        })
+        .map(|session| EndUserSession {
+            id: session.id,
+            service_name: session
+                .service_id
+                .as_ref()
+                .and_then(|id| service_names.get(id).cloned()),
+            service_id: session.service_id,
+            org_slug: session.org_slug,
+            ip_address: session.ip_address,
+            user_agent: session.user_agent,
+            expires_at: chrono::DateTime::from_naive_utc_and_offset(session.expires_at, Utc),
+            refresh_token_expires_at: session
+                .refresh_token_expires_at
+                .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, Utc)),
+            created_at: chrono::DateTime::from_naive_utc_and_offset(session.created_at, Utc),
+        })
+        .collect::<Vec<_>>();
+
+    let session_count = sessions
+        .iter()
+        .filter(|session| session.expires_at.naive_utc() > now)
+        .count() as i64;
+
+    use crate::entities::login_events::{Column as LoginEventColumn, Entity as LoginEvents};
+    let login_rows = LoginEvents::find()
+        .filter(LoginEventColumn::UserId.eq(&end_user_id))
+        .filter(LoginEventColumn::OrgId.eq(&organization.id))
+        .order_by_desc(LoginEventColumn::CreatedAt)
+        .limit(20)
+        .all(&state.db)
+        .await?;
+
+    let recent_logins = login_rows
+        .into_iter()
+        .map(|event| EndUserLoginEvent {
+            id: event.id,
+            service_name: event
+                .service_id
+                .as_ref()
+                .and_then(|id| service_names.get(id).cloned()),
+            service_id: event.service_id,
+            provider: event.provider,
+            ip_address: event.ip_address,
+            user_agent: event.user_agent,
+            risk_score: event.risk_score,
+            risk_factors: event
+                .risk_factors
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
+            geo_country: event.geo_country,
+            geo_city: event.geo_city,
+            created_at: chrono::DateTime::from_naive_utc_and_offset(event.created_at, Utc),
+        })
+        .collect();
 
     Ok(Json(EndUserDetailResponse {
         user: end_user_obj,
         subscriptions,
         identities,
         session_count,
+        sessions,
+        recent_logins,
     }))
 }
 
@@ -348,18 +488,14 @@ pub async fn revoke_end_user_sessions(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is admin or owner (required for session management)
-    crate::middleware::check_org_admin(&state.db, &user.id, &organization.id).await?;
+    require_end_user_manager(&state, &organization.id, &user.id).await?;
 
-    // Verify this user has subscriptions to this organization's services
-    let subscription_count = SubscriptionStore::count_by_user_and_org(
-        DB::Conn(&state.db),
-        &end_user_id,
-        &organization.id,
-    )
-    .await? as i64;
+    // Verify this user is an end-user of this organization
+    let is_end_user =
+        SubscriptionStore::is_end_user_of_org(DB::Conn(&state.db), &end_user_id, &organization.id)
+            .await?;
 
-    if subscription_count == 0 {
+    if !is_end_user {
         return Err(AppError::NotFound(
             "User is not an end-user of this organization".to_string(),
         ));

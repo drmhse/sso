@@ -195,3 +195,21 @@ export interface ImpersonateResponse {
   target_user: ImpersonationUserInfo;
   actor_user: ImpersonationUserInfo;
 }
+
+/**
+ * Platform user
+ */
+export interface PlatformUser {
+  id: string;
+  email: string;
+  is_platform_owner: boolean;
+  created_at: string;
+}
+
+/**
+ * Platform user list response
+ */
+export interface PlatformUserListResponse {
+  users: PlatformUser[];
+  total: number;
+}

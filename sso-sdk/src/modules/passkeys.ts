@@ -4,6 +4,8 @@ import {
   PasskeyRegisterFinishResponse,
   PasskeyAuthStartResponse,
   PasskeyAuthFinishResponse,
+  UserPasskey,
+  PasskeyActionResponse,
   RegistrationResponseJSON,
   AuthenticationResponseJSON,
 } from '../types/passkeys';
@@ -88,6 +90,32 @@ export class PasskeysModule {
       '/api/auth/passkeys/register/start',
       { name: displayName }
     );
+    return response.data;
+  }
+
+  /**
+   * List registered passkeys for the authenticated user.
+   */
+  async list(): Promise<UserPasskey[]> {
+    const response = await this.http.get<UserPasskey[]>('/api/auth/passkeys');
+    return response.data;
+  }
+
+  /**
+   * Rename a passkey for the authenticated user.
+   */
+  async updateName(passkeyId: string, name: string): Promise<UserPasskey> {
+    const response = await this.http.patch<UserPasskey>(`/api/auth/passkeys/${passkeyId}`, {
+      name,
+    });
+    return response.data;
+  }
+
+  /**
+   * Delete a passkey for the authenticated user.
+   */
+  async delete(passkeyId: string): Promise<PasskeyActionResponse> {
+    const response = await this.http.delete<PasskeyActionResponse>(`/api/auth/passkeys/${passkeyId}`);
     return response.data;
   }
 
@@ -191,10 +219,14 @@ export class PasskeysModule {
    * Start the passkey authentication ceremony.
    * Returns the options required to get credentials from the browser.
    */
-  async authenticateStart(email: string): Promise<PasskeyAuthStartResponse> {
+  async authenticateStart(email: string, context?: {
+    org_slug?: string;
+    service_slug?: string;
+    redirect_uri?: string;
+  }): Promise<PasskeyAuthStartResponse> {
     const response = await this.http.post<PasskeyAuthStartResponse>(
       '/api/auth/passkeys/authenticate/start',
-      { email }
+      { email, ...context }
     );
     return response.data;
   }
@@ -218,13 +250,17 @@ export class PasskeysModule {
    * Authenticate with a passkey and obtain a JWT token
    * ...
    */
-  async login(email: string): Promise<PasskeyAuthFinishResponse> {
+  async login(email: string, context?: {
+    org_slug?: string;
+    service_slug?: string;
+    redirect_uri?: string;
+  }): Promise<PasskeyAuthFinishResponse> {
     if (!this.isSupported()) {
       throw new Error('WebAuthn is not supported in this browser');
     }
 
     // Start authentication ceremony
-    const startData = await this.authenticateStart(email);
+    const startData = await this.authenticateStart(email, context);
 
     // Convert server options to browser format
     const getOptions: CredentialRequestOptions = {

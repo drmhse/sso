@@ -1,5 +1,7 @@
 //! Audit logging service for MFA and other security events
 
+#![allow(dead_code)]
+
 use crate::db::models::OrganizationAuditLogWithUser;
 use crate::entities::users;
 use crate::entities::{mfa_audit_log, organization_audit_log};
@@ -73,8 +75,6 @@ pub enum MfaAuditEvent {
     #[strum(serialize = "mfa_force_disabled_by_admin")]
     ForceDisabledByAdmin,
 }
-
-
 
 // ...
 

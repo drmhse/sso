@@ -38,6 +38,18 @@ pub struct UserSearchResult {
     pub created_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UserListParams {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserListResponse {
+    pub users: Vec<UserSearchResult>,
+    pub total: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MfaStatusResponse {
     pub enabled: bool,
@@ -47,6 +59,70 @@ pub struct MfaStatusResponse {
 // ============================================================================
 // User Management Endpoints
 // ============================================================================
+
+/// GET /api/platform/users/:user_id - Get a single user by ID
+pub async fn get_platform_user(
+    State(state): State<AppState>,
+    auth_user: Extension<AuthUser>,
+    Path(user_id): Path<String>,
+) -> Result<Json<UserSearchResult>> {
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    let user = UserStore::find_by_id(DB::Conn(&state.db), &user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    Ok(Json(UserSearchResult {
+        id: user.id,
+        email: user.email,
+        is_platform_owner: user.is_platform_owner,
+        created_at: chrono::DateTime::<Utc>::from_naive_utc_and_offset(user.created_at, Utc)
+            .to_rfc3339(),
+    }))
+}
+
+/// GET /api/platform/users - List all users with pagination
+pub async fn list_users(
+    State(state): State<AppState>,
+    auth_user: Extension<AuthUser>,
+    Query(params): Query<UserListParams>,
+) -> Result<Json<UserListResponse>> {
+    // Only platform owners can list users
+    if !auth_user.user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "Platform owner access required".to_string(),
+        ));
+    }
+
+    let limit_val = params.limit.unwrap_or(50).min(100); // Cap at 100 results
+    let offset_val = params.offset.unwrap_or(0).max(0);
+
+    // Get users using store
+    let users =
+        UserStore::list_all(DB::Conn(&state.db), limit_val as u64, offset_val as u64).await?;
+    let total = UserStore::count_all(DB::Conn(&state.db), false).await? as i64;
+
+    // Convert to response format
+    let user_results = users
+        .into_iter()
+        .map(|u| UserSearchResult {
+            id: u.id,
+            email: u.email,
+            is_platform_owner: u.is_platform_owner,
+            created_at: chrono::DateTime::<Utc>::from_naive_utc_and_offset(u.created_at, Utc)
+                .to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(UserListResponse {
+        users: user_results,
+        total,
+    }))
+}
 
 /// GET /api/platform/users/search - Search users by email or ID
 pub async fn search_users(
@@ -98,44 +174,50 @@ pub async fn promote_platform_owner(
     let user_id = req.user_id.clone();
     let owner_id = auth_user.user.id.clone();
 
-    let updated_user = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "promote_platform_owner", |db| {
-        let user_id = user_id.clone();
-        let owner_id = owner_id.clone();
-        Box::pin(async move {
-            // Fetch user
-            let user_model = UserStore::find_by_id(db.clone(), &user_id)
-                .await?
-                .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let updated_user = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "promote_platform_owner",
+        |db| {
+            let user_id = user_id.clone();
+            let owner_id = owner_id.clone();
+            Box::pin(async move {
+                // Fetch user
+                let user_model = UserStore::find_by_id(db.clone(), &user_id)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-            if user_model.is_platform_owner {
-                return Err(AppError::BadRequest(
-                    "User is already a platform owner".to_string(),
-                ));
-            }
+                if user_model.is_platform_owner {
+                    return Err(AppError::BadRequest(
+                        "User is already a platform owner".to_string(),
+                    ));
+                }
 
-            // Update user
-            let mut user_active: users::ActiveModel = user_model.into();
-            user_active.is_platform_owner = Set(true);
+                // Update user
+                let mut user_active: users::ActiveModel = user_model.into();
+                user_active.is_platform_owner = Set(true);
 
-            let updated_user_model = user_active.update(&db).await?;
-            let updated_user = user_model_to_old(updated_user_model.clone());
+                let updated_user_model = user_active.update(&db).await?;
+                let updated_user = user_model_to_old(updated_user_model.clone());
 
-            // Create audit log
-            create_audit_log(
-                &db,
-                &owner_id,
-                "promote_platform_owner",
-                "user",
-                &user_id,
-                Some(json!({
-                    "user_email": updated_user_model.email,
-                })),
-            )
-            .await?;
+                // Create audit log
+                create_audit_log(
+                    &db,
+                    &owner_id,
+                    "promote_platform_owner",
+                    "user",
+                    &user_id,
+                    Some(json!({
+                        "user_email": updated_user_model.email,
+                    })),
+                )
+                .await?;
 
-            Ok(updated_user)
-        })
-    })
+                Ok(updated_user)
+            })
+        },
+    )
     .await?;
 
     Ok(Json(updated_user))
@@ -161,54 +243,60 @@ pub async fn demote_platform_owner(
 
     let owner_id = auth_user.user.id.clone();
 
-    let updated_user = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "demote_platform_owner", |db| {
-        let user_id = user_id.clone();
-        let owner_id = owner_id.clone();
-        Box::pin(async move {
-            // Fetch user to demote
-            let user_model = UserStore::find_by_id(db.clone(), &user_id)
-                .await?
-                .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let updated_user = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "demote_platform_owner",
+        |db| {
+            let user_id = user_id.clone();
+            let owner_id = owner_id.clone();
+            Box::pin(async move {
+                // Fetch user to demote
+                let user_model = UserStore::find_by_id(db.clone(), &user_id)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-            if !user_model.is_platform_owner {
-                return Err(AppError::BadRequest(
-                    "User is not a platform owner".to_string(),
-                ));
-            }
+                if !user_model.is_platform_owner {
+                    return Err(AppError::BadRequest(
+                        "User is not a platform owner".to_string(),
+                    ));
+                }
 
-            // Check if this is the last platform owner
-            // Check if we can demote this user (must have at least one other platform owner)
-            let owner_count = UserStore::count_platform_owners(db.clone()).await? as i64;
+                // Check if this is the last platform owner
+                // Check if we can demote this user (must have at least one other platform owner)
+                let owner_count = UserStore::count_platform_owners(db.clone()).await? as i64;
 
-            if owner_count <= 1 {
-                return Err(AppError::BadRequest(
-                    "Cannot demote the last platform owner".to_string(),
-                ));
-            }
+                if owner_count <= 1 {
+                    return Err(AppError::BadRequest(
+                        "Cannot demote the last platform owner".to_string(),
+                    ));
+                }
 
-            // Update user
-            let mut user_active: users::ActiveModel = user_model.into();
-            user_active.is_platform_owner = Set(false);
+                // Update user
+                let mut user_active: users::ActiveModel = user_model.into();
+                user_active.is_platform_owner = Set(false);
 
-            let updated_user_model = user_active.update(&db).await?;
-            let updated_user = user_model_to_old(updated_user_model.clone());
+                let updated_user_model = user_active.update(&db).await?;
+                let updated_user = user_model_to_old(updated_user_model.clone());
 
-            // Create audit log
-            create_audit_log(
-                &db,
-                &owner_id,
-                "demote_platform_owner",
-                "user",
-                &user_id,
-                Some(json!({
-                    "user_email": updated_user_model.email,
-                })),
-            )
-            .await?;
+                // Create audit log
+                create_audit_log(
+                    &db,
+                    &owner_id,
+                    "demote_platform_owner",
+                    "user",
+                    &user_id,
+                    Some(json!({
+                        "user_email": updated_user_model.email,
+                    })),
+                )
+                .await?;
 
-            Ok(updated_user)
-        })
-    })
+                Ok(updated_user)
+            })
+        },
+    )
     .await?;
 
     Ok(Json(updated_user))

@@ -1,14 +1,44 @@
 use crate::error::{AppError, Result};
-use crate::middleware::{check_org_admin, AuthUser};
+use crate::middleware::AuthUser;
+use crate::services::permission_service::{PermissionService, CAP_INTEGRATIONS_MANAGE};
+use crate::services::tier_enforcement::TierService;
 use crate::state::AppState;
 use crate::store::{organizations::OrganizationStore, scim_tokens::ScimTokenStore, DB};
-use crate::services::tier_enforcement::TierService;
 use axum::{
     extract::{Path, State},
     Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+async fn require_integration_manager(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    if PermissionService::check(
+        DB::Conn(&state.db),
+        org_id,
+        user_id,
+        CAP_INTEGRATIONS_MANAGE,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "Insufficient permissions to manage integrations".to_string(),
+    ))
+}
+
+async fn require_scim_token_in_org(state: &AppState, org_id: &str, token_id: &str) -> Result<()> {
+    let token = ScimTokenStore::find_by_id(DB::Conn(&state.db), token_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("SCIM token not found".to_string()))?;
+
+    if token.org_id != org_id {
+        return Err(AppError::NotFound("SCIM token not found".to_string()));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateScimTokenRequest {
@@ -49,8 +79,7 @@ pub async fn create_scim_token(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Verify user is admin or owner of organization
-    check_org_admin(&state.db, &auth_user.user.id, &org.id).await?;
+    require_integration_manager(&state, &org.id, &auth_user.user.id).await?;
 
     // Tier/Entitlement Check
     TierService::check_feature_access(
@@ -111,8 +140,7 @@ pub async fn list_scim_tokens(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Verify user is admin or owner of organization
-    check_org_admin(&state.db, &auth_user.user.id, &org.id).await?;
+    require_integration_manager(&state, &org.id, &auth_user.user.id).await?;
 
     // List tokens
     let tokens = ScimTokenStore::list_by_org(DB::Conn(&state.db), &org.id).await?;
@@ -149,8 +177,8 @@ pub async fn revoke_scim_token(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Verify user is admin or owner of organization
-    check_org_admin(&state.db, &auth_user.user.id, &org.id).await?;
+    require_integration_manager(&state, &org.id, &auth_user.user.id).await?;
+    require_scim_token_in_org(&state, &org.id, &token_id).await?;
 
     // Revoke token
     ScimTokenStore::revoke(DB::Conn(&state.db), &token_id).await?;
@@ -169,8 +197,8 @@ pub async fn delete_scim_token(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Verify user is admin or owner of organization
-    check_org_admin(&state.db, &auth_user.user.id, &org.id).await?;
+    require_integration_manager(&state, &org.id, &auth_user.user.id).await?;
+    require_scim_token_in_org(&state, &org.id, &token_id).await?;
 
     // Delete token
     ScimTokenStore::delete(DB::Conn(&state.db), &token_id).await?;

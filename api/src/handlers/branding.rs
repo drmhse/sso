@@ -7,6 +7,11 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::services::domain_verification::{
+    normalize_verifiable_domain, verify_dns_txt_record, verify_http_file,
+};
+use crate::services::permission_service::{PermissionService, CAP_ORG_SETTINGS_MANAGE};
+use crate::services::tier_enforcement::TierService;
 use crate::{
     db::models::{
         BrandingConfiguration, DomainConfiguration, DomainVerificationMethod,
@@ -18,11 +23,9 @@ use crate::{
     state::AppState,
     store::{memberships::MembershipStore, organizations::OrganizationStore, DB},
 };
-use crate::services::tier_enforcement::TierService;
 
-// Helper function to check if user has owner/admin access
-async fn check_owner_or_admin(
-    db: &sea_orm::DatabaseConnection,
+async fn require_settings_manager(
+    state: &AppState,
     org_id: &str,
     user_id: &str,
     is_platform_owner: bool,
@@ -31,16 +34,20 @@ async fn check_owner_or_admin(
         return Ok(());
     }
 
-    let is_owner_or_admin =
-        MembershipStore::is_owner_or_admin(DB::Conn(db), org_id, user_id).await?;
-
-    if is_owner_or_admin {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden(
-            "Only organization owners and admins can perform this action".to_string(),
-        ))
+    if PermissionService::check(
+        DB::Conn(&state.db),
+        org_id,
+        user_id,
+        CAP_ORG_SETTINGS_MANAGE,
+    )
+    .await?
+    {
+        return Ok(());
     }
+
+    Err(AppError::Forbidden(
+        "Insufficient permissions to manage organization settings".to_string(),
+    ))
 }
 
 // Request/Response Types
@@ -69,8 +76,8 @@ pub async fn set_custom_domain(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    check_owner_or_admin(
-        &state.db,
+    require_settings_manager(
+        &state,
         &org.id,
         &auth_user.claims.sub,
         auth_user.claims.is_platform_owner,
@@ -86,16 +93,7 @@ pub async fn set_custom_domain(
     )
     .await?;
 
-    // Validate domain format
-    let domain = req.domain.trim().to_lowercase();
-    if domain.is_empty() {
-        return Err(AppError::BadRequest("domain cannot be empty".to_string()));
-    }
-
-    // Basic domain validation - must contain at least one dot and no spaces
-    if !domain.contains('.') || domain.contains(' ') {
-        return Err(AppError::BadRequest("Invalid domain format".to_string()));
-    }
+    let domain = normalize_verifiable_domain(&req.domain)?;
 
     // Check if domain is already in use by another organization
     use crate::entities::prelude::Organizations;
@@ -119,26 +117,32 @@ pub async fn set_custom_domain(
     let domain_clone = domain.clone();
     let verification_token_clone = verification_token.clone();
 
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "set_custom_domain", |db| {
-        let org_id = org_id.clone();
-        let domain = domain_clone.clone();
-        let verification_token = verification_token_clone.clone();
-        Box::pin(async move {
-            let org_model = Organizations::find()
-                .filter(organizations::Column::Id.eq(&org_id))
-                .one(&db)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "set_custom_domain",
+        |db| {
+            let org_id = org_id.clone();
+            let domain = domain_clone.clone();
+            let verification_token = verification_token_clone.clone();
+            Box::pin(async move {
+                let org_model = Organizations::find()
+                    .filter(organizations::Column::Id.eq(&org_id))
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-            let mut org_active: organizations::ActiveModel = org_model.into();
-            org_active.custom_domain = Set(Some(domain));
-            org_active.domain_verified = Set(false);
-            org_active.domain_verification_token = Set(Some(verification_token));
-            org_active.updated_at = Set(chrono::Utc::now().naive_utc());
-            org_active.update(&db).await?;
-            Ok(())
-        })
-    })
+                let mut org_active: organizations::ActiveModel = org_model.into();
+                org_active.custom_domain = Set(Some(domain));
+                org_active.domain_verified = Set(false);
+                org_active.domain_verification_token = Set(Some(verification_token));
+                org_active.updated_at = Set(chrono::Utc::now().naive_utc());
+                org_active.update(&db).await?;
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -187,8 +191,8 @@ pub async fn verify_custom_domain(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    check_owner_or_admin(
-        &state.db,
+    require_settings_manager(
+        &state,
         &org.id,
         &auth_user.claims.sub,
         auth_user.claims.is_platform_owner,
@@ -223,23 +227,29 @@ pub async fn verify_custom_domain(
     if dns_verified || http_verified {
         // Mark domain as verified
         let org_id = org.id.clone();
-        with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "verify_custom_domain", |db| {
-            let org_id = org_id.clone();
-            Box::pin(async move {
-                use crate::entities::prelude::Organizations;
-                let org_model = Organizations::find()
-                    .filter(organizations::Column::Id.eq(&org_id))
-                    .one(&db)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        with_retrying_transaction(
+            &state.db,
+            #[cfg(feature = "db_sqlite")]
+            &state.db_writer,
+            "verify_custom_domain",
+            |db| {
+                let org_id = org_id.clone();
+                Box::pin(async move {
+                    use crate::entities::prelude::Organizations;
+                    let org_model = Organizations::find()
+                        .filter(organizations::Column::Id.eq(&org_id))
+                        .one(&db)
+                        .await?
+                        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-                let mut org_active: organizations::ActiveModel = org_model.into();
-                org_active.domain_verified = Set(true);
-                org_active.updated_at = Set(chrono::Utc::now().naive_utc());
-                org_active.update(&db).await?;
-                Ok(())
-            })
-        })
+                    let mut org_active: organizations::ActiveModel = org_model.into();
+                    org_active.domain_verified = Set(true);
+                    org_active.updated_at = Set(chrono::Utc::now().naive_utc());
+                    org_active.update(&db).await?;
+                    Ok(())
+                })
+            },
+        )
         .await?;
 
         // Non-blocking audit via actor
@@ -308,8 +318,8 @@ pub async fn delete_custom_domain(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    check_owner_or_admin(
-        &state.db,
+    require_settings_manager(
+        &state,
         &org.id,
         &auth_user.claims.sub,
         auth_user.claims.is_platform_owner,
@@ -319,25 +329,31 @@ pub async fn delete_custom_domain(
     let domain = org.custom_domain.clone();
     let org_id = org.id.clone();
 
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "delete_custom_domain", |db| {
-        let org_id = org_id.clone();
-        Box::pin(async move {
-            use crate::entities::prelude::Organizations;
-            let org_model = Organizations::find()
-                .filter(organizations::Column::Id.eq(&org_id))
-                .one(&db)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "delete_custom_domain",
+        |db| {
+            let org_id = org_id.clone();
+            Box::pin(async move {
+                use crate::entities::prelude::Organizations;
+                let org_model = Organizations::find()
+                    .filter(organizations::Column::Id.eq(&org_id))
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-            let mut org_active: organizations::ActiveModel = org_model.into();
-            org_active.custom_domain = Set(None);
-            org_active.domain_verified = Set(false);
-            org_active.domain_verification_token = Set(None);
-            org_active.updated_at = Set(chrono::Utc::now().naive_utc());
-            org_active.update(&db).await?;
-            Ok(())
-        })
-    })
+                let mut org_active: organizations::ActiveModel = org_model.into();
+                org_active.custom_domain = Set(None);
+                org_active.domain_verified = Set(false);
+                org_active.domain_verification_token = Set(None);
+                org_active.updated_at = Set(chrono::Utc::now().naive_utc());
+                org_active.update(&db).await?;
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -366,8 +382,8 @@ pub async fn update_branding(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    check_owner_or_admin(
-        &state.db,
+    require_settings_manager(
+        &state,
         &org.id,
         &auth_user.claims.sub,
         auth_user.claims.is_platform_owner,
@@ -405,26 +421,32 @@ pub async fn update_branding(
     let logo_url = req.logo_url.clone();
     let primary_color = req.primary_color.clone();
 
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "update_branding", |db| {
-        let org_id = org_id.clone();
-        let logo_url = logo_url.clone();
-        let primary_color = primary_color.clone();
-        Box::pin(async move {
-            use crate::entities::prelude::Organizations;
-            let org_model = Organizations::find()
-                .filter(organizations::Column::Id.eq(&org_id))
-                .one(&db)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "update_branding",
+        |db| {
+            let org_id = org_id.clone();
+            let logo_url = logo_url.clone();
+            let primary_color = primary_color.clone();
+            Box::pin(async move {
+                use crate::entities::prelude::Organizations;
+                let org_model = Organizations::find()
+                    .filter(organizations::Column::Id.eq(&org_id))
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-            let mut org_active: organizations::ActiveModel = org_model.into();
-            org_active.brand_logo_url = Set(logo_url);
-            org_active.brand_primary_color = Set(primary_color);
-            org_active.updated_at = Set(chrono::Utc::now().naive_utc());
-            org_active.update(&db).await?;
-            Ok(())
-        })
-    })
+                let mut org_active: organizations::ActiveModel = org_model.into();
+                org_active.brand_logo_url = Set(logo_url);
+                org_active.brand_primary_color = Set(primary_color);
+                org_active.updated_at = Set(chrono::Utc::now().naive_utc());
+                org_active.update(&db).await?;
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -483,56 +505,4 @@ pub async fn get_public_branding(
         logo_url: org.brand_logo_url,
         primary_color: org.brand_primary_color,
     }))
-}
-
-// Helper functions for domain verification
-
-async fn verify_dns_txt_record(domain: &str, expected_token: &str) -> bool {
-    use hickory_resolver::TokioAsyncResolver;
-
-    // Create DNS resolver with system configuration
-    let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-
-    // Look up TXT records for _sso-verification.{domain}
-    let record_name = format!("_sso-verification.{}", domain);
-
-    match resolver.txt_lookup(&record_name).await {
-        Ok(records) => {
-            // Check if any TXT record matches the expected token
-            for record in records.iter() {
-                // TXT records can have multiple strings; concatenate them
-                let txt_value = record
-                    .txt_data()
-                    .iter()
-                    .map(|data| String::from_utf8_lossy(data.as_ref()))
-                    .collect::<Vec<_>>()
-                    .join("");
-
-                if txt_value.trim() == expected_token {
-                    return true;
-                }
-            }
-            false
-        }
-        Err(_) => false,
-    }
-}
-
-async fn verify_http_file(domain: &str, expected_token: &str) -> bool {
-    // Try to fetch http://domain/.well-known/sso-verification.txt
-    let url = format!("http://{}/.well-known/sso-verification.txt", domain);
-
-    match reqwest::get(&url).await {
-        Ok(response) => {
-            if let Ok(body) = response.text().await {
-                body.trim() == expected_token
-            } else {
-                false
-            }
-        }
-        Err(_) => false,
-    }
 }

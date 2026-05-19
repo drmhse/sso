@@ -13,6 +13,7 @@ pub enum Provider {
     Google,
     Microsoft,
     Oidc,
+    Password,
 }
 
 impl Provider {
@@ -22,6 +23,7 @@ impl Provider {
             "google" => Ok(Provider::Google),
             "microsoft" => Ok(Provider::Microsoft),
             "oidc" => Ok(Provider::Oidc),
+            "password" => Ok(Provider::Password),
             _ => Err(AppError::BadRequest("Invalid provider".to_string())),
         }
     }
@@ -32,6 +34,7 @@ impl Provider {
             Provider::Google => "google",
             Provider::Microsoft => "microsoft",
             Provider::Oidc => "oidc",
+            Provider::Password => "password",
         }
     }
 }
@@ -57,15 +60,28 @@ pub struct OAuthClient {
     microsoft_client: Option<BasicClient>,
 }
 
+fn platform_redirect_uri(
+    config: &Config,
+    provider: Provider,
+    configured_redirect_uri: Option<&String>,
+) -> String {
+    configured_redirect_uri.cloned().unwrap_or_else(|| {
+        format!(
+            "{}/auth/admin/{}/callback",
+            config.base_url,
+            provider.as_str()
+        )
+    })
+}
+
 impl OAuthClient {
     pub fn new(config: &Config) -> Result<Self> {
         // Only create GitHub client if credentials are configured
         let github_client = match (
             &config.platform_github_client_id,
             &config.platform_github_client_secret,
-            &config.platform_github_redirect_uri,
         ) {
-            (Some(client_id), Some(client_secret), Some(redirect_uri)) => {
+            (Some(client_id), Some(client_secret)) => {
                 let github_auth_url = config
                     .platform_github_auth_url
                     .clone()
@@ -74,6 +90,11 @@ impl OAuthClient {
                     .platform_github_token_url
                     .clone()
                     .unwrap_or_else(|| "https://github.com/login/oauth/access_token".to_string());
+                let redirect_uri = platform_redirect_uri(
+                    config,
+                    Provider::Github,
+                    config.platform_github_redirect_uri.as_ref(),
+                );
 
                 Some(
                     BasicClient::new(
@@ -87,7 +108,7 @@ impl OAuthClient {
                         ),
                     )
                     .set_redirect_uri(
-                        RedirectUrl::new(redirect_uri.clone())
+                        RedirectUrl::new(redirect_uri)
                             .map_err(|e| AppError::OAuth(e.to_string()))?,
                     ),
                 )
@@ -99,9 +120,8 @@ impl OAuthClient {
         let google_client = match (
             &config.platform_google_client_id,
             &config.platform_google_client_secret,
-            &config.platform_google_redirect_uri,
         ) {
-            (Some(client_id), Some(client_secret), Some(redirect_uri)) => {
+            (Some(client_id), Some(client_secret)) => {
                 let google_auth_url = config
                     .platform_google_auth_url
                     .clone()
@@ -110,6 +130,11 @@ impl OAuthClient {
                     .platform_google_token_url
                     .clone()
                     .unwrap_or_else(|| "https://oauth2.googleapis.com/token".to_string());
+                let redirect_uri = platform_redirect_uri(
+                    config,
+                    Provider::Google,
+                    config.platform_google_redirect_uri.as_ref(),
+                );
 
                 Some(
                     BasicClient::new(
@@ -123,7 +148,7 @@ impl OAuthClient {
                         ),
                     )
                     .set_redirect_uri(
-                        RedirectUrl::new(redirect_uri.clone())
+                        RedirectUrl::new(redirect_uri)
                             .map_err(|e| AppError::OAuth(e.to_string()))?,
                     ),
                 )
@@ -135,9 +160,8 @@ impl OAuthClient {
         let microsoft_client = match (
             &config.platform_microsoft_client_id,
             &config.platform_microsoft_client_secret,
-            &config.platform_microsoft_redirect_uri,
         ) {
-            (Some(client_id), Some(client_secret), Some(redirect_uri)) => {
+            (Some(client_id), Some(client_secret)) => {
                 let microsoft_auth_url =
                     config
                         .platform_microsoft_auth_url
@@ -152,6 +176,11 @@ impl OAuthClient {
                     .unwrap_or_else(|| {
                         "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string()
                     });
+                let redirect_uri = platform_redirect_uri(
+                    config,
+                    Provider::Microsoft,
+                    config.platform_microsoft_redirect_uri.as_ref(),
+                );
 
                 Some(
                     BasicClient::new(
@@ -165,7 +194,7 @@ impl OAuthClient {
                         ),
                     )
                     .set_redirect_uri(
-                        RedirectUrl::new(redirect_uri.clone())
+                        RedirectUrl::new(redirect_uri)
                             .map_err(|e| AppError::OAuth(e.to_string()))?,
                     ),
                 )
@@ -186,18 +215,32 @@ impl OAuthClient {
             Provider::Google => self.google_client.as_ref(),
             Provider::Microsoft => self.microsoft_client.as_ref(),
             Provider::Oidc => None,
+            Provider::Password => None,
         }
     }
 
     #[allow(dead_code)]
-    pub fn get_authorization_url(&self, provider: Provider) -> Result<(String, CsrfToken)> {
+    pub fn get_authorization_url(
+        &self,
+        provider: Provider,
+        redirect_uri: Option<&str>,
+    ) -> Result<(String, CsrfToken)> {
         let client = self.get_client(provider).ok_or_else(|| {
             AppError::BadRequest(format!(
                 "OAuth provider '{}' is not configured",
                 provider.as_str()
             ))
         })?;
-        let (auth_url, csrf_token) = client.authorize_url(CsrfToken::new_random).url();
+
+        let mut auth_request = client.authorize_url(CsrfToken::new_random);
+
+        if let Some(uri) = redirect_uri {
+            auth_request = auth_request.set_redirect_uri(std::borrow::Cow::Owned(
+                RedirectUrl::new(uri.to_string()).map_err(|e| AppError::OAuth(e.to_string()))?,
+            ));
+        }
+
+        let (auth_url, csrf_token) = auth_request.url();
         Ok((auth_url.to_string(), csrf_token))
     }
 
@@ -206,6 +249,7 @@ impl OAuthClient {
         &self,
         provider: Provider,
         scopes: Vec<String>,
+        redirect_uri: Option<&str>,
     ) -> Result<(String, CsrfToken)> {
         let client = self.get_client(provider).ok_or_else(|| {
             AppError::BadRequest(format!(
@@ -216,10 +260,17 @@ impl OAuthClient {
 
         let scopes_oauth: Vec<Scope> = scopes.into_iter().map(Scope::new).collect();
 
-        let (auth_url, csrf_token) = client
+        let mut auth_request = client
             .authorize_url(CsrfToken::new_random)
-            .add_scopes(scopes_oauth)
-            .url();
+            .add_scopes(scopes_oauth);
+
+        if let Some(uri) = redirect_uri {
+            auth_request = auth_request.set_redirect_uri(std::borrow::Cow::Owned(
+                RedirectUrl::new(uri.to_string()).map_err(|e| AppError::OAuth(e.to_string()))?,
+            ));
+        }
+
+        let (auth_url, csrf_token) = auth_request.url();
 
         Ok((auth_url.to_string(), csrf_token))
     }
@@ -228,6 +279,7 @@ impl OAuthClient {
         &self,
         provider: Provider,
         scopes: Vec<String>,
+        redirect_uri: Option<&str>,
     ) -> Result<(String, CsrfToken, String)> {
         let client = self.get_client(provider).ok_or_else(|| {
             AppError::BadRequest(format!(
@@ -238,8 +290,11 @@ impl OAuthClient {
 
         let scopes_oauth: Vec<Scope> = scopes.into_iter().map(Scope::new).collect();
 
-        // Generate PKCE challenge (only for Microsoft)
-        let (pkce_challenge, pkce_verifier) = if provider == Provider::Microsoft {
+        // Generate PKCE challenge for all OAuth/OIDC providers.
+        let (pkce_challenge, pkce_verifier) = if matches!(
+            provider,
+            Provider::Github | Provider::Google | Provider::Microsoft | Provider::Oidc
+        ) {
             let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
             (Some(challenge), Some(verifier))
         } else {
@@ -249,6 +304,12 @@ impl OAuthClient {
         let mut auth_request = client
             .authorize_url(CsrfToken::new_random)
             .add_scopes(scopes_oauth);
+
+        if let Some(uri) = redirect_uri {
+            auth_request = auth_request.set_redirect_uri(std::borrow::Cow::Owned(
+                RedirectUrl::new(uri.to_string()).map_err(|e| AppError::OAuth(e.to_string()))?,
+            ));
+        }
 
         if let Some(challenge) = pkce_challenge {
             auth_request = auth_request.set_pkce_challenge(challenge);

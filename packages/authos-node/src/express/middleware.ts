@@ -313,6 +313,116 @@ export function createAuthMiddleware(options: AuthOSNodeOptions) {
     };
   }
 
+  /**
+   * Middleware that requires the user to belong to a specific service
+   * Now that JWTs include service claims, this validates service-scoped access.
+   *
+   * @example
+   * ```typescript
+   * app.get(
+   *   '/service/:slug/data',
+   *   requireAuth(),
+   *   requireService((req) => req.params.slug),
+   *   (req, res) => { ... }
+   * );
+   * ```
+   */
+  function requireService(
+    getServiceSlug: string | ((req: Request) => string),
+    permOptions: RequirePermissionOptions = {}
+  ): RequestHandler {
+    const { message = 'Service access required' } = permOptions;
+
+    return (req: Request, res: Response, next: NextFunction): void => {
+      if (!req.auth) {
+        res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required',
+          code: 'NOT_AUTHENTICATED',
+        });
+        return;
+      }
+
+      const requiredService = typeof getServiceSlug === 'function' ? getServiceSlug(req) : getServiceSlug;
+      const userService = req.auth.claims.service;
+
+      if (!userService || userService !== requiredService) {
+        res.status(403).json({
+          error: 'Forbidden',
+          message,
+          code: 'WRONG_SERVICE',
+          required: requiredService,
+        });
+        return;
+      }
+
+      next();
+    };
+  }
+
+  /**
+   * Middleware that requires the user to belong to a specific org AND service
+   * Provides complete tenant isolation for multi-tenant applications.
+   *
+   * @example
+   * ```typescript
+   * app.get(
+   *   '/orgs/:org/services/:service/data',
+   *   requireAuth(),
+   *   requireTenant(
+   *     (req) => req.params.org,
+   *     (req) => req.params.service
+   *   ),
+   *   (req, res) => { ... }
+   * );
+   * ```
+   */
+  function requireTenant(
+    getOrgSlug: string | ((req: Request) => string),
+    getServiceSlug: string | ((req: Request) => string),
+    permOptions: RequirePermissionOptions = {}
+  ): RequestHandler {
+    const { message = 'Tenant access required' } = permOptions;
+
+    return (req: Request, res: Response, next: NextFunction): void => {
+      if (!req.auth) {
+        res.status(401).json({
+          error: 'Unauthorized',
+          message: 'Authentication required',
+          code: 'NOT_AUTHENTICATED',
+        });
+        return;
+      }
+
+      const requiredOrg = typeof getOrgSlug === 'function' ? getOrgSlug(req) : getOrgSlug;
+      const requiredService = typeof getServiceSlug === 'function' ? getServiceSlug(req) : getServiceSlug;
+      const userOrg = req.auth.claims.org;
+      const userService = req.auth.claims.service;
+
+      if (!userOrg || userOrg !== requiredOrg) {
+        res.status(403).json({
+          error: 'Forbidden',
+          message,
+          code: 'WRONG_ORGANIZATION',
+          required: { org: requiredOrg, service: requiredService },
+        });
+        return;
+      }
+
+      if (!userService || userService !== requiredService) {
+        res.status(403).json({
+          error: 'Forbidden',
+          message,
+          code: 'WRONG_SERVICE',
+          required: { org: requiredOrg, service: requiredService },
+        });
+        return;
+      }
+
+      next();
+    };
+  }
+
   return {
     requireAuth,
     requirePermission,
@@ -320,5 +430,7 @@ export function createAuthMiddleware(options: AuthOSNodeOptions) {
     requireAllPermissions,
     requirePlatformOwner,
     requireOrganization,
+    requireService,
+    requireTenant,
   };
 }

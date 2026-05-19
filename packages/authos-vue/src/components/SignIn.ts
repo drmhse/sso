@@ -33,7 +33,7 @@ export const SignIn = defineComponent({
   },
   emits: ['success', 'error'],
   setup(props, { slots, emit }) {
-    const { client } = useAuthOS();
+    const { client, options } = useAuthOS();
 
     const email = ref('');
     const password = ref('');
@@ -52,7 +52,9 @@ export const SignIn = defineComponent({
           const result = await client.auth.login({
             email: email.value,
             password: password.value,
-          });
+            org_slug: options.org,
+            service_slug: options.service,
+          } as any);
 
           if (result.expires_in === MFA_PREAUTH_EXPIRY) {
             preauthToken.value = result.access_token;
@@ -95,30 +97,80 @@ export const SignIn = defineComponent({
         return slots.default(slotProps);
       }
 
-      return h('form', { onSubmit: (e: Event) => { e.preventDefault(); submit(); } }, [
-        step.value === 'credentials'
-          ? [
+      // MFA step
+      if (step.value === 'mfa') {
+        return h('div', { 'data-authos-signin': '', 'data-state': 'mfa' }, [
+          h('form', { onSubmit: (e: Event) => { e.preventDefault(); submit(); } }, [
+            h('div', { 'data-authos-field': 'mfa-code' }, [
+              h('label', { for: 'authos-mfa-code' }, 'Verification Code'),
               h('input', {
-                type: 'email',
-                value: email.value,
-                placeholder: 'Email',
-                onInput: (e: Event) => (email.value = (e.target as HTMLInputElement).value),
+                id: 'authos-mfa-code',
+                type: 'text',
+                inputMode: 'numeric',
+                autocomplete: 'one-time-code',
+                value: mfaCode.value,
+                placeholder: 'Enter 6-digit code',
+                required: true,
+                disabled: isSubmitting.value,
+                onInput: (e: Event) => (mfaCode.value = (e.target as HTMLInputElement).value),
               }),
-              h('input', {
-                type: 'password',
-                value: password.value,
-                placeholder: 'Password',
-                onInput: (e: Event) => (password.value = (e.target as HTMLInputElement).value),
-              }),
-            ]
-          : h('input', {
-              type: 'text',
-              value: mfaCode.value,
-              placeholder: 'MFA Code',
-              onInput: (e: Event) => (mfaCode.value = (e.target as HTMLInputElement).value),
+            ]),
+            error.value && h('div', { 'data-authos-error': '' }, error.value),
+            h('button', {
+              type: 'submit',
+              disabled: isSubmitting.value,
+              'data-authos-submit': '',
+            }, isSubmitting.value ? 'Verifying...' : 'Verify'),
+            h('button', {
+              type: 'button',
+              'data-authos-back': '',
+              onClick: () => {
+                step.value = 'credentials';
+                mfaCode.value = '';
+                preauthToken.value = '';
+                error.value = null;
+              },
+            }, 'Back to login'),
+          ]),
+        ]);
+      }
+
+      // Credentials step
+      return h('div', { 'data-authos-signin': '', 'data-state': 'credentials' }, [
+        h('form', { onSubmit: (e: Event) => { e.preventDefault(); submit(); } }, [
+          h('div', { 'data-authos-field': 'email' }, [
+            h('label', { for: 'authos-email' }, 'Email'),
+            h('input', {
+              id: 'authos-email',
+              type: 'email',
+              autocomplete: 'email',
+              value: email.value,
+              placeholder: 'Enter your email',
+              required: true,
+              disabled: isSubmitting.value,
+              onInput: (e: Event) => (email.value = (e.target as HTMLInputElement).value),
             }),
-        error.value && h('p', { style: 'color: red' }, error.value),
-        h('button', { type: 'submit', disabled: isSubmitting.value }, isSubmitting.value ? 'Signing in...' : 'Sign In'),
+          ]),
+          h('div', { 'data-authos-field': 'password' }, [
+            h('label', { for: 'authos-password' }, 'Password'),
+            h('input', {
+              id: 'authos-password',
+              type: 'password',
+              autocomplete: 'current-password',
+              value: password.value,
+              placeholder: 'Enter your password',
+              required: true,
+              disabled: isSubmitting.value,
+              onInput: (e: Event) => (password.value = (e.target as HTMLInputElement).value),
+            }),
+          ]),
+          error.value && h('div', { 'data-authos-error': '' }, error.value),
+          h('button', {
+            type: 'submit',
+            disabled: isSubmitting.value,
+            'data-authos-submit': '',
+          }, isSubmitting.value ? 'Signing in...' : 'Sign In'),
+        ]),
       ]);
     };
   },

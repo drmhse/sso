@@ -26,9 +26,13 @@ import { AuthErrorCodes } from "@drmhse/sso-sdk";
 interface LoginFormProps {
   onSuccess?: () => void;
   redirectTo?: string;
+  /** Organization slug for tenant-scoped login */
+  orgSlug?: string;
+  /** Service slug for service-scoped login (used with orgSlug) */
+  serviceSlug?: string;
 }
 
-export function LoginForm({ onSuccess, redirectTo }: LoginFormProps) {
+export function LoginForm({ onSuccess, redirectTo, orgSlug, serviceSlug }: LoginFormProps) {
   const { client } = useAuthOS();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -44,7 +48,7 @@ export function LoginForm({ onSuccess, redirectTo }: LoginFormProps) {
     setLoading(true);
 
     try {
-      const response = await client.auth.login({ email, password });
+      const response = await client.auth.login({ email, password, org_slug: orgSlug, service_slug: serviceSlug });
 
       if (response.mfa_required) {
         setMfaRequired(true);
@@ -212,6 +216,10 @@ import { AuthErrorCodes } from "@drmhse/sso-sdk";
 
 interface Props {
   redirectTo?: string;
+  /** Organization slug for tenant-scoped login */
+  orgSlug?: string;
+  /** Service slug for service-scoped login (used with orgSlug) */
+  serviceSlug?: string;
 }
 
 const props = defineProps<Props>();
@@ -237,6 +245,8 @@ async function handleSubmit() {
     const response = await client.auth.login({
       email: email.value,
       password: password.value,
+      org_slug: props.orgSlug,
+      service_slug: props.serviceSlug,
     });
 
     if (response.mfa_required) {

@@ -2,11 +2,14 @@ use crate::constants::{DEFAULT_MAX_USERS, INVITATION_EXPIRY_DAYS, VALID_INVITATI
 use crate::entities::{organization_invitations, organizations, users};
 use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::permission_service::{
+    PermissionService, CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE,
+};
 use crate::state::AppState;
 use crate::store::{
     invitations::InvitationStore, memberships::MembershipStore,
-    organization_tiers::OrganizationTierStore, organizations::OrganizationStore, users::UserStore,
-    DB,
+    organization_roles::OrganizationRoleStore, organization_tiers::OrganizationTierStore,
+    organizations::OrganizationStore, users::UserStore, DB,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -26,6 +29,23 @@ fn hash_invitation_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+async fn validate_invitation_role(db: DB<'_>, org_id: &str, role: &str) -> Result<()> {
+    if VALID_INVITATION_ROLES.contains(&role) {
+        return Ok(());
+    }
+
+    if OrganizationRoleStore::find_by_org_and_slug(db, org_id, role)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(
+        "Invalid role. Choose admin, member, or a custom organization role.".to_string(),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateInvitationRequest {
     pub email: String,
@@ -35,6 +55,11 @@ pub struct CreateInvitationRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateInvitationRequest {
     pub token: String,
+}
+
+enum InvitationLookup {
+    Token(String),
+    Id(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -52,7 +77,7 @@ pub struct ListInvitationsQuery {
     pub status: Option<String>,
 }
 
-/// Create invitation (owner/admin only)
+/// Create invitation.
 pub async fn create_invitation(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -66,16 +91,33 @@ pub async fn create_invitation(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner or admin
-    let _membership =
-        crate::middleware::check_org_admin(&state.db, &user.id, &organization.id).await?;
+    if !PermissionService::check(
+        DB::Conn(&state.db),
+        &organization.id,
+        &user.id,
+        CAP_ORG_MEMBERS_MANAGE,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to create invitations".to_string(),
+        ));
+    }
 
-    // Validate role
-    if !VALID_INVITATION_ROLES.contains(&req.role.as_str()) {
-        return Err(AppError::BadRequest(format!(
-            "Invalid role. Must be one of: {}",
-            VALID_INVITATION_ROLES.join(", ")
-        )));
+    validate_invitation_role(DB::Conn(&state.db), &organization.id, &req.role).await?;
+
+    if req.role != "member"
+        && !PermissionService::check(
+            DB::Conn(&state.db),
+            &organization.id,
+            &user.id,
+            CAP_ORG_ROLES_MANAGE,
+        )
+        .await?
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to invite members with this role".to_string(),
+        ));
     }
 
     // Check if email is already a member
@@ -136,7 +178,10 @@ pub async fn create_invitation(
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     // Enqueue invitation email to job queue (non-blocking)
-    let invitation_url = format!("{}/invitations/accept/{}", state.base_url, token);
+    let invitation_url = format!(
+        "{}/invitations/accept?token={}",
+        state.web_client_url, token
+    );
     let email_subject = format!("You've been invited to join {}", organization.name);
     let email_body = format!(
         "{} ({}) has invited you to join {} as a {}.\n\n\
@@ -195,7 +240,6 @@ pub async fn list_user_invitations(
                 "id": row.id,
                 "email": row.email,
                 "role": row.role,
-                "token": row.token,
                 "expires_at": DateTime::<Utc>::from_naive_utc_and_offset(row.expires_at, Utc).to_rfc3339(),
                 "created_at": DateTime::<Utc>::from_naive_utc_and_offset(row.created_at, Utc).to_rfc3339(),
                 "organization_slug": row.org_slug,
@@ -207,130 +251,252 @@ pub async fn list_user_invitations(
     Ok(Json(responses))
 }
 
-/// Accept invitation (public endpoint)
+/// Accept invitation for the authenticated user.
 pub async fn accept_invitation(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Json(req): Json<UpdateInvitationRequest>,
 ) -> Result<Json<()>> {
-    accept_invitation_internal(State(state), req.token, "accepted").await
+    accept_invitation_internal(
+        State(state),
+        InvitationLookup::Token(req.token),
+        "accepted",
+        Some(auth_user.user.email.clone()),
+        None,
+    )
+    .await
 }
 
-/// Decline invitation (public endpoint)
+/// Accept invitation by invitation ID for the authenticated invitee.
+pub async fn accept_invitation_by_id(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(invitation_id): Path<String>,
+) -> Result<Json<()>> {
+    accept_invitation_internal(
+        State(state),
+        InvitationLookup::Id(invitation_id),
+        "accepted",
+        Some(auth_user.user.email.clone()),
+        None,
+    )
+    .await
+}
+
+/// Accept invitation by invitation ID as an organization member manager.
+pub async fn accept_invitation_as_admin(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((org_slug, invitation_id)): Path<(String, String)>,
+) -> Result<Json<()>> {
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    if !PermissionService::check(
+        DB::Conn(&state.db),
+        &organization.id,
+        &auth_user.user.id,
+        CAP_ORG_MEMBERS_MANAGE,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to accept invitations".to_string(),
+        ));
+    }
+
+    accept_invitation_internal(
+        State(state),
+        InvitationLookup::Id(invitation_id),
+        "accepted",
+        None,
+        Some(organization.id),
+    )
+    .await
+}
+
+/// Decline invitation by token.
 pub async fn decline_invitation(
     State(state): State<AppState>,
     Json(req): Json<UpdateInvitationRequest>,
 ) -> Result<Json<()>> {
-    accept_invitation_internal(State(state), req.token, "rejected").await
+    accept_invitation_internal(
+        State(state),
+        InvitationLookup::Token(req.token),
+        "rejected",
+        None,
+        None,
+    )
+    .await
+}
+
+/// Decline invitation by invitation ID for the authenticated invitee.
+pub async fn decline_invitation_by_id(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(invitation_id): Path<String>,
+) -> Result<Json<()>> {
+    accept_invitation_internal(
+        State(state),
+        InvitationLookup::Id(invitation_id),
+        "rejected",
+        Some(auth_user.user.email.clone()),
+        None,
+    )
+    .await
 }
 
 /// Internal invitation acceptance/rejection logic
 async fn accept_invitation_internal(
     state: State<AppState>,
-    token: String,
+    lookup: InvitationLookup,
     new_status: &str,
+    expected_email: Option<String>,
+    expected_org_id: Option<String>,
 ) -> Result<Json<()>> {
-    // Hash the token to look it up
-    let token_hash = hash_invitation_token(&token);
     let new_status = new_status.to_string();
 
     // Execute transaction with retry on database contention
-    let affected_user_id = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "accept_invitation", |db| {
-        let token_hash = token_hash.clone();
-        let new_status = new_status.clone();
-        Box::pin(async move {
-            // Find invitation
-            use crate::entities::prelude::OrganizationInvitations;
-            let invitation = OrganizationInvitations::find()
-                .filter(organization_invitations::Column::Token.eq(&token_hash))
-                .filter(organization_invitations::Column::Status.eq("pending"))
-                .one(&db)
-                .await?
+    let affected_user_id = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "accept_invitation",
+        |db| {
+            let lookup = match &lookup {
+                InvitationLookup::Token(token) => InvitationLookup::Token(token.clone()),
+                InvitationLookup::Id(invitation_id) => InvitationLookup::Id(invitation_id.clone()),
+            };
+            let new_status = new_status.clone();
+            let expected_email = expected_email.clone();
+            let expected_org_id = expected_org_id.clone();
+            Box::pin(async move {
+                // Find invitation
+                use crate::entities::prelude::OrganizationInvitations;
+                let invitation = match &lookup {
+                    InvitationLookup::Token(token) => {
+                        let token_hash = hash_invitation_token(token);
+                        OrganizationInvitations::find()
+                            .filter(organization_invitations::Column::Token.eq(&token_hash))
+                            .filter(organization_invitations::Column::Status.eq("pending"))
+                            .one(&db)
+                            .await?
+                    }
+                    InvitationLookup::Id(invitation_id) => {
+                        OrganizationInvitations::find()
+                            .filter(organization_invitations::Column::Id.eq(invitation_id))
+                            .filter(organization_invitations::Column::Status.eq("pending"))
+                            .one(&db)
+                            .await?
+                    }
+                }
                 .ok_or_else(|| {
                     AppError::NotFound("Invitation not found or already processed".to_string())
                 })?;
 
-            // Check if expired
-            let expires_at = DateTime::<Utc>::from_naive_utc_and_offset(invitation.expires_at, Utc);
+                // Check if expired
+                let expires_at =
+                    DateTime::<Utc>::from_naive_utc_and_offset(invitation.expires_at, Utc);
 
-            if expires_at < Utc::now() {
-                return Err(AppError::BadRequest("Invitation has expired".to_string()));
-            }
-
-            // Track user_id for cache invalidation
-            let mut affected_user_id: Option<String> = None;
-
-            if new_status == "accepted" {
-                // Find or create user
-                let user = find_or_create_user_internal(db.clone(), &invitation.email).await?;
-                affected_user_id = Some(user.id.clone());
-
-                // Check team limits
-                let member_count =
-                    MembershipStore::count_by_org(db.clone(), &invitation.org_id, None).await?;
-
-                // Get organization limits
-                use crate::entities::prelude::Organizations;
-                let org = Organizations::find()
-                    .filter(organizations::Column::Id.eq(&invitation.org_id))
-                    .one(&db)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-
-                let tier_limit = if let (Some(max_users), Some(_tier_id)) =
-                    (org.max_users, org.tier_id.as_ref())
-                {
-                    // Use org-specific limit if set
-                    max_users as i64
-                } else if let Some(tier_id) = org.tier_id.as_ref() {
-                    // Use tier default
-                    let tier = OrganizationTierStore::find_by_id(db.clone(), tier_id)
-                        .await?
-                        .ok_or_else(|| AppError::NotFound("Tier not found".to_string()))?;
-
-                    tier.default_max_users as i64
-                } else {
-                    DEFAULT_MAX_USERS // Free tier default
-                };
-
-                if member_count >= tier_limit as u64 {
-                    return Err(AppError::BadRequest("Team limit reached".to_string()));
+                if expires_at < Utc::now() {
+                    return Err(AppError::BadRequest("Invitation has expired".to_string()));
                 }
 
-                // Create membership
-                use crate::entities::memberships;
-                let new_membership = memberships::ActiveModel {
-                    id: Set(Uuid::new_v4().to_string()),
-                    org_id: Set(invitation.org_id.clone()),
-                    user_id: Set(user.id.clone()),
-                    role: Set(invitation.role.clone()),
-                    created_at: Set(Utc::now().naive_utc()),
-                    ..Default::default()
-                };
-                new_membership.insert(&db).await?;
+                if let Some(expected_email) = expected_email.as_ref() {
+                    if !invitation.email.eq_ignore_ascii_case(expected_email) {
+                        return Err(AppError::Forbidden(
+                            "This invitation belongs to another email address".to_string(),
+                        ));
+                    }
+                }
 
-                // Grant organization permission for the new member
-                use crate::entities::permissions::RelationTuple;
-                use crate::store::permissions::PermissionsStore;
-                PermissionsStore::grant(
-                    db.clone(),
-                    RelationTuple::user(
-                        "organization".to_string(),
-                        invitation.org_id.clone(),
-                        invitation.role.clone(),
-                        user.id.clone(),
-                    ),
-                )
-                .await?;
-            }
+                if let Some(expected_org_id) = expected_org_id.as_ref() {
+                    if invitation.org_id != *expected_org_id {
+                        return Err(AppError::Forbidden(
+                            "This invitation does not belong to the specified organization"
+                                .to_string(),
+                        ));
+                    }
+                }
 
-            // Update invitation status
-            let mut invitation_active: organization_invitations::ActiveModel = invitation.into();
-            invitation_active.status = Set(new_status);
-            invitation_active.update(&db).await?;
+                // Track user_id for cache invalidation
+                let mut affected_user_id: Option<String> = None;
 
-            Ok(affected_user_id)
-        })
-    })
+                if new_status == "accepted" {
+                    // Find or create user
+                    let user = find_or_create_user_internal(db.clone(), &invitation.email).await?;
+                    affected_user_id = Some(user.id.clone());
+
+                    // Check team limits
+                    let member_count =
+                        MembershipStore::count_by_org(db.clone(), &invitation.org_id, None).await?;
+
+                    // Get organization limits
+                    use crate::entities::prelude::Organizations;
+                    let org = Organizations::find()
+                        .filter(organizations::Column::Id.eq(&invitation.org_id))
+                        .one(&db)
+                        .await?
+                        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+                    let tier_limit = if let (Some(max_users), Some(_tier_id)) =
+                        (org.max_users, org.tier_id.as_ref())
+                    {
+                        // Use org-specific limit if set
+                        max_users as i64
+                    } else if let Some(tier_id) = org.tier_id.as_ref() {
+                        // Use tier default
+                        let tier = OrganizationTierStore::find_by_id(db.clone(), tier_id)
+                            .await?
+                            .ok_or_else(|| AppError::NotFound("Tier not found".to_string()))?;
+
+                        tier.default_max_users as i64
+                    } else {
+                        DEFAULT_MAX_USERS // Free tier default
+                    };
+
+                    if member_count >= tier_limit as u64 {
+                        return Err(AppError::BadRequest("Team limit reached".to_string()));
+                    }
+
+                    // Create membership
+                    use crate::entities::memberships;
+                    let new_membership = memberships::ActiveModel {
+                        id: Set(Uuid::new_v4().to_string()),
+                        org_id: Set(invitation.org_id.clone()),
+                        user_id: Set(user.id.clone()),
+                        role: Set(invitation.role.clone()),
+                        created_at: Set(Utc::now().naive_utc()),
+                        ..Default::default()
+                    };
+                    new_membership.insert(&db).await?;
+
+                    // Grant organization permission for the new member
+                    use crate::entities::permissions::RelationTuple;
+                    use crate::store::permissions::PermissionsStore;
+                    PermissionsStore::grant(
+                        db.clone(),
+                        RelationTuple::user(
+                            "organization".to_string(),
+                            invitation.org_id.clone(),
+                            invitation.role.clone(),
+                            user.id.clone(),
+                        ),
+                    )
+                    .await?;
+                }
+
+                // Update invitation status
+                let mut invitation_active: organization_invitations::ActiveModel =
+                    invitation.into();
+                invitation_active.status = Set(new_status);
+                invitation_active.update(&db).await?;
+
+                Ok(affected_user_id)
+            })
+        },
+    )
     .await?;
 
     // CRITICAL: Invalidate permission cache after accepting invitation
@@ -343,18 +509,16 @@ async fn accept_invitation_internal(
 
 /// Accept invitation via email link (redirect)
 pub async fn accept_invitation_redirect(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<Redirect> {
-    // For now, redirect to a simple success page
-    // In production, this would redirect to your web app
-    Ok(Redirect::permanent(&format!(
-        "/invitations/accept?token={}",
-        token
+    Ok(Redirect::temporary(&format!(
+        "{}/invitations/accept?token={}",
+        state.web_client_url, token
     )))
 }
 
-/// Cancel invitation (owner/admin only)
+/// Cancel invitation.
 pub async fn cancel_invitation(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -367,9 +531,18 @@ pub async fn cancel_invitation(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner or admin
-    let _membership =
-        crate::middleware::check_org_admin(&state.db, &user.id, &organization.id).await?;
+    if !PermissionService::check(
+        DB::Conn(&state.db),
+        &organization.id,
+        &user.id,
+        CAP_ORG_MEMBERS_MANAGE,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to cancel invitations".to_string(),
+        ));
+    }
 
     // Cancel invitation - find it first, then update
     use crate::entities::prelude::OrganizationInvitations;
@@ -390,7 +563,7 @@ pub async fn cancel_invitation(
     Ok(Json(()))
 }
 
-/// List organization invitations (owner/admin only)
+/// List organization invitations.
 pub async fn list_invitations(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -404,9 +577,18 @@ pub async fn list_invitations(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner or admin
-    let _membership =
-        crate::middleware::check_org_admin(&state.db, &user.id, &organization.id).await?;
+    if !PermissionService::check(
+        DB::Conn(&state.db),
+        &organization.id,
+        &user.id,
+        CAP_ORG_MEMBERS_MANAGE,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to view invitations".to_string(),
+        ));
+    }
 
     // Extract pagination parameters with defaults
     let page = query.page.unwrap_or(1).max(1);
@@ -448,10 +630,7 @@ pub async fn list_invitations(
 }
 
 /// Helper function to find or create a user within a transaction (for invitation acceptance)
-async fn find_or_create_user_internal(
-    db: DB<'_>,
-    email: &str,
-) -> Result<users::Model> {
+async fn find_or_create_user_internal(db: DB<'_>, email: &str) -> Result<users::Model> {
     // Check if user exists
     use crate::entities::prelude::Users;
     if let Some(user) = Users::find()

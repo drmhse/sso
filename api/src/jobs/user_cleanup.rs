@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::store::{users::UserStore, DB};
 use chrono::{Duration, Utc};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};

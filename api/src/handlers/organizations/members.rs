@@ -1,12 +1,16 @@
-use crate::constants::{DEFAULT_MAX_USERS, DEFAULT_TIER_NAME};
+use crate::constants::{DEFAULT_MAX_USERS, DEFAULT_TIER_NAME, VALID_ORG_ROLES};
 use crate::entities::{memberships, users};
 use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
+use crate::services::permission_service::{
+    PermissionService, CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE,
+};
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, organization_tiers::OrganizationTierStore,
-    organizations::OrganizationStore, users::UserStore, DB,
+    memberships::MembershipStore, organization_roles::OrganizationRoleStore,
+    organization_tiers::OrganizationTierStore, organizations::OrganizationStore,
+    permissions::PermissionsStore, services::ServiceStore, users::UserStore, DB,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -14,6 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize)]
 pub struct OrganizationMember {
@@ -50,6 +55,50 @@ pub struct ListMembersQuery {
 #[derive(Debug, Deserialize)]
 pub struct TransferOwnershipRequest {
     pub new_owner_email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemberServiceAccess {
+    pub service_id: String,
+    pub service_slug: String,
+    pub service_name: String,
+    pub access: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMemberServiceAccessRequest {
+    pub grants: Vec<MemberServiceAccessGrant>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemberServiceAccessGrant {
+    pub service_slug: String,
+    pub access: Option<String>,
+}
+
+async fn validate_org_role(db: DB<'_>, org_id: &str, role: &str) -> Result<()> {
+    if role == "owner" || VALID_ORG_ROLES.contains(&role) {
+        return Ok(());
+    }
+
+    if OrganizationRoleStore::find_by_org_and_slug(db, org_id, role)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(
+        "Invalid role. Choose a system role or custom organization role.".to_string(),
+    ))
+}
+
+async fn can_manage_members(state: &AppState, org_id: &str, user_id: &str) -> Result<bool> {
+    PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_ORG_MEMBERS_MANAGE).await
+}
+
+async fn can_manage_roles(state: &AppState, org_id: &str, user_id: &str) -> Result<bool> {
+    PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_ORG_ROLES_MANAGE).await
 }
 
 /// List organization members
@@ -89,6 +138,7 @@ pub async fn list_members(
             let user = users::Model {
                 id: row.user_id.clone(),
                 email: row.user_email,
+                org_id: None,
                 is_platform_owner: row.user_is_platform_owner,
                 password_hash: None,
                 email_verified_at: None,
@@ -151,15 +201,17 @@ pub async fn update_member_role(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner
-    crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
-
-    // Validate role
-    if !crate::constants::VALID_ORG_ROLES.contains(&req.role.as_str()) {
-        return Err(AppError::BadRequest(
-            "Invalid role. Must be owner, admin, or member".to_string(),
+    if !can_manage_roles(&state, &organization.id, &user.id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to change member roles".to_string(),
         ));
     }
+
+    if req.role == "owner" {
+        crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
+    }
+
+    validate_org_role(DB::Conn(&state.db), &organization.id, &req.role).await?;
 
     // Cannot change own role (prevent self-demotion from owner)
     if user_id == user.id {
@@ -194,6 +246,22 @@ pub async fn update_member_role(
         None,
     )
     .await?;
+
+    let services = ServiceStore::list_by_org(DB::Conn(&state.db), &organization.id).await?;
+    for service in services {
+        for relation in ["viewer", "manager"] {
+            PermissionsStore::revoke(
+                DB::Conn(&state.db),
+                "service",
+                &service.id,
+                relation,
+                SUBJECT_TYPE_USER,
+                &user_id,
+                None,
+            )
+            .await?;
+        }
+    }
 
     // Grant new role permission
     use crate::entities::permissions::RelationTuple;
@@ -235,41 +303,55 @@ pub async fn update_member_role(
         let org_id = organization.id.clone();
         let new_owner_id = user_id.clone();
 
-        with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "transfer_ownership_via_role_update", |db| {
-            let org_id = org_id.clone();
-            let new_owner_id = new_owner_id.clone();
-            let current_user_id = current_user_id.clone();
-            Box::pin(async move {
-                // Update organization owner
-                OrganizationStore::transfer_ownership(db.clone(), &org_id, &new_owner_id).await?;
+        with_retrying_transaction(
+            &state.db,
+            #[cfg(feature = "db_sqlite")]
+            &state.db_writer,
+            "transfer_ownership_via_role_update",
+            |db| {
+                let org_id = org_id.clone();
+                let new_owner_id = new_owner_id.clone();
+                let current_user_id = current_user_id.clone();
+                Box::pin(async move {
+                    // Update organization owner
+                    OrganizationStore::transfer_ownership(db.clone(), &org_id, &new_owner_id)
+                        .await?;
 
-                // Demote previous owner to admin
-                let prev_owner_membership =
-                    MembershipStore::find_by_org_and_user(db.clone(), &org_id, &current_user_id)
-                        .await?
-                        .ok_or_else(|| {
-                            AppError::NotFound("Previous owner membership not found".to_string())
-                        })?;
-                MembershipStore::update_role(db.clone(), &prev_owner_membership.id, "admin")
-                    .await?;
+                    // Demote previous owner to admin
+                    let prev_owner_membership = MembershipStore::find_by_org_and_user(
+                        db.clone(),
+                        &org_id,
+                        &current_user_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::NotFound("Previous owner membership not found".to_string())
+                    })?;
+                    MembershipStore::update_role(db.clone(), &prev_owner_membership.id, "admin")
+                        .await?;
 
-                Ok(())
-            })
-        })
+                    Ok(())
+                })
+            },
+        )
         .await?;
 
         // Invalidate permission cache for previous owner as well
         state.permission_cache.invalidate(&user.id).await;
 
-        let ownership_event = OrgAuditBuilder::new(&organization.id, Some(&user.id), "org.ownership_transferred")
-            .target("organization", &organization.id)
-            .success(true)
-            .details_json(Some(json!({
-                "previous_owner_email": user.email,
-                "new_owner_email": target_user.email,
-                "ownership_transferred": true
-            })))
-            .build();
+        let ownership_event = OrgAuditBuilder::new(
+            &organization.id,
+            Some(&user.id),
+            "org.ownership_transferred",
+        )
+        .target("organization", &organization.id)
+        .success(true)
+        .details_json(Some(json!({
+            "previous_owner_email": user.email,
+            "new_owner_email": target_user.email,
+            "ownership_transferred": true
+        })))
+        .build();
         state.audit_actor.log_org(ownership_event).await;
     }
 
@@ -297,9 +379,16 @@ pub async fn remove_member(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner or admin (owner can remove anyone, admin can remove members)
+    if !can_manage_members(&state, &organization.id, &user.id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to remove members".to_string(),
+        ));
+    }
+
     let caller_membership =
-        crate::middleware::check_org_admin(&state.db, &user.id, &organization.id).await?;
+        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &organization.id, &user.id)
+            .await?
+            .ok_or_else(|| AppError::Forbidden("Not a member of this organization".to_string()))?;
 
     // Cannot remove yourself
     if user_id == user.id {
@@ -365,6 +454,179 @@ pub async fn remove_member(
     Ok(Json(()))
 }
 
+/// List a member's direct per-service access grants.
+pub async fn list_member_service_access(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((org_slug, user_id)): Path<(String, String)>,
+) -> Result<Json<Vec<MemberServiceAccess>>> {
+    let actor = &auth_user.user;
+
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    if !can_manage_members(&state, &organization.id, &actor.id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to view service access".to_string(),
+        ));
+    }
+
+    MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &organization.id, &user_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("User is not a member of this organization".to_string())
+        })?;
+
+    let services = ServiceStore::list_by_org(DB::Conn(&state.db), &organization.id).await?;
+    let mut response = Vec::with_capacity(services.len());
+
+    for service in services {
+        let access = if PermissionsStore::check(
+            DB::Conn(&state.db),
+            "service",
+            &service.id,
+            "manager",
+            &user_id,
+        )
+        .await?
+        {
+            Some("manager".to_string())
+        } else if PermissionsStore::check(
+            DB::Conn(&state.db),
+            "service",
+            &service.id,
+            "viewer",
+            &user_id,
+        )
+        .await?
+        {
+            Some("viewer".to_string())
+        } else {
+            None
+        };
+
+        response.push(MemberServiceAccess {
+            service_id: service.id,
+            service_slug: service.slug,
+            service_name: service.name,
+            access,
+        });
+    }
+
+    Ok(Json(response))
+}
+
+/// Replace a member's direct per-service access grants.
+pub async fn update_member_service_access(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((org_slug, user_id)): Path<(String, String)>,
+    Json(req): Json<UpdateMemberServiceAccessRequest>,
+) -> Result<Json<Vec<MemberServiceAccess>>> {
+    let actor = &auth_user.user;
+
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    if !can_manage_members(&state, &organization.id, &actor.id).await? {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to update service access".to_string(),
+        ));
+    }
+
+    MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &organization.id, &user_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("User is not a member of this organization".to_string())
+        })?;
+
+    let mut requested_grants = BTreeMap::new();
+    for grant in req.grants {
+        if let Some(access) = grant.access.as_deref() {
+            if access != "viewer" && access != "manager" {
+                return Err(AppError::BadRequest(
+                    "Service access must be viewer, manager, or null".to_string(),
+                ));
+            }
+        }
+
+        requested_grants.insert(grant.service_slug, grant.access);
+    }
+
+    let mut validated_grants = Vec::with_capacity(requested_grants.len());
+    for (service_slug, access) in requested_grants {
+        let service = ServiceStore::find_by_org_and_slug(
+            DB::Conn(&state.db),
+            &organization.id,
+            &service_slug,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Service '{}' not found", service_slug)))?;
+
+        validated_grants.push((service.id, access));
+    }
+
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "update_member_service_access",
+        |db| {
+            let grants = validated_grants.clone();
+            let user_id = user_id.clone();
+            Box::pin(async move {
+                for (service_id, access) in grants {
+                    for relation in ["viewer", "manager"] {
+                        PermissionsStore::revoke(
+                            db.clone(),
+                            "service",
+                            &service_id,
+                            relation,
+                            crate::entities::permissions::SUBJECT_TYPE_USER,
+                            &user_id,
+                            None,
+                        )
+                        .await?;
+                    }
+
+                    if let Some(access) = access {
+                        PermissionsStore::grant(
+                            db.clone(),
+                            crate::entities::permissions::RelationTuple::user(
+                                "service",
+                                service_id,
+                                access,
+                                user_id.clone(),
+                            ),
+                        )
+                        .await?;
+                    }
+                }
+
+                Ok(())
+            })
+        },
+    )
+    .await?;
+
+    state.permission_cache.invalidate(&user_id).await;
+
+    let event = OrgAuditBuilder::new(
+        &organization.id,
+        Some(&actor.id),
+        "member.service_access_updated",
+    )
+    .target("user", &user_id)
+    .success(true)
+    .details_json(Some(json!({ "target_user_id": user_id.clone() })))
+    .build();
+    state.audit_actor.log_org(event).await;
+
+    list_member_service_access(State(state), auth_user, Path((org_slug, user_id))).await
+}
+
 /// Transfer ownership to another member (owner only)
 pub async fn transfer_ownership(
     State(state): State<AppState>,
@@ -400,30 +662,37 @@ pub async fn transfer_ownership(
     let membership_id = membership.id.clone();
     let prev_owner_id = user.id.clone();
 
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "transfer_ownership", |db| {
-        let org_id = org_id.clone();
-        let new_owner_id = new_owner_id.clone();
-        let membership_id = membership_id.clone();
-        let prev_owner_id = prev_owner_id.clone();
-        Box::pin(async move {
-            // Update organization owner
-            OrganizationStore::transfer_ownership(db.clone(), &org_id, &new_owner_id).await?;
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "transfer_ownership",
+        |db| {
+            let org_id = org_id.clone();
+            let new_owner_id = new_owner_id.clone();
+            let membership_id = membership_id.clone();
+            let prev_owner_id = prev_owner_id.clone();
+            Box::pin(async move {
+                // Update organization owner
+                OrganizationStore::transfer_ownership(db.clone(), &org_id, &new_owner_id).await?;
 
-            // Update membership roles
-            MembershipStore::update_role(db.clone(), &membership_id, "owner").await?;
+                // Update membership roles
+                MembershipStore::update_role(db.clone(), &membership_id, "owner").await?;
 
-            // Demote previous owner to admin
-            let prev_owner_membership =
-                MembershipStore::find_by_org_and_user(db.clone(), &org_id, &prev_owner_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::NotFound("Previous owner membership not found".to_string())
-                    })?;
-            MembershipStore::update_role(db.clone(), &prev_owner_membership.id, "admin").await?;
+                // Demote previous owner to admin
+                let prev_owner_membership =
+                    MembershipStore::find_by_org_and_user(db.clone(), &org_id, &prev_owner_id)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::NotFound("Previous owner membership not found".to_string())
+                        })?;
+                MembershipStore::update_role(db.clone(), &prev_owner_membership.id, "admin")
+                    .await?;
 
-            Ok(())
-        })
-    })
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     // CRITICAL: Invalidate permission cache for both users (new owner and old owner)

@@ -3,6 +3,8 @@
 //! Implements proper parsing of SCIM 2.0 filter expressions
 //! Supports standard operators: eq, ne, co, sw, ew, pr, gt, ge, lt, le
 
+#![allow(dead_code)]
+
 use crate::error::{AppError, Result};
 
 /// SCIM Filter operators

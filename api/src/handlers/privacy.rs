@@ -10,13 +10,86 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
+
+#[derive(Debug, Deserialize)]
+pub struct ForgetUserRequest {
+    pub current_password: Option<String>,
+    pub mfa_code: Option<String>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ForgetUserResponse {
     pub success: bool,
     pub message: String,
     pub user_id: String,
+}
+
+async fn verify_self_delete_authorization(
+    state: &AppState,
+    user: &crate::entities::users::Model,
+    req: &ForgetUserRequest,
+) -> Result<()> {
+    if let Some(code) = req
+        .mfa_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if crate::handlers::user::verify_mfa_code(&state.db, &user.id, code).await? {
+            return Ok(());
+        }
+    }
+
+    if let Some(password) = req
+        .current_password
+        .as_deref()
+        .filter(|password| !password.is_empty())
+    {
+        let password_hash = user.password_hash.as_ref().ok_or_else(|| {
+            AppError::BadRequest(
+                "Password verification is not available for this account. Verify with MFA instead."
+                    .to_string(),
+            )
+        })?;
+
+        let password_hash_clone = password_hash.clone();
+        let password_input = password.to_string();
+        let _permit = crate::services::concurrency::ARGON2_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|_| {
+                AppError::InternalServerError("Password verification unavailable".to_string())
+            })?;
+
+        let is_valid = tokio::task::spawn_blocking(move || {
+            let parsed_hash = match PasswordHash::new(&password_hash_clone) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    tracing::error!("Corrupted password hash in database: {}", e);
+                    return false;
+                }
+            };
+
+            Argon2::default()
+                .verify_password(password_input.as_bytes(), &parsed_hash)
+                .is_ok()
+        })
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!("Password verification failed: {}", e))
+        })?;
+
+        if is_valid {
+            return Ok(());
+        }
+    }
+
+    Err(AppError::Forbidden(
+        "Confirm account deletion with your current password or MFA code".to_string(),
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +159,7 @@ pub async fn forget_user(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(user_id): Path<String>,
+    payload: Option<Json<ForgetUserRequest>>,
 ) -> Result<Json<ForgetUserResponse>> {
     let requesting_user = &auth_user.user;
 
@@ -99,6 +173,50 @@ pub async fn forget_user(
         return Err(AppError::Forbidden(
             "Platform owners cannot be anonymized".to_string(),
         ));
+    }
+
+    if requesting_user.id == user_id {
+        let req = payload.map(|Json(req)| req).ok_or_else(|| {
+            AppError::BadRequest(
+                "Confirm account deletion with your current password or MFA code".to_string(),
+            )
+        })?;
+
+        verify_self_delete_authorization(&state, &target_user, &req).await?;
+
+        let memberships = MembershipStore::list_by_user(DB::Conn(&state.db), &user_id).await?;
+
+        UserStore::anonymize(DB::Conn(&state.db), &user_id).await?;
+
+        use crate::services::audit_builder::OrgAuditBuilder;
+        for membership in memberships {
+            let event = OrgAuditBuilder::new(
+                &membership.org_id,
+                Some(&requesting_user.id),
+                "user.anonymized",
+            )
+            .target("user", &user_id)
+            .success(true)
+            .details_json(Some(serde_json::json!({
+                "reason": "Self-service GDPR Right to be Forgotten"
+            })))
+            .build();
+            state.audit_actor.log_org(event).await;
+        }
+
+        tracing::warn!(
+            actor_id = %requesting_user.id,
+            target_user_id = %user_id,
+            "User anonymized their own account for GDPR compliance"
+        );
+
+        return Ok(Json(ForgetUserResponse {
+            success: true,
+            message:
+                "Your account data has been anonymized. PII has been removed while preserving audit logs."
+                    .to_string(),
+            user_id,
+        }));
     }
 
     // Get all organizations the target user is a member of
@@ -145,11 +263,17 @@ pub async fn forget_user(
     // Non-blocking audit via actor for all organizations
     use crate::services::audit_builder::OrgAuditBuilder;
     for membership in memberships {
-        let event = OrgAuditBuilder::new(&membership.org_id, Some(&requesting_user.id), "user.anonymized")
-            .target("user", &user_id)
-            .success(true)
-            .details_json(Some(serde_json::json!({"reason": "GDPR Right to be Forgotten"})))
-            .build();
+        let event = OrgAuditBuilder::new(
+            &membership.org_id,
+            Some(&requesting_user.id),
+            "user.anonymized",
+        )
+        .target("user", &user_id)
+        .success(true)
+        .details_json(Some(
+            serde_json::json!({"reason": "GDPR Right to be Forgotten"}),
+        ))
+        .build();
         state.audit_actor.log_org(event).await;
     }
 

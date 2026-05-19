@@ -7,7 +7,6 @@ use argon2::{
     Argon2,
 };
 use chrono::{NaiveDate, NaiveDateTime};
-use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, FromQueryResult, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Set,
@@ -96,6 +95,66 @@ impl UserStore {
             .one(&db)
             .await?;
         Ok(result)
+    }
+
+    /// Security Audit Item 1: Find a user by email with tenant context
+    ///
+    /// - org_id = None: Find platform-level user (org_id IS NULL)
+    /// - org_id = Some(id): Find user in specific organization
+    ///
+    /// This enforces tenant isolation for user lookups.
+    pub async fn find_by_email_with_context(
+        db: DB<'_>,
+        email: &str,
+        org_id: Option<&str>,
+    ) -> Result<Option<users::Model>> {
+        let mut query = Users::find().filter(users::Column::Email.eq(email));
+
+        match org_id {
+            Some(id) => {
+                query = query.filter(users::Column::OrgId.eq(Some(id.to_string())));
+            }
+            None => {
+                query = query.filter(users::Column::OrgId.is_null());
+            }
+        }
+
+        let result = query.one(&db).await?;
+        Ok(result)
+    }
+
+    /// Security Audit Item 1: Create a user associated with an organization
+    ///
+    /// Used by Service API to create tenant-scoped users.
+    pub async fn create_with_org_id(
+        db: DB<'_>,
+        email: &str,
+        password_hash: Option<String>,
+        org_id: &str,
+    ) -> Result<users::Model> {
+        let new_user = users::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            email: Set(email.to_string()),
+            org_id: Set(Some(org_id.to_string())),
+            is_platform_owner: Set(false),
+            password_hash: Set(password_hash),
+            ..Default::default()
+        };
+
+        let user = new_user.insert(&db).await?;
+        Ok(user)
+    }
+
+    /// Security Audit Item 1: Find any user by email (ignoring tenant context)
+    ///
+    /// WARNING: Use carefully. Primarily for security checks (preventing enumeration)
+    /// or for internal system logic. Do NOT use for authentication without checking org_id.
+    pub async fn find_any_by_email(db: DB<'_>, email: &str) -> Result<Option<users::Model>> {
+        let user = Users::find()
+            .filter(users::Column::Email.eq(email))
+            .one(&db)
+            .await?;
+        Ok(user)
     }
 
     /// Find or create a user by email address
@@ -348,9 +407,10 @@ impl UserStore {
         end_date: NaiveDateTime,
         include_platform_owners: bool,
     ) -> Result<Vec<UserGrowthTrendData>> {
-        use sea_orm::sea_query::{Alias, Func, SimpleExpr};
+        use sea_orm::sea_query::{Alias, Expr, SimpleExpr};
+        // Use DATE() function - works in SQLite, MySQL, PostgreSQL
         let date_expr: SimpleExpr =
-            Func::cast_as(Expr::col(users::Column::CreatedAt), Alias::new("DATE")).into();
+            Expr::cust_with_expr("DATE($1)", Expr::col(users::Column::CreatedAt));
 
         let mut query = Users::find()
             .filter(users::Column::CreatedAt.gte(start_date))
@@ -371,6 +431,17 @@ impl UserStore {
             .await?;
 
         Ok(results)
+    }
+
+    /// List all users with pagination
+    pub async fn list_all(db: DB<'_>, limit: u64, offset: u64) -> Result<Vec<users::Model>> {
+        let users = Users::find()
+            .order_by_desc(users::Column::CreatedAt)
+            .limit(limit)
+            .offset(offset)
+            .all(&db)
+            .await?;
+        Ok(users)
     }
 
     /// Count total users with optional platform owner filter

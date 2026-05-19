@@ -5,9 +5,42 @@ use crate::entities::identities;
 use chrono::{Duration, Utc};
 use sea_orm::DatabaseConnection;
 
+const REFRESH_LOOKAHEAD: Duration = Duration::minutes(5);
+
 pub struct TokenRefreshJob {
     db: DatabaseConnection,
     encryption: Option<EncryptionService>,
+}
+
+fn platform_oauth_credentials(
+    config: &crate::config::Config,
+    provider: Provider,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    match provider {
+        Provider::Google => Ok((
+            config
+                .platform_google_client_id
+                .clone()
+                .ok_or("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")?,
+            config
+                .platform_google_client_secret
+                .clone()
+                .ok_or("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")?,
+        )),
+        Provider::Microsoft => Ok((
+            config
+                .platform_microsoft_client_id
+                .clone()
+                .ok_or("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")?,
+            config
+                .platform_microsoft_client_secret
+                .clone()
+                .ok_or("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")?,
+        )),
+        Provider::Github => Err("GitHub token refresh not supported".into()),
+        Provider::Oidc => Err("OIDC token refresh not supported yet".into()),
+        Provider::Password => Err("Password token refresh not supported".into()),
+    }
 }
 
 impl TokenRefreshJob {
@@ -31,7 +64,7 @@ impl TokenRefreshJob {
     async fn refresh_expiring_tokens(&self) -> Result<(), Box<dyn std::error::Error>> {
         use crate::store::{identities::IdentityStore, DB};
 
-        let threshold = Utc::now() + Duration::hours(1);
+        let threshold = Utc::now() + REFRESH_LOOKAHEAD;
         let threshold_str = threshold.to_rfc3339();
 
         let expiring_identities =
@@ -59,76 +92,42 @@ impl TokenRefreshJob {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let provider = Provider::from_str(&identity.provider)
             .map_err(|e| format!("Invalid provider: {}", e))?;
+        if !matches!(provider, Provider::Google | Provider::Microsoft) {
+            tracing::debug!(
+                identity_id = %identity.id,
+                provider = %identity.provider,
+                "Skipping unsupported provider token refresh"
+            );
+            return Ok(());
+        }
 
-        // 1. Determine which credentials to use
+        // 1. Determine which credentials to use. Service-scoped identities may
+        // have an issuing org even when they used platform OAuth credentials.
+        let config = crate::config::Config::from_env().map_err(|e| e.to_string())?;
         let (client_id, client_secret) = if let Some(org_id) = &identity.issuing_org_id {
-            // Case 1: BYOO Token
             use crate::store::{
                 organization_oauth_credentials::OrganizationOAuthCredentialsStore, DB,
             };
 
-            let creds = OrganizationOAuthCredentialsStore::find_by_org_and_provider(
+            if let Some(creds) = OrganizationOAuthCredentialsStore::find_by_org_and_provider(
                 DB::Conn(&self.db),
                 org_id,
                 &identity.provider,
             )
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-            .ok_or("BYOO credentials not found for org")?;
-
-            let encryption = self
-                .encryption
-                .as_ref()
-                .ok_or("Encryption service unavailable for BYOO secret")?;
-
-            // Create OAuth client using the new encapsulated method
-            let _oauth_client =
-                crate::store::organizations::OrganizationStore::get_oauth_client_for_org(
-                    crate::store::DB::Conn(&self.db),
-                    org_id,
-                    provider,
-                    encryption,
-                )
-                .await
-                .map_err(|e| format!("Failed to create OAuth client: {}", e))?;
-
-            // For now, return the credentials directly since that's what the existing code expects
-            let secret = encryption.decrypt(&creds.client_secret_encrypted)?;
-            (creds.client_id, secret)
-        } else {
-            // Case 2: Platform Token (Admin or Default)
-            use crate::store::{users::UserStore, DB};
-
-            let user = UserStore::find_by_id(DB::Conn(&self.db), &identity.user_id)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-                .ok_or("User not found")?;
-
-            let _is_platform_owner = user.is_platform_owner;
-
-            let config = crate::config::Config::from_env().map_err(|e| e.to_string())?;
-
-            // Case 2: Platform Credentials (used for both admin and non-admin users)
-            match provider {
-                Provider::Google => (
-                    config.platform_google_client_id
-                        .ok_or("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")?,
-                    config.platform_google_client_secret
-                        .ok_or("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")?,
-                ),
-                Provider::Microsoft => (
-                    config.platform_microsoft_client_id
-                        .ok_or("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")?,
-                    config.platform_microsoft_client_secret
-                        .ok_or("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")?,
-                ),
-                Provider::Github => {
-                    return Err("GitHub token refresh not supported".into())
-                }
-                Provider::Oidc => {
-                    return Err("OIDC token refresh not supported yet".into())
-                }
+            {
+                let encryption = self
+                    .encryption
+                    .as_ref()
+                    .ok_or("Encryption service unavailable for BYOO secret")?;
+                let secret = encryption.decrypt(&creds.client_secret_encrypted)?;
+                (creds.client_id, secret)
+            } else {
+                platform_oauth_credentials(&config, provider)?
             }
+        } else {
+            platform_oauth_credentials(&config, provider)?
         };
 
         // 2. Get the refresh token
@@ -163,6 +162,7 @@ impl TokenRefreshJob {
             }
             Provider::Github => return Ok(()), // GitHub refresh tokens are complex/optional, skip for now
             Provider::Oidc => return Err("OIDC token refresh not supported yet".into()),
+            Provider::Password => return Err("Password token refresh not supported".into()),
         };
 
         // 4. Update the identity in the database

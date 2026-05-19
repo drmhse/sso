@@ -1,8 +1,8 @@
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::permission_service::{PermissionService, CAP_ORG_SETTINGS_MANAGE};
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore,
     organization_oauth_credentials::OrganizationOAuthCredentialsStore,
     organizations::OrganizationStore, DB,
 };
@@ -11,6 +11,24 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+
+async fn require_settings_manager(state: &AppState, org_id: &str, user: &AuthUser) -> Result<()> {
+    if user.user.is_platform_owner
+        || PermissionService::check(
+            DB::Conn(&state.db),
+            org_id,
+            &user.user.id,
+            CAP_ORG_SETTINGS_MANAGE,
+        )
+        .await?
+    {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "Insufficient permissions to manage organization settings".to_string(),
+    ))
+}
 
 // OAuth Credentials Management
 
@@ -39,17 +57,7 @@ pub async fn set_org_oauth_credentials(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Verify user is admin or owner of the organization
-    let membership =
-        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &org.id, &user.user.id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Membership not found".to_string()))?;
-
-    if membership.role != "owner" && membership.role != "admin" {
-        return Err(AppError::Forbidden(
-            "Must be an owner or admin to manage OAuth credentials".to_string(),
-        ));
-    }
+    require_settings_manager(&state, &org.id, &user).await?;
 
     // Validate provider
     if provider != "github" && provider != "google" && provider != "microsoft" {
@@ -99,11 +107,7 @@ pub async fn get_org_oauth_credentials(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Verify user is a member of the organization
-    let _membership =
-        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &org.id, &user.user.id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Membership not found".to_string()))?;
+    require_settings_manager(&state, &org.id, &user).await?;
 
     // Validate provider
     if provider != "github" && provider != "google" && provider != "microsoft" {
@@ -161,20 +165,7 @@ pub async fn set_org_smtp(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner or admin of the organization
-    let membership = MembershipStore::find_by_org_and_user(
-        DB::Conn(&state.db),
-        &organization.id,
-        &auth_user.user.id,
-    )
-    .await?
-    .ok_or_else(|| AppError::Forbidden("Not a member of this organization".to_string()))?;
-
-    if membership.role != "owner" && membership.role != "admin" {
-        return Err(AppError::Forbidden(
-            "Only owners and admins can configure SMTP".to_string(),
-        ));
-    }
+    require_settings_manager(&state, &organization.id, &auth_user).await?;
 
     // Encrypt the SMTP password
     let encryption = state.encryption.as_ref().ok_or_else(|| {
@@ -216,20 +207,7 @@ pub async fn get_org_smtp(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is member of the organization
-    let membership = MembershipStore::find_by_org_and_user(
-        DB::Conn(&state.db),
-        &organization.id,
-        &auth_user.user.id,
-    )
-    .await?
-    .ok_or_else(|| AppError::Forbidden("Not a member of this organization".to_string()))?;
-
-    if membership.role != "owner" && membership.role != "admin" {
-        return Err(AppError::Forbidden(
-            "Only owners and admins can view SMTP configuration".to_string(),
-        ));
-    }
+    require_settings_manager(&state, &organization.id, &auth_user).await?;
 
     let configured = organization.smtp_host.is_some();
 
@@ -254,20 +232,7 @@ pub async fn delete_org_smtp(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner or admin of the organization
-    let membership = MembershipStore::find_by_org_and_user(
-        DB::Conn(&state.db),
-        &organization.id,
-        &auth_user.user.id,
-    )
-    .await?
-    .ok_or_else(|| AppError::Forbidden("Not a member of this organization".to_string()))?;
-
-    if membership.role != "owner" && membership.role != "admin" {
-        return Err(AppError::Forbidden(
-            "Only owners and admins can delete SMTP configuration".to_string(),
-        ));
-    }
+    require_settings_manager(&state, &organization.id, &auth_user).await?;
 
     // Clear SMTP settings
     OrganizationStore::clear_smtp_config(DB::Conn(&state.db), &organization.id).await?;

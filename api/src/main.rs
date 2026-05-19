@@ -14,6 +14,7 @@ mod router;
 mod services;
 mod state;
 mod store;
+mod utils;
 
 use crate::auth::jwt::JwtService;
 use crate::auth::sso::OAuthClient;
@@ -29,6 +30,7 @@ use crate::jobs::saml_state_cleanup::SamlStateCleanupJob;
 use crate::jobs::token_refresh::TokenRefreshJob;
 use crate::state::AppState;
 use axum::extract::State;
+use axum::http::{header, HeaderValue};
 use axum::Json;
 use axum::{
     routing::{get, post},
@@ -44,7 +46,7 @@ use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use std::env;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use webauthn_rs::prelude::*;
 
@@ -57,8 +59,8 @@ async fn ensure_platform_owner(db: &DatabaseConnection, email: &str) -> anyhow::
 
     let db_conn = DbEnum::Conn(db);
 
-    // Try to find the user by email
-    match UserStore::find_by_email(db_conn.clone(), email).await {
+    // Try to find the user by email (explicitly platform scope/no org)
+    match UserStore::find_by_email_with_context(db_conn.clone(), email, None).await {
         Ok(Some(user)) => {
             // User exists, ensure they are a platform owner
             if !user.is_platform_owner {
@@ -206,6 +208,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Load environment variables
     dotenvy::dotenv().ok();
+
+    // Handle "setup-geoip" command for container initialization
+    // This replaces the need for curl/tar in the runtime image
+    if std::env::args().nth(1).as_deref() == Some("setup-geoip") {
+        crate::services::geoip_setup::run_setup().await?;
+        return Ok(());
+    }
 
     // Load configuration
     let config = Config::from_env().expect("Failed to load configuration");
@@ -433,7 +442,7 @@ async fn main() -> anyhow::Result<()> {
                 geoip_db_path
             );
             tracing::warn!("   To enable impossible travel detection and geo-risk analysis:");
-            tracing::warn!("   1. Run: ./scripts/setup_geoip.sh");
+            tracing::warn!("   1. Run: ./sso setup-geoip");
             tracing::warn!("   2. Or set: GEOIP_DISABLED=true (not recommended for production)");
         } else {
             tracing::info!("✓ GeoIP database available: {}", geoip_db_path);
@@ -490,6 +499,13 @@ async fn main() -> anyhow::Result<()> {
         .max_capacity(10_000)
         .build();
 
+    // Security Audit Item 3: Initialize domain cache for dynamic CORS
+    // TTL: 5 minutes (300 seconds), Max capacity: 10,000 domains
+    let domain_cache: Cache<String, bool> = Cache::builder()
+        .time_to_live(Duration::from_secs(300))
+        .max_capacity(10_000)
+        .build();
+
     // Initialize buffered audit actor
     // Uses db_writer for SQLite to avoid contention with main db pool
     #[cfg(feature = "db_sqlite")]
@@ -515,6 +531,7 @@ async fn main() -> anyhow::Result<()> {
         webauthn_service: webauthn_service.clone(),
         permission_cache,
         user_cache,
+        domain_cache,
         audit_actor: audit_actor.clone(),
         config: config.clone(),
     };
@@ -527,7 +544,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Build routes using the router module
-    let active_org_routes = router::active_org_routes(&app_state);
+    let _active_org_routes = router::active_org_routes(&app_state);
     let protected_routes = router::protected_routes(&app_state);
     let analytics_routes = router::analytics_routes(&app_state);
     let mfa_routes = router::mfa_routes(&app_state, &config);
@@ -568,17 +585,35 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn(
             crate::middleware::extract_request_info_middleware,
         ))
-        // CORS
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        // ========================================================================
+        // Security Headers (Security Audit Item 4)
+        // ========================================================================
+        .layer(SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        // ========================================================================
+        // Dynamic CORS (Security Audit Item 3)
+        // ========================================================================
+        // Replaces permissive CorsLayer with domain-aware CORS validation
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::middleware::dynamic_cors_middleware,
+        ))
         // Request timeout: Fail fast at 30 seconds to prevent runaway requests
         // Note: 5s was too aggressive - SAML cert generation (RSA) needs ~10-20s under load
         // 30s provides protection while allowing legitimate slow crypto operations
-        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(30)))
+        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
+            30,
+        )))
         // HTTP request duration metrics - outermost layer to capture full request lifecycle
         // This measures time including CORS handling, auth, and all other middleware
         .layer(axum::middleware::from_fn(

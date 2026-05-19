@@ -4,6 +4,8 @@
 //! of individual billing providers (Stripe, Polar, etc.) allowing the application to
 //! work with any provider through a unified interface.
 
+#![allow(dead_code)]
+
 use super::models::{
     BillingCustomer, BillingEvent, BillingProviderType, CheckoutResult, CreateCheckoutRequest,
     CreateCustomerRequest, PortalResult,
@@ -26,8 +28,10 @@ pub trait BillingProvider: Send + Sync {
     async fn create_customer(&self, request: CreateCustomerRequest) -> Result<String>;
 
     /// Generate a checkout link for purchasing a subscription
-    async fn create_checkout_session(&self, request: CreateCheckoutRequest)
-        -> Result<CheckoutResult>;
+    async fn create_checkout_session(
+        &self,
+        request: CreateCheckoutRequest,
+    ) -> Result<CheckoutResult>;
 
     /// Generate a portal link for managing existing subscription
     async fn create_portal_session(

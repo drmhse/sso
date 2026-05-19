@@ -22,6 +22,8 @@ import {
   LookupEmailResponse,
   ResendVerificationRequest,
   ResendVerificationResponse,
+  AuthContextRequest,
+  AuthContextResponse,
 } from '../types';
 
 /**
@@ -334,7 +336,7 @@ export class AuthModule {
 
   /**
    * Login with email and password.
-   * Automatically persists the session and configures the client.
+   * Automatically persists the session once authentication is complete.
    *
    * @param payload Login credentials (email and password)
    * @returns Access token, refresh token, and expiration info
@@ -345,17 +347,18 @@ export class AuthModule {
    *   email: 'user@example.com',
    *   password: 'SecurePassword123!'
    * });
-   * // Session is automatically saved - no need for manual token management
+   * // Session is automatically saved unless MFA is required
    * ```
    */
   public async login(payload: LoginRequest): Promise<RefreshTokenResponse> {
     const response = await this.http.post<RefreshTokenResponse>('/api/auth/login', payload);
 
-    // MAGIC HAPPENS HERE: Auto-save tokens
-    await this.session.setSession({
-      access_token: response.data.access_token,
-      refresh_token: response.data.refresh_token,
-    });
+    if (response.data.refresh_token) {
+      await this.session.setSession({
+        access_token: response.data.access_token,
+        refresh_token: response.data.refresh_token,
+      });
+    }
 
     return response.data;
   }
@@ -495,6 +498,22 @@ export class AuthModule {
     const response = await this.http.post<LookupEmailResponse>('/api/auth/lookup-email', {
       email
     });
+    return response.data;
+  }
+
+  /**
+   * Fetch public hosted-auth context for an organization/service login.
+   */
+  public async getContext(params: AuthContextRequest = {}): Promise<AuthContextResponse> {
+    const searchParams = new URLSearchParams();
+    if (params.org) searchParams.append('org', params.org);
+    if (params.service) searchParams.append('service', params.service);
+    if (params.redirect_uri) searchParams.append('redirect_uri', params.redirect_uri);
+
+    const query = searchParams.toString();
+    const response = await this.http.get<AuthContextResponse>(
+      `/api/auth/context${query ? `?${query}` : ''}`
+    );
     return response.data;
   }
 }

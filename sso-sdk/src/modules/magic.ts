@@ -7,7 +7,12 @@ export interface MagicLinkRequest {
   /** Email address to send the magic link to */
   email: string;
   /** Optional organization context */
+  org_slug?: string;
   orgSlug?: string;
+  /** Optional service context */
+  service_slug?: string;
+  /** Optional service callback URI */
+  redirect_uri?: string;
 }
 
 /**
@@ -41,7 +46,10 @@ export class MagicLinks {
    * @returns Promise resolving to magic link response
    */
   async request(data: MagicLinkRequest): Promise<MagicLinkResponse> {
-    const response = await this.http.post('/api/auth/magic-link/request', data);
+    const response = await this.http.post('/api/auth/magic-link/request', {
+      ...data,
+      org_slug: data.org_slug || data.orgSlug,
+    });
     return response.data;
   }
 
@@ -76,7 +84,8 @@ export class MagicLinks {
       params.append('redirect_uri', redirectUri);
     }
 
-    return this.http.get(`/api/auth/magic-link/verify?${params.toString()}`);
+    const response = await this.http.get(`/api/auth/magic-link/verify?${params.toString()}`);
+    return response.data;
   }
 
   /**

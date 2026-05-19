@@ -1,4 +1,3 @@
-use crate::constants::JWT_EXPIRE_HOURS;
 use crate::db::models::User;
 use crate::entities::users;
 use crate::error::{with_deadlock_retry, with_retrying_transaction, AppError, Result};
@@ -62,7 +61,10 @@ pub async fn verify_mfa_login(
             .ip_address(Some(&request_info.ip_address))
             .user_agent(Some(request_info.user_agent.clone()))
             .success(false)
-            .details(Some(&format!("method:{},reason:invalid_code", verification_type)))
+            .details(Some(&format!(
+                "method:{},reason:invalid_code",
+                verification_type
+            )))
             .build();
         state.audit_actor.log_mfa(event).await;
 
@@ -139,44 +141,56 @@ pub async fn verify_mfa_login(
     };
 
     // Create session (use retry for SQLite contention)
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "create_session_mfa", |db| {
-        let user_id = user.id.clone();
-        let token_hash = token_hash.clone();
-        let expires_at = expires_at.naive_utc();
-        let refresh_token = refresh_token.clone();
-        let refresh_expires_at = refresh_expires_at.naive_utc();
-        let org_slug = org_slug.map(|s| s.to_string());
-        let service_id = service_id.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_session_mfa",
+        |db| {
+            let user_id = user.id.clone();
+            let token_hash = token_hash.clone();
+            let expires_at = expires_at.naive_utc();
+            let refresh_token = refresh_token.clone();
+            let refresh_expires_at = refresh_expires_at.naive_utc();
+            let org_slug = org_slug.map(|s| s.to_string());
+            let service_id = service_id.clone();
 
-        Box::pin(async move {
-            SessionStore::create(
-                db.clone(),
-                &user_id,
-                &token_hash,
-                expires_at,
-                Some(&refresh_token),
-                Some(refresh_expires_at),
-                org_slug.as_deref(),
-                service_id.as_deref(),
-                None,
-                None,
-            )
-            .await
-        })
-    })
+            Box::pin(async move {
+                SessionStore::create(
+                    db.clone(),
+                    &user_id,
+                    &token_hash,
+                    expires_at,
+                    Some(&refresh_token),
+                    Some(refresh_expires_at),
+                    org_slug.as_deref(),
+                    service_id.as_deref(),
+                    None,
+                    None,
+                )
+                .await
+            })
+        },
+    )
     .await?;
 
     // If this is for a device flow, authorize the device code now
 
     if let Some(device_code_id) = req.device_code_id {
-        with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "authorize_device_code", |db| {
-            let device_code_id = device_code_id.clone();
-            let user_id = user.id.clone();
-            Box::pin(async move {
-                // Verify the device code belongs to this user and update its status
-                DeviceCodeStore::authorize_for_user(db.clone(), &device_code_id, &user_id).await
-            })
-        })
+        with_retrying_transaction(
+            &state.db,
+            #[cfg(feature = "db_sqlite")]
+            &state.db_writer,
+            "authorize_device_code",
+            |db| {
+                let device_code_id = device_code_id.clone();
+                let user_id = user.id.clone();
+                Box::pin(async move {
+                    // Verify the device code belongs to this user and update its status
+                    DeviceCodeStore::authorize_for_user(db.clone(), &device_code_id, &user_id).await
+                })
+            },
+        )
         .await?;
     }
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::entities::permissions::RelationTuple;
 use crate::error::{AppError, Result};
 use crate::store::permissions::PermissionsStore;

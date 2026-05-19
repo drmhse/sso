@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const DEFAULT_TIER_NAME: &str = "free";
 pub const DEFAULT_MAX_SERVICES: i64 = 2;
 pub const DEFAULT_MAX_USERS: i64 = 3;
@@ -23,4 +25,3 @@ pub const MIN_SLUG_LENGTH: usize = 3;
 pub const MAX_SLUG_LENGTH: usize = 50;
 pub const MIN_NAME_LENGTH: usize = 2;
 pub const MAX_NAME_LENGTH: usize = 100;
-

@@ -4,6 +4,7 @@ import {
   ServiceListResponse,
   CreateServicePayload,
   CreateServiceResponse,
+  RotateServiceSecretResponse,
   UpdateServicePayload,
   PlanResponse,
   CreatePlanPayload,
@@ -77,13 +78,12 @@ export class ServicesModule {
    *
    * @param orgSlug Organization slug
    * @param serviceSlug Service slug
-   * @returns Service with provider grants and plans
+   * @returns Service details
    *
    * @example
    * ```typescript
    * const service = await sso.services.get('acme-corp', 'main-app');
-   * console.log(service.service.redirect_uris);
-   * console.log(service.plans);
+   * console.log(service.name, service.client_id);
    * ```
    */
   public async get(orgSlug: string, serviceSlug: string): Promise<Service> {
@@ -136,6 +136,21 @@ export class ServicesModule {
    */
   public async delete(orgSlug: string, serviceSlug: string): Promise<void> {
     await this.http.delete(`/api/organizations/${orgSlug}/services/${serviceSlug}`);
+  }
+
+  /**
+   * Rotate a service client secret.
+   * The new secret is returned once and cannot be retrieved later.
+   */
+  public async rotateSecret(
+    orgSlug: string,
+    serviceSlug: string
+  ): Promise<RotateServiceSecretResponse> {
+    const response = await this.http.post<RotateServiceSecretResponse>(
+      `/api/organizations/${orgSlug}/services/${serviceSlug}/secret/rotate`,
+      {}
+    );
+    return response.data;
   }
 
   /**

@@ -65,7 +65,7 @@ export type ServiceType = 'web' | 'mobile' | 'desktop' | 'api';
 /**
  * Organization member roles
  */
-export type MemberRole = 'owner' | 'admin' | 'member';
+export type MemberRole = 'owner' | 'admin' | 'member' | (string & {});
 
 /**
  * Invitation status

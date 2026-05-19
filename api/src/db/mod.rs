@@ -53,7 +53,7 @@ pub async fn init_db(config: &Config) -> Result<DatabaseConnection, DbErr> {
 #[cfg(feature = "db_sqlite")]
 pub async fn init_db_writer(config: &Config) -> Result<DatabaseConnection, DbErr> {
     let mut opt = ConnectOptions::new(&config.database_url);
-    
+
     // Single connection for serialized writes
     opt.max_connections(1)
         .min_connections(1)

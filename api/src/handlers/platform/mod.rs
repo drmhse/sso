@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // Platform module - handles all platform governance, analytics, and user management endpoints
 // This module is organized into logical sub-modules:
 // - governance: Organization approval, tier management, and lifecycle operations
@@ -7,6 +9,7 @@
 pub mod analytics;
 pub mod governance;
 pub mod impersonation;
+pub mod operations;
 pub mod users;
 
 use crate::db::models::{Organization, PlatformAuditLog, User};
@@ -38,12 +41,13 @@ pub use analytics::{
 
 // User management handlers
 pub use users::{
-    demote_platform_owner, force_disable_user_mfa, get_user_mfa_status, promote_platform_owner,
-    search_users,
+    demote_platform_owner, force_disable_user_mfa, get_platform_user, get_user_mfa_status,
+    list_users, promote_platform_owner, search_users,
 };
 
 // Impersonation handlers
 pub use impersonation::impersonate_user;
+pub use operations::get_operations_status;
 
 // Additional handlers that weren't in the split (kept in this module)
 use crate::error::AppError;
@@ -83,6 +87,7 @@ pub(crate) fn org_model_to_old(model: organizations::Model) -> Organization {
         domain_verification_token: model.domain_verification_token,
         brand_logo_url: model.brand_logo_url,
         brand_primary_color: model.brand_primary_color,
+        feature_overrides: model.feature_overrides,
         created_at: chrono::DateTime::from_naive_utc_and_offset(model.created_at, Utc),
         updated_at: chrono::DateTime::from_naive_utc_and_offset(model.updated_at, Utc),
     }
@@ -189,40 +194,46 @@ pub async fn delete_organization_platform(
         ));
     }
 
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "delete_organization", |db| {
-        let org_id = org_id.clone();
-        let auth_user_id = auth_user.user.id.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "delete_organization",
+        |db| {
+            let org_id = org_id.clone();
+            let auth_user_id = auth_user.user.id.clone();
 
-        Box::pin(async move {
-            // Fetch organization
-            let org_model = OrganizationStore::find_by_id(db.clone(), &org_id)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+            Box::pin(async move {
+                // Fetch organization
+                let org_model = OrganizationStore::find_by_id(db.clone(), &org_id)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-            let org_slug = org_model.slug.clone();
-            let org_name = org_model.name.clone();
+                let org_slug = org_model.slug.clone();
+                let org_name = org_model.name.clone();
 
-            // Create audit log before deletion
-            create_audit_log(
-                &db,
-                &auth_user_id,
-                "delete_organization",
-                "organization",
-                &org_id,
-                Some(json!({
-                    "org_slug": org_slug,
-                    "org_name": org_name,
-                    "status": org_model.status,
-                })),
-            )
-            .await?;
+                // Create audit log before deletion
+                create_audit_log(
+                    &db,
+                    &auth_user_id,
+                    "delete_organization",
+                    "organization",
+                    &org_id,
+                    Some(json!({
+                        "org_slug": org_slug,
+                        "org_name": org_name,
+                        "status": org_model.status,
+                    })),
+                )
+                .await?;
 
-            // Delete organization (database cascades will handle related data)
-            OrganizationStore::delete(db.clone(), &org_id).await?;
+                // Delete organization (database cascades will handle related data)
+                OrganizationStore::delete(db.clone(), &org_id).await?;
 
-            Ok(())
-        })
-    })
+                Ok(())
+            })
+        },
+    )
     .await?;
 
     Ok(Json(json!({

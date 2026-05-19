@@ -1,0 +1,86 @@
+# Multi-tenant SSO Platform - SQLite Configuration for Coolify
+#
+# Usage: Copy this content into Coolify's Docker Compose configuration.
+
+version: "3.8"
+
+# ============================================================================
+# YAML Anchors
+# ============================================================================
+
+x-common-env: &common-env
+  RUST_LOG: ${RUST_LOG:-info}
+  JWT_PRIVATE_KEY_BASE64: ${JWT_PRIVATE_KEY_BASE64}
+  JWT_PUBLIC_KEY_BASE64: ${JWT_PUBLIC_KEY_BASE64}
+  JWT_KID: ${JWT_KID}
+  JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
+  PLATFORM_GITHUB_CLIENT_ID: ${PLATFORM_GITHUB_CLIENT_ID}
+  PLATFORM_GITHUB_CLIENT_SECRET: ${PLATFORM_GITHUB_CLIENT_SECRET}
+  PLATFORM_GITHUB_REDIRECT_URI: ${PLATFORM_GITHUB_REDIRECT_URI}
+  PLATFORM_GOOGLE_CLIENT_ID: ${PLATFORM_GOOGLE_CLIENT_ID}
+  PLATFORM_GOOGLE_CLIENT_SECRET: ${PLATFORM_GOOGLE_CLIENT_SECRET}
+  PLATFORM_GOOGLE_REDIRECT_URI: ${PLATFORM_GOOGLE_REDIRECT_URI}
+  PLATFORM_MICROSOFT_CLIENT_ID: ${PLATFORM_MICROSOFT_CLIENT_ID}
+  PLATFORM_MICROSOFT_CLIENT_SECRET: ${PLATFORM_MICROSOFT_CLIENT_SECRET}
+  PLATFORM_MICROSOFT_REDIRECT_URI: ${PLATFORM_MICROSOFT_REDIRECT_URI}
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+  STRIPE_API_BASE_URL: ${STRIPE_API_BASE_URL}
+  STRIPE_WEBHOOK_TEST_MODE: ${STRIPE_WEBHOOK_TEST_MODE}
+  SMTP_HOST: ${SMTP_HOST}
+  SMTP_PORT: ${SMTP_PORT}
+  SMTP_USERNAME: ${SMTP_USERNAME}
+  SMTP_PASSWORD: ${SMTP_PASSWORD}
+  SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL}
+  SMTP_FROM_NAME: ${SMTP_FROM_NAME}
+  SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+  SERVER_PORT: ${SERVER_PORT:-3000}
+  BASE_URL: ${BASE_URL:-http://localhost:3001}
+  PLATFORM_DASHBOARD_BASE_URL: ${PLATFORM_DASHBOARD_BASE_URL:-http://localhost:5173}
+  TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+  TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+  PLATFORM_OWNER_EMAIL: ${PLATFORM_OWNER_EMAIL:-admin@example.com}
+  PLATFORM_OWNER_PASSWORD: ${PLATFORM_OWNER_PASSWORD}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  DISABLE_RATE_LIMITING: ${DISABLE_RATE_LIMITING}
+  GEOIP_DISABLED: ${GEOIP_DISABLED:-false}
+  GEOIP_DATABASE_PATH: ${GEOIP_DATABASE_PATH:-/app/geoip/GeoLite2-City.mmdb}
+  MAXMIND_LICENSE_KEY: ${MAXMIND_LICENSE_KEY}
+  DEVICE_TRUST_SECRET: ${DEVICE_TRUST_SECRET}
+  JOB_PROCESSOR_INTERVAL_SECS: ${JOB_PROCESSOR_INTERVAL_SECS:-10}
+  JOB_PROCESSOR_BATCH_SIZE: ${JOB_PROCESSOR_BATCH_SIZE:-10}
+
+x-common-app: &common-app
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        cpus: "2"
+        memory: 2G
+      reservations:
+        cpus: "2"
+        memory: 2G
+  
+# ============================================================================
+# Services
+# ============================================================================
+
+services:
+  sso:
+    <<: *common-app
+    image: editoredit/sso:sqlite-0.1.39
+    environment:
+      <<: *common-env
+      DATABASE_URL: ${DATABASE_URL:-sqlite:/app/data/data.db}
+      SERVER_PORT: 80
+    volumes:
+      - sso_sqlite_data:/app/data
+      - sso_geoip_data:/app/geoip
+
+# ============================================================================
+# Networks & Volumes
+# ============================================================================
+
+volumes:
+  sso_sqlite_data:
+  sso_geoip_data:

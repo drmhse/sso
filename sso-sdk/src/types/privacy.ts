@@ -74,6 +74,14 @@ export interface ExportUserDataResponse {
 }
 
 /**
+ * User anonymization confirmation payload.
+ */
+export interface ForgetUserRequest {
+  current_password?: string;
+  mfa_code?: string;
+}
+
+/**
  * User anonymization response (GDPR Right to be Forgotten)
  */
 export interface ForgetUserResponse {

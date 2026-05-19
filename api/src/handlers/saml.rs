@@ -1,12 +1,14 @@
 use crate::db::models::{SamlCertificateInfo, User};
 use crate::error::{with_retrying_transaction, AppError, Json400, Result};
 use crate::middleware::{AuthUser, RequestInfo};
+use crate::services::permission_service::{PermissionService, CAP_SERVICES_MANAGE};
+use crate::services::tier_enforcement::TierService;
 use crate::state::AppState;
 use crate::store::{
-    organizations::OrganizationStore, saml_signing_keys::SamlSigningKeysStore,
-    saml_states::SamlStateStore, services::ServiceStore, DB,
+    memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
+    saml_signing_keys::SamlSigningKeysStore, saml_states::SamlStateStore, services::ServiceStore,
+    DB,
 };
-use crate::services::tier_enforcement::TierService;
 use axum::{
     extract::{Extension, Path, Query, State},
     response::{Html, IntoResponse, Redirect, Response},
@@ -14,7 +16,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{Duration, Utc};
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SerialNumber};
 use reqwest::Url;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::signature::{SignatureEncoding, Signer};
@@ -23,6 +25,52 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
+
+// Security Audit Item 7: XXE (XML External Entity) Prevention
+// This function validates XML input to prevent XXE attacks which could lead to:
+// - File disclosure (reading local files)
+// - SSRF (Server-Side Request Forgery)
+// - Denial of Service (billion laughs attack)
+fn validate_xml_no_xxe(xml: &str) -> Result<()> {
+    // Check for dangerous patterns in a case-insensitive manner
+    let xml_upper = xml.to_uppercase();
+
+    // Reject DOCTYPE declarations (could reference external entities)
+    if xml_upper.contains("<!DOCTYPE") {
+        return Err(AppError::BadRequest(
+            "XML external entities (DOCTYPE) are forbidden in SAML requests".to_string(),
+        ));
+    }
+
+    // Reject ENTITY declarations (could define external entities)
+    if xml_upper.contains("<!ENTITY") {
+        return Err(AppError::BadRequest(
+            "XML external entities (ENTITY) are forbidden in SAML requests".to_string(),
+        ));
+    }
+
+    // Reject SYSTEM references (external file/URL references)
+    if xml_upper.contains("SYSTEM ")
+        || xml_upper.contains("SYSTEM\"")
+        || xml_upper.contains("SYSTEM'")
+    {
+        return Err(AppError::BadRequest(
+            "XML external entities (SYSTEM) are forbidden in SAML requests".to_string(),
+        ));
+    }
+
+    // Reject PUBLIC references (external DTD references)
+    if xml_upper.contains("PUBLIC ")
+        || xml_upper.contains("PUBLIC\"")
+        || xml_upper.contains("PUBLIC'")
+    {
+        return Err(AppError::BadRequest(
+            "XML external entities (PUBLIC) are forbidden in SAML requests".to_string(),
+        ));
+    }
+
+    Ok(())
+}
 
 // SAML Response Builder for deduplicating XML generation
 struct SamlResponseBuilder {
@@ -599,9 +647,27 @@ async fn can_manage_service(
     user_id: &str,
     org_id: &str,
 ) -> Result<bool> {
-    use crate::store::{memberships::MembershipStore, DB};
+    PermissionService::check(DB::Conn(pool), org_id, user_id, CAP_SERVICES_MANAGE).await
+}
 
-    MembershipStore::is_owner_or_admin(DB::Conn(pool), org_id, user_id).await
+async fn can_manage_specific_service(
+    pool: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    org_id: &str,
+    service_id: &str,
+) -> Result<bool> {
+    if can_manage_service(pool, user_id, org_id).await? {
+        return Ok(true);
+    }
+
+    if MembershipStore::find_by_org_and_user(DB::Conn(pool), org_id, user_id)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+
+    PermissionsStore::check(DB::Conn(pool), "service", service_id, "manager", user_id).await
 }
 
 // Handler: Configure SAML for a service
@@ -624,13 +690,6 @@ pub async fn configure_saml(
         ));
     }
 
-    // Check permissions
-    if !can_manage_service(&state.db, &user.user.id, &org.id).await? {
-        return Err(AppError::Forbidden(
-            "You don't have permission to manage this service".into(),
-        ));
-    }
-
     // Tier/Entitlement Check
     TierService::check_feature_access(
         DB::Conn(&state.db),
@@ -644,6 +703,12 @@ pub async fn configure_saml(
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+
+    if !can_manage_specific_service(&state.db, &user.user.id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You don't have permission to manage this service".into(),
+        ));
+    }
 
     // Validate entity_id and acs_url
     if req.enabled {
@@ -712,33 +777,40 @@ pub async fn configure_saml(
             AppError::InternalServerError(format!("Failed to serialize attribute mapping: {}", e))
         })?;
 
-
     // Update service SAML configuration
     // Update service configuration with retry
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "configure_saml", |db| {
-        let service_id = service.id.clone();
-        let req = req.clone();
-        Box::pin(async move {
-            let name_id_format = req.name_id_format.clone()
-                .unwrap_or_else(|| "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_string());
-                
-            ServiceStore::update_saml_config(
-                db.clone(),
-                &service_id,
-                req.enabled,
-                req.entity_id.as_deref(),
-                req.acs_url.as_deref(),
-                req.slo_url.as_deref(),
-                Some(&name_id_format),
-                req.attribute_mapping.as_ref().map(|m| {
-                     serde_json::to_string(m).unwrap_or_default()
-                }).as_deref(),
-                req.sign_assertions.unwrap_or(true),
-                req.sign_response.unwrap_or(true),
-            )
-            .await
-        })
-    })
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "configure_saml",
+        |db| {
+            let service_id = service.id.clone();
+            let req = req.clone();
+            Box::pin(async move {
+                let name_id_format = req.name_id_format.clone().unwrap_or_else(|| {
+                    "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_string()
+                });
+
+                ServiceStore::update_saml_config(
+                    db.clone(),
+                    &service_id,
+                    req.enabled,
+                    req.entity_id.as_deref(),
+                    req.acs_url.as_deref(),
+                    req.slo_url.as_deref(),
+                    Some(&name_id_format),
+                    req.attribute_mapping
+                        .as_ref()
+                        .map(|m| serde_json::to_string(m).unwrap_or_default())
+                        .as_deref(),
+                    req.sign_assertions.unwrap_or(true),
+                    req.sign_response.unwrap_or(true),
+                )
+                .await
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -778,17 +850,16 @@ pub async fn get_saml_config(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
 
-    // Check permissions
-    if !can_manage_service(&state.db, &user.user.id, &org.id).await? {
-        return Err(AppError::Forbidden(
-            "You don't have permission to view this service".into(),
-        ));
-    }
-
     // Get service
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+
+    if !can_manage_specific_service(&state.db, &user.user.id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You don't have permission to view this service".into(),
+        ));
+    }
 
     // Check if certificate exists
     let count =
@@ -832,17 +903,16 @@ pub async fn generate_saml_certificate(
         ));
     }
 
-    // Check permissions
-    if !can_manage_service(&state.db, &user.user.id, &org.id).await? {
-        return Err(AppError::Forbidden(
-            "You don't have permission to manage this service".into(),
-        ));
-    }
-
     // Get service
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+
+    if !can_manage_specific_service(&state.db, &user.user.id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You don't have permission to manage this service".into(),
+        ));
+    }
 
     // Check if SAML is enabled
     if !service.saml_enabled {
@@ -857,56 +927,67 @@ pub async fn generate_saml_certificate(
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("Encryption service not available".into()))?;
 
-    // Generate RSA 2048 key pair - OFFLOAD TO BLOCKING THREAD
-    // RSA key generation is CPU-bound (~1-5 seconds) and would block the async runtime
+    // Generate certificate parameters with RSA key pair
+    // Generate 2048-bit RSA key pair for SAML signing using the rsa crate directly
+    // This ensures compatibility with the rsa crate's PKCS#8 parser used in signing
+    use rand::rngs::OsRng;
     use rsa::pkcs8::EncodePrivateKey;
-    use rsa::RsaPrivateKey as RsaKey;
+    use rsa::RsaPrivateKey;
 
-    let rsa_key_pem = tokio::task::spawn_blocking(move || {
-        use rand::rngs::OsRng;
-        let mut rng = OsRng;
-        let bits = 2048;
-        
-        let rsa_key = RsaKey::new(&mut rng, bits)
-            .map_err(|e| format!("Failed to generate RSA key: {}", e))?;
-        
+    let mut rng = OsRng;
+    let bits = 2048;
+    let rsa_key = RsaPrivateKey::new(&mut rng, bits)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to generate RSA key: {}", e)))?;
+
+    // Convert to PKCS#8 PEM for rcgen (rcgen expects PEM format)
+    let private_key_pem_for_rcgen =
         rsa_key
             .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-            .map(|pem| pem.to_string())
-            .map_err(|e| format!("Failed to encode RSA key to PKCS#8: {}", e))
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("RSA generation task failed: {}", e)))?
-    .map_err(|e| AppError::InternalServerError(e))?;
+            .map_err(|e| {
+                AppError::InternalServerError(format!(
+                    "Failed to encode RSA key to PKCS#8 PEM: {}",
+                    e
+                ))
+            })?;
 
-    // Import the RSA key into rcgen
-    use rcgen::{KeyPair, PKCS_RSA_SHA256};
-    let key_pair = KeyPair::from_pem(&rsa_key_pem).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to import RSA key into rcgen: {}", e))
+    // Create rcgen KeyPair from the PEM-encoded private key
+    let key_pair = KeyPair::from_pem(private_key_pem_for_rcgen.as_str()).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to create KeyPair from PEM: {}", e))
     })?;
 
-    // Generate certificate parameters with RSA key pair
-    let mut params = CertificateParams::default();
-    params.alg = &PKCS_RSA_SHA256;
-    params.key_pair = Some(key_pair);
+    // Create certificate parameters
+    // rcgen 0.13 requires SANs in new()
+    let mut params = CertificateParams::new(vec![org.name.clone()]).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to create certificate params: {}", e))
+    })?;
 
+    // Set validity period using time crate
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + time::Duration::days(365 * 10); // 10 years
+    params.serial_number = Some(SerialNumber::from(42));
+
+    // Set Distinguished Name (Subject)
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::CommonName, format!("{} SAML IdP", org.name));
     distinguished_name.push(DnType::OrganizationName, &org.name);
     params.distinguished_name = distinguished_name;
 
-    // Generate certificate with the RSA key pair
-    let cert = Certificate::from_params(params).map_err(|e| {
+    // Create certificate using the specific key pair (RSA)
+    let cert = params.self_signed(&key_pair).map_err(|e| {
         AppError::InternalServerError(format!("Failed to generate certificate: {}", e))
     })?;
 
     // Get the certificate PEM (public part)
-    let public_cert_pem = cert.serialize_pem().map_err(|e| {
-        AppError::InternalServerError(format!("Failed to serialize certificate: {}", e))
-    })?;
+    let public_cert_pem = cert.pem();
 
-    // Get the private key in PKCS#8 format directly from rcgen
-    let private_key_pem = cert.serialize_private_key_pem();
+    // Convert the RSA private key to PEM format (this will be compatible with rsa crate's parser)
+    let private_key_pem = rsa_key
+        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+        .map_err(|e| {
+            AppError::InternalServerError(format!("Failed to encode private key to PEM: {}", e))
+        })?
+        .to_string();
 
     // Encrypt the PKCS#8 private key
     let private_key_encrypted = encryption.encrypt(&private_key_pem).map_err(|e| {
@@ -923,67 +1004,82 @@ pub async fn generate_saml_certificate(
     let helper_private_key = private_key_encrypted.clone();
     let helper_public_cert = public_cert_pem.clone();
     let helper_key_id = encryption_key_id.clone();
-    
-    let cert_info = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "generate_saml_cert", |db| {
-        let service_id = helper_service_id.clone();
-        let private_key_encrypted = helper_private_key.clone();
-        let public_cert_pem = helper_public_cert.clone();
-        let encryption_key_id = helper_key_id.clone();
-        let valid_from = valid_from;
-        let valid_until = valid_until;
 
-        Box::pin(async move {
-            use sea_orm::{EntityTrait, QuerySelect};
-            // 1. LOCKING: Select the Service row "FOR UPDATE" to serialize concurrent requests
-            let _service_lock = crate::entities::services::Entity::find_by_id(&service_id)
-                .lock_exclusive()
-                .one(&db)
-                .await
-                .map_err(|e| AppError::InternalServerError(format!("Failed to lock service: {}", e)))?
-                .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+    let cert_info = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "generate_saml_cert",
+        |db| {
+            let service_id = helper_service_id.clone();
+            let private_key_encrypted = helper_private_key.clone();
+            let public_cert_pem = helper_public_cert.clone();
+            let encryption_key_id = helper_key_id.clone();
+            let valid_from = valid_from;
+            let valid_until = valid_until;
 
-            // 2. Check if a recent active certificate already exists
-            if let Some(existing_cert) =
-                SamlSigningKeysStore::find_active_by_service(db.clone(), &service_id).await?
-            {
-                let created_at = chrono::DateTime::from_naive_utc_and_offset(existing_cert.created_at, Utc);
-                let age = Utc::now().signed_duration_since(created_at);
-                if age.num_seconds() < 1 {
-                    return Ok(SamlCertificateInfo {
-                        public_key: existing_cert.public_key,
-                        valid_from: chrono::DateTime::from_naive_utc_and_offset(existing_cert.valid_from, Utc),
-                        valid_until: chrono::DateTime::from_naive_utc_and_offset(existing_cert.valid_until, Utc),
-                        is_active: existing_cert.is_active,
-                        created_at,
-                    });
+            Box::pin(async move {
+                use sea_orm::{EntityTrait, QuerySelect};
+                // 1. LOCKING: Select the Service row "FOR UPDATE" to serialize concurrent requests
+                let _service_lock = crate::entities::services::Entity::find_by_id(&service_id)
+                    .lock_exclusive()
+                    .one(&db)
+                    .await
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!("Failed to lock service: {}", e))
+                    })?
+                    .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+
+                // 2. Check if a recent active certificate already exists
+                if let Some(existing_cert) =
+                    SamlSigningKeysStore::find_active_by_service(db.clone(), &service_id).await?
+                {
+                    let created_at =
+                        chrono::DateTime::from_naive_utc_and_offset(existing_cert.created_at, Utc);
+                    let age = Utc::now().signed_duration_since(created_at);
+                    if age.num_seconds() < 1 {
+                        return Ok(SamlCertificateInfo {
+                            public_key: existing_cert.public_key,
+                            valid_from: chrono::DateTime::from_naive_utc_and_offset(
+                                existing_cert.valid_from,
+                                Utc,
+                            ),
+                            valid_until: chrono::DateTime::from_naive_utc_and_offset(
+                                existing_cert.valid_until,
+                                Utc,
+                            ),
+                            is_active: existing_cert.is_active,
+                            created_at,
+                        });
+                    }
                 }
-            }
 
-            // 3. Deactivate any existing active keys
-            SamlSigningKeysStore::deactivate_all_for_service(db.clone(), &service_id).await?;
+                // 3. Deactivate any existing active keys
+                SamlSigningKeysStore::deactivate_all_for_service(db.clone(), &service_id).await?;
 
-            // 4. Insert new certificate
-            SamlSigningKeysStore::create(
-                db.clone(),
-                &service_id,
-                private_key_encrypted,
-                &public_cert_pem,
-                &encryption_key_id,
-                valid_from,
-                valid_until,
-                true, // is_active
-            )
-            .await?;
+                // 4. Insert new certificate
+                SamlSigningKeysStore::create(
+                    db.clone(),
+                    &service_id,
+                    private_key_encrypted,
+                    &public_cert_pem,
+                    &encryption_key_id,
+                    valid_from,
+                    valid_until,
+                    true, // is_active
+                )
+                .await?;
 
-            Ok(SamlCertificateInfo {
-                public_key: public_cert_pem,
-                valid_from,
-                valid_until,
-                is_active: true,
-                created_at: Utc::now(),
+                Ok(SamlCertificateInfo {
+                    public_key: public_cert_pem,
+                    valid_from,
+                    valid_until,
+                    is_active: true,
+                    created_at: Utc::now(),
+                })
             })
-        })
-    })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -1014,17 +1110,16 @@ pub async fn get_saml_certificate(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
 
-    // Check permissions
-    if !can_manage_service(&state.db, &user.user.id, &org.id).await? {
-        return Err(AppError::Forbidden(
-            "You don't have permission to view this service".into(),
-        ));
-    }
-
     // Get service
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+
+    if !can_manage_specific_service(&state.db, &user.user.id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You don't have permission to view this service".into(),
+        ));
+    }
 
     // Get active certificate
     let cert = SamlSigningKeysStore::find_active_by_service(DB::Conn(&state.db), &service.id)
@@ -1052,41 +1147,46 @@ pub async fn delete_saml_config(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
 
-    // Check permissions
-    if !can_manage_service(&state.db, &user.user.id, &org.id).await? {
-        return Err(AppError::Forbidden(
-            "You don't have permission to manage this service".into(),
-        ));
-    }
-
     // Get service
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
 
+    if !can_manage_specific_service(&state.db, &user.user.id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You don't have permission to manage this service".into(),
+        ));
+    }
+
     // Delete SAML configuration
     // Delete SAML configuration with retry
-    with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "delete_saml_config", |db| {
-        let service_id = service.id.clone();
-        Box::pin(async move {
-            ServiceStore::update_saml_config(
-                db.clone(),
-                &service_id,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-                false,
-            )
-            .await?;
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "delete_saml_config",
+        |db| {
+            let service_id = service.id.clone();
+            Box::pin(async move {
+                ServiceStore::update_saml_config(
+                    db.clone(),
+                    &service_id,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .await?;
 
-            // Deactivate certificates
-            SamlSigningKeysStore::deactivate_all_for_service(db.clone(), &service_id).await
-        })
-    })
+                // Deactivate certificates
+                SamlSigningKeysStore::deactivate_all_for_service(db.clone(), &service_id).await
+            })
+        },
+    )
     .await?;
 
     // Non-blocking audit via actor
@@ -1269,6 +1369,9 @@ pub async fn saml_sso(
     // Parse XML to extract important fields
     use quick_xml::events::Event;
     use quick_xml::Reader;
+
+    // Security Audit Item 7: Validate XML for XXE attacks before parsing
+    validate_xml_no_xxe(&saml_request_xml)?;
 
     let mut reader = Reader::from_str(&saml_request_xml);
     reader.trim_text(true);
@@ -2040,6 +2143,9 @@ async fn process_saml_logout_request(
     // Parse XML to extract important fields
     use quick_xml::events::Event;
     use quick_xml::Reader;
+
+    // Security Audit Item 7: Validate XML for XXE attacks before parsing
+    validate_xml_no_xxe(&saml_request_xml)?;
 
     let mut reader = Reader::from_str(&saml_request_xml);
     reader.trim_text(true);

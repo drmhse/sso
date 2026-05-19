@@ -87,8 +87,10 @@ impl BillingProvider for PolarProvider {
         // Add metadata if provided
         if !request.metadata.is_empty() {
             if let Some(customer_metadata) = payload.get_mut("customer_metadata") {
-                customer_metadata["metadata"] = serde_json::to_value(&request.metadata)
-                    .map_err(|e| AppError::Billing(format!("Failed to serialize metadata: {}", e)))?;
+                customer_metadata["metadata"] =
+                    serde_json::to_value(&request.metadata).map_err(|e| {
+                        AppError::Billing(format!("Failed to serialize metadata: {}", e))
+                    })?;
             } else {
                 payload["customer_metadata"] = serde_json::json!({
                     "metadata": request.metadata
@@ -129,7 +131,11 @@ impl BillingProvider for PolarProvider {
         }
 
         let response: CustomerSessionResponse = self
-            .api_request(reqwest::Method::POST, "/v1/customer-sessions/", Some(payload))
+            .api_request(
+                reqwest::Method::POST,
+                "/v1/customer-sessions/",
+                Some(payload),
+            )
             .await?;
 
         Ok(PortalResult {
@@ -156,9 +162,9 @@ impl BillingProvider for PolarProvider {
             .ok_or_else(|| AppError::BadRequest("Missing svix-signature header".to_string()))?;
 
         // Validate timestamp to prevent replay attacks (allow 5 minute tolerance)
-        let timestamp = svix_timestamp.parse::<i64>().map_err(|_| {
-            AppError::BadRequest("Invalid svix-timestamp format".to_string())
-        })?;
+        let timestamp = svix_timestamp
+            .parse::<i64>()
+            .map_err(|_| AppError::BadRequest("Invalid svix-timestamp format".to_string()))?;
 
         let current_time = chrono::Utc::now().timestamp();
         let time_diff = (current_time - timestamp).abs();
@@ -186,9 +192,7 @@ impl BillingProvider for PolarProvider {
 
         let secret = base64::engine::general_purpose::STANDARD
             .decode(secret_base64)
-            .map_err(|e| {
-                AppError::Billing(format!("Invalid webhook secret encoding: {}", e))
-            })?;
+            .map_err(|e| AppError::Billing(format!("Invalid webhook secret encoding: {}", e)))?;
 
         // Generate expected signature using HMAC-SHA256
         use hmac::{Hmac, Mac};
@@ -199,7 +203,8 @@ impl BillingProvider for PolarProvider {
         let mut mac = HmacSha256::new_from_slice(&secret)
             .map_err(|_| AppError::Billing("Invalid webhook secret".to_string()))?;
         mac.update(signed_content.as_bytes());
-        let expected_signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let expected_signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
         // Parse signature header (format: "v1,sig1= v2,sig2=")
         // We need to verify against any of the provided signatures
@@ -242,7 +247,11 @@ impl BillingProvider for PolarProvider {
 
 impl PolarProvider {
     /// Parse Polar webhook event into normalized billing event
-    fn parse_polar_event(&self, event_type: &str, event: &serde_json::Value) -> Result<BillingEvent> {
+    fn parse_polar_event(
+        &self,
+        event_type: &str,
+        event: &serde_json::Value,
+    ) -> Result<BillingEvent> {
         let data = event.get("data").ok_or_else(|| {
             AppError::BadRequest("Missing data field in Polar webhook".to_string())
         })?;
@@ -270,7 +279,10 @@ impl PolarProvider {
             }
             "subscription.updated" => {
                 // Determine status from the subscription data
-                let status_str = data.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+                let status_str = data
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("active");
                 let status = Self::parse_subscription_status(status_str);
                 self.parse_subscription_event(data, status)
             }
@@ -294,7 +306,10 @@ impl PolarProvider {
             }
             "order.created" => {
                 let customer_id = self.extract_customer_id(data)?;
-                let subscription_id = data.get("subscription_id").and_then(|v| v.as_str()).map(String::from);
+                let subscription_id = data
+                    .get("subscription_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
 
                 Ok(BillingEvent::CheckoutCompleted {
                     external_customer_id: Some(customer_id),
@@ -322,7 +337,11 @@ impl PolarProvider {
         }
     }
 
-    fn parse_subscription_event(&self, data: &serde_json::Value, status: SubscriptionStatus) -> Result<BillingEvent> {
+    fn parse_subscription_event(
+        &self,
+        data: &serde_json::Value,
+        status: SubscriptionStatus,
+    ) -> Result<BillingEvent> {
         let customer_id = self.extract_customer_id(data)?;
         let subscription_id = self.extract_subscription_id(data)?;
 

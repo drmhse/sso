@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use lettre::message::{header::ContentType, Mailbox};
 use lettre::transport::smtp::authentication::Credentials;
@@ -133,7 +135,7 @@ impl EmailService {
         token: &str,
         base_url: &str,
     ) -> Result<()> {
-        let reset_url = format!("{}/auth/reset-password?token={}", base_url, token);
+        let reset_url = format!("{}/reset-password?token={}", base_url, token);
 
         let subject = "Reset Your Password";
         let body = format!(
@@ -158,7 +160,7 @@ impl EmailService {
         inviter_email: &str,
         role: &str,
     ) -> Result<()> {
-        let invitation_url = format!("{}/invitations/accept/{}", base_url, token);
+        let invitation_url = format!("{}/invitations/accept?token={}", base_url, token);
 
         let subject = format!("You've been invited to join {}", organization_name);
         let body = format!(
@@ -204,7 +206,8 @@ impl EmailService {
 }
 
 /// Helper function to get an email service for a specific organization.
-/// Falls back to platform-level SMTP if organization hasn't configured their own.
+/// Security Audit Item 10: Does NOT fall back to platform SMTP if org has their own configured.
+/// This prevents platform branding from leaking to white-label customers.
 pub async fn get_email_service_for_org(
     db: &sea_orm::DatabaseConnection,
     org_id: &str,
@@ -240,43 +243,55 @@ pub async fn get_email_service_for_org(
         .one(db)
         .await?;
 
-    // If organization has SMTP configured, use it
+    // If organization has SMTP configured, use it (no fallback!)
     if let Some(settings) = org_smtp {
-        if let (
-            Some(host),
-            Some(port),
-            Some(username),
-            Some(password_encrypted),
-            Some(from_email),
-        ) = (
-            settings.smtp_host,
-            settings.smtp_port,
-            settings.smtp_username,
-            settings.smtp_password_encrypted,
-            settings.smtp_from_email,
-        ) {
+        // Check if org has any SMTP configuration at all
+        let has_smtp_config = settings.smtp_host.is_some() || settings.smtp_from_email.is_some();
+
+        if has_smtp_config {
+            // Org has SMTP configured - try to use it, fail if incomplete/broken
+            let (host, port, username, password_encrypted, from_email) = match (
+                settings.smtp_host,
+                settings.smtp_port,
+                settings.smtp_username,
+                settings.smtp_password_encrypted,
+                settings.smtp_from_email,
+            ) {
+                (Some(h), Some(p), Some(u), Some(pwd), Some(from)) => (h, p, u, pwd, from),
+                _ => {
+                    // Security Audit Item 10: Fail immediately, don't fall back
+                    return Err(anyhow::anyhow!(
+                        "Organization SMTP configuration is incomplete. \
+                        All fields (host, port, username, password, from_email) are required."
+                    ));
+                }
+            };
+
             // Decrypt the password
-            if let Some(enc) = encryption {
-                let password = enc
-                    .decrypt(&password_encrypted)
-                    .map_err(|e| anyhow::anyhow!("Failed to decrypt SMTP password: {}", e))?;
+            let encryption = encryption.ok_or_else(|| {
+                anyhow::anyhow!("Encryption service required to decrypt org SMTP password")
+            })?;
 
-                let config = SmtpConfig {
-                    host,
-                    port: port as u16,
-                    username,
-                    password,
-                    from_email,
-                    from_name: settings
-                        .smtp_from_name
-                        .unwrap_or_else(|| "SSO Platform".to_string()),
-                };
+            let password = encryption
+                .decrypt(&password_encrypted)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt SMTP password: {}", e))?;
 
-                return Ok(Some(EmailService::from_config(config)?));
-            }
+            let config = SmtpConfig {
+                host,
+                port: port as u16,
+                username,
+                password,
+                from_email,
+                from_name: settings
+                    .smtp_from_name
+                    .unwrap_or_else(|| "SSO Platform".to_string()),
+            };
+
+            // Security Audit Item 10: If org SMTP is configured but fails, DON'T fall back
+            return Ok(Some(EmailService::from_config(config)?));
         }
     }
 
-    // Fall back to platform-level SMTP
+    // Only fall back to platform-level SMTP if org has NO SMTP config at all
     Ok(EmailService::from_env().ok())
 }

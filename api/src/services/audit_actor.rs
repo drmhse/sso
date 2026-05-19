@@ -30,9 +30,13 @@ pub enum AuditMsg {
 }
 
 /// Handle to send audit events to the background actor
+///
+/// Security Audit Item 11: Uses fail-closed pattern.
+/// When the channel is full, falls back to direct DB insert instead of dropping events.
 #[derive(Clone)]
 pub struct AuditHandle {
     sender: mpsc::Sender<AuditMsg>,
+    db: DatabaseConnection,
 }
 
 impl AuditHandle {
@@ -40,34 +44,81 @@ impl AuditHandle {
     pub fn new(db: DatabaseConnection) -> Self {
         // Buffer up to 10k audit events (prevents backpressure on handlers)
         let (tx, rx) = mpsc::channel(10_000);
-        
+
         // Spawn the actor
-        let actor = AuditActor::new(db, rx);
+        let actor = AuditActor::new(db.clone(), rx);
         tokio::spawn(actor.run());
-        
-        tracing::info!("Audit actor started with 10k event buffer");
-        
-        Self { sender: tx }
+
+        tracing::info!("Audit actor started with 10k event buffer (fail-closed mode)");
+
+        Self { sender: tx, db }
     }
 
-    /// Log a login event (non-blocking)
+    /// Log a login event (non-blocking, with fail-closed fallback)
+    ///
+    /// Security Audit Item 11: If channel is full, performs blocking insert
+    /// instead of dropping the event.
     pub async fn log_login(&self, model: login_events::ActiveModel) {
-        if let Err(e) = self.sender.send(AuditMsg::Login(model)).await {
-            tracing::error!("Failed to queue login event: {}", e);
+        // Try non-blocking send first
+        match self.sender.try_send(AuditMsg::Login(model.clone())) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Security Audit Item 11: Channel full - do blocking insert
+                tracing::warn!("Audit channel full, performing blocking login event insert");
+                if let Err(e) = crate::entities::prelude::LoginEvents::insert(model)
+                    .exec(&self.db)
+                    .await
+                {
+                    tracing::error!("CRITICAL: Failed to insert login audit event: {}", e);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("Audit actor channel closed unexpectedly");
+            }
         }
     }
 
-    /// Log an organization audit event (non-blocking)
+    /// Log an organization audit event (non-blocking, with fail-closed fallback)
+    ///
+    /// Security Audit Item 11: If channel is full, performs blocking insert
+    /// instead of dropping the event.
     pub async fn log_org(&self, model: organization_audit_log::ActiveModel) {
-        if let Err(e) = self.sender.send(AuditMsg::Org(model)).await {
-            tracing::error!("Failed to queue org audit event: {}", e);
+        match self.sender.try_send(AuditMsg::Org(model.clone())) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Audit channel full, performing blocking org audit insert");
+                if let Err(e) = crate::entities::prelude::OrganizationAuditLog::insert(model)
+                    .exec(&self.db)
+                    .await
+                {
+                    tracing::error!("CRITICAL: Failed to insert org audit event: {}", e);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("Audit actor channel closed unexpectedly");
+            }
         }
     }
 
-    /// Log an MFA audit event (non-blocking)
+    /// Log an MFA audit event (non-blocking, with fail-closed fallback)
+    ///
+    /// Security Audit Item 11: If channel is full, performs blocking insert
+    /// instead of dropping the event.
     pub async fn log_mfa(&self, model: mfa_audit_log::ActiveModel) {
-        if let Err(e) = self.sender.send(AuditMsg::Mfa(model)).await {
-            tracing::error!("Failed to queue MFA audit event: {}", e);
+        match self.sender.try_send(AuditMsg::Mfa(model.clone())) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Audit channel full, performing blocking MFA audit insert");
+                if let Err(e) = crate::entities::prelude::MfaAuditLog::insert(model)
+                    .exec(&self.db)
+                    .await
+                {
+                    tracing::error!("CRITICAL: Failed to insert MFA audit event: {}", e);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("Audit actor channel closed unexpectedly");
+            }
         }
     }
 
@@ -101,7 +152,7 @@ impl AuditActor {
         let mut login_batch: Vec<login_events::ActiveModel> = Vec::with_capacity(100);
         let mut org_batch: Vec<organization_audit_log::ActiveModel> = Vec::with_capacity(100);
         let mut mfa_batch: Vec<mfa_audit_log::ActiveModel> = Vec::with_capacity(100);
-        
+
         // Flush every 1 second even if batch isn't full
         let mut ticker = interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -112,7 +163,7 @@ impl AuditActor {
                 _ = ticker.tick() => {
                     self.flush_all(&mut login_batch, &mut org_batch, &mut mfa_batch).await;
                 }
-                
+
                 // Receive new events
                 msg = self.rx.recv() => {
                     match msg {

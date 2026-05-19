@@ -1,8 +1,10 @@
-use crate::constants::JWT_EXPIRE_HOURS;
 use crate::error::{AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
-use crate::store::{magic_links::MagicLinksStore, sessions::SessionStore, users::UserStore, DB};
+use crate::store::{
+    magic_links::MagicLinksStore, memberships::MembershipStore, organizations::OrganizationStore,
+    services::ServiceStore, sessions::SessionStore, users::UserStore, DB,
+};
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
@@ -21,6 +23,8 @@ pub use super::session::RefreshTokenResponse;
 pub struct MagicLinkRequest {
     pub email: String,
     pub org_slug: Option<String>, // Optional: for organization context
+    pub service_slug: Option<String>,
+    pub redirect_uri: Option<String>,
 }
 
 // Magic Link Response
@@ -35,6 +39,102 @@ pub struct VerifyMagicLinkQuery {
     pub token: String,
     #[allow(dead_code)]
     pub redirect_uri: Option<String>, // Optional: where to redirect after success
+}
+
+fn build_magic_context(
+    org_slug: Option<&str>,
+    service_slug: Option<&str>,
+    redirect_uri: Option<&str>,
+) -> String {
+    if org_slug.is_none() && service_slug.is_none() && redirect_uri.is_none() {
+        return "default".to_string();
+    }
+
+    serde_json::json!({
+        "org_slug": org_slug,
+        "service_slug": service_slug,
+        "redirect_uri": redirect_uri,
+    })
+    .to_string()
+}
+
+fn parse_magic_context(context: &str) -> (Option<String>, Option<String>, Option<String>) {
+    if context == "default" || context.is_empty() {
+        return (None, None, None);
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(context) {
+        let org_slug = value
+            .get("org_slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let service_slug = value
+            .get("service_slug")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let redirect_uri = value
+            .get("redirect_uri")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        return (org_slug, service_slug, redirect_uri);
+    }
+
+    // Backward compatibility for older tokens where context was just org_slug.
+    (Some(context.to_string()), None, None)
+}
+
+async fn resolve_magic_service_context(
+    state: &AppState,
+    org_slug: Option<&str>,
+    service_slug: Option<&str>,
+    redirect_uri: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    if service_slug.is_some() && org_slug.is_none() {
+        return Err(AppError::BadRequest(
+            "service_slug requires org_slug".to_string(),
+        ));
+    }
+
+    if redirect_uri.is_some() && service_slug.is_none() {
+        return Err(AppError::BadRequest(
+            "redirect_uri requires org_slug and service_slug".to_string(),
+        ));
+    }
+
+    let Some(org_slug) = org_slug else {
+        return Ok((None, None));
+    };
+
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    if let Some(service_slug) = service_slug {
+        let service =
+            ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+        if let Some(redirect_uri) = redirect_uri {
+            if let Some(allowed_uris_json) = service.redirect_uris.as_ref() {
+                let allowed_uris: Vec<String> =
+                    serde_json::from_str(allowed_uris_json).map_err(|e| {
+                        AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e))
+                    })?;
+
+                if !allowed_uris.is_empty() && !allowed_uris.contains(&redirect_uri.to_string()) {
+                    return Err(AppError::BadRequest(format!(
+                        "redirect_uri '{}' is not registered for this service",
+                        redirect_uri
+                    )));
+                }
+            }
+        }
+
+        return Ok((Some(org.id), Some(service.id)));
+    }
+
+    Ok((Some(org.id), None))
 }
 
 /// POST /api/auth/magic-link/request - Request a magic link
@@ -67,23 +167,55 @@ pub async fn request_magic_link(
         ));
     }
 
-    // Find user by email
-    let user = UserStore::find_by_email(DB::Conn(&state.db), &req.email).await?;
+    let context = build_magic_context(
+        req.org_slug.as_deref(),
+        req.service_slug.as_deref(),
+        req.redirect_uri.as_deref(),
+    );
+    let (issuing_org_id, issuing_service_id) = resolve_magic_service_context(
+        &state,
+        req.org_slug.as_deref(),
+        req.service_slug.as_deref(),
+        req.redirect_uri.as_deref(),
+    )
+    .await?;
+
+    // Service-scoped magic links must resolve the tenant user, not a same-email
+    // platform or sibling-organization user.
+    let user = if issuing_service_id.is_some() {
+        UserStore::find_by_email_with_context(
+            DB::Conn(&state.db),
+            &req.email,
+            issuing_org_id.as_deref(),
+        )
+        .await?
+    } else {
+        UserStore::find_by_email(DB::Conn(&state.db), &req.email).await?
+    };
 
     // Generate magic link token
     let token = MagicLinksStore::create(
         DB::Conn(&state.db),
         &req.email,
         user.as_ref().map(|u| u.id.as_str()),
-        req.org_slug.as_deref().unwrap_or("default"),
+        &context,
     )
     .await?;
 
     // Send magic link email via job queue
-    let magic_link_url = format!(
-        "{}/auth/magic-link/verify?token={}",
-        state.web_client_url, token
-    );
+    let magic_link_url = {
+        let mut params = url::form_urlencoded::Serializer::new(String::new());
+        params.append_pair("token", &token);
+        if let Some(redirect_uri) = req.redirect_uri.as_deref() {
+            params.append_pair("redirect_uri", redirect_uri);
+        }
+
+        format!(
+            "{}/auth/magic-link/verify?{}",
+            state.web_client_url.trim_end_matches('/'),
+            params.finish()
+        )
+    };
     let email_subject = "Your Magic Sign-In Link".to_string();
     let email_body = format!(
         "Click the link below to sign in:\n\n{}\n\n\
@@ -198,17 +330,104 @@ pub async fn verify_magic_link(
         "Magic link authentication successful"
     );
 
+    let (org_slug_owned, service_slug_owned, context_redirect_uri) =
+        parse_magic_context(&magic_link.context);
+    let org_slug = org_slug_owned.as_deref();
+    let service_slug = service_slug_owned.as_deref();
+    let redirect_uri = query
+        .redirect_uri
+        .as_deref()
+        .or(context_redirect_uri.as_deref());
+
+    if service_slug.is_some() && org_slug.is_none() {
+        return Err(AppError::BadRequest(
+            "service_slug requires org_slug".to_string(),
+        ));
+    }
+
+    if redirect_uri.is_some() && service_slug.is_none() {
+        return Err(AppError::BadRequest(
+            "redirect_uri requires org_slug and service_slug".to_string(),
+        ));
+    }
+
+    let service_id = if let (Some(org_slug), Some(service_slug)) = (org_slug, service_slug) {
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        let service =
+            ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+        if let Some(redirect_uri) = redirect_uri {
+            if let Some(allowed_uris_json) = service.redirect_uris.as_ref() {
+                let allowed_uris: Vec<String> =
+                    serde_json::from_str(allowed_uris_json).map_err(|e| {
+                        AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e))
+                    })?;
+
+                if !allowed_uris.is_empty() && !allowed_uris.contains(&redirect_uri.to_string()) {
+                    return Err(AppError::BadRequest(format!(
+                        "redirect_uri '{}' is not registered for this service",
+                        redirect_uri
+                    )));
+                }
+            }
+        }
+
+        if !user.is_platform_owner {
+            use crate::entities::{identities, prelude::Identities};
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+            let has_service_identity = Identities::find()
+                .filter(identities::Column::UserId.eq(&user.id))
+                .filter(identities::Column::IssuingOrgId.eq(&org.id))
+                .filter(identities::Column::IssuingServiceId.eq(&service.id))
+                .one(&state.db)
+                .await?
+                .is_some();
+
+            if !has_service_identity {
+                return Err(AppError::Forbidden(
+                    "You do not have access to this service".to_string(),
+                ));
+            }
+        }
+
+        Some(service.id)
+    } else {
+        if let Some(org_slug) = org_slug {
+            let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+            if !user.is_platform_owner {
+                let _membership =
+                    MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &org.id, &user.id)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::Forbidden(
+                                "You are not a member of this organization".to_string(),
+                            )
+                        })?;
+            }
+        }
+
+        None
+    };
+
     // Take action based on risk
     use crate::services::risk_engine::RiskAction;
     match risk_assessment.action {
         RiskAction::Allow | RiskAction::LogOnly => {
-            // Generate JWT token
+            // Generate JWT token with org context from magic link (Security Audit Item 4)
             let token = state.jwt_service.create_token(
                 &user.id,
                 &user.email,
                 user.is_platform_owner,
-                None, // No org context
-                None, // No service context
+                org_slug,
+                service_slug,
             )?;
 
             // Create session with refresh token
@@ -225,8 +444,8 @@ pub async fn verify_magic_link(
                 expires_at.naive_utc(),
                 Some(&refresh_token),
                 Some(refresh_expires_at.naive_utc()),
-                None, // No org context
-                None, // No service context
+                org_slug,
+                service_id.as_deref(),
                 None,
                 None,
             )
@@ -235,7 +454,7 @@ pub async fn verify_magic_link(
             // Generate device trust cookie
             let device_token = state.risk_engine.generate_device_token(&user.id);
             let device_cookie_value = format!(
-                "{}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+                "device_token={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
                 device_token,
                 90 * 24 * 3600 // 90 days in seconds
             );
@@ -277,11 +496,12 @@ pub async fn verify_magic_link(
 
         RiskAction::ChallengeMFA => {
             // Issue pre-auth token requiring MFA
-            let preauth_token = state.jwt_service.create_token(
+            let preauth_token = state.jwt_service.create_mfa_preauth_token(
                 &user.id,
                 &user.email,
                 user.is_platform_owner,
-                None,
+                org_slug,
+                service_slug,
                 None,
             )?;
 

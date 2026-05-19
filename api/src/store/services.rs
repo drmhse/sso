@@ -344,6 +344,24 @@ impl ServiceStore {
         Ok(updated_service)
     }
 
+    /// Rotate a service client secret hash.
+    pub async fn update_client_secret_hash(
+        db: DB<'_>,
+        org_id: &str,
+        slug: &str,
+        client_secret_hash: &str,
+    ) -> Result<services::Model> {
+        let service = Self::find_by_org_and_slug(db.clone(), org_id, slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+        let mut service_active: services::ActiveModel = service.into();
+        service_active.client_secret_hash = Set(client_secret_hash.to_string());
+
+        let updated_service = service_active.update(&db).await?;
+        Ok(updated_service)
+    }
+
     /// Delete service by organization and slug
     pub async fn delete_by_org_and_slug(db: DB<'_>, org_id: &str, slug: &str) -> Result<u64> {
         let result = Services::delete_many()
@@ -359,5 +377,53 @@ impl ServiceStore {
     pub async fn count_all(db: DB<'_>) -> Result<u64> {
         let count = Services::find().count(&db).await?;
         Ok(count)
+    }
+
+    /// Check if an origin is allowed based on registered redirect URIs across ALL services.
+    ///
+    /// This performs a two-step verification for security:
+    /// 1. DB: Find rows where redirect_uris string contains the origin (broad filter)
+    /// 2. App: Parse JSON and strictly compare URL origins to prevent prefix attacks
+    ///
+    /// This prevents `https://app.com` from accidentally allowing `https://app.com.attacker.com`.
+    pub async fn is_origin_allowed(db: DB<'_>, origin: &str) -> Result<bool> {
+        use url::Url;
+
+        // Quick check for invalid origins
+        if origin.is_empty() || origin == "null" {
+            return Ok(false);
+        }
+
+        // 1. Broad SQL filter: Find services that *might* contain this origin
+        // We use a LIKE query to reduce the working set.
+        // Note: This matches substring, so "https://app.com" matches "https://app.com.evil.com"
+        // We MUST validate strictly in step 2.
+        let candidates = Services::find()
+            .filter(services::Column::RedirectUris.contains(origin))
+            .all(&db)
+            .await?;
+
+        // 2. Strict validation in memory
+        for service in candidates {
+            if let Some(json_str) = service.redirect_uris {
+                if let Ok(uris) = serde_json::from_str::<Vec<String>>(&json_str) {
+                    for uri in uris {
+                        // Parse the redirect URI to extract its origin (scheme + host + port)
+                        if let Ok(parsed_uri) = Url::parse(&uri) {
+                            // Construct the origin string from the redirect URI
+                            let uri_origin = parsed_uri.origin().ascii_serialization();
+
+                            // Compare strict equality
+                            // Trim trailing slashes for consistent comparison
+                            if uri_origin.trim_end_matches('/') == origin.trim_end_matches('/') {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 }

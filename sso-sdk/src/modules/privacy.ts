@@ -1,5 +1,5 @@
 import { HttpClient } from '../http';
-import { ExportUserDataResponse, ForgetUserResponse } from '../types';
+import { ExportUserDataResponse, ForgetUserRequest, ForgetUserResponse } from '../types';
 
 /**
  * Privacy and GDPR compliance methods
@@ -46,8 +46,14 @@ export class PrivacyModule {
    * // "User data has been anonymized. PII has been removed while preserving audit logs."
    * ```
    */
-  public async forgetUser(userId: string): Promise<ForgetUserResponse> {
-    const response = await this.http.delete<ForgetUserResponse>(`/api/privacy/forget/${userId}`);
+  public async forgetUser(
+    userId: string,
+    payload: ForgetUserRequest = {}
+  ): Promise<ForgetUserResponse> {
+    const response = await this.http.delete<ForgetUserResponse>(
+      `/api/privacy/forget/${userId}`,
+      payload
+    );
     return response.data;
   }
 }

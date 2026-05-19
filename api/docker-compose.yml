@@ -1,0 +1,229 @@
+# Multi-tenant SSO Platform - Docker Compose Configuration
+#
+# Usage:
+#   docker-compose up                          # Run with SQLite (default)
+#   docker-compose --profile postgres up       # Run with PostgreSQL
+#   docker-compose --profile mysql up          # Run with MySQL
+#
+# All environment variables can be set via .env file (loaded automatically)
+
+# ============================================================================
+# YAML Anchors - Define once, reuse everywhere
+# ============================================================================
+
+# Common environment variables for all SSO services
+x-common-env: &common-env
+  RUST_LOG: ${RUST_LOG:-info}
+
+  # JWT Configuration
+  JWT_PRIVATE_KEY_BASE64: ${JWT_PRIVATE_KEY_BASE64}
+  JWT_PUBLIC_KEY_BASE64: ${JWT_PUBLIC_KEY_BASE64}
+  JWT_KID: ${JWT_KID}
+  JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
+
+  # Platform OAuth (Admin Authentication)
+  PLATFORM_GITHUB_CLIENT_ID: ${PLATFORM_GITHUB_CLIENT_ID}
+  PLATFORM_GITHUB_CLIENT_SECRET: ${PLATFORM_GITHUB_CLIENT_SECRET}
+  PLATFORM_GITHUB_REDIRECT_URI: ${PLATFORM_GITHUB_REDIRECT_URI}
+  PLATFORM_GOOGLE_CLIENT_ID: ${PLATFORM_GOOGLE_CLIENT_ID}
+  PLATFORM_GOOGLE_CLIENT_SECRET: ${PLATFORM_GOOGLE_CLIENT_SECRET}
+  PLATFORM_GOOGLE_REDIRECT_URI: ${PLATFORM_GOOGLE_REDIRECT_URI}
+  PLATFORM_MICROSOFT_CLIENT_ID: ${PLATFORM_MICROSOFT_CLIENT_ID}
+  PLATFORM_MICROSOFT_CLIENT_SECRET: ${PLATFORM_MICROSOFT_CLIENT_SECRET}
+  PLATFORM_MICROSOFT_REDIRECT_URI: ${PLATFORM_MICROSOFT_REDIRECT_URI}
+
+
+  # Stripe
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+  STRIPE_API_BASE_URL: ${STRIPE_API_BASE_URL}
+  STRIPE_WEBHOOK_TEST_MODE: ${STRIPE_WEBHOOK_TEST_MODE}
+
+  # SMTP/Email Configuration
+  SMTP_HOST: ${SMTP_HOST}
+  SMTP_PORT: ${SMTP_PORT}
+  SMTP_USERNAME: ${SMTP_USERNAME}
+  SMTP_PASSWORD: ${SMTP_PASSWORD}
+  SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL}
+  SMTP_FROM_NAME: ${SMTP_FROM_NAME}
+
+  # Server
+  SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+  SERVER_PORT: ${SERVER_PORT:-3000}
+  BASE_URL: ${BASE_URL:-http://localhost:3001}
+  PLATFORM_DASHBOARD_BASE_URL: ${PLATFORM_DASHBOARD_BASE_URL:-http://localhost:5173}
+  TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+  TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+
+  # Database Connection Pool (Optional)
+  # DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-200}
+  # DB_MIN_CONNECTIONS: ${DB_MIN_CONNECTIONS:-5}
+  # DB_ACQUIRE_TIMEOUT_SECS: ${DB_ACQUIRE_TIMEOUT_SECS:-30}
+  # DB_IDLE_TIMEOUT_SECS: ${DB_IDLE_TIMEOUT_SECS:-600}
+  # DB_MAX_LIFETIME_SECS: ${DB_MAX_LIFETIME_SECS:-1800}
+
+  # Platform Owner
+  PLATFORM_OWNER_EMAIL: ${PLATFORM_OWNER_EMAIL:-admin@example.com}
+  PLATFORM_OWNER_PASSWORD: ${PLATFORM_OWNER_PASSWORD}
+
+  # Security
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  DISABLE_RATE_LIMITING: ${DISABLE_RATE_LIMITING}
+
+  # GeoIP (Optional - auto-downloads on first run if MAXMIND_LICENSE_KEY is set)
+  GEOIP_DISABLED: ${GEOIP_DISABLED:-false}
+  GEOIP_DATABASE_PATH: ${GEOIP_DATABASE_PATH:-/app/geoip/GeoLite2-City.mmdb}
+  MAXMIND_LICENSE_KEY: ${MAXMIND_LICENSE_KEY}
+
+  # Device Trust (Optional)
+  DEVICE_TRUST_SECRET: ${DEVICE_TRUST_SECRET}
+
+  # Job Processing
+  JOB_PROCESSOR_INTERVAL_SECS: ${JOB_PROCESSOR_INTERVAL_SECS:-10}
+  JOB_PROCESSOR_BATCH_SIZE: ${JOB_PROCESSOR_BATCH_SIZE:-10}
+
+# Common app configuration (resources, restart policy)
+# Note: Image tags use format: editoredit/sso:<backend>-latest or editoredit/sso:latest (sqlite default)
+x-common-app: &common-app
+  env_file:
+    - .env
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        cpus: '2'
+        memory: 2G
+      reservations:
+        cpus: '2'
+        memory: 2G
+  networks:
+    - sso-network
+
+# ============================================================================
+# Services
+# ============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # SSO API - SQLite (Default)
+  # --------------------------------------------------------------------------
+  sso:
+    <<: *common-app
+    image: editoredit/sso:latest  # SQLite is the default
+    container_name: sso-sqlite
+    profiles: ["", "sqlite"]  # Runs by default (empty profile) or with --profile sqlite
+    environment:
+      <<: *common-env
+      DATABASE_URL: ${DATABASE_URL:-sqlite:/app/data/data.db}
+      SERVER_PORT: ${SERVER_PORT:-3001}
+    ports:
+      - "${SERVER_PORT:-3001}:${SERVER_PORT:-3001}"
+    volumes:
+      - sso_sqlite_data:/app/data
+      - sso_geoip_data:/app/geoip
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sso.rule=Host(`athapi.authos.dev`)"
+      - "traefik.http.routers.sso.entrypoints=websecure"
+      - "traefik.http.routers.sso.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sso.loadbalancer.server.port=${SERVER_PORT:-3001}"
+      - "traefik.http.routers.sso.service=sso"
+
+  # --------------------------------------------------------------------------
+  # SSO API - PostgreSQL
+  # --------------------------------------------------------------------------
+  sso-postgres:
+    <<: *common-app
+    image: editoredit/sso:psql-latest
+    container_name: sso-postgres
+    profiles: ["postgres"]
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgres://${POSTGRES_USER:-sso}:${POSTGRES_PASSWORD:-sso_password}@postgres:5432/${POSTGRES_DB:-sso}
+      SERVER_PORT: 3000
+      BASE_URL: ${BASE_URL:-http://localhost:3001}
+    ports:
+      - "3001:3000"
+    volumes:
+      - sso_geoip_data:/app/geoip
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: sso-postgres-db
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sso}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sso_password}
+      POSTGRES_DB: ${POSTGRES_DB:-sso}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    networks:
+      - sso-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sso}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # SSO API - MySQL
+  # --------------------------------------------------------------------------
+  sso-mysql:
+    <<: *common-app
+    image: editoredit/sso:mysql-latest
+    container_name: sso-mysql
+    profiles: ["mysql"]
+    environment:
+      <<: *common-env
+      DATABASE_URL: mysql://${MYSQL_USER:-sso}:${MYSQL_PASSWORD:-sso_password}@mysql:3306/${MYSQL_DATABASE:-sso}
+      SERVER_PORT: 3000
+      BASE_URL: ${BASE_URL:-http://localhost:3002}
+    ports:
+      - "3002:3000"
+    volumes:
+      - sso_geoip_data:/app/geoip
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.0
+    container_name: sso-mysql-db
+    profiles: ["mysql"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sso}
+      MYSQL_USER: ${MYSQL_USER:-sso}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-sso_password}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    restart: unless-stopped
+    networks:
+      - sso-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER:-sso}", "-p${MYSQL_PASSWORD:-sso_password}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ============================================================================
+# Networks & Volumes
+# ============================================================================
+
+networks:
+  sso-network:
+    driver: bridge
+
+volumes:
+  sso_sqlite_data:
+  sso_geoip_data:
+  postgres_data:
+  mysql_data:

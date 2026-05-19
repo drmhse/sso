@@ -40,24 +40,31 @@ impl PlanStore {
         plan_id: &str,
         service_id: &str,
         name: &str,
+        description: Option<&str>,
         price_cents: i64,
         currency: &str,
         features: &str,
         stripe_price_id: Option<&str>,
+        is_default: bool,
         created_at: chrono::NaiveDateTime,
     ) -> Result<()> {
         let new_plan = plans::ActiveModel {
             id: Set(plan_id.to_string()),
             service_id: Set(service_id.to_string()),
             name: Set(name.to_string()),
+            description: Set(description.map(|s| s.to_string())),
             price_cents: Set(price_cents as i32),
             currency: Set(currency.to_string()),
             features: Set(Some(features.to_string())),
             stripe_price_id: Set(stripe_price_id.map(|s| s.to_string())),
+            is_default: Set(is_default),
             created_at: Set(created_at),
         };
 
-        new_plan.insert(&db).await?;
+        new_plan
+            .insert(&db)
+            .await
+            .map_err(crate::error::handle_sea_orm_error)?;
         Ok(())
     }
 
@@ -66,10 +73,12 @@ impl PlanStore {
         db: DB<'_>,
         plan_id: &str,
         name: Option<&str>,
+        description: Option<Option<&str>>,
         price_cents: Option<i64>,
         currency: Option<&str>,
         features: Option<&str>,
         stripe_price_id: Option<Option<&str>>,
+        is_default: Option<bool>,
     ) -> Result<plans::Model> {
         // First, find the plan
         let plan = Plans::find()
@@ -85,6 +94,9 @@ impl PlanStore {
         if let Some(n) = name {
             active_plan.name = Set(n.to_string());
         }
+        if let Some(d) = description {
+            active_plan.description = Set(d.map(|s| s.to_string()));
+        }
         if let Some(p) = price_cents {
             active_plan.price_cents = Set(p as i32);
         }
@@ -96,6 +108,9 @@ impl PlanStore {
         }
         if let Some(sp) = stripe_price_id {
             active_plan.stripe_price_id = Set(sp.map(|s| s.to_string()));
+        }
+        if let Some(d) = is_default {
+            active_plan.is_default = Set(d);
         }
 
         // Save and return updated plan

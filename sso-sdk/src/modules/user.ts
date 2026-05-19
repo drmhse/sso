@@ -1,5 +1,5 @@
 import { HttpClient } from '../http';
-import { UserProfile, UpdateUserProfilePayload, Subscription, Identity, StartLinkResponse, ChangePasswordRequest, ChangePasswordResponse, SetPasswordRequest, SetPasswordResponse, MfaStatusResponse, MfaSetupResponse, MfaVerifyResponse, BackupCodesResponse, UserDevice, ListDevicesResponse, RevokeDeviceResponse } from '../types';
+import { UserProfile, UpdateUserProfilePayload, Subscription, Identity, StartLinkResponse, ChangePasswordRequest, ChangePasswordResponse, SetPasswordRequest, SetPasswordResponse, MfaStatusResponse, MfaSetupResponse, MfaVerifyResponse, BackupCodesResponse, UserDevice, ListDevicesResponse, RevokeDeviceResponse, LinkedAccountsResponse, GrantLinkedAccountRequest, LinkedAccountGrant, ProviderTokenRequestDetails, CompleteProviderTokenRequestPayload, CompleteProviderTokenRequestResponse } from '../types';
 
 /**
  * Identity (social account linking) methods
@@ -54,6 +54,51 @@ class IdentitiesModule {
    */
   public async unlink(provider: string): Promise<void> {
     await this.http.delete(`/api/user/identities/${provider}`);
+  }
+}
+
+class LinkedAccountsModule {
+  constructor(private http: HttpClient) {}
+
+  public async list(): Promise<LinkedAccountsResponse> {
+    const response = await this.http.get<LinkedAccountsResponse>('/api/user/linked-accounts');
+    return response.data;
+  }
+
+  public async startLink(provider: string): Promise<StartLinkResponse> {
+    const response = await this.http.post<StartLinkResponse>(`/api/user/linked-accounts/${provider}/link`, {});
+    return response.data;
+  }
+
+  public async grant(accountId: string, payload: GrantLinkedAccountRequest): Promise<LinkedAccountGrant> {
+    const response = await this.http.post<LinkedAccountGrant>(`/api/user/linked-accounts/${accountId}/grants`, payload);
+    return response.data;
+  }
+
+  public async revokeGrant(accountId: string, serviceId: string): Promise<void> {
+    await this.http.delete(`/api/user/linked-accounts/${accountId}/grants/${serviceId}`);
+  }
+
+  public async unlink(accountId: string): Promise<void> {
+    await this.http.delete(`/api/user/linked-accounts/${accountId}`);
+  }
+
+  public async getProviderTokenRequest(state: string): Promise<ProviderTokenRequestDetails> {
+    const response = await this.http.get<ProviderTokenRequestDetails>(`/api/user/provider-token-requests/${state}`);
+    return response.data;
+  }
+
+  public async completeProviderTokenRequest(
+    state: string,
+    payload: CompleteProviderTokenRequestPayload = {},
+  ): Promise<CompleteProviderTokenRequestResponse> {
+    const response = await this.http.post<CompleteProviderTokenRequestResponse>(`/api/user/provider-token-requests/${state}/complete`, payload);
+    return response.data;
+  }
+
+  public async startProviderTokenRequestLink(state: string): Promise<StartLinkResponse> {
+    const response = await this.http.post<StartLinkResponse>(`/api/user/provider-token-requests/${state}/link`, {});
+    return response.data;
   }
 }
 
@@ -282,11 +327,13 @@ class DevicesModule {
  */
 export class UserModule {
   public readonly identities: IdentitiesModule;
+  public readonly linkedAccounts: LinkedAccountsModule;
   public readonly mfa: MfaModule;
   public readonly devices: DevicesModule;
 
   constructor(private http: HttpClient) {
     this.identities = new IdentitiesModule(http);
+    this.linkedAccounts = new LinkedAccountsModule(http);
     this.mfa = new MfaModule(http);
     this.devices = new DevicesModule(http);
   }

@@ -4,7 +4,7 @@
  * @packageDocumentation
  */
 
-export { initCommand, addCommand } from './commands';
+export { initCommand, addCommand, provisionActCommand } from './commands';
 export { getTemplate, getAvailableTemplates } from './templates/registry';
 export type { Template, TemplateFile } from './templates/registry';
 export {

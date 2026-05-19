@@ -1,13 +1,13 @@
 use crate::auth::jwt::JwtService;
 use crate::auth::sso::Provider;
-use crate::constants::{DEVICE_CODE_EXPIRE_MINUTES, JWT_EXPIRE_HOURS};
+use crate::constants::DEVICE_CODE_EXPIRE_MINUTES;
 use crate::db::models::User;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::store::{
-    device_codes::DeviceCodeStore, identities::IdentityStore,
-    organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
-    subscriptions::SubscriptionStore, totp::TotpStore, DB,
+    device_codes::DeviceCodeStore, identities::IdentityStore, organizations::OrganizationStore,
+    services::ServiceStore, sessions::SessionStore, subscriptions::SubscriptionStore,
+    totp::TotpStore, DB,
 };
 use axum::{extract::State, Json};
 use chrono::Utc;

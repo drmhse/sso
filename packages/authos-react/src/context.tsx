@@ -1,23 +1,37 @@
 import { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { SsoClient, UserProfile, Organization } from '@drmhse/sso-sdk';
 import type { AuthOSContextState, AuthOSProviderProps } from './types';
+import { injectStyles, applyVariables } from './styles';
 
 const AuthOSContext = createContext<AuthOSContextState | null>(null);
 
 /**
  * Provider component that wraps your app and provides AuthOS context.
  *
- * @example
+ * @example Basic usage
  * ```tsx
- * import { AuthOSProvider } from '@drmhse/authos-react';
+ * import { AuthOSProvider, SignIn, SignedOut } from '@drmhse/authos-react';
  *
  * function App() {
  *   return (
- *     <AuthOSProvider config={{ baseURL: 'https://auth.example.com' }}>
- *       <YourApp />
+ *     <AuthOSProvider config={{ baseURL: 'https://sso.example.com' }}>
+ *       <SignedOut>
+ *         <SignIn />
+ *       </SignedOut>
  *     </AuthOSProvider>
  *   );
  * }
+ * ```
+ *
+ * @example With OAuth (requires org and service)
+ * ```tsx
+ * <AuthOSProvider config={{
+ *   baseURL: 'https://sso.example.com',
+ *   org: 'my-org',
+ *   service: 'my-app',
+ * }}>
+ *   <SignIn providers={['github', 'google']} />
+ * </AuthOSProvider>
  * ```
  *
  * @example With SSR token (Next.js App Router)
@@ -31,7 +45,7 @@ const AuthOSContext = createContext<AuthOSContextState | null>(null);
  *
  *   return (
  *     <AuthOSProvider
- *       config={{ baseURL: 'https://auth.example.com' }}
+ *       config={{ baseURL: 'https://sso.example.com' }}
  *       initialSessionToken={token}
  *     >
  *       {children}
@@ -47,7 +61,31 @@ export function AuthOSProvider({ config, children, client: externalClient, initi
   if (!clientRef.current) {
     clientRef.current = externalClient ?? new SsoClient(config);
   }
+
+
   const client = clientRef.current;
+
+  // Inject styles on mount
+  useEffect(() => {
+    injectStyles();
+
+    // Apply custom appearance variables if provided
+    if (config.appearance?.variables) {
+      applyVariables(config.appearance.variables as Record<string, string>);
+    }
+
+    // Runtime validation for OAuth configuration
+    if (config.org && !config.service) {
+      console.warn(
+        '[AuthOS] You provided "org" but not "service". OAuth flows may not work correctly.'
+      );
+    }
+    if (!config.org && config.service) {
+      console.warn(
+        '[AuthOS] You provided "service" but not "org". OAuth flows may not work correctly.'
+      );
+    }
+  }, [config.appearance]);
 
   // If we have an initial token from SSR, set it on the client immediately
   // This prevents the loading flash and enables immediate auth state
@@ -95,6 +133,7 @@ export function AuthOSProvider({ config, children, client: externalClient, initi
   const contextValue = useMemo<AuthOSContextState>(
     () => ({
       client,
+      config,
       user,
       isAuthenticated: !!user,
       isLoading,
@@ -103,7 +142,7 @@ export function AuthOSProvider({ config, children, client: externalClient, initi
       setOrganization,
       refreshUser,
     }),
-    [client, user, isLoading, organization, refreshUser]
+    [client, config, user, isLoading, organization, refreshUser]
   );
 
   return <AuthOSContext.Provider value={contextValue}>{children}</AuthOSContext.Provider>;

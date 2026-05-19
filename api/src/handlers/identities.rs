@@ -8,12 +8,12 @@ use crate::store::{
     organizations::OrganizationStore, services::ServiceStore, DB,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use chrono::Utc;
 use sea_orm::DatabaseConnection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
 pub struct IdentityResponse {
@@ -23,6 +23,11 @@ pub struct IdentityResponse {
 #[derive(Debug, Serialize)]
 pub struct StartLinkResponse {
     pub authorization_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StartLinkQuery {
+    pub redirect_uri: Option<String>,
 }
 
 /// Helper function to determine the identity context (org_id and service_id) from auth user claims
@@ -105,6 +110,7 @@ pub async fn list_identities(
 pub async fn start_link(
     State(state): State<AppState>,
     Path(provider_str): Path<String>,
+    Query(query): Query<StartLinkQuery>,
     auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
 ) -> Result<Json<StartLinkResponse>> {
     let auth_user = auth_user
@@ -120,7 +126,7 @@ pub async fn start_link(
     );
 
     let (
-        _scopes,
+        scopes,
         is_admin_flow,
         org_slug,
         service_slug,
@@ -155,6 +161,7 @@ pub async fn start_link(
             Provider::Microsoft => &service.microsoft_scopes,
             Provider::Google => &service.google_scopes,
             Provider::Oidc => &None, // OIDC scopes are dynamically managed
+            Provider::Password => &None,
         };
 
         let scopes = scopes_json
@@ -180,6 +187,7 @@ pub async fn start_link(
                         "email".to_string(),
                         "profile".to_string(),
                     ],
+                    Provider::Password => vec![],
                 }
             });
 
@@ -190,16 +198,27 @@ pub async fn start_link(
             .and_then(|uris| serde_json::from_str(uris).ok())
             .unwrap_or_default();
 
-        let base_redirect = redirect_uris.first().ok_or_else(|| {
-            AppError::InternalServerError("Service has no redirect_uris configured".to_string())
-        })?;
+        let base_redirect = match query.redirect_uri.as_deref() {
+            Some(redirect_uri) => {
+                if !redirect_uris.is_empty()
+                    && !redirect_uris
+                        .iter()
+                        .any(|allowed_uri| allowed_uri == redirect_uri)
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "redirect_uri '{}' is not registered for this service",
+                        redirect_uri
+                    )));
+                }
+                redirect_uri
+            }
+            None => redirect_uris.first().map(String::as_str).ok_or_else(|| {
+                AppError::InternalServerError("Service has no redirect_uris configured".to_string())
+            })?,
+        };
 
         // Build redirect URL with query params for linking flow
-        let redirect_uri = format!(
-            "{}?status=success&provider={}&action=link",
-            base_redirect,
-            provider.as_str()
-        );
+        let redirect_uri = build_link_redirect_uri(base_redirect, provider.as_str())?;
 
         // Check if org has BYOO credentials for this provider
         let provider_str = provider.as_str();
@@ -229,9 +248,19 @@ pub async fn start_link(
             get_authorization_url_for_client(&custom_client, provider, scopes.clone())
         } else {
             // Use platform credentials
-            state
-                .oauth_client
-                .get_authorization_url_with_pkce(provider, scopes.clone())?
+            // Use ADMIN callback URL because that's what's registered with providers
+            // (GitHub/Microsoft only allow 1 callback per app)
+            let callback_url = format!(
+                "{}/auth/admin/{}/callback",
+                state.base_url,
+                provider.as_str()
+            );
+
+            state.oauth_client.get_authorization_url_with_pkce(
+                provider,
+                scopes.clone(),
+                Some(&callback_url),
+            )?
         };
 
         (
@@ -251,6 +280,7 @@ pub async fn start_link(
             Provider::Github => vec!["user:email".to_string()],
             Provider::Microsoft => vec![
                 "User.Read".to_string(),
+                "offline_access".to_string(),
                 "email".to_string(),
                 "openid".to_string(),
                 "profile".to_string(),
@@ -265,19 +295,28 @@ pub async fn start_link(
                 "email".to_string(),
                 "profile".to_string(),
             ],
+            Provider::Password => vec![],
         };
 
         // Generate OAuth authorization URL with platform credentials
-        let (auth_url, csrf_token, pkce_verifier) = state
-            .oauth_client
-            .get_authorization_url_with_pkce(provider, default_scopes.clone())?;
-
-        // For platform-level linking, use base_url + settings page
-        let redirect_uri = format!(
-            "{}/settings/connections?status=success&provider={}&action=link",
+        // Use ADMIN callback URL because that's what's registered with providers
+        // (GitHub/Microsoft only allow 1 callback per app)
+        let callback_url = format!(
+            "{}/auth/admin/{}/callback",
             state.base_url,
             provider.as_str()
         );
+
+        let (auth_url, csrf_token, pkce_verifier) =
+            state.oauth_client.get_authorization_url_with_pkce(
+                provider,
+                default_scopes.clone(),
+                Some(&callback_url),
+            )?;
+
+        // For platform-level linking, use base_url + settings page
+        let redirect_base = format!("{}/settings/connections", state.base_url);
+        let redirect_uri = build_link_redirect_uri(&redirect_base, provider.as_str())?;
 
         (
             default_scopes,
@@ -294,7 +333,7 @@ pub async fn start_link(
 
     // Store OAuth state with user_id_for_linking set
     let expires_at = (Utc::now() + chrono::Duration::minutes(10)).naive_utc();
-    let pkce_value = if provider == Provider::Microsoft && !pkce_verifier.is_empty() {
+    let pkce_value = if !pkce_verifier.is_empty() {
         Some(pkce_verifier.as_str())
     } else {
         None
@@ -313,6 +352,8 @@ pub async fn start_link(
         None, // device_user_code
         None, // saml_state_id
         None, // upstream_connection_id
+        Some(&scopes),
+        None, // provider_token_request_state
         &expires_at,
     )
     .await?;
@@ -320,6 +361,19 @@ pub async fn start_link(
     Ok(Json(StartLinkResponse {
         authorization_url: auth_url,
     }))
+}
+
+fn build_link_redirect_uri(base_redirect: &str, provider: &str) -> Result<String> {
+    let mut redirect_url = url::Url::parse(base_redirect)
+        .map_err(|_| AppError::BadRequest("Invalid redirect_uri".to_string()))?;
+
+    redirect_url
+        .query_pairs_mut()
+        .append_pair("status", "success")
+        .append_pair("provider", provider)
+        .append_pair("action", "link");
+
+    Ok(redirect_url.to_string())
 }
 
 /// DELETE /api/user/identities/:provider - Unlink a social account

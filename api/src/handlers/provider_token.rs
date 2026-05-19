@@ -55,6 +55,7 @@ pub async fn get_provider_token(
         Provider::Microsoft => service.microsoft_scopes.is_some(),
         Provider::Google => service.google_scopes.is_some(),
         Provider::Oidc => true, // OIDC scopes are dynamically managed
+        Provider::Password => false,
     };
 
     if !has_scopes {
@@ -146,7 +147,7 @@ async fn refresh_provider_token_with_lock(
     let lock_timeout = TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS;
 
     // Try to acquire lock
-    let lock_acquired = acquire_refresh_lock(&state.db, &identity.user_id, lock_timeout).await?;
+    let lock_acquired = acquire_refresh_lock(&state.db, &identity.id, lock_timeout).await?;
 
     if !lock_acquired {
         // Another process is already refreshing - wait and retry
@@ -164,7 +165,7 @@ async fn refresh_provider_token_with_lock(
     let result = refresh_provider_token(state, identity).await;
 
     // Always release lock
-    let _ = release_refresh_lock(&state.db, &identity.user_id).await;
+    let _ = release_refresh_lock(&state.db, &identity.id).await;
 
     result
 }
@@ -245,6 +246,11 @@ async fn refresh_provider_token(
                     "OIDC token refresh not supported yet".to_string(),
                 ))
             }
+            Provider::Password => {
+                 return Err(AppError::OAuth(
+                    "Password token refresh not supported".to_string(),
+                ))
+            }
         }
     };
 
@@ -275,6 +281,11 @@ async fn refresh_provider_token(
         Provider::Oidc => {
             return Err(AppError::OAuth(
                 "OIDC token refresh not supported yet".to_string(),
+            ))
+        }
+        Provider::Password => {
+            return Err(AppError::OAuth(
+                "Password token refresh not supported".to_string(),
             ))
         }
     };
@@ -332,12 +343,12 @@ fn parse_scopes(scopes_json: &Option<String>) -> Vec<String> {
 
 async fn acquire_refresh_lock(
     pool: &DatabaseConnection,
-    user_id: &str,
+    lock_key: &str,
     timeout_seconds: i64,
 ) -> Result<bool> {
-    TokenRefreshLockStore::acquire_lock(DB::Conn(pool), user_id, timeout_seconds).await
+    TokenRefreshLockStore::acquire_lock(DB::Conn(pool), lock_key, timeout_seconds).await
 }
 
-async fn release_refresh_lock(pool: &DatabaseConnection, user_id: &str) -> Result<()> {
-    TokenRefreshLockStore::release_lock(DB::Conn(pool), user_id).await
+async fn release_refresh_lock(pool: &DatabaseConnection, lock_key: &str) -> Result<()> {
+    TokenRefreshLockStore::release_lock(DB::Conn(pool), lock_key).await
 }

@@ -238,9 +238,12 @@ pub async fn get_login_activity(
 
     let result = activity
         .into_iter()
-        .map(|item| LoginActivityPoint {
-            date: item.date,
-            count: item.count,
+        .filter_map(|item| {
+            // Skip entries with NULL dates
+            item.date.map(|date| LoginActivityPoint {
+                date,
+                count: item.count,
+            })
         })
         .collect();
 

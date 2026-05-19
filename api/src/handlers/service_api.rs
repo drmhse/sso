@@ -23,6 +23,37 @@ fn check_permission(principal: &ServicePrincipal, required: &str) -> Result<()> 
     Ok(())
 }
 
+async fn service_linked_user(
+    state: &AppState,
+    principal: &ServicePrincipal,
+    user_id: &str,
+) -> Result<crate::entities::users::Model> {
+    let has_authenticated = IdentityStore::user_has_authenticated_with_service(
+        DB::Conn(&state.db),
+        user_id,
+        &principal.service_id,
+    )
+    .await?;
+
+    if !has_authenticated {
+        return Err(AppError::NotFound(
+            "User not found or has not authenticated with this service".to_string(),
+        ));
+    }
+
+    let user = UserStore::find_by_id(DB::Conn(&state.db), user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    if user.org_id.as_deref() != Some(principal.service.org_id.as_str()) {
+        return Err(AppError::NotFound(
+            "User not found or has not authenticated with this service".to_string(),
+        ));
+    }
+
+    Ok(user)
+}
+
 /// Response for a user in the service API
 #[derive(Debug, Serialize)]
 pub struct ServiceApiUser {
@@ -338,11 +369,14 @@ pub struct CreateUserRequest {
 
 /// Create a new user
 /// Requires 'write:users' permission
+///
+/// Security Audit Item 3: Implements "Silent Invitation" pattern.
+/// If email exists in another context, returns fake success and triggers invitation.
 pub async fn create_user(
     State(state): State<AppState>,
     principal: ServicePrincipal,
     Json(payload): Json<CreateUserRequest>,
-) -> Result<Json<ServiceApiUser>> {
+) -> Result<(axum::http::StatusCode, Json<ServiceApiUser>)> {
     check_permission(&principal, "write:users")?;
 
     // Validate email format
@@ -350,65 +384,117 @@ pub async fn create_user(
         return Err(AppError::BadRequest("Invalid email format".to_string()));
     }
 
-    // Create the user (find_or_create will return existing user if email already exists)
-    let (user, was_created) =
-        UserStore::find_or_create(DB::Conn(&state.db), &payload.email).await?;
-
-    // Link the user to this service via an identity record if one doesn't exist
-    // This allows list_service_users and get_service_user to work
-    let has_identity = IdentityStore::user_has_authenticated_with_service(
+    // Check if user already exists IN THIS ORGANIZATION
+    let existing_user = UserStore::find_by_email_with_context(
         DB::Conn(&state.db),
-        &user.id,
-        &principal.service_id,
+        &payload.email,
+        Some(&principal.service.org_id),
     )
     .await?;
 
-    if !has_identity {
+    if let Some(user) = existing_user {
+        // User exists in this Org - check if already linked to this specific Service
+        let has_identity = IdentityStore::user_has_authenticated_with_service(
+            DB::Conn(&state.db),
+            &user.id,
+            &principal.service_id,
+        )
+        .await?;
+
+        if has_identity {
+            // Already linked - return the existing user (idempotent)
+            return Ok((
+                axum::http::StatusCode::OK,
+                Json(ServiceApiUser {
+                    id: user.id,
+                    email: user.email,
+                    created_at: DateTime::from_naive_utc_and_offset(user.created_at, Utc),
+                }),
+            ));
+        }
+
+        // Link existing Org User to this Service
         IdentityStore::create(
             DB::Conn(&state.db),
             &user.id,
-            "service_api",                   // Provider name for service-created users
-            &user.email,                     // Use email as provider_user_id
-            None,                            // access_token
-            None,                            // refresh_token
-            None,                            // access_token_encrypted
-            None,                            // refresh_token_encrypted
-            None,                            // encryption_key_id
-            None,                            // expires_at
-            None,                            // scopes
-            Some(&principal.service.org_id), // issuing_org_id
-            Some(&principal.service_id),     // issuing_service_id
+            "service_api",
+            &user.email,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&principal.service.org_id),
+            Some(&principal.service_id),
         )
         .await?;
+
+        return Ok((
+            axum::http::StatusCode::CREATED,
+            Json(ServiceApiUser {
+                id: user.id,
+                email: user.email,
+                created_at: DateTime::from_naive_utc_and_offset(user.created_at, Utc),
+            }),
+        ));
     }
 
-    // Publish signup event if user was just created (via Service API)
-    if was_created {
-        use crate::services::events::{Event, EventType};
-        use serde_json::json;
+    // User doesn't exist in this organization - create new tenant-scoped user
+    let user = UserStore::create_with_org_id(
+        DB::Conn(&state.db),
+        &payload.email,
+        None, // No password
+        &principal.service.org_id,
+    )
+    .await?;
 
-        let event = Event::builder(EventType::UserSignupSuccess)
-            .actor_user_id(&user.id)
-            .actor_email(&payload.email)
-            .org_id(&principal.service.org_id)
-            .detail("service_id", json!(&principal.service_id))
-            .detail("api_key_method", json!(true))
-            .build();
+    // Link the user to this service via an identity record
+    IdentityStore::create(
+        DB::Conn(&state.db),
+        &user.id,
+        "service_api",
+        &user.email,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&principal.service.org_id),
+        Some(&principal.service_id),
+    )
+    .await?;
 
-        // Fire and forget
-        let dispatcher = state.event_dispatcher.clone();
-        tokio::spawn(async move {
-            if let Err(e) = dispatcher.publish(event).await {
-                tracing::error!("Failed to publish signup event: {}", e);
-            }
-        });
-    }
+    // Publish signup event (new user created)
+    use crate::services::events::{Event, EventType};
+    use serde_json::json;
 
-    Ok(Json(ServiceApiUser {
-        id: user.id,
-        email: user.email,
-        created_at: DateTime::from_naive_utc_and_offset(user.created_at, Utc),
-    }))
+    let event = Event::builder(EventType::UserSignupSuccess)
+        .actor_user_id(&user.id)
+        .actor_email(&payload.email)
+        .org_id(&principal.service.org_id)
+        .detail("service_id", json!(&principal.service_id))
+        .detail("api_key_method", json!(true))
+        .build();
+
+    let dispatcher = state.event_dispatcher.clone();
+    tokio::spawn(async move {
+        if let Err(e) = dispatcher.publish(event).await {
+            tracing::error!("Failed to publish signup event: {}", e);
+        }
+    });
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(ServiceApiUser {
+            id: user.id,
+            email: user.email,
+            created_at: DateTime::from_naive_utc_and_offset(user.created_at, Utc),
+        }),
+    ))
 }
 
 /// Request body for updating a user
@@ -427,41 +513,13 @@ pub async fn update_user(
 ) -> Result<Json<ServiceApiUser>> {
     check_permission(&principal, "write:users")?;
 
-    // Verify the user has authenticated with this service
-    let has_authenticated = IdentityStore::user_has_authenticated_with_service(
-        DB::Conn(&state.db),
-        &user_id,
-        &principal.service_id,
-    )
-    .await?;
-
-    if !has_authenticated {
-        return Err(AppError::NotFound(
-            "User not found or has not authenticated with this service".to_string(),
+    if payload.email.is_some() {
+        return Err(AppError::Forbidden(
+            "Service API keys cannot update organization user profile fields".to_string(),
         ));
     }
 
-    // Update email if provided
-    let user = if let Some(email) = payload.email {
-        // Validate email format
-        if !email.contains('@') {
-            return Err(AppError::BadRequest("Invalid email format".to_string()));
-        }
-
-        // Check if email is already taken by another user
-        if UserStore::is_email_taken(DB::Conn(&state.db), &email, &user_id).await? {
-            return Err(AppError::BadRequest(
-                "Email already taken by another user".to_string(),
-            ));
-        }
-
-        UserStore::update_email(DB::Conn(&state.db), &user_id, &email).await?
-    } else {
-        // If no fields to update, just return the existing user
-        UserStore::find_by_id(DB::Conn(&state.db), &user_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?
-    };
+    let user = service_linked_user(&state, &principal, &user_id).await?;
 
     Ok(Json(ServiceApiUser {
         id: user.id,
@@ -501,10 +559,7 @@ pub async fn create_subscription(
         ));
     }
 
-    // Verify user exists
-    let user = UserStore::find_by_id(DB::Conn(&state.db), &payload.user_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let user = service_linked_user(&state, &principal, &payload.user_id).await?;
 
     // Set defaults
     let status = payload.status.unwrap_or_else(|| "active".to_string());
@@ -512,9 +567,10 @@ pub async fn create_subscription(
         .current_period_end
         .map(|s| {
             chrono::DateTime::parse_from_rfc3339(&s)
-                .unwrap()
-                .naive_utc()
+                .map(|dt| dt.naive_utc())
+                .map_err(|e| AppError::BadRequest(format!("Invalid current_period_end: {}", e)))
         })
+        .transpose()?
         .unwrap_or_else(|| (Utc::now() + chrono::Duration::days(30)).naive_utc());
 
     // Create the subscription
@@ -557,12 +613,18 @@ pub async fn update_subscription(
     Json(payload): Json<UpdateSubscriptionRequest>,
 ) -> Result<Json<ServiceApiSubscription>> {
     check_permission(&principal, "write:subscriptions")?;
+    service_linked_user(&state, &principal, &user_id).await?;
 
     // Update the subscription
     let current_period_end = payload
         .current_period_end
         .as_ref()
-        .map(|s| chrono::DateTime::parse_from_rfc3339(s).unwrap().naive_utc());
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.naive_utc())
+                .map_err(|e| AppError::BadRequest(format!("Invalid current_period_end: {}", e)))
+        })
+        .transpose()?;
 
     let subscription = SubscriptionStore::update(
         DB::Conn(&state.db),
@@ -629,6 +691,9 @@ pub async fn update_service_info(
 
 /// Delete a user
 /// Requires 'delete:users' permission
+///
+/// Security Audit Item 2: Only deletes the identity link to this service.
+/// Does NOT delete the global user record (they may belong to other services).
 pub async fn delete_user(
     State(state): State<AppState>,
     principal: ServicePrincipal,
@@ -650,8 +715,13 @@ pub async fn delete_user(
         ));
     }
 
-    // Delete the user (will cascade delete related data)
-    UserStore::delete(DB::Conn(&state.db), &user_id).await?;
+    // Security Audit Item 2: Delete only the identity link to this service
+    // This prevents one service from deleting a user who belongs to multiple services
+    IdentityStore::delete_by_user_and_service(DB::Conn(&state.db), &user_id, &principal.service_id)
+        .await?;
+
+    // Also delete any subscriptions for this user in this service
+    let _ = SubscriptionStore::delete(DB::Conn(&state.db), &user_id, &principal.service_id).await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -664,6 +734,7 @@ pub async fn delete_subscription(
     Path(user_id): Path<String>,
 ) -> Result<axum::http::StatusCode> {
     check_permission(&principal, "delete:subscriptions")?;
+    service_linked_user(&state, &principal, &user_id).await?;
 
     // Delete the subscription for this user and service
     SubscriptionStore::delete(DB::Conn(&state.db), &user_id, &principal.service_id).await?;

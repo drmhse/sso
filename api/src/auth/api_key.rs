@@ -44,7 +44,7 @@ impl ApiKeyService {
         }
 
         let parts: Vec<&str> = key.splitn(3, '_').collect();
-        if parts.len() < 2 {
+        if parts.len() != 3 || parts[1].is_empty() || parts[2].is_empty() {
             return None;
         }
 

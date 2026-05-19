@@ -1,10 +1,12 @@
-use crate::constants::JWT_EXPIRE_HOURS;
+#![allow(dead_code)]
+
 use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    email_verification::EmailVerificationStore, invitations::InvitationStore,
-    memberships::MembershipStore, password_reset::PasswordResetStore, sessions::SessionStore,
+    email_verification::EmailVerificationStore, identities::IdentityStore,
+    invitations::InvitationStore, memberships::MembershipStore, organizations::OrganizationStore,
+    password_reset::PasswordResetStore, services::ServiceStore, sessions::SessionStore,
     totp::TotpStore, users::UserStore, DB,
 };
 use axum::{
@@ -21,6 +23,17 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+
+// Static dummy hash for timing attack mitigation (Security Audit Item 6)
+// Used to perform password verification even when user doesn't exist,
+// ensuring consistent response times regardless of email existence
+static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(b"dummy_password_for_timing_attack_mitigation", &salt)
+        .expect("Failed to generate dummy hash")
+        .to_string()
+});
 
 // Helper function to hash JWT tokens for session tracking
 pub fn hash_token(token: &str) -> String {
@@ -41,7 +54,12 @@ pub use super::session::RefreshTokenResponse;
 pub struct RegisterRequest {
     pub email: String,
     pub password: String,
-    pub org_slug: Option<String>, // Optional: use organization-specific SMTP
+    /// Organization slug for tenant context. When provided, the user is attributed to this organization.
+    pub org_slug: Option<String>,
+    /// Service slug for service attribution. When provided with org_slug, creates a scoped identity.
+    pub service_slug: Option<String>,
+    /// Service callback URI to preserve app return context in verification links.
+    pub redirect_uri: Option<String>,
 }
 
 // Register Response
@@ -61,7 +79,12 @@ pub struct VerifyEmailQuery {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
-    pub org_slug: Option<String>, // Optional: for organization management context
+    /// Organization slug for tenant context
+    pub org_slug: Option<String>,
+    /// Service slug for service-scoped access (used with org_slug)
+    pub service_slug: Option<String>,
+    /// Service callback URI for hosted password login. Validated before tokens are returned.
+    pub redirect_uri: Option<String>,
     pub saml_state: Option<String>,
 }
 
@@ -70,6 +93,8 @@ pub struct LoginRequest {
 pub struct ForgotPasswordRequest {
     pub email: String,
     pub org_slug: Option<String>, // Optional: use organization-specific SMTP
+    pub service_slug: Option<String>,
+    pub redirect_uri: Option<String>,
 }
 
 // Forgot Password Response
@@ -95,12 +120,81 @@ pub struct ResetPasswordResponse {
 #[derive(Debug, Deserialize)]
 pub struct ResendVerificationRequest {
     pub email: String,
+    pub org_slug: Option<String>,
+    pub service_slug: Option<String>,
+    pub redirect_uri: Option<String>,
 }
 
 // Resend Verification Response
 #[derive(Debug, Serialize)]
 pub struct ResendVerificationResponse {
     pub message: String,
+}
+
+fn validate_service_redirect_uri(
+    redirect_uri: &str,
+    service: &crate::db::models::Service,
+) -> Result<()> {
+    if let Some(allowed_uris_json) = service.redirect_uris.as_ref() {
+        let allowed_uris: Vec<String> = serde_json::from_str(allowed_uris_json).map_err(|e| {
+            AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e))
+        })?;
+
+        if !allowed_uris.is_empty() && !allowed_uris.contains(&redirect_uri.to_string()) {
+            return Err(AppError::BadRequest(format!(
+                "redirect_uri '{}' is not registered for this service",
+                redirect_uri
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn build_auth_link(
+    web_client_url: &str,
+    path: &str,
+    token_name: &str,
+    token: &str,
+    org_slug: Option<&str>,
+    service_slug: Option<&str>,
+    redirect_uri: Option<&str>,
+) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair(token_name, token);
+
+    if let Some(org_slug) = org_slug {
+        serializer.append_pair("org", org_slug);
+    }
+
+    if let Some(service_slug) = service_slug {
+        serializer.append_pair("service", service_slug);
+    }
+
+    if let Some(redirect_uri) = redirect_uri {
+        serializer.append_pair("redirect_uri", redirect_uri);
+    }
+
+    format!(
+        "{}/{}?{}",
+        web_client_url.trim_end_matches('/'),
+        path.trim_start_matches('/'),
+        serializer.finish()
+    )
+}
+
+async fn resolve_org_id_from_slug(
+    state: &AppState,
+    org_slug: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(slug) = org_slug {
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        Ok(Some(org.id))
+    } else {
+        Ok(None)
+    }
 }
 
 /// POST /api/auth/register - Register a new user with email and password
@@ -136,15 +230,6 @@ pub async fn register(
         ));
     }
 
-    // Check if user already exists
-    let existing_user = UserStore::find_by_email(DB::Conn(&state.db), &req.email).await?;
-
-    if existing_user.is_some() {
-        return Err(AppError::BadRequest(
-            "User with this email already exists".to_string(),
-        ));
-    }
-
     // Hash password using Argon2
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -157,43 +242,157 @@ pub async fn register(
     let email = req.email.clone();
     let is_platform_owner = state.config.platform_owner_email.as_ref() == Some(&email);
     let verification_token = Uuid::new_v4().to_string();
+    let org_slug = req.org_slug.clone();
+    let service_slug = req.service_slug.clone();
 
-    // Execute transaction with automatic retry on database contention
-    let _user_id = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "register_user", |db| {
-        let email = email.clone();
-        let password_hash = password_hash.clone();
-        let verification_token = verification_token.clone();
-        Box::pin(async move {
-            // Create user within the transaction
-            let user =
-                UserStore::create(db.clone(), &email, Some(password_hash), is_platform_owner)
-                    .await?;
-            let user_id = user.id.clone();
+    // Resolve org_id and service_id from slugs (if provided)
+    let (issuing_org_id, issuing_service_id) = if let (Some(org_s), Some(service_s)) =
+        (&org_slug, &service_slug)
+    {
+        // Validate that org exists
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_s)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-            // Automatically accept any pending invitations for this email
-            InvitationStore::accept_all_pending_for_email(db.clone(), &email, &user_id).await?;
+        // Validate that service exists within org
+        let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_s)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
-            // Generate email verification token
-            let token_hash = hash_token(&verification_token);
-            let expires_at = Utc::now() + chrono::Duration::hours(24);
+        if let Some(redirect_uri) = &req.redirect_uri {
+            let service_model = crate::db::models::Service::from(service.clone());
+            validate_service_redirect_uri(redirect_uri, &service_model)?;
+        }
 
-            EmailVerificationStore::create(
-                db.clone(),
-                &user_id,
-                &token_hash,
-                &expires_at.naive_utc(),
-            )
-            .await?;
+        (Some(org.id), Some(service.id))
+    } else if let Some(org_s) = &org_slug {
+        // Just Org slug provided (no service)
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_s)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-            Ok(user_id)
-        })
-    })
+        (Some(org.id), None)
+    } else {
+        (None, None)
+    };
+
+    // Check if user already exists (scoped to tenant if org_id is present)
+    let existing_user = UserStore::find_by_email_with_context(
+        DB::Conn(&state.db),
+        &req.email,
+        issuing_org_id.as_deref(),
+    )
     .await?;
 
+    if existing_user.is_some() {
+        return Err(AppError::BadRequest(
+            "User with this email already exists".to_string(),
+        ));
+    }
+
+    // Execute transaction with automatic retry on database contention
+    let user_id = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "register_user",
+        |db| {
+            let email = email.clone();
+            let password_hash = password_hash.clone();
+            let verification_token = verification_token.clone();
+            let issuing_org_id = issuing_org_id.clone();
+            let issuing_service_id = issuing_service_id.clone();
+
+            Box::pin(async move {
+                // Create user within the transaction (scoped if org_id available)
+                let user = if let Some(ref org_id) = issuing_org_id {
+                    UserStore::create_with_org_id(db.clone(), &email, Some(password_hash), org_id)
+                        .await?
+                } else {
+                    UserStore::create(db.clone(), &email, Some(password_hash), is_platform_owner)
+                        .await?
+                };
+                let user_id = user.id.clone();
+
+                // Automatically accept any pending invitations for this email
+                InvitationStore::accept_all_pending_for_email(db.clone(), &email, &user_id).await?;
+
+                // Create password identity with org/service context (if provided)
+                // This ensures password users are tracked the same as OAuth users
+                IdentityStore::create(
+                    db.clone(),
+                    &user_id,
+                    "password", // provider
+                    &email,     // provider_user_id (email serves as unique ID for password)
+                    None,       // access_token (N/A for password)
+                    None,       // refresh_token (N/A for password)
+                    None,       // access_token_encrypted
+                    None,       // refresh_token_encrypted
+                    None,       // encryption_key_id
+                    None,       // expires_at
+                    None,       // scopes
+                    issuing_org_id.as_deref(),
+                    issuing_service_id.as_deref(),
+                )
+                .await?;
+
+                // Generate email verification token
+                let token_hash = hash_token(&verification_token);
+                let expires_at = Utc::now() + chrono::Duration::hours(24);
+
+                EmailVerificationStore::create(
+                    db.clone(),
+                    &user_id,
+                    &token_hash,
+                    &expires_at.naive_utc(),
+                )
+                .await?;
+
+                Ok(user_id)
+            })
+        },
+    )
+    .await?;
+
+    state.permission_cache.invalidate(&user_id).await;
+
+    // Publish signup event for webhooks (password signup with org/service context)
+    if issuing_org_id.is_some() {
+        use crate::services::events::{Event, EventType};
+        use serde_json::json;
+
+        let mut event_builder = Event::builder(EventType::UserSignupSuccess)
+            .actor_user_id(&user_id)
+            .actor_email(&email)
+            .detail("provider", json!("password"));
+
+        if let Some(ref org_id) = issuing_org_id {
+            event_builder = event_builder.org_id(org_id);
+        }
+
+        if let Some(ref service_id) = issuing_service_id {
+            event_builder = event_builder.detail("service_id", json!(service_id));
+        }
+
+        let event = event_builder.build();
+
+        let dispatcher = state.event_dispatcher.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dispatcher.publish(event).await {
+                tracing::error!("Failed to publish signup event: {}", e);
+            }
+        });
+    }
+
     // Enqueue verification email to job queue (non-blocking)
-    let verification_url = format!(
-        "{}/verify-email?token={}",
-        state.web_client_url, verification_token
+    let verification_url = build_auth_link(
+        &state.web_client_url,
+        "/verify-email",
+        "token",
+        &verification_token,
+        req.org_slug.as_deref(),
+        req.service_slug.as_deref(),
+        req.redirect_uri.as_deref(),
     );
     let email_subject = "Verify Your Email Address";
     let email_body = format!(
@@ -269,23 +468,42 @@ pub async fn login(
     Extension(request_info): Extension<RequestInfo>,
     Json400(req): Json400<LoginRequest>,
 ) -> Result<Json<RefreshTokenResponse>> {
-    // Find user by email
-    let user = UserStore::find_by_email(DB::Conn(&state.db), &req.email)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("Invalid email or password".to_string()))?;
+    // Resolve org_id from slug if provided to establish tenant context
+    let context_org_id = if let Some(ref slug) = req.org_slug {
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        Some(org.id)
+    } else {
+        None
+    };
 
-    // Check if user has a password set
-    let password_hash = user.password_hash.as_ref().ok_or_else(|| {
-        AppError::Unauthorized(
-            "Password login not available for this account. Please use OAuth login.".to_string(),
-        )
-    })?;
+    // Find user by email (scoped to tenant context)
+    // - If org_slug provided: WHERE email=? AND org_id=?
+    // - If no org_slug: WHERE email=? AND org_id IS NULL (Platform login)
+    let user_result = UserStore::find_by_email_with_context(
+        DB::Conn(&state.db),
+        &req.email,
+        context_org_id.as_deref(),
+    )
+    .await?;
+
+    // Determine the hash to verify against:
+    // - If user exists and has password: use their hash
+    // - If user doesn't exist or has no password: use DUMMY_HASH (timing attack mitigation)
+    // Security Audit Item 6: This prevents email enumeration via timing side-channel
+    let (user, password_hash, is_dummy) = match &user_result {
+        Some(u) if u.password_hash.is_some() => {
+            (Some(u), u.password_hash.as_ref().unwrap().clone(), false)
+        }
+        _ => (user_result.as_ref(), DUMMY_HASH.clone(), true),
+    };
 
     // Verify password using spawn_blocking to avoid blocking the async runtime
     // Argon2 is CPU-intensive (~50-100ms), so we offload to the blocking thread pool
     use crate::services::concurrency::ARGON2_SEMAPHORE;
-    
-    let password_hash_clone = password_hash.clone();
+
+    let password_hash_clone = password_hash;
     let password_input = req.password.clone();
 
     // Acquire semaphore permit to limit concurrent hash operations
@@ -311,14 +529,96 @@ pub async fn login(
     .await
     .map_err(|e| AppError::InternalServerError(format!("Password verification failed: {}", e)))?;
 
-    if !is_valid {
-        return Err(AppError::Unauthorized("Invalid email or password".to_string()));
+    // Return error if:
+    // - Password verification failed, OR
+    // - We were using dummy hash (user doesn't exist or has no password)
+    if !is_valid || is_dummy {
+        // Different error messages for OAuth-only accounts vs non-existent users
+        if user.map(|u| u.password_hash.is_none()).unwrap_or(false) {
+            return Err(AppError::Unauthorized(
+                "Password login not available for this account. Please use OAuth login."
+                    .to_string(),
+            ));
+        }
+        return Err(AppError::Unauthorized(
+            "Invalid email or password".to_string(),
+        ));
     }
+
+    // At this point, user exists and password is valid
+    let user = user.expect("User must exist when is_dummy is false");
 
     // Check if email is verified
     if user.email_verified_at.is_none() {
         return Err(AppError::Unauthorized(
             "Please verify your email address before logging in".to_string(),
+        ));
+    }
+
+    if req.service_slug.is_some() && req.org_slug.is_none() {
+        return Err(AppError::BadRequest(
+            "service_slug requires org_slug".to_string(),
+        ));
+    }
+
+    // Validate requested tenant/service access before issuing either a full
+    // session token or an MFA pre-auth token. The MFA verifier trusts these
+    // claims when completing the challenge, so they must be authorized here.
+    if let Some(org_slug) = &req.org_slug {
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+        if let Some(service_slug) = &req.service_slug {
+            let service =
+                ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+            if let Some(redirect_uri) = &req.redirect_uri {
+                let service_model = crate::db::models::Service::from(service.clone());
+                validate_service_redirect_uri(redirect_uri, &service_model)?;
+            }
+
+            if !user.is_platform_owner {
+                let has_identity = IdentityStore::find_by_user_and_provider(
+                    DB::Conn(&state.db),
+                    &user.id,
+                    "password",
+                    Some(&org.id),
+                    Some(&service.id),
+                )
+                .await?
+                .is_some();
+
+                if !has_identity {
+                    return Err(AppError::Forbidden(
+                        "You do not have access to this service".to_string(),
+                    ));
+                }
+            }
+        } else {
+            if req.redirect_uri.is_some() {
+                return Err(AppError::BadRequest(
+                    "redirect_uri requires org_slug and service_slug".to_string(),
+                ));
+            }
+
+            if !user.is_platform_owner {
+                let _membership = MembershipStore::find_by_org_slug_and_user(
+                    DB::Conn(&state.db),
+                    org_slug,
+                    &user.id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    AppError::Forbidden("You are not a member of this organization".to_string())
+                })?;
+            }
+        }
+    } else if req.redirect_uri.is_some() {
+        return Err(AppError::BadRequest(
+            "redirect_uri requires org_slug and service_slug".to_string(),
         ));
     }
 
@@ -357,22 +657,15 @@ pub async fn login(
             crate::services::risk_engine::RiskAction::ChallengeMFA
         )
     {
-        // If org_slug is provided, verify membership before MFA
-        if let Some(org_slug) = &req.org_slug {
-            let _membership =
-                MembershipStore::find_by_org_slug_and_user(DB::Conn(&state.db), org_slug, &user.id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Forbidden("You are not a member of this organization".to_string())
-                    })?;
-        }
+        // MFA is required - we'll verify access rights after MFA completion
+        // The main token generation flow will check membership or identity as appropriate
 
         let preauth_token = state.jwt_service.create_mfa_preauth_token(
             &user.id,
             &user.email,
             user.is_platform_owner,
             req.org_slug.as_deref(),
-            None,
+            req.service_slug.as_deref(),
             req.saml_state.as_deref(),
         )?;
 
@@ -391,24 +684,14 @@ pub async fn login(
         }
         RiskAction::ChallengeMFA => {
             // Risk engine demands MFA challenge
-            if let Some(org_slug) = &req.org_slug {
-                let _membership = MembershipStore::find_by_org_slug_and_user(
-                    DB::Conn(&state.db),
-                    org_slug,
-                    &user.id,
-                )
-                .await?
-                .ok_or_else(|| {
-                    AppError::Forbidden("You are not a member of this organization".to_string())
-                })?;
-            }
+            // Access rights will be verified after MFA completion
 
             let preauth_token = state.jwt_service.create_mfa_preauth_token(
                 &user.id,
                 &user.email,
                 user.is_platform_owner,
                 req.org_slug.as_deref(),
-                None,
+                req.service_slug.as_deref(),
                 req.saml_state.as_deref(),
             )?;
 
@@ -454,22 +737,75 @@ pub async fn login(
         .await?;
     }
 
-    // Generate JWT based on context (org_slug or platform owner)
+    // Generate JWT based on context (org_slug, service_slug, or platform owner)
+    let mut login_event_org_id: Option<String> = None;
+    let mut login_event_service_id: Option<String> = None;
+
     let token = if let Some(org_slug) = &req.org_slug {
-        // Organization management login - verify membership
-        let _membership =
-            MembershipStore::find_by_org_slug_and_user(DB::Conn(&state.db), org_slug, &user.id)
+        // Resolve org for later use
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        login_event_org_id = Some(org.id.clone());
+
+        // Determine service context for JWT
+        let service_slug_for_token = if let Some(service_slug) = &req.service_slug {
+            // Service-scoped login (end-user login to a service)
+            // This path does NOT require org membership - just identity for the service
+            let service =
+                ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+            if let Some(redirect_uri) = &req.redirect_uri {
+                let service_model = crate::db::models::Service::from(service.clone());
+                validate_service_redirect_uri(redirect_uri, &service_model)?;
+            }
+
+            // Verify user has identity for this org+service (unless platform owner)
+            if !user.is_platform_owner {
+                let has_identity = IdentityStore::find_by_user_and_provider(
+                    DB::Conn(&state.db),
+                    &user.id,
+                    "password",
+                    Some(&org.id),
+                    Some(&service.id),
+                )
                 .await?
-                .ok_or_else(|| {
-                    AppError::Forbidden("You are not a member of this organization".to_string())
-                })?;
+                .is_some();
+
+                if !has_identity {
+                    return Err(AppError::Forbidden(
+                        "You do not have access to this service".to_string(),
+                    ));
+                }
+            }
+
+            login_event_service_id = Some(service.id.clone());
+            Some(service_slug.as_str())
+        } else {
+            if req.redirect_uri.is_some() {
+                return Err(AppError::BadRequest(
+                    "redirect_uri requires org_slug and service_slug".to_string(),
+                ));
+            }
+
+            // Org-level login (team member login) - requires membership
+            let _membership =
+                MembershipStore::find_by_org_slug_and_user(DB::Conn(&state.db), org_slug, &user.id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Forbidden("You are not a member of this organization".to_string())
+                    })?;
+            None
+        };
 
         state.jwt_service.create_token(
             &user.id,
             &user.email,
             user.is_platform_owner,
             Some(org_slug),
-            None,
+            service_slug_for_token,
         )?
     } else {
         // Platform-level login (for platform owners or users without org context)
@@ -492,84 +828,90 @@ pub async fn login(
     let helper_org_slug = req.org_slug.clone();
     let helper_ip = request_info.ip_address.clone();
     let helper_risk_action = risk_assessment.action.clone();
-    
+
     // Generate device token outside transaction to avoid recreating it on retry if possible
     let device_token = state.risk_engine.generate_device_token(&user.id);
     let helper_device_token = device_token.clone();
 
     // Execute session and device creation in retrying transaction
-    let _device_cookie = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "login_session_create", |db| {
-        let user_id = helper_user_id.clone();
-        let token_hash = helper_token_hash.clone();
-        let refresh_token = helper_refresh_token.clone();
-        let org_slug = helper_org_slug.clone();
-        let ip_address = helper_ip.clone();
-        let risk_action = helper_risk_action.clone();
-        let device_token = helper_device_token.clone();
-        
-        // Capture time/expirations for inside transaction consistency
-        let now = Utc::now();
-        let expires_at_naive = expires_at.naive_utc();
-        let refresh_expires_at_naive = refresh_expires_at.naive_utc();
+    let _device_cookie = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "login_session_create",
+        |db| {
+            let user_id = helper_user_id.clone();
+            let token_hash = helper_token_hash.clone();
+            let refresh_token = helper_refresh_token.clone();
+            let org_slug = helper_org_slug.clone();
+            let ip_address = helper_ip.clone();
+            let risk_action = helper_risk_action.clone();
+            let device_token = helper_device_token.clone();
 
-        Box::pin(async move {
-            SessionStore::create(
-                db.clone(),
-                &user_id,
-                &token_hash,
-                expires_at_naive,
-                Some(&refresh_token),
-                Some(refresh_expires_at_naive),
-                org_slug.as_deref(),
-                None,
-                None,
-                None,
-            )
-            .await?;
+            // Capture time/expirations for inside transaction consistency
+            let now = Utc::now();
+            let expires_at_naive = expires_at.naive_utc();
+            let refresh_expires_at_naive = refresh_expires_at.naive_utc();
 
-            // Generate device trust cookie if risk assessment allows
-            if matches!(risk_action, RiskAction::Allow) {
-                let device_cookie_value = format!(
-                    "device_token={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
-                    device_token,
-                    90 * 24 * 3600 // 90 days in seconds
-                );
-
-                // Store device in database
-                use crate::store::user_devices::UserDevicesStore;
-                use sha2::{Digest, Sha256};
-
-                let mut hasher = Sha256::new();
-                hasher.update(device_token.as_bytes());
-                let token_hash = hex::encode(hasher.finalize());
-
-                let device_expires = (now + chrono::Duration::days(90)).naive_utc();
-
-                UserDevicesStore::create(
+            Box::pin(async move {
+                SessionStore::create(
                     db.clone(),
                     &user_id,
                     &token_hash,
-                    "Password Login Device",
-                    Some(ip_address),
-                    device_expires,
+                    expires_at_naive,
+                    Some(&refresh_token),
+                    Some(refresh_expires_at_naive),
+                    org_slug.as_deref(),
+                    None,
+                    None,
+                    None,
                 )
                 .await?;
 
-                Ok(Some(device_cookie_value))
-            } else {
-                Ok(None)
-            }
-        })
-    })
+                // Generate device trust cookie if risk assessment allows
+                if matches!(risk_action, RiskAction::Allow) {
+                    let device_cookie_value = format!(
+                        "device_token={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+                        device_token,
+                        90 * 24 * 3600 // 90 days in seconds
+                    );
+
+                    // Store device in database
+                    use crate::store::user_devices::UserDevicesStore;
+                    use sha2::{Digest, Sha256};
+
+                    let mut hasher = Sha256::new();
+                    hasher.update(device_token.as_bytes());
+                    let token_hash = hex::encode(hasher.finalize());
+
+                    let device_expires = (now + chrono::Duration::days(90)).naive_utc();
+
+                    UserDevicesStore::create(
+                        db.clone(),
+                        &user_id,
+                        &token_hash,
+                        "Password Login Device",
+                        Some(ip_address),
+                        device_expires,
+                    )
+                    .await?;
+
+                    Ok(Some(device_cookie_value))
+                } else {
+                    Ok(None)
+                }
+            })
+        },
+    )
     .await?;
 
-    // Publish login success event for webhooks (password login, no org/service context)
+    // Publish login success event for webhooks
     crate::handlers::auth::oauth::publish_login_event(
         &state.event_dispatcher,
         &user.id,
         &user.email,
-        None,
-        None,
+        login_event_org_id.as_deref(),
+        login_event_service_id.as_deref(),
         Some("password"),
     )
     .await;
@@ -605,8 +947,28 @@ pub async fn forgot_password(
         ));
     }
 
-    // Find user by email
-    let user = UserStore::find_by_email(DB::Conn(&state.db), &req.email).await?;
+    let org_id = resolve_org_id_from_slug(&state, req.org_slug.as_deref()).await?;
+
+    if let (Some(org_slug), Some(service_slug), Some(redirect_uri)) = (
+        req.org_slug.as_deref(),
+        req.service_slug.as_deref(),
+        req.redirect_uri.as_deref(),
+    ) {
+        let org_id = org_id
+            .as_deref()
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), org_id, service_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+        let service_model = crate::db::models::Service::from(service);
+        validate_service_redirect_uri(redirect_uri, &service_model)?;
+        let _ = org_slug;
+    }
+
+    // Find user by email, scoped to tenant context when provided.
+    let user =
+        UserStore::find_by_email_with_context(DB::Conn(&state.db), &req.email, org_id.as_deref())
+            .await?;
 
     // Always return success to prevent email enumeration
     if user.is_none() {
@@ -640,9 +1002,14 @@ pub async fn forgot_password(
     .await?;
 
     // Enqueue password reset email to job queue (non-blocking)
-    let reset_url = format!(
-        "{}/auth/reset-password?token={}",
-        state.base_url, reset_token
+    let reset_url = build_auth_link(
+        &state.web_client_url,
+        "/reset-password",
+        "token",
+        &reset_token,
+        req.org_slug.as_deref(),
+        req.service_slug.as_deref(),
+        req.redirect_uri.as_deref(),
     );
     let email_subject = "Reset Your Password";
     let email_body = format!(
@@ -753,8 +1120,24 @@ pub async fn resend_verification(
         ));
     }
 
-    // Find user by email
-    let user = UserStore::find_by_email(DB::Conn(&state.db), &req.email).await?;
+    let org_id = resolve_org_id_from_slug(&state, req.org_slug.as_deref()).await?;
+
+    if let (Some(service_slug), Some(redirect_uri), Some(org_id)) = (
+        req.service_slug.as_deref(),
+        req.redirect_uri.as_deref(),
+        org_id.as_deref(),
+    ) {
+        let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), org_id, service_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+        let service_model = crate::db::models::Service::from(service);
+        validate_service_redirect_uri(redirect_uri, &service_model)?;
+    }
+
+    // Find user by email, scoped to tenant context when provided.
+    let user =
+        UserStore::find_by_email_with_context(DB::Conn(&state.db), &req.email, org_id.as_deref())
+            .await?;
 
     // If user not found, return generic success to avoid enumeration
     if user.is_none() {
@@ -789,9 +1172,14 @@ pub async fn resend_verification(
     .await?;
 
     // Enqueue verification email
-    let verification_url = format!(
-        "{}/verify-email?token={}",
-        state.web_client_url, verification_token
+    let verification_url = build_auth_link(
+        &state.web_client_url,
+        "/verify-email",
+        "token",
+        &verification_token,
+        req.org_slug.as_deref(),
+        req.service_slug.as_deref(),
+        req.redirect_uri.as_deref(),
     );
     let email_subject = "Verify Your Email Address";
     let email_body = format!(

@@ -2,6 +2,7 @@
 
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::permission_service::{PermissionService, CAP_WEBHOOKS_MANAGE};
 use crate::state::AppState;
 use crate::store::{
     organizations::OrganizationStore, webhook_deliveries::WebhookDeliveryStore,
@@ -15,6 +16,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
+
+async fn require_webhook_manager(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    if PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_WEBHOOKS_MANAGE).await? {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "Insufficient permissions to manage webhooks".to_string(),
+    ))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateWebhookRequest {
@@ -38,6 +49,8 @@ pub struct WebhookResponse {
     pub url: String,
     pub events: Vec<String>,
     pub is_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
 }
@@ -195,8 +208,7 @@ pub async fn create_webhook(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is admin or owner
-    crate::middleware::check_org_admin(&state.db, &auth_user.user.id, &organization.id).await?;
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
 
     // Check for duplicate webhook name
     let existing_webhook =
@@ -250,6 +262,7 @@ pub async fn create_webhook(
         url: webhook.url,
         events,
         is_active: webhook.is_active,
+        secret: Some(secret),
         created_at: chrono::DateTime::from_naive_utc_and_offset(webhook.created_at, Utc),
         updated_at: chrono::DateTime::from_naive_utc_and_offset(webhook.updated_at, Utc),
     }))
@@ -266,8 +279,7 @@ pub async fn list_webhooks(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is admin or owner
-    crate::middleware::check_org_admin(&state.db, &auth_user.user.id, &organization.id).await?;
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
 
     // Get webhooks
     let webhooks =
@@ -287,6 +299,7 @@ pub async fn list_webhooks(
                 url: w.url,
                 events,
                 is_active: w.is_active,
+                secret: None,
                 created_at: DateTime::from_naive_utc_and_offset(w.created_at, Utc),
                 updated_at: DateTime::from_naive_utc_and_offset(w.updated_at, Utc),
             }
@@ -310,8 +323,7 @@ pub async fn get_webhook(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is admin or owner
-    crate::middleware::check_org_admin(&state.db, &auth_user.user.id, &organization.id).await?;
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
 
     // Get webhook
     let webhook = WebhookStore::find_by_id(DB::Conn(&state.db), &webhook_id)
@@ -332,6 +344,7 @@ pub async fn get_webhook(
         url: webhook.url,
         events,
         is_active: webhook.is_active,
+        secret: None,
         created_at: chrono::DateTime::from_naive_utc_and_offset(webhook.created_at, Utc),
         updated_at: chrono::DateTime::from_naive_utc_and_offset(webhook.updated_at, Utc),
     }))
@@ -349,8 +362,7 @@ pub async fn update_webhook(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is admin or owner
-    crate::middleware::check_org_admin(&state.db, &auth_user.user.id, &organization.id).await?;
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
 
     // Get existing webhook
     let existing_webhook = WebhookStore::find_by_id(DB::Conn(&state.db), &webhook_id)
@@ -477,6 +489,7 @@ pub async fn update_webhook(
         url: updated_webhook.url,
         events,
         is_active: updated_webhook.is_active,
+        secret: None,
         created_at: DateTime::from_naive_utc_and_offset(updated_webhook.created_at, Utc),
         updated_at: DateTime::from_naive_utc_and_offset(updated_webhook.updated_at, Utc),
     }))
@@ -493,8 +506,7 @@ pub async fn delete_webhook(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is admin or owner
-    crate::middleware::check_org_admin(&state.db, &auth_user.user.id, &organization.id).await?;
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
 
     // Check if webhook exists
     let existing_webhook = WebhookStore::find_by_id(DB::Conn(&state.db), &webhook_id)
@@ -524,8 +536,7 @@ pub async fn get_webhook_deliveries(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is admin or owner
-    crate::middleware::check_org_admin(&state.db, &auth_user.user.id, &organization.id).await?;
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
 
     // Check if webhook exists
     let _existing_webhook = WebhookStore::find_by_id(DB::Conn(&state.db), &webhook_id)
@@ -601,6 +612,56 @@ pub async fn get_webhook_deliveries(
         deliveries: delivery_responses,
         pagination,
     }))
+}
+
+/// Trigger a test webhook event (owner/admin only)
+pub async fn test_webhook(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((org_slug, webhook_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    // Get organization
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
+
+    // Check if webhook exists
+    let existing_webhook = WebhookStore::find_by_id(DB::Conn(&state.db), &webhook_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
+
+    // Verify webhook belongs to organization
+    if existing_webhook.org_id != organization.id {
+        return Err(AppError::NotFound("Webhook not found".to_string()));
+    }
+
+    // Create test payload
+    let test_payload = serde_json::json!({
+        "event": "webhook.test.ping",
+        "timestamp": Utc::now().to_rfc3339(),
+        "organization_id": organization.id,
+        "actor_user_id": auth_user.user.id,
+        "message": "This is a test event triggered from the AuthOS dashboard.",
+    });
+
+    use crate::services::job_queue::JobQueueService;
+
+    // Enqueue delivery
+    let (job_id, delivery_id) = JobQueueService::enqueue_webhook(
+        DB::Conn(&state.db),
+        &webhook_id,
+        "webhook.test.ping",
+        &test_payload,
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "job_id": job_id,
+        "delivery_id": delivery_id
+    })))
 }
 
 /// Get available webhook event types

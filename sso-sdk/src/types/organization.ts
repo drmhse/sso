@@ -17,6 +17,12 @@ export interface Organization {
   rejected_by?: string | null;
   rejected_at?: string | null;
   rejection_reason?: string | null;
+  custom_domain?: string | null;
+  domain_verified?: boolean;
+  domain_verification_token?: string | null;
+  brand_logo_url?: string | null;
+  brand_primary_color?: string | null;
+  feature_overrides?: string | Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 }
@@ -67,6 +73,20 @@ export interface OrganizationMember {
   joined_at: string;
 }
 
+export interface MemberServiceAccess {
+  service_id: string;
+  service_slug: string;
+  service_name: string;
+  access: 'viewer' | 'manager' | null;
+}
+
+export interface UpdateMemberServiceAccessPayload {
+  grants: Array<{
+    service_slug: string;
+    access: 'viewer' | 'manager' | null;
+  }>;
+}
+
 /**
  * Create organization payload (authenticated endpoint)
  */
@@ -89,6 +109,17 @@ export interface CreateOrganizationResponse {
   membership: Membership;
   access_token: string;
   refresh_token: string;
+}
+
+/**
+ * Select organization response - returned when switching org context
+ */
+export interface SelectOrganizationResponse {
+  organization: Organization;
+  membership: Membership;
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
 }
 
 /**
@@ -304,6 +335,7 @@ export interface WebhookResponse {
   url: string;
   events: string[];
   is_active: boolean;
+  secret?: string;
   created_at: string;
   updated_at: string;
 }

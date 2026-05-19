@@ -359,18 +359,19 @@ async fn update_customer_subscription_status(
     external_customer_id: &str,
     status: &str,
 ) -> Result<()> {
-    let found_subscriptions = match find_subscriptions_by_customer(pool, provider, external_customer_id).await {
-        Ok(subs) => subs,
-        Err(e) => {
-            tracing::warn!(
-                provider = %provider,
-                customer = %external_customer_id,
-                error = %e,
-                "Could not find subscriptions for customer, may be test data"
-            );
-            return Ok(());
-        }
-    };
+    let found_subscriptions =
+        match find_subscriptions_by_customer(pool, provider, external_customer_id).await {
+            Ok(subs) => subs,
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider,
+                    customer = %external_customer_id,
+                    error = %e,
+                    "Could not find subscriptions for customer, may be test data"
+                );
+                return Ok(());
+            }
+        };
 
     if found_subscriptions.is_empty() {
         tracing::warn!(
@@ -399,7 +400,10 @@ async fn update_customer_subscription_status(
                 for subscription in &found_subscriptions {
                     let mut active_model: subscriptions::ActiveModel = subscription.clone().into();
                     active_model.status = Set(status.clone());
-                    active_model.update(&db).await.map_err(AppError::SeaOrmDatabase)?;
+                    active_model
+                        .update(&db)
+                        .await
+                        .map_err(AppError::SeaOrmDatabase)?;
                 }
                 Ok(())
             })

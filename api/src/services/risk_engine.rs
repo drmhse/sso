@@ -45,7 +45,7 @@ impl GeoIpReader {
                         error = %e,
                         "Failed to load GeoIP database - geographic security features will be unavailable"
                     );
-                    tracing::error!("To resolve this issue, run: ./scripts/setup_geoip.sh");
+                    tracing::error!("To resolve this issue, run: ./sso setup-geoip");
                     tracing::error!("Or disable GeoIP features by setting: GEOIP_DISABLED=true");
                     Self { reader: None }
                 }
@@ -73,7 +73,7 @@ impl GeoIpReader {
         // but their internal fields are still Options.
         let country = city.country.iso_code?.to_string();
         let city_name = city.city.names.english.map(|s| s.to_string());
-        
+
         let location = city.location;
         let latitude = location.latitude?;
         let longitude = location.longitude?;

@@ -66,6 +66,20 @@ fn user_to_scim(user: users::Model, base_url: &str) -> ScimUser {
     }
 }
 
+async fn scoped_email_conflict(
+    state: &AppState,
+    org_id: &str,
+    email: &str,
+    current_user_id: Option<&str>,
+) -> Result<bool> {
+    let existing =
+        UserStore::find_by_email_with_context(DB::Conn(&state.db), email, Some(org_id)).await?;
+
+    Ok(existing
+        .map(|user| current_user_id.map(|id| user.id != id).unwrap_or(true))
+        .unwrap_or(false))
+}
+
 /// List Users - GET /scim/v2/Users
 pub async fn list_users(
     State(state): State<AppState>,
@@ -217,11 +231,8 @@ pub async fn create_user(
         req.user_name.clone()
     };
 
-    // Check if user already exists
-    if UserStore::find_by_email(DB::Conn(&state.db), &email)
-        .await?
-        .is_some()
-    {
+    // Check if user already exists in this SCIM token's organization.
+    if scoped_email_conflict(&state, &scim_auth.org_id, &email, None).await? {
         let error = ScimError::uniqueness(format!("User with email {} already exists", email));
         return Ok((StatusCode::CONFLICT, Json(error)).into_response());
     }
@@ -231,55 +242,62 @@ pub async fn create_user(
     let org_id_clone = scim_auth.org_id.clone();
 
     // Use retrying transaction for atomicity with automatic retry on contention
-    let created_user = with_retrying_transaction(&state.db, #[cfg(feature = "db_sqlite")] &state.db_writer, "scim_create_user", |db| {
-        let email = email_clone.clone();
-        let org_id = org_id_clone.clone();
+    let created_user = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "scim_create_user",
+        |db| {
+            let email = email_clone.clone();
+            let org_id = org_id_clone.clone();
 
-        Box::pin(async move {
-            // Create user
-            let user = users::ActiveModel {
-                id: Set(Uuid::new_v4().to_string()),
-                email: Set(email.to_lowercase()),
-                password_hash: Set(None),
-                is_platform_owner: Set(false),
-                email_verified_at: Set(None),
-                created_at: Set(Utc::now().naive_utc()),
-                updated_at: Set(None),
-                deleted_at: Set(None),
-            };
+            Box::pin(async move {
+                // Create user
+                let user = users::ActiveModel {
+                    id: Set(Uuid::new_v4().to_string()),
+                    email: Set(email.to_lowercase()),
+                    org_id: Set(Some(org_id.clone())),
+                    password_hash: Set(None),
+                    is_platform_owner: Set(false),
+                    email_verified_at: Set(None),
+                    created_at: Set(Utc::now().naive_utc()),
+                    updated_at: Set(None),
+                    deleted_at: Set(None),
+                };
 
-            let created_user = user.insert(&db).await?;
+                let created_user = user.insert(&db).await?;
 
-            // Create membership in organization with 'member' role
-            MembershipStore::create(db.clone(), &org_id, &created_user.id, "member").await?;
+                // Create membership in organization with 'member' role
+                MembershipStore::create(db.clone(), &org_id, &created_user.id, "member").await?;
 
-            // Grant member permission in the permissions table
-            PermissionsStore::grant(
-                db.clone(),
-                RelationTuple {
-                    namespace: "organization".to_string(),
-                    object_id: org_id.clone(),
-                    relation: "member".to_string(),
-                    subject_type: SUBJECT_TYPE_USER.to_string(),
-                    subject_id: created_user.id.clone(),
-                    subject_relation: None,
-                },
-            )
-            .await?;
+                // Grant member permission in the permissions table
+                PermissionsStore::grant(
+                    db.clone(),
+                    RelationTuple {
+                        namespace: "organization".to_string(),
+                        object_id: org_id.clone(),
+                        relation: "member".to_string(),
+                        subject_type: SUBJECT_TYPE_USER.to_string(),
+                        subject_id: created_user.id.clone(),
+                        subject_relation: None,
+                    },
+                )
+                .await?;
 
-            // Enqueue welcome email job using the proper email job type
-            JobQueueService::enqueue_email(
-                db.clone(),
-                &created_user.email,
-                "Welcome!",
-                &format!("Welcome to the platform, {}!", created_user.email),
-                None,
-            )
-            .await?;
+                // Enqueue welcome email job using the proper email job type
+                JobQueueService::enqueue_email(
+                    db.clone(),
+                    &created_user.email,
+                    "Welcome!",
+                    &format!("Welcome to the platform, {}!", created_user.email),
+                    None,
+                )
+                .await?;
 
-            Ok(created_user)
-        })
-    })
+                Ok(created_user)
+            })
+        },
+    )
     .await?;
 
     tracing::debug!(
@@ -326,6 +344,11 @@ pub async fn update_user(
         req.user_name.clone()
     };
 
+    if scoped_email_conflict(&state, &scim_auth.org_id, &email, Some(&user.id)).await? {
+        let error = ScimError::uniqueness(format!("User with email {} already exists", email));
+        return Ok((StatusCode::CONFLICT, Json(error)).into_response());
+    }
+
     let mut active_user: users::ActiveModel = user.into();
     active_user.email = Set(email.to_lowercase());
     active_user.updated_at = Set(Some(Utc::now().naive_utc()));
@@ -361,6 +384,7 @@ pub async fn patch_user(
         return Ok((StatusCode::NOT_FOUND, Json(error)).into_response());
     }
 
+    let current_user_id = user.id.clone();
     let mut active_user: users::ActiveModel = user.into();
 
     // Process each operation
@@ -373,12 +397,42 @@ pub async fn patch_user(
                         // Handle email updates
                         if let Some(value) = op.value {
                             if let Some(email_str) = value.as_str() {
+                                if scoped_email_conflict(
+                                    &state,
+                                    &scim_auth.org_id,
+                                    email_str,
+                                    Some(&current_user_id),
+                                )
+                                .await?
+                                {
+                                    let error = ScimError::uniqueness(format!(
+                                        "User with email {} already exists",
+                                        email_str
+                                    ));
+                                    return Ok((StatusCode::CONFLICT, Json(error)).into_response());
+                                }
                                 active_user.email = Set(email_str.to_lowercase());
                             } else if let Some(emails_arr) = value.as_array() {
                                 if let Some(first_email) = emails_arr.first() {
                                     if let Some(email_val) =
                                         first_email.get("value").and_then(|v| v.as_str())
                                     {
+                                        if scoped_email_conflict(
+                                            &state,
+                                            &scim_auth.org_id,
+                                            email_val,
+                                            Some(&current_user_id),
+                                        )
+                                        .await?
+                                        {
+                                            let error = ScimError::uniqueness(format!(
+                                                "User with email {} already exists",
+                                                email_val
+                                            ));
+                                            return Ok(
+                                                (StatusCode::CONFLICT, Json(error)).into_response()
+                                            );
+                                        }
                                         active_user.email = Set(email_val.to_lowercase());
                                     }
                                 }

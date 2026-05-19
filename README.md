@@ -6,7 +6,7 @@
 
 ## Repository Structure
 
-This monorepo contains the core backend API and the ecosystem of client libraries:
+This public repository contains the core backend API and the ecosystem of client libraries. Proprietary dashboard and internal operations tooling are not included here.
 
 | Path | Package | Description |
 |------|---------|-------------|
@@ -47,13 +47,33 @@ cd api
 
 # 1. Setup environment
 cp .env.example .env
-# Edit .env to add your database URL (defaults to SQLite) and keys
+# Edit .env to add your database URL and generated keys
 
 # 2. Run the server
 cargo run --release
 ```
 
-The API will start at `http://localhost:3000`.
+With the example environment, the API starts at `http://localhost:3001`.
+
+### Run a Published Docker Image
+
+The backend API is also published as public Docker images:
+
+| Backend | Image |
+|---------|-------|
+| SQLite default | `editoredit/sso:latest` or `editoredit/sso:sqlite-latest` |
+| PostgreSQL | `editoredit/sso:psql-latest` |
+| MySQL | `editoredit/sso:mysql-latest` |
+
+The repository includes Compose examples under [`api/`](./api):
+
+```bash
+cd api
+cp .env.example .env
+docker compose -f docker-compose.sqlite.yml up
+```
+
+For version-pinned deployments, use the matching `<backend>-<version>` tags such as `editoredit/sso:sqlite-0.1.39`.
 
 ### 2. Integrate the Frontend
 
@@ -82,7 +102,7 @@ import { AuthOSProvider } from '@drmhse/authos-react';
 
 export default function App() {
   return (
-    <AuthOSProvider config={{ baseURL: 'http://localhost:3000' }}>
+    <AuthOSProvider config={{ baseURL: 'http://localhost:3001' }}>
       <YourApp />
     </AuthOSProvider>
   );
@@ -117,6 +137,20 @@ npm run build
 ```
 
 This uses `tsup` to build distributable bundles for all packages in `packages/` and `sso-sdk/`.
+
+To build only one surface:
+
+```bash
+npm run build:sdk
+npm run build:packages
+```
+
+To check the Rust API:
+
+```bash
+cd api
+cargo check
+```
 
 ## Security
 

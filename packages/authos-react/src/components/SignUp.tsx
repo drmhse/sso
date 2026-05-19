@@ -1,7 +1,8 @@
 import { useState, useCallback, FormEvent } from 'react';
 import { SsoApiError } from '@drmhse/sso-sdk';
 import { useAuthOSContext } from '../context';
-import type { SignUpProps } from '../types';
+import { OAuthButton } from './OAuthButton';
+import type { SignUpProps, SupportedOAuthProvider } from '../types';
 
 /**
  * Headless SignUp component that handles user registration.
@@ -15,13 +16,23 @@ import type { SignUpProps } from '../types';
  *     <SignUp
  *       onSuccess={() => console.log('Registration successful!')}
  *       onError={(error) => console.error('Registration failed:', error)}
+ *       providers={['github', 'google']}
  *     />
  *   );
  * }
  * ```
  */
-export function SignUp({ onSuccess, onError, orgSlug, showSignIn = true, className }: SignUpProps) {
-  const { client } = useAuthOSContext();
+export function SignUp({
+  onSuccess,
+  onError,
+  orgSlug,
+  serviceSlug,
+  showSignIn = true,
+  className,
+  providers = false,
+  showDivider = true,
+}: SignUpProps) {
+  const { client, config } = useAuthOSContext();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -29,6 +40,10 @@ export function SignUp({ onSuccess, onError, orgSlug, showSignIn = true, classNa
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
+
+  // Determine if we have OAuth configured
+  const hasOAuthConfig = !!(config.org && config.service);
+  const oauthProviders = providers && Array.isArray(providers) ? providers : [];
 
   const handleSubmit = useCallback(
     async (e: FormEvent) => {
@@ -52,8 +67,9 @@ export function SignUp({ onSuccess, onError, orgSlug, showSignIn = true, classNa
         await client.auth.register({
           email,
           password,
-          org_slug: orgSlug,
-        });
+          org_slug: orgSlug ?? config.org,
+          service_slug: serviceSlug ?? config.service,
+        } as any);
 
         setIsSuccess(true);
         onSuccess?.();
@@ -65,7 +81,7 @@ export function SignUp({ onSuccess, onError, orgSlug, showSignIn = true, classNa
         setIsLoading(false);
       }
     },
-    [client, email, password, confirmPassword, orgSlug, onSuccess, onError]
+    [client, email, password, confirmPassword, orgSlug, serviceSlug, onSuccess, onError]
   );
 
   if (isSuccess) {
@@ -81,6 +97,31 @@ export function SignUp({ onSuccess, onError, orgSlug, showSignIn = true, classNa
 
   return (
     <div className={className} data-authos-signup data-state="form">
+      {/* OAuth Buttons Section */}
+      {oauthProviders.length > 0 && (
+        <div data-authos-oauth-section="">
+          {oauthProviders.map((provider: SupportedOAuthProvider) => (
+            <OAuthButton
+              key={provider}
+              provider={provider}
+              disabled={isLoading || !hasOAuthConfig}
+            />
+          ))}
+          {!hasOAuthConfig && (
+            <p data-authos-oauth-warning="" style={{ color: 'orange', fontSize: '0.875rem' }}>
+              OAuth requires org and service in AuthOSProvider config
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Divider */}
+      {oauthProviders.length > 0 && showDivider && (
+        <div data-authos-divider="">
+          <span>or</span>
+        </div>
+      )}
+
       <form onSubmit={handleSubmit}>
         <div data-authos-field="email">
           <label htmlFor="authos-signup-email">Email</label>

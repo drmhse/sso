@@ -1,5 +1,7 @@
 //! Job Queue Service - Persistent background job processing with Transactional Outbox pattern
 
+#![allow(dead_code)]
+
 use crate::error::{AppError, Result};
 use crate::store::system_jobs::SystemJobStore;
 use crate::store::webhook_deliveries::WebhookDeliveryStore;
@@ -14,7 +16,6 @@ use serde_json;
 pub enum JobType {
     SendEmail,
     DeliverWebhook,
-    StreamAuditLogs,
     Custom(String),
 }
 
@@ -23,7 +24,6 @@ impl JobType {
         match self {
             JobType::SendEmail => "send_email",
             JobType::DeliverWebhook => "deliver_webhook",
-            JobType::StreamAuditLogs => "stream_audit_logs",
             JobType::Custom(s) => s,
         }
     }
@@ -32,7 +32,6 @@ impl JobType {
         match s {
             "send_email" => JobType::SendEmail,
             "deliver_webhook" => JobType::DeliverWebhook,
-            "stream_audit_logs" => JobType::StreamAuditLogs,
             _ => JobType::Custom(s.to_string()),
         }
     }
@@ -54,14 +53,6 @@ pub struct WebhookJobPayload {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub delivery_id: String,
-}
-
-/// Audit log streaming job payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditLogStreamPayload {
-    pub siem_config_id: String,
-    pub audit_type: String, // "login_events", "mfa_audit_log", "organization_audit_log", "platform_audit_log"
-    pub batch_id: String,
 }
 
 /// Job Queue Service
@@ -131,7 +122,7 @@ impl JobQueueService {
         webhook_id: &str,
         event_type: &str,
         payload: &serde_json::Value,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         // Create a delivery record first
         let delivery_id = WebhookDeliveryStore::create_delivery(
             db.clone(),
@@ -146,10 +137,10 @@ impl JobQueueService {
             webhook_id: webhook_id.to_string(),
             event_type: event_type.to_string(),
             payload: payload.clone(),
-            delivery_id,
+            delivery_id: delivery_id.clone(),
         };
 
-        Self::enqueue(
+        let job_id = Self::enqueue(
             db,
             JobType::DeliverWebhook,
             &job_payload,
@@ -157,34 +148,13 @@ impl JobQueueService {
             5,    // Max 5 retries for webhooks
             None, // Execute immediately
         )
-        .await
-    }
+        .await?;
 
-    /// Enqueue an audit log streaming job
-    pub async fn enqueue_audit_log_stream(
-        db: DB<'_>,
-        siem_config_id: &str,
-        audit_type: &str,
-        batch_id: &str,
-    ) -> Result<String> {
-        let job_payload = AuditLogStreamPayload {
-            siem_config_id: siem_config_id.to_string(),
-            audit_type: audit_type.to_string(),
-            batch_id: batch_id.to_string(),
-        };
-
-        Self::enqueue(
-            db,
-            JobType::StreamAuditLogs,
-            &job_payload,
-            1,    // Higher priority for log streaming
-            3,    // Max 3 retries
-            None, // Execute immediately
-        )
-        .await
+        Ok((job_id, delivery_id))
     }
 
     /// Get pending jobs for processing
+    #[allow(deprecated)]
     pub async fn get_pending_jobs(
         db: &DatabaseConnection,
         limit: u64,
@@ -193,6 +163,7 @@ impl JobQueueService {
     }
 
     /// Mark job as processing
+    #[allow(deprecated)]
     pub async fn mark_processing(db: &DatabaseConnection, job_id: &str) -> Result<()> {
         SystemJobStore::mark_as_processing(DB::Conn(db), job_id).await
     }

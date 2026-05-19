@@ -38,6 +38,9 @@ export interface PasskeyRegisterFinishResponse {
  */
 export interface PasskeyAuthStartRequest {
   email: string;
+  org_slug?: string;
+  service_slug?: string;
+  redirect_uri?: string;
 }
 
 /**
@@ -60,6 +63,10 @@ export interface PasskeyAuthFinishRequest {
  * Response from finishing passkey authentication
  */
 export interface PasskeyAuthFinishResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+  /** Backward compatible alias for access_token. */
   token: string;
   user_id: string;
   device_trust_token?: string;
@@ -112,4 +119,25 @@ export interface Passkey {
   transports?: string;
   last_used_at?: string;
   created_at: string;
+}
+
+/**
+ * Passkey shown in authenticated self-service settings.
+ */
+export interface UserPasskey {
+  id: string;
+  name: string;
+  backup_eligible: boolean;
+  backup_state: boolean;
+  transports?: string | null;
+  last_used_at?: string | null;
+  created_at: string;
+}
+
+/**
+ * Generic passkey action response.
+ */
+export interface PasskeyActionResponse {
+  success: boolean;
+  message: string;
 }

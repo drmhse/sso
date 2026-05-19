@@ -3,6 +3,7 @@
 use crate::entities::billing_customers;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::permission_service::{PermissionService, CAP_BILLING_MANAGE};
 use crate::state::AppState;
 use crate::store::{memberships::MembershipStore, organizations::OrganizationStore, DB};
 use axum::{
@@ -35,7 +36,7 @@ pub async fn create_portal_session(
     Json(req): Json<BillingPortalRequest>,
 ) -> Result<Json<BillingPortalResponse>> {
     // 1. Verify membership and get org
-    let membership = MembershipStore::find_by_org_slug_and_user(
+    MembershipStore::find_by_org_slug_and_user(
         DB::Conn(&state.db),
         &org_slug,
         &auth_user.claims.sub,
@@ -43,17 +44,24 @@ pub async fn create_portal_session(
     .await?
     .ok_or_else(|| AppError::Forbidden("You are not a member of this organization".to_string()))?;
 
-    // 2. Verify user is an owner (only owners can access billing)
-    if membership.role != "owner" {
-        return Err(AppError::Forbidden(
-            "Only organization owners can access billing management".to_string(),
-        ));
-    }
-
-    // 3. Get organization
+    // 2. Get organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // 3. Verify billing capability
+    if !PermissionService::check(
+        DB::Conn(&state.db),
+        &org.id,
+        &auth_user.user.id,
+        CAP_BILLING_MANAGE,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to manage billing".to_string(),
+        ));
+    }
 
     // 4. Get billing customer for this organization
     let provider_type = state.billing_provider.provider_type();
@@ -95,7 +103,7 @@ pub async fn get_billing_info(
     Path(org_slug): Path<String>,
 ) -> Result<Json<BillingInfoResponse>> {
     // Verify membership
-    let membership = MembershipStore::find_by_org_slug_and_user(
+    MembershipStore::find_by_org_slug_and_user(
         DB::Conn(&state.db),
         &org_slug,
         &auth_user.claims.sub,
@@ -103,17 +111,23 @@ pub async fn get_billing_info(
     .await?
     .ok_or_else(|| AppError::Forbidden("You are not a member of this organization".to_string()))?;
 
-    // Only owners and admins can view billing info
-    if membership.role != "owner" && membership.role != "admin" {
-        return Err(AppError::Forbidden(
-            "Only organization owners and admins can view billing information".to_string(),
-        ));
-    }
-
     // Get organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    if !PermissionService::check(
+        DB::Conn(&state.db),
+        &org.id,
+        &auth_user.user.id,
+        CAP_BILLING_MANAGE,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden(
+            "Insufficient permissions to view billing information".to_string(),
+        ));
+    }
 
     // Check for billing customer
     let provider_type = state.billing_provider.provider_type();
