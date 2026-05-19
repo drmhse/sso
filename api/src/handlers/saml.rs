@@ -16,11 +16,12 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{Duration, Utc};
+use openssl::hash::MessageDigest;
+use openssl::pkey::PKey;
+use openssl::rsa::Rsa;
+use openssl::sign::Signer;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SerialNumber};
 use reqwest::Url;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::signature::{SignatureEncoding, Signer};
-use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -268,13 +269,12 @@ fn sign_xml_element(
     private_key_pem: &str,
     public_cert_pem: &str,
 ) -> Result<String> {
-    // Parse the private key from PKCS#8 PEM format (rcgen's serialize_private_key_pem() output)
-    let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem).map_err(|e| {
+    let private_key = PKey::private_key_from_pem(private_key_pem.as_bytes()).map_err(|e| {
         tracing::error!(
             "Failed to parse private key. PEM preview: {}",
             &private_key_pem.chars().take(100).collect::<String>()
         );
-        AppError::InternalServerError(format!("Failed to parse PKCS#8 private key: {}", e))
+        AppError::InternalServerError(format!("Failed to parse private key: {}", e))
     })?;
 
     // Canonicalize the XML element (basic C14N - remove extra whitespace, normalize)
@@ -325,14 +325,16 @@ fn sign_xml_element(
     // Canonicalize SignedInfo (use version with namespace)
     let canonical_signed_info = canonicalize_xml(&signed_info_for_signing);
 
-    // Sign the SignedInfo using RSA-PKCS#1 v1.5 with SHA-256
-    use rsa::pkcs1v15::SigningKey;
-    let signing_key = SigningKey::<Sha256>::new(private_key);
-    let signature = signing_key
-        .try_sign(canonical_signed_info.as_bytes())
+    let mut signer = Signer::new(MessageDigest::sha256(), &private_key)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to create signer: {}", e)))?;
+    signer
+        .update(canonical_signed_info.as_bytes())
+        .map_err(|e| AppError::InternalServerError(format!("Failed to update signer: {}", e)))?;
+    let signature = signer
+        .sign_to_vec()
         .map_err(|e| AppError::InternalServerError(format!("Failed to sign XML: {}", e)))?;
 
-    let signature_b64 = BASE64.encode(signature.to_bytes());
+    let signature_b64 = BASE64.encode(signature);
 
     // Extract certificate content (remove PEM headers/footers)
     let cert_content = public_cert_pem
@@ -927,31 +929,23 @@ pub async fn generate_saml_certificate(
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("Encryption service not available".into()))?;
 
-    // Generate certificate parameters with RSA key pair
-    // Generate 2048-bit RSA key pair for SAML signing using the rsa crate directly
-    // This ensures compatibility with the rsa crate's PKCS#8 parser used in signing
-    use rand::rngs::OsRng;
-    use rsa::pkcs8::EncodePrivateKey;
-    use rsa::RsaPrivateKey;
-
-    let mut rng = OsRng;
-    let bits = 2048;
-    let rsa_key = RsaPrivateKey::new(&mut rng, bits)
+    let rsa_key = Rsa::generate(2048)
         .map_err(|e| AppError::InternalServerError(format!("Failed to generate RSA key: {}", e)))?;
+    let key_pair_pem = PKey::from_rsa(rsa_key)
+        .and_then(|key| key.private_key_to_pem_pkcs8())
+        .map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to encode RSA key to PKCS#8 PEM: {}",
+                e
+            ))
+        })?;
 
-    // Convert to PKCS#8 PEM for rcgen (rcgen expects PEM format)
-    let private_key_pem_for_rcgen =
-        rsa_key
-            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-            .map_err(|e| {
-                AppError::InternalServerError(format!(
-                    "Failed to encode RSA key to PKCS#8 PEM: {}",
-                    e
-                ))
-            })?;
+    let private_key_pem = String::from_utf8(key_pair_pem).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to encode private key PEM as UTF-8: {}", e))
+    })?;
 
     // Create rcgen KeyPair from the PEM-encoded private key
-    let key_pair = KeyPair::from_pem(private_key_pem_for_rcgen.as_str()).map_err(|e| {
+    let key_pair = KeyPair::from_pem(&private_key_pem).map_err(|e| {
         AppError::InternalServerError(format!("Failed to create KeyPair from PEM: {}", e))
     })?;
 
@@ -980,14 +974,6 @@ pub async fn generate_saml_certificate(
 
     // Get the certificate PEM (public part)
     let public_cert_pem = cert.pem();
-
-    // Convert the RSA private key to PEM format (this will be compatible with rsa crate's parser)
-    let private_key_pem = rsa_key
-        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-        .map_err(|e| {
-            AppError::InternalServerError(format!("Failed to encode private key to PEM: {}", e))
-        })?
-        .to_string();
 
     // Encrypt the PKCS#8 private key
     let private_key_encrypted = encryption.encrypt(&private_key_pem).map_err(|e| {

@@ -40,8 +40,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
-use rsa::pkcs8::DecodePublicKey;
-use rsa::traits::PublicKeyParts;
+use openssl::pkey::PKey;
 use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use std::env;
@@ -177,11 +176,12 @@ async fn jwks_handler() -> Result<Json<JwksResponse>, axum::http::StatusCode> {
     let pem_str = String::from_utf8(public_key_pem)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let rsa_key = rsa::RsaPublicKey::from_public_key_pem(&pem_str)
+    let rsa_key = PKey::public_key_from_pem(pem_str.as_bytes())
+        .and_then(|key| key.rsa())
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let n = URL_SAFE_NO_PAD.encode(rsa_key.n().to_bytes_be());
-    let e = URL_SAFE_NO_PAD.encode(rsa_key.e().to_bytes_be());
+    let n = URL_SAFE_NO_PAD.encode(rsa_key.n().to_vec());
+    let e = URL_SAFE_NO_PAD.encode(rsa_key.e().to_vec());
 
     let jwk = Jwk {
         kty: "RSA".to_string(),

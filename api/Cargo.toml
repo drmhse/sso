@@ -52,9 +52,6 @@ aes-gcm = "0.10"
 base64 = "0.22"
 subtle = "2.5"
 
-# RSA
-rsa = { version = "0.9", features = ["sha2", "pem"] }
-
 # HTTP types
 http = "1.0"
 
