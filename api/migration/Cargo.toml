@@ -23,3 +23,6 @@ default = ["db_sqlite"]
 db_sqlite = ["sea-orm-migration/sqlx-sqlite"]
 db_psql = ["sea-orm-migration/sqlx-postgres"]
 db_mysql = ["sea-orm-migration/sqlx-mysql"]
+
+[patch.crates-io]
+sqlx-mysql = { path = "../vendor/sqlx-mysql" }

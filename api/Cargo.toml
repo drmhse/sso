@@ -126,6 +126,9 @@ db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite"]
 db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres"]
 db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql"]
 
+[patch.crates-io]
+sqlx-mysql = { path = "vendor/sqlx-mysql" }
+
 # =============================================================================
 # Release Profile - Optimized for SIZE ("z")
 # =============================================================================
