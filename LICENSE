@@ -1,0 +1,20 @@
+# AuthOS Licensing
+
+AuthOS uses different licenses for different parts of this repository:
+
+| Path | License |
+|------|---------|
+| `api/` | GNU Affero General Public License v3.0 only |
+| `api/vendor/sqlx-mysql/` | MIT OR Apache-2.0, inherited from SQLx |
+| `sso-sdk/` | MIT |
+| `packages/authos-cli/` | MIT |
+| `packages/authos-node/` | MIT |
+| `packages/authos-react/` | MIT |
+| `packages/authos-vue/` | MIT |
+
+The canonical license texts are available in [`LICENSES/`](./LICENSES):
+
+- [`LICENSES/AGPL-3.0.txt`](./LICENSES/AGPL-3.0.txt)
+- [`LICENSES/MIT.txt`](./LICENSES/MIT.txt)
+
+Package-specific license files are also kept with each publishable package so npm consumers receive the applicable license text.

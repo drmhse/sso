@@ -160,5 +160,10 @@ cargo check
 
 ## License
 
-*   **API**: [AGPL-3.0](./api/LICENSE)
-*   **SDKs & Packages**: [MIT](./sso-sdk/LICENSE)
+AuthOS is multi-licensed by repository area:
+
+*   **API**: [AGPL-3.0-only](./LICENSES/AGPL-3.0.txt)
+*   **SDKs & Packages**: [MIT](./LICENSES/MIT.txt)
+*   **Vendored SQLx MySQL patch**: MIT OR Apache-2.0, with license texts in [`api/vendor/sqlx-mysql/`](./api/vendor/sqlx-mysql)
+
+See [LICENSE](./LICENSE) for the complete licensing map.

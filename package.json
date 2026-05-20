@@ -27,7 +27,7 @@
     "multi-tenant"
   ],
   "author": "DRM HSE <info@drmhse.com>",
-  "license": "SEE LICENSE IN api/LICENSE AND sso-sdk/LICENSE",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=18.0.0"
   },
