@@ -17,6 +17,12 @@ This public repository contains the core backend API and the ecosystem of client
 | **[`packages/authos-node/`](./packages/authos-node)** | `@drmhse/authos-node` | Node.js server adapter (Express middleware, webhook verification). |
 | **[`packages/authos-cli/`](./packages/authos-cli)** | `@drmhse/authos-cli` | CLI tool for scaffolding AuthOS components into your app. |
 
+## AI Agent Skills
+
+Source-verified Agent Skills for AuthOS are available at [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill). They are designed for AI coding agents that need to implement, integrate, deploy, or operate AuthOS using the public API, SDK, package, and docs surfaces.
+
+See the install guide at [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-agent-skills/).
+
 ## Key Features
 
 *   **Multi-Tenant Architecture**: Built from the ground up for B2B applications. Users belong to organizations with specific roles and permissions.
