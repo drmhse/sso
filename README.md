@@ -161,10 +161,10 @@ npm run authos:binary -- --backend sqlite --platform linux/amd64
 
 ## License
 
-AuthOS is multi-licensed by repository area:
+AuthOS is split across two first-party license buckets:
 
 - API: [AGPL-3.0-only](./LICENSES/AGPL-3.0.txt)
 - SDKs and packages: [MIT](./LICENSES/MIT.txt)
-- Vendored SQLx MySQL patch: MIT OR Apache-2.0 under [api/vendor/sqlx-mysql/](./api/vendor/sqlx-mysql)
 
-See [LICENSE](./LICENSE) for the full licensing map.
+Vendored third-party code keeps its upstream notices in place under its own directory.
+See [LICENSE](./LICENSE) for the repository licensing map.

@@ -1,16 +1,20 @@
 # AuthOS Licensing
 
-AuthOS uses different licenses for different parts of this repository:
+AuthOS uses different licenses for first-party parts of this repository:
 
 | Path | License |
 |------|---------|
 | `api/` | GNU Affero General Public License v3.0 only |
-| `api/vendor/sqlx-mysql/` | MIT OR Apache-2.0, inherited from SQLx |
 | `sso-sdk/` | MIT |
 | `packages/authos-cli/` | MIT |
 | `packages/authos-node/` | MIT |
 | `packages/authos-react/` | MIT |
 | `packages/authos-vue/` | MIT |
+
+Vendored third-party code keeps its upstream license notices in place. For example,
+[`api/vendor/sqlx-mysql/`](./api/vendor/sqlx-mysql) includes the original SQLx
+`LICENSE-MIT` and `LICENSE-APACHE` files as required attribution, but that is not a
+separate AuthOS product license.
 
 The canonical license texts are available in [`LICENSES/`](./LICENSES):
 
