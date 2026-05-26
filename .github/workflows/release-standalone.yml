@@ -79,6 +79,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -93,6 +96,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            install.sh
             dist/authos-sqlite-linux-amd64.tar.gz
             dist/authos-sqlite-linux-arm64.tar.gz
             dist/SHA256SUMS.txt

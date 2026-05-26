@@ -48,27 +48,27 @@ The intended public release targets are:
 - `linux/amd64`
 - `linux/arm64`
 
-### Install From a Release Bundle
+### Install From GitHub Releases
 
 On a Linux host with `systemd` and `python3`:
 
 ```bash
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64) AUTHOS_ARCH=amd64 ;;
-  aarch64|arm64) AUTHOS_ARCH=arm64 ;;
-  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
-esac
-
-curl -L -o "authos-sqlite-linux-${AUTHOS_ARCH}.tar.gz" \
-  "https://github.com/drmhse/AuthOS/releases/latest/download/authos-sqlite-linux-${AUTHOS_ARCH}.tar.gz"
-tar -xzf "authos-sqlite-linux-${AUTHOS_ARCH}.tar.gz"
-cd "authos-sqlite-linux-${AUTHOS_ARCH}"
+curl -fsSL -o install.sh https://github.com/drmhse/AuthOS/releases/latest/download/install.sh
+chmod +x install.sh
 sudo ./install.sh
 ```
 
-If you want a specific release instead of the latest one, download the matching asset from the
-[GitHub releases page](https://github.com/drmhse/AuthOS/releases).
+The release installer detects `amd64` vs `arm64`, downloads the matching standalone bundle,
+extracts it, and runs the bundled installer.
+
+If you want a specific release instead of the latest one:
+
+```bash
+AUTHOS_VERSION=v0.1.41
+curl -fsSL -o install.sh "https://github.com/drmhse/AuthOS/releases/download/${AUTHOS_VERSION}/install.sh"
+chmod +x install.sh
+sudo AUTHOS_RELEASE_TAG="${AUTHOS_VERSION}" ./install.sh
+```
 
 Two supported bootstrap modes:
 
