@@ -102,8 +102,16 @@ export function useManagedConfig() {
       };
 
       const targetUrl = resolveTargetUrl(payload);
-      await waitForService(targetUrl);
-      window.location.href = `${targetUrl}/app#setup`;
+      const recovery = await waitForServiceRecovery(window.location.origin, targetUrl);
+
+      if (recovery.targetReady) {
+        window.location.href = `${targetUrl}/app#setup`;
+        return;
+      }
+
+      await loadConfig();
+      messageType.value = 'success';
+      message.value = `AuthOS restarted. Finish bringing ${targetUrl} online, then open ${targetUrl}/app#setup.`;
     } catch (error) {
       messageType.value = 'error';
       message.value = error.message || 'Failed to apply the managed config.';
@@ -139,23 +147,47 @@ function resolveTargetUrl(config) {
   return String(url).replace(/\/$/, '');
 }
 
-async function waitForService(targetUrl) {
-  const readyUrl = `${targetUrl}/health/ready`;
+async function waitForServiceRecovery(currentOrigin, targetUrl) {
+  const currentUrl = String(currentOrigin || '').replace(/\/$/, '');
+  const normalizedTargetUrl = String(targetUrl || '').replace(/\/$/, '');
+  const sameOrigin = currentUrl === normalizedTargetUrl;
   const deadline = Date.now() + 90000;
+  let currentReady = false;
 
   while (Date.now() < deadline) {
-    try {
-      const response = await fetch(readyUrl, { cache: 'no-store' });
-      if (response.ok) {
-        return;
-      }
-    } catch (error) {
-      // Ignore transient connection failures while AuthOS restarts.
+    if (await isReady(normalizedTargetUrl)) {
+      return { currentReady: true, targetReady: true };
     }
+
+    if (sameOrigin) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      continue;
+    }
+
+    if (!currentReady && await isReady(currentUrl)) {
+      currentReady = true;
+      return { currentReady: true, targetReady: false };
+    }
+
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
   }
 
-  throw new Error(`Timed out waiting for AuthOS to restart at ${readyUrl}.`);
+  if (currentReady) {
+    return { currentReady: true, targetReady: false };
+  }
+
+  throw new Error(`Timed out waiting for AuthOS to restart at ${normalizedTargetUrl}/health/ready.`);
+}
+
+async function isReady(baseUrl) {
+  if (!baseUrl) return false;
+
+  try {
+    const response = await fetch(`${baseUrl}/health/ready`, { cache: 'no-store' });
+    return response.ok;
+  } catch (error) {
+    return false;
+  }
 }
 
 async function request(token, url, init = {}) {

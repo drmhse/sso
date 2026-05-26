@@ -123,6 +123,10 @@ cp .env.example .env
 cargo run --release
 ```
 
+Keep `PLATFORM_BASE_URL` pointed at the embedded lite client unless you are
+explicitly handing off to a separate full web client. With the default example
+env, that means leaving it on `http://localhost:3001`.
+
 For direct Cargo work, the API will still compile if `lite-web-client/dist` has not been built yet. In that case it embeds a placeholder page instead of failing the build.
 
 ## SDK Usage

@@ -13,7 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -245,6 +245,9 @@ def normalize_config(config: dict, install_state: dict | None = None) -> dict:
         raise RuntimeError("Managed config must be a JSON object")
 
     deployment = config.setdefault("deployment", {})
+    previous_base_url = normalize_url_value(deployment.get("baseUrl"))
+    previous_platform_base_url = normalize_url_value(deployment.get("platformBaseUrl"))
+    previous_public_urls = {value for value in (previous_base_url, previous_platform_base_url) if value}
     if deployment.get("backend", "sqlite") != "sqlite":
         raise RuntimeError("Standalone AuthOS currently supports deployment.backend=sqlite only")
 
@@ -321,17 +324,22 @@ def normalize_config(config: dict, install_state: dict | None = None) -> dict:
         oauth.setdefault(provider, {
             "clientId": "",
             "clientSecret": "",
-            "redirectUri": f"{deployment['baseUrl']}/auth/admin/{provider}/callback",
             "authUrl": "",
             "tokenUrl": "",
             "userApiUrl": "",
         })
         oauth[provider].setdefault("clientId", "")
         oauth[provider].setdefault("clientSecret", "")
-        oauth[provider].setdefault("redirectUri", f"{deployment['baseUrl']}/auth/admin/{provider}/callback")
         oauth[provider].setdefault("authUrl", "")
         oauth[provider].setdefault("tokenUrl", "")
         oauth[provider].setdefault("userApiUrl", "")
+        oauth[provider]["redirectUri"] = admin_oauth_redirect_uri(deployment["baseUrl"], provider)
+
+    rewrite_managed_service_redirects(
+        config.get("services") or [],
+        previous_public_urls,
+        deployment["baseUrl"],
+    )
 
     return config
 
@@ -460,6 +468,43 @@ def build_env(config: dict, state: dict, paths: dict) -> dict:
         add_if(env, "SMTP_FROM_NAME", smtp.get("fromName"))
 
     return env
+
+
+def rewrite_managed_service_redirects(services: list[dict], previous_public_urls: set[str], base_url: str) -> None:
+    for service in services:
+        redirect_uris = service.get("redirectUris")
+        if not isinstance(redirect_uris, list):
+            continue
+
+        rewritten = []
+        for redirect_uri in redirect_uris:
+            normalized = normalize_url_value(redirect_uri)
+            if normalized and should_follow_authos_callback(normalized, previous_public_urls):
+                rewritten.append(f"{base_url}/callback")
+            else:
+                rewritten.append(redirect_uri)
+        service["redirectUris"] = rewritten
+
+
+def should_follow_authos_callback(url: str, previous_public_urls: set[str]) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return False
+
+    if parsed.query or parsed.fragment or parsed.path.rstrip("/") != "/callback":
+        return False
+
+    origin = normalize_url_value(f"{parsed.scheme}://{parsed.netloc}")
+    return bool(origin and origin in previous_public_urls)
+
+
+def admin_oauth_redirect_uri(base_url: str, provider: str) -> str:
+    return f"{normalize_url_value(base_url)}/auth/admin/{provider}/callback"
+
+
+def normalize_url_value(value) -> str:
+    return str(value or "").strip().rstrip("/")
 
 
 def configure_caddy(config: dict, paths: dict) -> None:
