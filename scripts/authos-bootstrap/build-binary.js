@@ -81,6 +81,7 @@ async function main() {
   if (!args.skipUpx) {
     await assertCommand('upx', ['--version'], ROOT);
   }
+  await run('npm', ['run', 'build', '-w', '@drmhse/sso-sdk'], ROOT);
   await run('npm', ['--workspace', 'lite-web-client', 'run', 'build'], ROOT);
   await run(
     'cargo',
