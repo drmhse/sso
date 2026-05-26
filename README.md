@@ -53,10 +53,22 @@ The intended public release targets are:
 On a Linux host with `systemd` and `python3`:
 
 ```bash
-tar -xzf authos-sqlite-linux-amd64.tar.gz
-cd authos-sqlite-linux-amd64
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64) AUTHOS_ARCH=amd64 ;;
+  aarch64|arm64) AUTHOS_ARCH=arm64 ;;
+  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+
+curl -L -o "authos-sqlite-linux-${AUTHOS_ARCH}.tar.gz" \
+  "https://github.com/drmhse/AuthOS/releases/latest/download/authos-sqlite-linux-${AUTHOS_ARCH}.tar.gz"
+tar -xzf "authos-sqlite-linux-${AUTHOS_ARCH}.tar.gz"
+cd "authos-sqlite-linux-${AUTHOS_ARCH}"
 sudo ./install.sh
 ```
+
+If you want a specific release instead of the latest one, download the matching asset from the
+[GitHub releases page](https://github.com/drmhse/AuthOS/releases).
 
 Two supported bootstrap modes:
 
