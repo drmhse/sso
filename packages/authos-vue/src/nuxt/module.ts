@@ -38,7 +38,10 @@ export default defineNuxtModule<AuthOSModuleOptions>({
     path: '/',
     sameSite: 'lax',
   },
-  setup(options, nuxt) {
+  setup(
+    options: AuthOSModuleOptions,
+    nuxt: { options: { runtimeConfig: { public: Record<string, unknown> } } },
+  ) {
     const resolver = createResolver(import.meta.url);
 
     nuxt.options.runtimeConfig.public.authOS = {

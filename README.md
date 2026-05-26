@@ -1,175 +1,166 @@
 # AuthOS
 
-**The open-source, multi-tenant authentication platform for B2B2C applications.**
+Open-source authentication infrastructure for B2B and B2B2C products.
 
-[AuthOS](https://authos.dev) provides a production-grade identity infrastructure with a focus on performance, security, and developer experience. Built with a high-performance Rust backend and comprehensive TypeScript SDKs, it handles complex authentication flows so you don't have to.
+This public repository contains the Rust API, the TypeScript SDKs and adapters, and the lightweight embedded web client used by the standalone Linux bundles. The larger internal multi-tenant operations dashboard is not part of this repo.
 
 ## Repository Structure
 
-This public repository contains the core backend API and the ecosystem of client libraries. Proprietary dashboard and internal operations tooling are not included here.
+| Path | Description |
+|------|-------------|
+| [api/](./api) | Rust API and standalone binaries (`sso_sqlite`, `sso_psql`, `sso_mysql`). |
+| [lite-web-client/](./lite-web-client) | Embedded setup and end-user journey UI served directly by the API binary. |
+| [sso-sdk/](./sso-sdk) | Framework-agnostic TypeScript SDK. |
+| [packages/authos-react/](./packages/authos-react) | React and Next.js adapter package. |
+| [packages/authos-vue/](./packages/authos-vue) | Vue 3 and Nuxt adapter package. |
+| [packages/authos-node/](./packages/authos-node) | Node.js server adapter package. |
+| [packages/authos-cli/](./packages/authos-cli) | Scaffolding CLI package. |
+| [scripts/authos-standalone/](./scripts/authos-standalone) | Standalone Linux installer sources bundled into release artifacts. |
+| [scripts/authos-bootstrap/](./scripts/authos-bootstrap) | Release bundle builder for compressed standalone artifacts. |
 
-| Path | Package | Description |
-|------|---------|-------------|
-| **[`api/`](./api)** | Core Backend | High-performance Rust (Axum) API handling auth, users, and organizations. |
-| **[`sso-sdk/`](./sso-sdk)** | `@drmhse/sso-sdk` | Zero-dependency, framework-agnostic TypeScript client. |
-| **[`packages/authos-react/`](./packages/authos-react)** | `@drmhse/authos-react` | React & Next.js adapters with hooks, components, and middleware. |
-| **[`packages/authos-vue/`](./packages/authos-vue)** | `@drmhse/authos-vue` | Vue 3 & Nuxt adapters with composables and components. |
-| **[`packages/authos-node/`](./packages/authos-node)** | `@drmhse/authos-node` | Node.js server adapter (Express middleware, webhook verification). |
-| **[`packages/authos-cli/`](./packages/authos-cli)** | `@drmhse/authos-cli` | CLI tool for scaffolding AuthOS components into your app. |
+## What the Lite Client Covers
 
-## AI Agent Skills
+The embedded lite client is the public-facing bootstrap surface for the standalone build. It is intentionally narrower than the internal admin dashboard.
 
-Source-verified Agent Skills for AuthOS are available at [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill). They are designed for AI coding agents that need to implement, integrate, deploy, or operate AuthOS using the public API, SDK, package, and docs surfaces.
+It covers:
+- hosted sign-in and sign-up journeys
+- email verification and password reset flows
+- invitation acceptance
+- a single-platform setup workspace
+- platform owner account and organization basics
+- lightweight application and end-user management
+- managed config editing through structured form fields
 
-See the install guide at [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-agent-skills/).
+It does not expose the full internal multi-tenant operations surface.
 
-## Key Features
+## Standalone Linux Bundles
 
-*   **Multi-Tenant Architecture**: Built from the ground up for B2B applications. Users belong to organizations with specific roles and permissions.
-*   **Authentication Methods**:
-    *   Email/Password (Argon2 hashing)
-    *   OAuth2 / Social Login (GitHub, Google, Microsoft)
-    *   **Passkeys** (WebAuthn/FIDO2)
-    *   Magic Links (Passwordless)
-    *   Enterprise SSO / OIDC (Bring Your Own Auth)
-*   **Security**:
-    *   **MFA**: TOTP (Authenticator apps) and Backup Codes.
-    *   **Risk Engine**: Adaptive authentication based on IP velocity, impossible travel, and device fingerprinting.
-    *   **Device Trust**: Management and revocation of user devices.
-*   **Integration**:
-    *   **Billing**: Native support for Stripe and Polar.
-    *   **SCIM 2.0**: Automated user provisioning from external IdPs.
-    *   **SIEM Streaming**: Stream audit logs to Datadog, Splunk, Elastic, or S3.
-    *   **Webhooks**: Event-driven architecture with signed payloads.
+AuthOS can run without Docker and without Node.js on the target server.
 
-## Getting Started
+The standalone SQLite bundle contains:
+- the `authos` binary
+- the embedded lite web client
+- `install.sh`
+- the standalone installer helper
+- `authos.config.example.json`
 
-### 1. Run the Backend API
+The intended public release targets are:
+- `linux/amd64`
+- `linux/arm64`
 
-The core of AuthOS is the Rust API. You need Rust (1.89+) installed.
+### Install From a Release Bundle
+
+On a Linux host with `systemd` and `python3`:
+
+```bash
+tar -xzf authos-sqlite-linux-amd64.tar.gz
+cd authos-sqlite-linux-amd64
+sudo ./install.sh
+```
+
+Two supported bootstrap modes:
+
+1. Zero-config install: run `sudo ./install.sh` with no config file. AuthOS starts, prints a one-time bootstrap link, and the lite client opens the setup workspace at `/app#setup`.
+2. File-driven install: copy `authos.config.example.json` to `authos.config.json`, edit it, then run `sudo ./install.sh --config ./authos.config.json`.
+
+The setup workspace writes back to the managed `config.json` on disk and can queue a reload of the running service after changes are saved.
+
+### Optional Caddy
+
+The standalone installer supports an optional Caddy front-end for domain-based deployments. Host-level install controls stay outside the web-editable config surface; once the local admin enables Caddy, the managed setup form can update the domain-facing configuration and trigger a safe reload.
+
+## Local Build and Packaging
+
+Prerequisites for building standalone bundles locally:
+- Node.js 18+
+- Rust stable
+- `cargo-zigbuild`
+- `zig`
+- `upx`
+- `binutils` (`objdump`)
+
+Install workspace dependencies:
+
+```bash
+npm install
+```
+
+Build a compressed standalone bundle:
+
+```bash
+npm run authos:binary -- --backend sqlite --platform linux/amd64
+npm run authos:binary -- --backend sqlite --platform linux/arm64
+```
+
+Artifacts are written to `.authos/releases/`.
+
+The build path does three relevant things before emitting the archive:
+- Vite tree-shakes the lite client production assets
+- Rust builds with the size-focused release profile in [api/Cargo.toml](./api/Cargo.toml)
+- `upx --best --lzma` compresses the shipped binary and verifies the packed executable
+
+The bundle builder also prints section and size information so the binary footprint can be checked before release automation is changed.
+
+## GitHub Actions Release Flow
+
+The standalone release workflow lives in [.github/workflows/release-standalone.yml](./.github/workflows/release-standalone.yml).
+
+It:
+- builds `linux/amd64` and `linux/arm64` standalone SQLite bundles
+- runs the same local release builder used in development
+- uploads release artifacts for manual runs
+- attaches the bundles and checksums to tagged GitHub releases
+
+Tag pushes matching `v*` publish release assets. `workflow_dispatch` builds artifacts without requiring a tag.
+
+## Running the API Directly
+
+If you want the raw API without the standalone installer:
 
 ```bash
 cd api
-
-# 1. Setup environment
 cp .env.example .env
-# Edit .env to add your database URL and generated keys
-
-# 2. Run the server
 cargo run --release
 ```
 
-With the example environment, the API starts at `http://localhost:3001`.
+For direct Cargo work, the API will still compile if `lite-web-client/dist` has not been built yet. In that case it embeds a placeholder page instead of failing the build.
 
-### Run a Published Docker Image
+## SDK Usage
 
-The backend API is also published as public Docker images:
+Install only the package you need:
 
-| Backend | Image |
-|---------|-------|
-| SQLite default | `editoredit/sso:latest` or `editoredit/sso:sqlite-latest` |
-| PostgreSQL | `editoredit/sso:psql-latest` |
-| MySQL | `editoredit/sso:mysql-latest` |
-
-The repository includes Compose examples under [`api/`](./api):
-
-```bash
-cd api
-cp .env.example .env
-docker compose -f docker-compose.sqlite.yml up
-```
-
-For version-pinned deployments, use the matching `<backend>-<version>` tags such as `editoredit/sso:sqlite-0.1.39`.
-
-### 2. Integrate the Frontend
-
-You can scaffold a new integration using the CLI, or install specific packages manually.
-
-#### Using the CLI (Recommended)
-
-```bash
-# Initialize AuthOS in your React/Vue/Next.js/Nuxt project root
-npx @drmhse/authos-cli init
-
-# Add pre-built components (Login Form, User Profile, etc.)
-npx @drmhse/authos-cli add login-form
-npx @drmhse/authos-cli add user-profile
-```
-
-#### Manual Installation
-
-**React / Next.js:**
 ```bash
 npm install @drmhse/authos-react
-```
-
-```tsx
-import { AuthOSProvider } from '@drmhse/authos-react';
-
-export default function App() {
-  return (
-    <AuthOSProvider config={{ baseURL: 'http://localhost:3001' }}>
-      <YourApp />
-    </AuthOSProvider>
-  );
-}
-```
-
-**Vue / Nuxt:**
-```bash
 npm install @drmhse/authos-vue
-```
-
-**Node.js / Express:**
-```bash
 npm install @drmhse/authos-node
 ```
 
-## Development Workflow
+Nuxt and Vue users can configure either `baseURL` or `baseUrl`; both are supported by the public adapter runtime.
 
-### Prerequisites
-*   **Rust**: v1.89+
-*   **Node.js**: v18+
-*   **Database**: SQLite (default), PostgreSQL, or MySQL.
+## Development Checks
 
-### Building Packages
-
-To build the SDK and all adapter packages:
+Typical verification commands:
 
 ```bash
-# In the root directory
-npm install
 npm run build
+npm run typecheck
+cd api && cargo check
 ```
 
-This uses `tsup` to build distributable bundles for all packages in `packages/` and `sso-sdk/`.
-
-To build only one surface:
+To validate the standalone packaging path specifically:
 
 ```bash
-npm run build:sdk
-npm run build:packages
+npm --workspace lite-web-client run build
+cargo check --manifest-path api/Cargo.toml --no-default-features --features db_sqlite --bin sso_sqlite
+npm run authos:binary -- --backend sqlite --platform linux/amd64
 ```
-
-To check the Rust API:
-
-```bash
-cd api
-cargo check
-```
-
-## Security
-
-*   **Tokens**: Uses short-lived JWTs (RS256) and rotating Refresh Tokens.
-*   **Storage**: Client SDKs manage token persistence securely (Cookies for SSR, LocalStorage/Memory for SPA).
-*   **Encryption**: Sensitive data (OAuth secrets, SMTP credentials) is encrypted at rest (AES-GCM).
 
 ## License
 
 AuthOS is multi-licensed by repository area:
 
-*   **API**: [AGPL-3.0-only](./LICENSES/AGPL-3.0.txt)
-*   **SDKs & Packages**: [MIT](./LICENSES/MIT.txt)
-*   **Vendored SQLx MySQL patch**: MIT OR Apache-2.0, with license texts in [`api/vendor/sqlx-mysql/`](./api/vendor/sqlx-mysql)
+- API: [AGPL-3.0-only](./LICENSES/AGPL-3.0.txt)
+- SDKs and packages: [MIT](./LICENSES/MIT.txt)
+- Vendored SQLx MySQL patch: MIT OR Apache-2.0 under [api/vendor/sqlx-mysql/](./api/vendor/sqlx-mysql)
 
-See [LICENSE](./LICENSE) for the complete licensing map.
+See [LICENSE](./LICENSE) for the full licensing map.

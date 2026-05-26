@@ -21,6 +21,8 @@ dist-ssr/
 .env
 .env.*
 !.env.example
+authos.config.json
+.authos/
 
 # IDEs
 .idea/

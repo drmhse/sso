@@ -7,6 +7,7 @@
 // - users: User search, platform owner management, and MFA administration
 
 pub mod analytics;
+pub mod bootstrap;
 pub mod governance;
 pub mod impersonation;
 pub mod operations;
@@ -37,6 +38,9 @@ pub use governance::{
 pub use analytics::{
     get_growth_trends, get_login_activity, get_organization_status_breakdown,
     get_platform_overview, get_top_organizations,
+};
+pub use bootstrap::{
+    apply_managed_config, bootstrap_login, get_managed_config, update_managed_config,
 };
 
 // User management handlers

@@ -535,6 +535,9 @@ pub fn platform_routes(state: &AppState) -> Router<AppState> {
             "/api/platform/owners/:user_id",
             delete(demote_platform_owner),
         )
+        .route("/api/platform/bootstrap/config", get(get_managed_config))
+        .route("/api/platform/bootstrap/config", patch(update_managed_config))
+        .route("/api/platform/bootstrap/apply", post(apply_managed_config))
         .route("/api/platform/audit-log", get(get_audit_log))
         // Platform analytics routes
         .route(

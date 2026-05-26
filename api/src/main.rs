@@ -9,6 +9,7 @@ mod entities;
 mod error;
 mod handlers;
 mod jobs;
+mod lite_web;
 mod middleware;
 mod router;
 mod services;
@@ -237,9 +238,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("Failed to initialize SQLite writer connection");
 
-    // Bootstrap platform owner if configured
-    // If both email and password are set, use password-based bootstrap
-    // Otherwise fall back to OAuth-only bootstrap
+    // Bootstrap platform owner if configured.
+    // Password bootstrap is one-time only and will not overwrite an existing password.
     if let (Some(email), Some(password)) = (
         config.platform_owner_email.as_ref(),
         config.platform_owner_password.as_ref(),
@@ -522,6 +522,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_service: jwt_service.clone(),
         base_url: config.base_url.clone(),
         web_client_url: config.platform_dashboard_base_url.clone(),
+        full_web_client_url: config.full_web_client_base_url.clone(),
         encryption: encryption.clone().map(Arc::new),
         email_service: email_service.map(Arc::new),
         metrics_service: metrics_service.clone(),
@@ -544,7 +545,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Build routes using the router module
-    let _active_org_routes = router::active_org_routes(&app_state);
     let protected_routes = router::protected_routes(&app_state);
     let analytics_routes = router::analytics_routes(&app_state);
     let mfa_routes = router::mfa_routes(&app_state, &config);
@@ -553,6 +553,7 @@ async fn main() -> anyhow::Result<()> {
     let service_api_routes = router::service_api_routes(&app_state);
     let scim_routes = router::scim_routes(&app_state);
     let public_routes = router::public_routes(&config);
+    let lite_web_routes = lite_web::routes(&app_state);
 
     // Combine all routes
     let app = Router::new()
@@ -570,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(service_api_routes)
         .merge(scim_routes)
         .merge(analytics_routes)
+        .merge(lite_web_routes)
         .with_state(app_state.clone())
         // Health readiness check (needs DB access)
         .route("/health/ready", get(readiness))

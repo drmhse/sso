@@ -18,6 +18,7 @@ pub struct AppState {
     pub jwt_service: Arc<JwtService>,
     pub base_url: String,
     pub web_client_url: String,
+    pub full_web_client_url: Option<String>,
     pub encryption: Option<Arc<crate::encryption::EncryptionService>>,
     pub email_service: Option<Arc<crate::email::EmailService>>,
     pub metrics_service: Arc<crate::services::metrics::MfaMetricsService>,

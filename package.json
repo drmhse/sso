@@ -5,15 +5,18 @@
   "private": true,
   "workspaces": [
     "sso-sdk",
+    "lite-web-client",
     "packages/*"
   ],
   "scripts": {
     "build": "npm run build --workspaces",
     "typecheck": "npm run typecheck --workspaces --if-present",
+    "lite-web:build": "npm run build -w lite-web-client",
     "build:sdk": "npm run build -w @drmhse/sso-sdk",
     "build:packages": "npm run build -w @drmhse/authos-react -w @drmhse/authos-vue -w @drmhse/authos-node -w @drmhse/authos-cli",
     "typecheck:sdk": "npm run typecheck -w @drmhse/sso-sdk",
-    "typecheck:packages": "npm run typecheck -w @drmhse/authos-react -w @drmhse/authos-vue -w @drmhse/authos-node -w @drmhse/authos-cli"
+    "typecheck:packages": "npm run typecheck -w @drmhse/authos-react -w @drmhse/authos-vue -w @drmhse/authos-node -w @drmhse/authos-cli",
+    "authos:binary": "node scripts/authos-bootstrap/build-binary.js"
   },
   "repository": {
     "type": "git",

@@ -580,9 +580,9 @@ impl UserStore {
     }
 
     /// Ensures a platform owner exists with the given email and password.
-    /// If the user exists, updates them to be a platform owner with the new password.
+    /// If the user exists without a password, seeds the initial password.
+    /// If the user already has a password hash, leaves it unchanged.
     /// If the user doesn't exist, creates them as a platform owner.
-    /// This is called on startup to allow password-based login for the platform owner.
     pub async fn bootstrap_platform_owner(db: DB<'_>, email: &str, password: &str) -> Result<()> {
         // Hash the provided password
         let salt = SaltString::generate(&mut OsRng);
@@ -600,18 +600,17 @@ impl UserStore {
         // Try to find the user by email first
         match Self::find_by_email(db.clone(), email).await? {
             Some(user) => {
-                // User exists, update their record to be a platform owner
+                // User exists, ensure they are a platform owner.
                 let now = chrono::Utc::now().naive_utc();
                 let mut user_active: users::ActiveModel = user.into();
                 user_active.is_platform_owner = Set(true);
-                user_active.password_hash = Set(Some(password_hash));
-                user_active.email_verified_at = Set(Some(now));
                 user_active.updated_at = Set(Some(now));
+                if user_active.password_hash.as_ref().is_none() {
+                    user_active.password_hash = Set(Some(password_hash));
+                    user_active.email_verified_at = Set(Some(now));
+                }
                 user_active.update(&db).await?;
-                tracing::info!(
-                    "Platform owner status and password updated for existing user: {}",
-                    email
-                );
+                tracing::info!("Platform owner status ensured for existing user: {}", email);
             }
             None => {
                 // User doesn't exist, create them as platform owner using unified method

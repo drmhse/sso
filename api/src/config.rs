@@ -50,8 +50,13 @@ pub struct Config {
     pub server_port: u16,
     pub base_url: String,
     pub platform_dashboard_base_url: String,
+    pub full_web_client_base_url: Option<String>,
     pub platform_owner_email: Option<String>,
     pub platform_owner_password: Option<String>,
+    pub managed_config_path: Option<String>,
+    pub managed_state_path: Option<String>,
+    pub managed_status_path: Option<String>,
+    pub managed_request_path: Option<String>,
     pub disable_rate_limiting: bool,
 
     // Job Processing
@@ -137,12 +142,19 @@ impl Config {
                 .map_err(|_| "BASE_URL must be set")?
                 .trim_end_matches('/')
                 .to_string(),
-            platform_dashboard_base_url: env::var("PLATFORM_DASHBOARD_BASE_URL")
-                .map_err(|_| "PLATFORM_DASHBOARD_BASE_URL must be set")?
+            platform_dashboard_base_url: env::var("PLATFORM_BASE_URL")
+                .or_else(|_| env::var("PLATFORM_DASHBOARD_BASE_URL"))
+                .map_err(|_| "PLATFORM_BASE_URL must be set")?
                 .trim_end_matches('/')
                 .to_string(),
+            full_web_client_base_url: env_var_optional("FULL_WEB_CLIENT_BASE_URL")
+                .map(|value| value.trim_end_matches('/').to_string()),
             platform_owner_email: env_var_optional("PLATFORM_OWNER_EMAIL"),
             platform_owner_password: env_var_optional("PLATFORM_OWNER_PASSWORD"),
+            managed_config_path: env_var_optional("AUTHOS_MANAGED_CONFIG_PATH"),
+            managed_state_path: env_var_optional("AUTHOS_MANAGED_STATE_PATH"),
+            managed_status_path: env_var_optional("AUTHOS_MANAGED_STATUS_PATH"),
+            managed_request_path: env_var_optional("AUTHOS_MANAGED_REQUEST_PATH"),
             disable_rate_limiting: env::var("DISABLE_RATE_LIMITING")
                 .unwrap_or_default()
                 .to_lowercase()
