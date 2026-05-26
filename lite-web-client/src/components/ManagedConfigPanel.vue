@@ -37,7 +37,6 @@
       <ManagedConfigSmtpSection v-model:section="form.smtp" />
       <ManagedConfigOauthSection v-model:section="form.oauth" />
       <ManagedConfigServicesSection v-model:section="form.services" />
-      <ManagedConfigOutputsSection v-model:section="form.outputs" />
 
       <details class="panel-subtle">
         <summary>Advanced JSON preview</summary>
@@ -62,7 +61,6 @@ import ManagedConfigCaddySection from '@/features/setup/components/ManagedConfig
 import ManagedConfigDeploymentSection from '@/features/setup/components/ManagedConfigDeploymentSection.vue';
 import ManagedConfigMeta from '@/features/setup/components/ManagedConfigMeta.vue';
 import ManagedConfigOauthSection from '@/features/setup/components/ManagedConfigOauthSection.vue';
-import ManagedConfigOutputsSection from '@/features/setup/components/ManagedConfigOutputsSection.vue';
 import ManagedConfigPlatformOwnerSection from '@/features/setup/components/ManagedConfigPlatformOwnerSection.vue';
 import ManagedConfigServicesSection from '@/features/setup/components/ManagedConfigServicesSection.vue';
 import ManagedConfigSmtpSection from '@/features/setup/components/ManagedConfigSmtpSection.vue';

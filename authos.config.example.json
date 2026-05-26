@@ -1,10 +1,6 @@
 {
   "deployment": {
-    "project": "authos",
     "backend": "sqlite",
-    "image": "authos-local:sqlite-bootstrap",
-    "buildLocalImage": true,
-    "platform": "linux/amd64",
     "apiPort": 3001,
     "baseUrl": "http://localhost:3001",
     "platformBaseUrl": "http://localhost:3001",
@@ -79,9 +75,5 @@
         }
       ]
     }
-  ],
-  "outputs": {
-    "directory": ".authos",
-    "apiEnv": "api/.env"
-  }
+  ]
 }

@@ -5,7 +5,6 @@ import {
   DEFAULT_CONFIG,
   DEPLOYMENT_KEYS,
   OAUTH_PROVIDER_KEYS,
-  OUTPUT_KEYS,
   PLATFORM_OWNER_KEYS,
   SERVICE_KEYS,
   SMTP_KEYS,
@@ -67,10 +66,6 @@ export function normalizeManagedConfig(source = {}) {
   config.services = Array.isArray(source?.services) && source.services.length > 0
     ? source.services.map(normalizeService)
     : cloneData(DEFAULT_CONFIG.services).map(normalizeService);
-  config.outputs = {
-    ...cloneData(DEFAULT_CONFIG.outputs),
-    ...(source?.outputs || {}),
-  };
 
   return config;
 }
@@ -83,11 +78,7 @@ export function serializeManagedConfig(form) {
     DEPLOYMENT_KEYS,
     {
       ...config.deployment,
-      project: trimString(config.deployment?.project || DEFAULT_CONFIG.deployment.project),
       backend: 'sqlite',
-      image: trimString(config.deployment?.image || DEFAULT_CONFIG.deployment.image),
-      buildLocalImage: Boolean(config.deployment?.buildLocalImage),
-      platform: trimString(config.deployment?.platform || DEFAULT_CONFIG.deployment.platform),
       apiPort: parsePositiveInt(config.deployment?.apiPort, DEFAULT_CONFIG.deployment.apiPort),
       baseUrl: trimString(config.deployment?.baseUrl),
       platformBaseUrl: trimString(config.deployment?.platformBaseUrl),
@@ -212,15 +203,6 @@ export function serializeManagedConfig(form) {
     ))
     : [];
 
-  const outputs = orderedObject(
-    OUTPUT_KEYS,
-    {
-      ...config.outputs,
-      directory: trimString(config.outputs?.directory || DEFAULT_CONFIG.outputs.directory),
-      apiEnv: trimString(config.outputs?.apiEnv || DEFAULT_CONFIG.outputs.apiEnv),
-    },
-  );
-
   return {
     deployment,
     standalone,
@@ -230,7 +212,6 @@ export function serializeManagedConfig(form) {
     smtp,
     oauth,
     services,
-    outputs,
     ...extraTopLevel,
   };
 }

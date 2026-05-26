@@ -9,13 +9,6 @@
         <input id="deployment-api-port" v-model.number="section.apiPort" type="number" min="1" max="65535" class="input" />
       </div>
       <div class="field">
-        <label for="deployment-platform">Target platform</label>
-        <select id="deployment-platform" v-model="section.platform" class="input">
-          <option value="linux/amd64">linux/amd64</option>
-          <option value="linux/arm64">linux/arm64</option>
-        </select>
-      </div>
-      <div class="field">
         <label for="deployment-base-url">Base URL</label>
         <input id="deployment-base-url" v-model="section.baseUrl" class="input code" placeholder="http://localhost:3001" />
       </div>
@@ -42,10 +35,6 @@
         <input v-model="section.geoipDisabled" type="checkbox" />
         <span>Disable GeoIP</span>
       </label>
-      <label class="checkbox-field">
-        <input v-model="section.buildLocalImage" type="checkbox" />
-        <span>Build local Docker image during scripted bootstrap</span>
-      </label>
     </div>
 
     <div class="form-grid">
@@ -56,14 +45,6 @@
       <div class="field">
         <label for="deployment-job-batch-size">Job processor batch size</label>
         <input id="deployment-job-batch-size" v-model.number="section.jobProcessorBatchSize" type="number" min="1" class="input" />
-      </div>
-      <div class="field">
-        <label for="deployment-project">Project name</label>
-        <input id="deployment-project" v-model="section.project" class="input code" />
-      </div>
-      <div class="field">
-        <label for="deployment-image">Docker image tag</label>
-        <input id="deployment-image" v-model="section.image" class="input code" />
       </div>
     </div>
 
