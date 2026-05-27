@@ -5,6 +5,9 @@ const {
   getBackend,
   resolveBuildVersion,
   compileBackendBinary,
+  prepareFrontendAssets,
+  ensureLiteClientDist,
+  stageDockerBinary,
 } = require('./release-build');
 
 const ROOT = path.resolve(__dirname, '../..');
@@ -16,6 +19,8 @@ function parseArgs(argv) {
     outputDir: '.authos/releases',
     platform: 'linux/amd64',
     skipUpx: false,
+    skipFrontendBuild: false,
+    stageDockerDist: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -24,6 +29,8 @@ function parseArgs(argv) {
     else if (arg === '--output-dir') result.outputDir = argv[++index];
     else if (arg === '--platform') result.platform = argv[++index];
     else if (arg === '--skip-upx') result.skipUpx = true;
+    else if (arg === '--skip-frontend-build') result.skipFrontendBuild = true;
+    else if (arg === '--stage-docker-dist') result.stageDockerDist = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
 
@@ -72,14 +79,18 @@ async function main() {
   if (!args.skipUpx) {
     await assertCommand('upx', ['--version'], ROOT);
   }
-  await run('npm', ['run', 'build', '-w', '@drmhse/sso-sdk'], ROOT);
-  await run('npm', ['--workspace', 'lite-web-client', 'run', 'build'], ROOT);
-  const { target, binaryPath: builtBinary } = await compileBackendBinary({
+  if (args.skipFrontendBuild) {
+    await ensureLiteClientDist(ROOT);
+  } else {
+    await prepareFrontendAssets(ROOT);
+  }
+  const buildResult = await compileBackendBinary({
     root: ROOT,
     backendName: args.backend,
     platform: args.platform,
     buildVersion,
   });
+  const { target, binaryPath: builtBinary, apiDir: compiledApiDir } = buildResult;
   const releaseRoot = path.join(outputDir, `authos-${args.backend}-linux-${target.archiveArch}`);
   const archiveName = `authos-${args.backend}-linux-${target.archiveArch}.tar.gz`;
   const archivePath = path.join(outputDir, archiveName);
@@ -92,6 +103,9 @@ async function main() {
   await fs.mkdir(standaloneDir, { recursive: true });
   await fs.copyFile(builtBinary, bundledBinary);
   await fs.chmod(bundledBinary, 0o755);
+  if (args.stageDockerDist) {
+    await stageDockerBinary({ apiDir: compiledApiDir, target, backend, binaryPath: builtBinary });
+  }
   const builtStats = await fs.stat(builtBinary);
   console.log(`\nBuilt binary size: ${formatBytes(builtStats.size)} (${builtStats.size.toLocaleString()} bytes)`);
   await maybePrintSectionProfile(builtBinary, apiDir);

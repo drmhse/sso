@@ -126,21 +126,22 @@ The bundle builder also prints section and size information so the binary footpr
 
 ## GitHub Actions Release Flow
 
-The standalone release workflow lives in [.github/workflows/release-standalone.yml](./.github/workflows/release-standalone.yml).
-The Docker image release workflow lives in [.github/workflows/release-docker.yml](./.github/workflows/release-docker.yml).
+The release workflow lives in [.github/workflows/release.yml](./.github/workflows/release.yml).
 
 It:
-- builds `linux/amd64` and `linux/arm64` standalone SQLite bundles
-- runs the same local release builder used in development
-- uploads release artifacts for manual runs
-- attaches the bundles and checksums to tagged GitHub releases
+- builds the shared frontend assets once
+- fans out the backend and architecture compiles in parallel for:
+  - `sqlite` `linux/amd64`
+  - `sqlite` `linux/arm64`
+  - `postgres` `linux/amd64`
+  - `postgres` `linux/arm64`
+  - `mysql` `linux/amd64`
+  - `mysql` `linux/arm64`
+- reuses those outputs for both standalone bundle publishing and Docker image publishing
+- attaches the standalone bundles and checksums to tagged GitHub releases
+- publishes multi-arch Docker images with exact tag aliases and compatibility aliases without the leading `v`
 
-The Docker workflow:
-- stages exact-tag binaries for `linux/amd64` and `linux/arm64`
-- builds multi-arch Docker images for SQLite, PostgreSQL, and MySQL
-- publishes `latest`, backend-specific `*-latest`, exact git-tag aliases, and compatibility aliases without the leading `v`
-
-Tag pushes matching `v*` publish both standalone release assets and Docker images. `workflow_dispatch` on the standalone workflow still builds artifacts without requiring a tag.
+Tag pushes matching `v*` publish both standalone assets and Docker images. `workflow_dispatch` still builds release inputs without requiring a tag.
 
 ## Running the API Directly
 

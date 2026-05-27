@@ -1,0 +1,296 @@
+name: Release AuthOS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Build frontend assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Build shared frontend assets
+        run: |
+          npm run build -w @drmhse/sso-sdk
+          npm --workspace lite-web-client run build
+
+      - name: Archive frontend dist
+        run: tar -czf frontend-dist.tar.gz -C lite-web-client dist
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.backend }} ${{ matrix.arch }}
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite
+            binary_name: sso_sqlite
+            platform: linux/amd64
+            arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+            standalone: true
+          - backend: sqlite
+            binary_name: sso_sqlite
+            platform: linux/arm64
+            arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+            standalone: true
+          - backend: postgres
+            binary_name: sso_psql
+            platform: linux/amd64
+            arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+            standalone: false
+          - backend: postgres
+            binary_name: sso_psql
+            platform: linux/arm64
+            arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+            standalone: false
+          - backend: mysql
+            binary_name: sso_mysql
+            platform: linux/amd64
+            arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+            standalone: false
+          - backend: mysql
+            binary_name: sso_mysql
+            platform: linux/arm64
+            arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+            standalone: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            api -> target
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Install UPX and binutils
+        if: matrix.standalone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl binutils || sudo apt-get install -y upx binutils
+
+      - name: Set build version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "AUTHOS_BUILD_VERSION=${GITHUB_REF_NAME}" >> "${GITHUB_ENV}"
+          else
+            echo "AUTHOS_BUILD_VERSION=manual-${GITHUB_RUN_NUMBER}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: .artifacts/frontend
+
+      - name: Restore frontend dist
+        run: tar -xzf .artifacts/frontend/frontend-dist.tar.gz -C lite-web-client
+
+      - name: Build standalone bundle and stage Docker binary
+        if: matrix.standalone
+        run: npm run authos:binary -- --backend ${{ matrix.backend }} --platform ${{ matrix.platform }} --skip-frontend-build --stage-docker-dist
+
+      - name: Build Docker binary
+        if: ${{ !matrix.standalone }}
+        run: npm run authos:docker:dist -- --backend ${{ matrix.backend }} --platform ${{ matrix.platform }} --skip-frontend-build
+
+      - name: Generate standalone checksum
+        if: matrix.standalone
+        run: |
+          cd .authos/releases
+          sha256sum authos-sqlite-linux-${{ matrix.arch }}.tar.gz > authos-sqlite-linux-${{ matrix.arch }}.sha256
+
+      - name: Upload standalone artifacts
+        if: matrix.standalone
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.arch }}
+          path: |
+            .authos/releases/authos-sqlite-linux-${{ matrix.arch }}.tar.gz
+            .authos/releases/authos-sqlite-linux-${{ matrix.arch }}.sha256
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload Docker binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-${{ matrix.backend }}-${{ matrix.arch }}
+          path: api/target/dist/linux-${{ matrix.arch }}/${{ matrix.binary_name }}
+          retention-days: 3
+          if-no-files-found: error
+
+  publish_release:
+    name: Publish standalone release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download standalone artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: standalone-*
+          path: dist
+          merge-multiple: true
+
+      - name: Consolidate checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            install.sh
+            dist/authos-sqlite-linux-amd64.tar.gz
+            dist/authos-sqlite-linux-arm64.tar.gz
+            dist/SHA256SUMS.txt
+
+  publish_docker:
+    name: Publish ${{ matrix.backend }} image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite
+            binary_name: sso_sqlite
+            tag_prefix: sqlite
+          - backend: postgres
+            binary_name: sso_psql
+            tag_prefix: psql
+          - backend: mysql
+            binary_name: sso_mysql
+            tag_prefix: mysql
+    env:
+      DOCKER_IMAGE: editoredit/sso
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download amd64 Docker binary
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-${{ matrix.backend }}-amd64
+          path: .artifacts/docker/${{ matrix.backend }}/amd64
+
+      - name: Download arm64 Docker binary
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-${{ matrix.backend }}-arm64
+          path: .artifacts/docker/${{ matrix.backend }}/arm64
+
+      - name: Restore Docker binary layout
+        run: |
+          mkdir -p api/target/dist/linux-amd64 api/target/dist/linux-arm64
+          cp "$(find .artifacts/docker/${{ matrix.backend }}/amd64 -type f -name '${{ matrix.binary_name }}' | head -n 1)" "api/target/dist/linux-amd64/${{ matrix.binary_name }}"
+          cp "$(find .artifacts/docker/${{ matrix.backend }}/arm64 -type f -name '${{ matrix.binary_name }}' | head -n 1)" "api/target/dist/linux-arm64/${{ matrix.binary_name }}"
+          chmod +x "api/target/dist/linux-amd64/${{ matrix.binary_name }}" "api/target/dist/linux-arm64/${{ matrix.binary_name }}"
+
+      - name: Compute Docker tags
+        id: docker_tags
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+          BACKEND: ${{ matrix.backend }}
+          TAG_PREFIX: ${{ matrix.tag_prefix }}
+          DOCKER_IMAGE: ${{ env.DOCKER_IMAGE }}
+        run: |
+          set -euo pipefail
+          version_without_v="${VERSION_TAG#v}"
+          {
+            echo 'tags<<EOF'
+            if [ "${BACKEND}" = "sqlite" ]; then
+              echo "${DOCKER_IMAGE}:${VERSION_TAG}"
+              echo "${DOCKER_IMAGE}:${version_without_v}"
+              echo "${DOCKER_IMAGE}:latest"
+            fi
+            echo "${DOCKER_IMAGE}:${TAG_PREFIX}-${VERSION_TAG}"
+            echo "${DOCKER_IMAGE}:${TAG_PREFIX}-${version_without_v}"
+            echo "${DOCKER_IMAGE}:${TAG_PREFIX}-latest"
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          file: ./api/Dockerfile
+          push: true
+          provenance: false
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BINARY_NAME=${{ matrix.binary_name }}
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=AuthOS
+            org.opencontainers.image.source=https://github.com/drmhse/AuthOS
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}

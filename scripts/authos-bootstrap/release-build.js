@@ -1,4 +1,5 @@
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const { resolvePlatformTarget } = require('./targets');
 const { run } = require('./process');
 
@@ -72,9 +73,37 @@ async function compileBackendBinary({ root, backendName, platform, buildVersion 
   };
 }
 
+async function prepareFrontendAssets(root) {
+  await run('npm', ['run', 'build', '-w', '@drmhse/sso-sdk'], root);
+  await run('npm', ['--workspace', 'lite-web-client', 'run', 'build'], root);
+}
+
+async function ensureLiteClientDist(root) {
+  const distIndex = path.join(root, 'lite-web-client', 'dist', 'index.html');
+  try {
+    await fs.access(distIndex);
+  } catch (error) {
+    throw new Error(
+      'lite-web-client/dist is missing. Build frontend assets first or omit --skip-frontend-build.',
+    );
+  }
+}
+
+async function stageDockerBinary({ apiDir, target, backend, binaryPath }) {
+  const platformDir = path.join(apiDir, 'target', 'dist', `linux-${target.archiveArch}`);
+  const destination = path.join(platformDir, backend.binary);
+  await fs.mkdir(platformDir, { recursive: true });
+  await fs.copyFile(binaryPath, destination);
+  await fs.chmod(destination, 0o755);
+  return destination;
+}
+
 module.exports = {
   backends,
   getBackend,
   resolveBuildVersion,
   compileBackendBinary,
+  prepareFrontendAssets,
+  ensureLiteClientDist,
+  stageDockerBinary,
 };
