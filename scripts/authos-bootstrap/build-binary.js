@@ -1,16 +1,14 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { assertCommand, run } = require('./process');
-const { resolvePlatformTarget } = require('./targets');
+const {
+  getBackend,
+  resolveBuildVersion,
+  compileBackendBinary,
+} = require('./release-build');
 
 const ROOT = path.resolve(__dirname, '../..');
 const COPYFILE_DISABLE_ENV = { COPYFILE_DISABLE: '1' };
-
-const backends = {
-  sqlite: { binary: 'sso_sqlite', feature: 'db_sqlite' },
-  postgres: { binary: 'sso_psql', feature: 'db_psql' },
-  mysql: { binary: 'sso_mysql', feature: 'db_mysql' },
-};
 
 function parseArgs(argv) {
   const result = {
@@ -61,43 +59,12 @@ async function maybePrintSectionProfile(binaryPath, cwd) {
   }
 }
 
-async function resolveBuildVersion() {
-  const explicit = process.env.AUTHOS_BUILD_VERSION?.trim();
-  if (explicit) {
-    return explicit;
-  }
-
-  try {
-    const { stdout } = await run('git', ['describe', '--tags', '--exact-match'], ROOT, { quiet: true });
-    const tag = stdout.trim();
-    if (tag) {
-      return tag;
-    }
-  } catch (error) {
-    // Ignore; we raise a clearer distribution-time error below.
-  }
-
-  throw new Error(
-    'Standalone bundle builds require an exact git tag or AUTHOS_BUILD_VERSION. ' +
-      'Create a tag for the release commit or export AUTHOS_BUILD_VERSION before running authos:binary.',
-  );
-}
-
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const backend = backends[args.backend];
-  if (!backend) {
-    throw new Error(`Unsupported backend "${args.backend}". Use sqlite, postgres, or mysql.`);
-  }
-
-  const target = resolvePlatformTarget(args.platform);
+  const backend = getBackend(args.backend);
   const apiDir = path.join(ROOT, 'api');
   const outputDir = path.resolve(ROOT, args.outputDir);
-  const releaseRoot = path.join(outputDir, `authos-${args.backend}-linux-${target.archiveArch}`);
-  const archiveName = `authos-${args.backend}-linux-${target.archiveArch}.tar.gz`;
-  const archivePath = path.join(outputDir, archiveName);
-  const standaloneDir = path.join(releaseRoot, 'standalone');
-  const buildVersion = await resolveBuildVersion();
+  const buildVersion = await resolveBuildVersion(ROOT);
 
   console.log(`\nBuilding standalone AuthOS binary bundle for ${args.backend} on ${args.platform}...`);
   console.log(`Embedding build version: ${buildVersion}`);
@@ -107,26 +74,16 @@ async function main() {
   }
   await run('npm', ['run', 'build', '-w', '@drmhse/sso-sdk'], ROOT);
   await run('npm', ['--workspace', 'lite-web-client', 'run', 'build'], ROOT);
-  await run(
-    'cargo',
-    [
-      'zigbuild',
-      '--release',
-      '--target',
-      target.rustTarget,
-      '--no-default-features',
-      '--features',
-      backend.feature,
-      '--bin',
-      backend.binary,
-    ],
-    apiDir,
-    {
-      env: { AUTHOS_BUILD_VERSION: buildVersion },
-    },
-  );
-
-  const builtBinary = path.join(apiDir, `target/${target.rustTarget}/release/${backend.binary}`);
+  const { target, binaryPath: builtBinary } = await compileBackendBinary({
+    root: ROOT,
+    backendName: args.backend,
+    platform: args.platform,
+    buildVersion,
+  });
+  const releaseRoot = path.join(outputDir, `authos-${args.backend}-linux-${target.archiveArch}`);
+  const archiveName = `authos-${args.backend}-linux-${target.archiveArch}.tar.gz`;
+  const archivePath = path.join(outputDir, archiveName);
+  const standaloneDir = path.join(releaseRoot, 'standalone');
   const bundledBinary = path.join(releaseRoot, 'authos');
 
   await fs.rm(releaseRoot, { recursive: true, force: true });

@@ -48,6 +48,17 @@ The intended public release targets are:
 - `linux/amd64`
 - `linux/arm64`
 
+## Docker Images
+
+Tagged releases also publish Docker images for all three database backends on Docker Hub:
+
+- SQLite default: `editoredit/sso:latest`, `editoredit/sso:vX.Y.Z`, `editoredit/sso:X.Y.Z`
+- Explicit SQLite: `editoredit/sso:sqlite-latest`, `editoredit/sso:sqlite-vX.Y.Z`, `editoredit/sso:sqlite-X.Y.Z`
+- PostgreSQL: `editoredit/sso:psql-latest`, `editoredit/sso:psql-vX.Y.Z`, `editoredit/sso:psql-X.Y.Z`
+- MySQL: `editoredit/sso:mysql-latest`, `editoredit/sso:mysql-vX.Y.Z`, `editoredit/sso:mysql-X.Y.Z`
+
+Every `v*` release tag publishes the exact git tag alias and a compatibility alias without the leading `v`.
+
 ### Install From GitHub Releases
 
 On a Linux host with `systemd` and `python3`:
@@ -116,6 +127,7 @@ The bundle builder also prints section and size information so the binary footpr
 ## GitHub Actions Release Flow
 
 The standalone release workflow lives in [.github/workflows/release-standalone.yml](./.github/workflows/release-standalone.yml).
+The Docker image release workflow lives in [.github/workflows/release-docker.yml](./.github/workflows/release-docker.yml).
 
 It:
 - builds `linux/amd64` and `linux/arm64` standalone SQLite bundles
@@ -123,7 +135,12 @@ It:
 - uploads release artifacts for manual runs
 - attaches the bundles and checksums to tagged GitHub releases
 
-Tag pushes matching `v*` publish release assets. `workflow_dispatch` builds artifacts without requiring a tag.
+The Docker workflow:
+- stages exact-tag binaries for `linux/amd64` and `linux/arm64`
+- builds multi-arch Docker images for SQLite, PostgreSQL, and MySQL
+- publishes `latest`, backend-specific `*-latest`, exact git-tag aliases, and compatibility aliases without the leading `v`
+
+Tag pushes matching `v*` publish both standalone release assets and Docker images. `workflow_dispatch` on the standalone workflow still builds artifacts without requiring a tag.
 
 ## Running the API Directly
 
@@ -169,6 +186,7 @@ To validate the standalone packaging path specifically:
 npm --workspace lite-web-client run build
 cargo check --manifest-path api/Cargo.toml --no-default-features --features db_sqlite --bin sso_sqlite
 npm run authos:binary -- --backend sqlite --platform linux/amd64
+npm run authos:docker:dist -- --backend sqlite
 ```
 
 ## License

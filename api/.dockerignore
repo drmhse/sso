@@ -1,6 +1,7 @@
 # Build artifacts (exclude most of target, but allow dist/ for native builds)
 target/
 !target/dist/
+!target/dist/**
 
 **/*.rs.bk
 **/*.so

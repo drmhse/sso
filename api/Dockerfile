@@ -6,12 +6,13 @@
 # 2. This Dockerfile just packages it into a minimal Alpine image
 # 
 # Usage:
-#   docker build -f Dockerfile --build-arg BINARY_NAME=sso_sqlite .
+#   docker buildx build -f Dockerfile --platform linux/amd64,linux/arm64 --build-arg BINARY_NAME=sso_sqlite .
 # =============================================================================
 
 FROM alpine:3.20
 
 # Build argument for the binary name (e.g., sso_sqlite, sso_psql, sso_mysql)
+ARG TARGETARCH
 ARG BINARY_NAME=sso_sqlite
 
 # Install runtime dependencies
@@ -23,8 +24,8 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy the pre-built binary from target/dist (placed by docker-publish.js)
-COPY target/dist/${BINARY_NAME} /app/sso
+# Copy the pre-built binary from target/dist/linux-${TARGETARCH}
+COPY target/dist/linux-${TARGETARCH}/${BINARY_NAME} /app/sso
 
 # Copy the entrypoint
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh

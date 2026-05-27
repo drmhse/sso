@@ -16,7 +16,8 @@
     "build:packages": "npm run build -w @drmhse/authos-react -w @drmhse/authos-vue -w @drmhse/authos-node -w @drmhse/authos-cli",
     "typecheck:sdk": "npm run typecheck -w @drmhse/sso-sdk",
     "typecheck:packages": "npm run typecheck -w @drmhse/authos-react -w @drmhse/authos-vue -w @drmhse/authos-node -w @drmhse/authos-cli",
-    "authos:binary": "node scripts/authos-bootstrap/build-binary.js"
+    "authos:binary": "node scripts/authos-bootstrap/build-binary.js",
+    "authos:docker:dist": "node scripts/authos-bootstrap/prepare-docker-dist.js"
   },
   "repository": {
     "type": "git",
