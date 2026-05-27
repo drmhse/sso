@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
@@ -202,6 +203,8 @@ pub async fn register(
     State(state): State<AppState>,
     Json400(req): Json400<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>> {
+    ensure_email_delivery_configured(&state, "account registration")?;
+
     // Check email rate limit BEFORE processing the request (only if rate limiting is enabled)
     // Rate limiting is disabled when DISABLE_RATE_LIMITING=true is set
     if std::env::var("DISABLE_RATE_LIMITING")
@@ -928,6 +931,8 @@ pub async fn forgot_password(
     State(state): State<AppState>,
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResponse>> {
+    ensure_email_delivery_configured(&state, "password reset emails")?;
+
     // Check email rate limit BEFORE processing the request (only if rate limiting is enabled)
     // Rate limiting is disabled when DISABLE_RATE_LIMITING=true is set
     if std::env::var("DISABLE_RATE_LIMITING")
@@ -1102,6 +1107,8 @@ pub async fn resend_verification(
     State(state): State<AppState>,
     Json(req): Json<ResendVerificationRequest>,
 ) -> Result<Json<ResendVerificationResponse>> {
+    ensure_email_delivery_configured(&state, "verification emails")?;
+
     // Check email rate limit
     if std::env::var("DISABLE_RATE_LIMITING")
         .unwrap_or_default()

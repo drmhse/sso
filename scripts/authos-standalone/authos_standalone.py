@@ -13,6 +13,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from urllib.parse import quote, urlsplit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +34,13 @@ APPLY_PATH_UNIT_PATH = Path("/etc/systemd/system/authos-apply.path")
 CADDY_ROOT = Path("/etc/caddy")
 CADDY_SITE_DIR = CADDY_ROOT / "sites-enabled"
 CADDY_SITE_PATH = CADDY_SITE_DIR / "authos.caddy"
+RESERVED_ORG_SLUGS = {
+    "api", "www", "mail", "ftp", "admin", "root", "support", "help", "docs", "blog", "news",
+    "status", "health", "ping", "cdn", "assets", "static",
+}
+VALID_SERVICE_TYPES = {"web", "mobile", "desktop", "api"}
+ORG_SLUG_RE = re.compile(r"^[a-z0-9_-]{3,50}$")
+SERVICE_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 
 def main() -> int:
@@ -114,6 +123,7 @@ def apply(bundle_dir: Path, print_link: bool, start_service: bool) -> None:
 
     install_state = load_install_state()
     config = normalize_config(load_json(current_paths["config_path"]), install_state=install_state)
+    validate_managed_config(config)
     paths = current_paths
     ensure_dir(paths["sqlite_dir"], mode=0o700)
     chown_path(paths["sqlite_dir"], AUTHOS_USER, AUTHOS_USER)
@@ -148,19 +158,26 @@ def apply(bundle_dir: Path, print_link: bool, start_service: bool) -> None:
     remove_legacy_sudoers()
     configure_caddy(config, paths)
 
+    provision_report = []
+
     if start_service:
         run(["systemctl", "restart", "authos.service"])
         wait_for_systemd("authos.service")
+        wait_for_http_readiness(config["deployment"]["baseUrl"])
+        provision_report = provision_resources(config, state, paths)
 
     login_url = bootstrap_login_url(config, state)
-    write_status(paths["status_path"], {
+    status_payload = {
         "status": "success",
         "message": "AuthOS configuration applied successfully.",
         "updated_at": now_rfc3339(),
         "public_url": config["deployment"]["platformBaseUrl"],
         "config_path": str(paths["config_path"]),
         "login_url": login_url,
-    })
+    }
+    if provision_report:
+        status_payload["provisioning"] = provision_report
+    write_status(paths["status_path"], status_payload)
 
     if print_link:
         print("")
@@ -344,6 +361,50 @@ def normalize_config(config: dict, install_state: dict | None = None) -> dict:
     return config
 
 
+def validate_managed_config(config: dict) -> None:
+    services = config.get("services") or []
+    if not isinstance(services, list):
+        raise RuntimeError("services must be an array")
+
+    seen_services: set[tuple[str, str]] = set()
+    for index, service in enumerate(services):
+        if not isinstance(service, dict):
+            raise RuntimeError(f"services[{index}] must be an object")
+
+        org_slug = str(service.get("org") or "").strip()
+        if not org_slug:
+            raise RuntimeError(f"services[{index}].org is required")
+        if not ORG_SLUG_RE.fullmatch(org_slug):
+            raise RuntimeError(
+                f"services[{index}].org must be 3-50 characters of lowercase letters, digits, hyphens, or underscores"
+            )
+        if org_slug in RESERVED_ORG_SLUGS:
+            raise RuntimeError(
+                f"services[{index}].org '{org_slug}' is reserved; choose another organization slug"
+            )
+
+        service_slug = str(service.get("service") or "").strip()
+        if not service_slug:
+            raise RuntimeError(f"services[{index}].service is required")
+        if not SERVICE_SLUG_RE.fullmatch(service_slug):
+            raise RuntimeError(
+                f"services[{index}].service must be 1-100 characters of letters, digits, hyphens, or underscores"
+            )
+
+        service_type = str(service.get("type") or "web").strip()
+        if service_type not in VALID_SERVICE_TYPES:
+            raise RuntimeError(
+                f"services[{index}].type must be one of: {', '.join(sorted(VALID_SERVICE_TYPES))}"
+            )
+
+        service_key = (org_slug, service_slug)
+        if service_key in seen_services:
+            raise RuntimeError(
+                f"services[{index}] duplicates organization/service pair '{org_slug}/{service_slug}'"
+            )
+        seen_services.add(service_key)
+
+
 def ensure_state(state: dict) -> dict:
     if state.get("version") != STATE_VERSION:
         state = {}
@@ -468,6 +529,233 @@ def build_env(config: dict, state: dict, paths: dict) -> dict:
         add_if(env, "SMTP_FROM_NAME", smtp.get("fromName"))
 
     return env
+
+
+def provision_resources(config: dict, state: dict, paths: dict) -> list[dict]:
+    services = config.get("services") or []
+    if not services:
+        return []
+
+    base_url = config["deployment"]["baseUrl"]
+    token = acquire_management_token(base_url, state, paths)
+    client = StandaloneAuthOsClient(base_url, token)
+    report = []
+
+    for service in services:
+        try:
+            organization_status = ensure_organization(client, service["org"], service.get("orgName") or service["org"])
+            service_result = ensure_service(client, service)
+            api_keys = []
+            for api_key in service.get("apiKeys") or []:
+                api_keys.append(ensure_api_key(client, paths, service, api_key))
+            report.append({
+                "org": service["org"],
+                "organizationStatus": organization_status,
+                "service": service["service"],
+                "serviceStatus": service_result["status"],
+                "clientId": service_result["clientId"],
+                "apiKeys": api_keys,
+            })
+        except Exception as exc:
+            raise RuntimeError(
+                f"Provisioning failed for services entry '{service.get('org', '?')}/{service.get('service', '?')}': {exc}"
+            ) from exc
+
+    return report
+
+
+def acquire_management_token(base_url: str, state: dict, paths: dict) -> str:
+    original_bootstrap = json.loads(json.dumps(state.get("bootstrap_login") or {}))
+    temporary_bootstrap = {
+        "token": secrets.token_urlsafe(32),
+        "created_at": now_rfc3339(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        "used_at": None,
+    }
+
+    state["bootstrap_login"] = temporary_bootstrap
+    persist_state(paths, state)
+
+    try:
+        response = request_json(
+            f"{base_url}/api/public/bootstrap-login",
+            method="POST",
+            body={"token": temporary_bootstrap["token"]},
+        )
+        access_token = str(response.get("access_token") or "").strip()
+        if not access_token:
+            raise RuntimeError("Bootstrap login did not return an access token")
+        return access_token
+    finally:
+        state["bootstrap_login"] = original_bootstrap
+        persist_state(paths, state)
+
+
+class StandaloneAuthOsClient:
+    def __init__(self, base_url: str, token: str):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+
+    def request(self, pathname: str, method: str = "GET", body=None):
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {self.token}",
+        }
+        if body is not None:
+            headers["content-type"] = "application/json"
+        return request_json(f"{self.base_url}{pathname}", method=method, headers=headers, body=body)
+
+
+def ensure_organization(client: "StandaloneAuthOsClient", org_slug: str, org_name: str) -> str:
+    organization = None
+    status = "unchanged"
+
+    try:
+        response = client.request(f"/api/organizations/{quote(org_slug)}")
+        organization = response.get("organization") or response
+    except StandaloneHttpError as error:
+        if error.status != 404:
+            raise
+
+    if not organization:
+        response = client.request(
+            "/api/organizations",
+            method="POST",
+            body={"slug": org_slug, "name": org_name},
+        )
+        organization = response.get("organization") or response
+        status = "created"
+
+    org_status = organization.get("status")
+    org_id = organization.get("id")
+
+    if org_status == "pending" and org_id:
+        client.request(
+            f"/api/platform/organizations/{quote(org_id)}/approve",
+            method="POST",
+            body={"tier_id": organization.get("tier_id") or "tier_free"},
+        )
+        return "created+approved" if status == "created" else "approved"
+
+    if org_status == "suspended" and org_id:
+        client.request(
+            f"/api/platform/organizations/{quote(org_id)}/activate",
+            method="POST",
+            body={},
+        )
+        return "activated"
+
+    return status
+
+
+def ensure_service(client: "StandaloneAuthOsClient", service: dict) -> dict:
+    existing = find_service(client, service["org"], service["service"])
+    desired = {
+        "slug": service["service"],
+        "name": service.get("name") or service["service"],
+        "service_type": service.get("type") or "web",
+        "redirect_uris": service.get("redirectUris") or [],
+        "github_scopes": service.get("githubScopes") or [],
+    }
+
+    if not existing:
+        response = client.request(
+            f"/api/organizations/{quote(service['org'])}/services",
+            method="POST",
+            body=desired,
+        )
+        created = response.get("service") or response
+        return {
+            "status": "created",
+            "clientId": created.get("client_id") or "",
+        }
+
+    needs_update = (
+        existing.get("name") != desired["name"]
+        or existing.get("service_type") != desired["service_type"]
+        or not same_string_set(existing.get("redirect_uris") or [], desired["redirect_uris"])
+        or not same_string_set(existing.get("github_scopes") or [], desired["github_scopes"])
+    )
+    if not needs_update:
+        return {
+            "status": "unchanged",
+            "clientId": existing.get("client_id") or "",
+        }
+
+    updated = client.request(
+        f"/api/organizations/{quote(service['org'])}/services/{quote(service['service'])}",
+        method="PATCH",
+        body=desired,
+    )
+    return {
+        "status": "updated",
+        "clientId": updated.get("client_id") or existing.get("client_id") or "",
+    }
+
+
+def find_service(client: "StandaloneAuthOsClient", org_slug: str, service_slug: str):
+    response = client.request(f"/api/organizations/{quote(org_slug)}/services")
+    for candidate in response.get("services") or []:
+        if candidate.get("slug") == service_slug:
+            return candidate
+    return None
+
+
+def ensure_api_key(client: "StandaloneAuthOsClient", paths: dict, service: dict, api_key: dict) -> dict:
+    name = str(api_key.get("name") or "").strip()
+    if not name:
+        raise RuntimeError(f"Service {service['org']}/{service['service']} has an apiKeys[] entry without name")
+
+    list_response = client.request(
+        f"/api/organizations/{quote(service['org'])}/services/{quote(service['service'])}/api-keys"
+    )
+    for candidate in list_response.get("api_keys") or []:
+        if candidate.get("name") == name and not api_key.get("forceNew"):
+            return {
+                "name": name,
+                "status": "existing",
+                "prefix": candidate.get("prefix") or "",
+            }
+
+    write_to = str(api_key.get("writeTo") or "").strip()
+    if not write_to:
+        raise RuntimeError(
+            f"API key {name} needs writeTo because new API key secrets are shown once"
+        )
+
+    created = client.request(
+        f"/api/organizations/{quote(service['org'])}/services/{quote(service['service'])}/api-keys",
+        method="POST",
+        body={
+            "name": name,
+            "permissions": api_key.get("permissions") or [],
+        },
+    )
+
+    target = resolve_output_path(paths["data_dir"], write_to)
+    ensure_dir(target.parent, mode=0o700)
+    target.write_text(f"AUTHOS_API_KEY={created['key']}\n", encoding="utf-8")
+    os.chmod(target, 0o600)
+    chown_path(target, AUTHOS_USER, AUTHOS_USER)
+    return {
+        "name": name,
+        "status": "created",
+        "prefix": created.get("prefix") or "",
+        "writtenTo": str(target),
+    }
+
+
+def resolve_output_path(data_dir: Path, write_to: str) -> Path:
+    target = Path(write_to)
+    if target.is_absolute():
+        return target
+    return (data_dir / target).resolve()
+
+
+def same_string_set(left: list[str], right: list[str]) -> bool:
+    if len(left) != len(right):
+        return False
+    return set(left) == set(right)
 
 
 def rewrite_managed_service_redirects(services: list[dict], previous_public_urls: set[str], base_url: str) -> None:
@@ -766,6 +1054,11 @@ def write_json(path: Path, value, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def persist_state(paths: dict, state: dict) -> None:
+    write_json(paths["state_path"], state, mode=0o640)
+    chown_path(paths["state_path"], AUTHOS_USER, AUTHOS_USER)
+
+
 def write_env(path: Path, values: dict, mode: int) -> None:
     lines = ["# Generated by AuthOS standalone apply. Edit config.json and rerun authos-apply instead."]
     for key in sorted(values.keys()):
@@ -803,6 +1096,60 @@ def detect_primary_ip() -> str:
         pass
 
     return "127.0.0.1"
+
+
+def wait_for_http_readiness(base_url: str) -> None:
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=90)
+    last_error = "service did not respond"
+    ready_url = f"{base_url.rstrip('/')}/health/ready"
+
+    while datetime.now(timezone.utc) < deadline:
+        try:
+            payload = request_json(ready_url, method="GET")
+            if payload.get("status") == "ready":
+                return
+            last_error = json.dumps(payload)
+        except Exception as exc:
+            last_error = str(exc)
+        time_sleep(2)
+
+    raise RuntimeError(f"Timed out waiting for {ready_url}. Last error: {last_error}")
+
+
+class StandaloneHttpError(RuntimeError):
+    def __init__(self, status: int, response_text: str):
+        super().__init__(f"HTTP {status}: {response_text}")
+        self.status = status
+        self.response_text = response_text
+
+
+def request_json(url: str, method: str = "GET", headers: dict | None = None, body=None):
+    payload = None
+    request_headers = dict(headers or {})
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        request_headers.setdefault("content-type", "application/json")
+    request_headers.setdefault("accept", "application/json")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method=method,
+        headers=request_headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw = response.read().decode("utf-8")
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise StandaloneHttpError(exc.code, raw) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Request failed for {url}: {exc}") from exc
 
 
 def wait_for_systemd(service_name: str) -> None:

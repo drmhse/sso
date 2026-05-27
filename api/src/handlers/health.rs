@@ -4,6 +4,8 @@ use axum::Json;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Serialize;
 
+const BUILD_VERSION: &str = env!("AUTHOS_BUILD_VERSION");
+
 #[derive(Serialize)]
 pub struct HealthResponse {
     status: &'static str,
@@ -24,7 +26,7 @@ pub async fn health() -> (StatusCode, Json<HealthResponse>) {
         StatusCode::OK,
         Json(HealthResponse {
             status: "healthy",
-            version: env!("CARGO_PKG_VERSION"),
+            version: BUILD_VERSION,
         }),
     )
 }
@@ -52,7 +54,7 @@ pub async fn readiness(db: State<DatabaseConnection>) -> (StatusCode, Json<Readi
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ReadinessResponse {
                     status: "unhealthy",
-                    version: env!("CARGO_PKG_VERSION"),
+                    version: BUILD_VERSION,
                     database: "disconnected",
                 }),
             )
@@ -63,7 +65,7 @@ pub async fn readiness(db: State<DatabaseConnection>) -> (StatusCode, Json<Readi
         StatusCode::OK,
         Json(ReadinessResponse {
             status: "ready",
-            version: env!("CARGO_PKG_VERSION"),
+            version: BUILD_VERSION,
             database: db_status,
         }),
     )

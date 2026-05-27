@@ -1,52 +1,53 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack">
-      <div>
-        <div class="eyebrow">Set a new password</div>
-        <h1 class="title">Choose a new password</h1>
-        <p class="muted">This link expires after one hour.</p>
-      </div>
-
+  <AuthShell title="Choose a new password" description="This reset link expires after one hour.">
+    <div class="stack">
       <div v-if="message" class="alert alert-success">{{ message }}</div>
       <div v-if="errorMessage" class="alert alert-error">{{ errorMessage }}</div>
 
       <template v-if="token">
         <div class="field">
           <label for="password">New password</label>
-          <input id="password" v-model="password" type="password" class="input" placeholder="Minimum 8 characters" />
+          <input id="password" v-model="password" type="password" class="input input-lg" placeholder="Minimum 8 characters" />
         </div>
 
         <div class="field">
           <label for="confirm-password">Confirm password</label>
-          <input id="confirm-password" v-model="confirmPassword" type="password" class="input" placeholder="Repeat your password" />
+          <input id="confirm-password" v-model="confirmPassword" type="password" class="input input-lg" placeholder="Repeat your password" />
         </div>
 
-        <BaseButton :loading="loading" @click="handleSubmit">Reset password</BaseButton>
+        <BaseButton :loading="loading" block @click="handleSubmit">Reset password</BaseButton>
       </template>
 
       <div v-else class="alert alert-error">This reset link is invalid or missing its token.</div>
 
-      <p class="muted">
+      <p class="muted auth-centered-copy">
         <router-link :to="authRouteWithContext(route, '/')">Back to sign in</router-link>
       </p>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
-import { computed, ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { sso } from '@/lib/api';
+import AuthShell from '@/components/AuthShell.vue';
 import BaseButton from '@/components/BaseButton.vue';
+import { sso } from '@/lib/api';
 import { authRouteWithContext } from '@/utils/authFlowContext';
+import { scrubCurrentUrl } from '@/utils/urlSecurity';
 
 const route = useRoute();
-const token = computed(() => Array.isArray(route.query.token) ? route.query.token[0] : route.query.token);
+const token = ref(Array.isArray(route.query.token) ? route.query.token[0] : route.query.token);
 const password = ref('');
 const confirmPassword = ref('');
 const loading = ref(false);
 const message = ref('');
 const errorMessage = ref('');
+
+onMounted(() => {
+  if (!token.value) return;
+  scrubCurrentUrl({ queryKeys: ['token'] });
+});
 
 async function handleSubmit() {
   if (!token.value || password.value.length < 8 || password.value !== confirmPassword.value) {

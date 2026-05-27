@@ -1,34 +1,31 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack">
-      <div>
-        <div class="eyebrow">Support</div>
-        <h1 class="title">Need help signing in?</h1>
-        <p class="muted">
-          Contact your organization owner or support operator to recover access, reset MFA, or verify your account setup.
-        </p>
-      </div>
-
-      <div class="meta-grid">
-        <div class="meta-item">
-          <div class="meta-label">Common issues</div>
-          <div class="meta-value" style="font-size: 1rem;">Lost authenticator, expired invitation, or missing redirect URI.</div>
+  <AuthShell
+    title="Need help signing in?"
+    description="Contact your organization owner or support operator to recover access, reset MFA, or verify your account setup."
+  >
+    <div class="stack">
+      <div class="workspace-action-list">
+        <div class="workspace-action-card">
+          <div class="workspace-action-card__title">Common issues</div>
+          <div class="workspace-action-card__copy">Lost authenticator device, expired invitation, or a missing redirect URL.</div>
         </div>
-        <div class="meta-item">
-          <div class="meta-label">Next step</div>
-          <div class="meta-value" style="font-size: 1rem;">Return to sign in or ask your operator to review the organization settings.</div>
+
+        <div class="workspace-action-card">
+          <div class="workspace-action-card__title">Next step</div>
+          <div class="workspace-action-card__copy">Return to sign in or ask an operator to review your organization settings.</div>
         </div>
       </div>
 
-      <p class="muted">
+      <p class="muted auth-centered-copy">
         <router-link :to="authRouteWithContext(route, '/')">Back to sign in</router-link>
       </p>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
 import { useRoute } from 'vue-router';
+import AuthShell from '@/components/AuthShell.vue';
 import { authRouteWithContext } from '@/utils/authFlowContext';
 
 const route = useRoute();

@@ -14,6 +14,10 @@ export function storePostLoginRedirect(value) {
   return redirect;
 }
 
+export function clearPostLoginRedirect() {
+  sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
+}
+
 export function takePostLoginRedirect() {
   const redirect = normalizeInternalRedirect(sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY));
   sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
@@ -21,7 +25,7 @@ export function takePostLoginRedirect() {
 }
 
 export function defaultAuthenticatedRoute() {
-  return '/app';
+  return '/app/overview';
 }
 
 export function postLoginRedirect(route) {

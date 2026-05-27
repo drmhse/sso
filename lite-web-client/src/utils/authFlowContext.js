@@ -22,6 +22,10 @@ export function getAuthFlowContext(route) {
   };
 }
 
+export function hasServiceAuthContext(route) {
+  return getAuthFlowContext(route).isServiceFlow;
+}
+
 export function authRouteWithContext(route, path) {
   const ctx = getAuthFlowContext(route);
   const params = new URLSearchParams();

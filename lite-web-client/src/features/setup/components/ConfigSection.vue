@@ -1,8 +1,10 @@
 <template>
-  <section class="stack">
-    <div>
-      <h3>{{ title }}</h3>
+  <section class="workspace-card stack">
+    <div class="section-header">
+      <div>
+      <h3 class="section-title">{{ title }}</h3>
       <p v-if="description" class="muted">{{ description }}</p>
+      </div>
     </div>
     <slot />
   </section>

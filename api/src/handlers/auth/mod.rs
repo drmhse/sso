@@ -10,6 +10,7 @@
 // - magic: Passwordless magic link authentication
 
 pub mod device;
+pub(crate) mod email_delivery;
 pub mod hrd;
 pub mod magic;
 pub mod mfa;

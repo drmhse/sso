@@ -55,6 +55,8 @@ jobs:
         run: npm ci
 
       - name: Build standalone bundle
+        env:
+          AUTHOS_BUILD_VERSION: ${{ github.ref_name }}
         run: npm run authos:binary -- --backend sqlite --platform ${{ matrix.platform }}
 
       - name: Generate checksum

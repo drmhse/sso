@@ -1,51 +1,49 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack">
-      <div>
-        <div class="eyebrow">Create account</div>
-        <h1 class="title">Join AuthOS</h1>
-        <p class="muted">Create an account for hosted sign-in and your organization workspace.</p>
+  <AuthShell
+    title="Create your account"
+    description="Create an AuthOS operator account for hosted sign-in and your organization workspace."
+  >
+    <div class="stack">
+      <div class="auth-provider-grid">
+        <BaseButton variant="secondary" block @click="handleOAuthRegister('github')">GitHub</BaseButton>
+        <BaseButton variant="secondary" block @click="handleOAuthRegister('google')">Google</BaseButton>
+        <BaseButton variant="secondary" block @click="handleOAuthRegister('microsoft')">Microsoft</BaseButton>
       </div>
 
       <div v-if="message" class="alert alert-success">{{ message }}</div>
       <div v-if="errorMessage" class="alert alert-error">{{ errorMessage }}</div>
 
-      <div class="button-row">
-        <BaseButton variant="secondary" @click="handleOAuthRegister('github')">GitHub</BaseButton>
-        <BaseButton variant="secondary" @click="handleOAuthRegister('google')">Google</BaseButton>
-        <BaseButton variant="secondary" @click="handleOAuthRegister('microsoft')">Microsoft</BaseButton>
-      </div>
-
       <div class="field">
         <label for="email">Email address</label>
-        <input id="email" v-model="email" type="email" class="input" placeholder="name@company.com" />
+        <input id="email" v-model="email" type="email" class="input input-lg" placeholder="name@company.com" />
       </div>
 
       <div class="field">
         <label for="password">Password</label>
-        <input id="password" v-model="password" type="password" class="input" placeholder="Minimum 8 characters" />
+        <input id="password" v-model="password" type="password" class="input input-lg" placeholder="Minimum 8 characters" />
       </div>
 
       <div class="field">
         <label for="confirm-password">Confirm password</label>
-        <input id="confirm-password" v-model="confirmPassword" type="password" class="input" placeholder="Repeat your password" />
+        <input id="confirm-password" v-model="confirmPassword" type="password" class="input input-lg" placeholder="Repeat your password" />
       </div>
 
-      <BaseButton :loading="loading" @click="handlePasswordRegister">Create account</BaseButton>
+      <BaseButton :loading="loading" block @click="handlePasswordRegister">Create account</BaseButton>
 
-      <p class="muted">
+      <p class="muted auth-centered-copy">
         Already have an account?
         <router-link :to="authRouteWithContext(route, '/')">Sign in</router-link>.
       </p>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
 import { ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { sso } from '@/lib/api';
+import AuthShell from '@/components/AuthShell.vue';
 import BaseButton from '@/components/BaseButton.vue';
+import { sso } from '@/lib/api';
 import { authRouteWithContext, getAuthFlowContext } from '@/utils/authFlowContext';
 
 const route = useRoute();
@@ -92,8 +90,8 @@ async function handlePasswordRegister() {
       payload.redirect_uri = ctx.redirectUri;
     }
 
-    await sso.auth.register(payload);
-    message.value = `Verification email sent to ${email.value}.`;
+    const response = await sso.auth.register(payload);
+    message.value = response?.message || `Verification email sent to ${email.value}.`;
   } catch (error) {
     errorMessage.value = error.message || 'Registration failed.';
   } finally {

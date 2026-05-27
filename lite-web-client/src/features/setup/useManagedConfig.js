@@ -105,13 +105,13 @@ export function useManagedConfig() {
       const recovery = await waitForServiceRecovery(window.location.origin, targetUrl);
 
       if (recovery.targetReady) {
-        window.location.href = `${targetUrl}/app#setup`;
+        window.location.href = `${targetUrl}/app/platform-setup`;
         return;
       }
 
       await loadConfig();
       messageType.value = 'success';
-      message.value = `AuthOS restarted. Finish bringing ${targetUrl} online, then open ${targetUrl}/app#setup.`;
+      message.value = `AuthOS restarted. Finish bringing ${targetUrl} online, then open ${targetUrl}/app/platform-setup.`;
     } catch (error) {
       messageType.value = 'error';
       message.value = error.message || 'Failed to apply the managed config.';

@@ -1,4 +1,5 @@
 use crate::error::{AppError, Result};
+use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
@@ -147,6 +148,8 @@ pub async fn request_magic_link(
     Extension(_request_info): Extension<RequestInfo>,
     Json(req): Json<MagicLinkRequest>,
 ) -> Result<Json<MagicLinkResponse>> {
+    ensure_email_delivery_configured(&state, "magic-link sign-in")?;
+
     // Validate email format
     if req.email.is_empty() || !req.email.contains('@') {
         return Err(AppError::BadRequest("Invalid email format".to_string()));
@@ -334,10 +337,17 @@ pub async fn verify_magic_link(
         parse_magic_context(&magic_link.context);
     let org_slug = org_slug_owned.as_deref();
     let service_slug = service_slug_owned.as_deref();
-    let redirect_uri = query
-        .redirect_uri
-        .as_deref()
-        .or(context_redirect_uri.as_deref());
+    let redirect_uri = match (context_redirect_uri.as_deref(), query.redirect_uri.as_deref()) {
+        (Some(bound_redirect_uri), Some(requested_redirect_uri))
+            if requested_redirect_uri != bound_redirect_uri =>
+        {
+            return Err(AppError::BadRequest(
+                "redirect_uri does not match the issued magic link".to_string(),
+            ));
+        }
+        (Some(bound_redirect_uri), _) => Some(bound_redirect_uri),
+        (None, requested_redirect_uri) => requested_redirect_uri,
+    };
 
     if service_slug.is_some() && org_slug.is_none() {
         return Err(AppError::BadRequest(

@@ -1,19 +1,63 @@
 import { defineStore } from 'pinia';
 import router from '@/router';
 import { sso } from '@/lib/api';
+import { useAuthFlowStore } from '@/stores/authFlow';
+import { clearPostLoginRedirect, storePostLoginRedirect } from '@/utils/redirects';
 import { decodeJwt, isTokenExpired } from '@/utils/jwt';
+
+function canUseLocalStorage(method = 'getItem') {
+  return typeof localStorage !== 'undefined' && typeof localStorage[method] === 'function';
+}
+
+function storageGet(key, fallback = null) {
+  if (!canUseLocalStorage('getItem')) {
+    return fallback;
+  }
+
+  const value = localStorage.getItem(key);
+  return value ?? fallback;
+}
+
+function storageSet(key, value) {
+  if (!canUseLocalStorage('setItem')) {
+    return;
+  }
+
+  localStorage.setItem(key, value);
+}
+
+function storageRemove(key) {
+  if (!canUseLocalStorage('removeItem')) {
+    return;
+  }
+
+  localStorage.removeItem(key);
+}
+
+function storageJsonGet(key, fallback) {
+  const raw = storageGet(key);
+  if (!raw) {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    return fallback;
+  }
+}
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
-    token: localStorage.getItem('sso_access_token') || null,
-    refreshToken: localStorage.getItem('sso_refresh_token') || null,
-    user: JSON.parse(localStorage.getItem('sso_user') || 'null'),
-    claims: JSON.parse(localStorage.getItem('sso_claims') || 'null'),
-    status: localStorage.getItem('sso_status') || 'idle',
-    permissions: JSON.parse(localStorage.getItem('sso_permissions') || '[]'),
-    plan: localStorage.getItem('sso_plan') || null,
-    features: JSON.parse(localStorage.getItem('sso_features') || '[]'),
-    activeOrgRole: localStorage.getItem('sso_active_org_role') || null,
+    token: storageGet('sso_access_token'),
+    refreshToken: storageGet('sso_refresh_token'),
+    user: storageJsonGet('sso_user', null),
+    claims: storageJsonGet('sso_claims', null),
+    status: storageGet('sso_status', 'idle'),
+    permissions: storageJsonGet('sso_permissions', []),
+    plan: storageGet('sso_plan'),
+    features: storageJsonGet('sso_features', []),
+    activeOrgRole: storageGet('sso_active_org_role'),
   }),
 
   getters: {
@@ -29,11 +73,11 @@ export const useAuthStore = defineStore('auth', {
 
   actions: {
     async initializeAuth() {
-      const token = localStorage.getItem('sso_access_token');
+      const token = storageGet('sso_access_token');
       if (!token || isTokenExpired(token)) {
         this.clearAuth();
         this.status = 'idle';
-        localStorage.setItem('sso_status', 'idle');
+        storageSet('sso_status', 'idle');
         return;
       }
 
@@ -41,16 +85,16 @@ export const useAuthStore = defineStore('auth', {
       this.claims = decodeJwt(token);
       sso.setAuthToken(token);
 
-      const cachedStatus = localStorage.getItem('sso_status');
-      const cachedUser = localStorage.getItem('sso_user');
+      const cachedStatus = storageGet('sso_status');
+      const cachedUser = storageGet('sso_user');
       if (cachedStatus === 'authenticated' && cachedUser) {
-        this.user = JSON.parse(cachedUser);
+        this.user = storageJsonGet('sso_user', null);
         this.status = 'authenticated';
         return;
       }
 
       this.status = 'loading';
-      localStorage.setItem('sso_status', 'loading');
+      storageSet('sso_status', 'loading');
 
       try {
         const userData = await sso.user.getProfile();
@@ -58,12 +102,12 @@ export const useAuthStore = defineStore('auth', {
         this.permissions = userData.permissions || [];
         this.plan = userData.plan || null;
         this.features = userData.features || [];
-        localStorage.setItem('sso_user', JSON.stringify(userData));
-        localStorage.setItem('sso_permissions', JSON.stringify(this.permissions));
-        localStorage.setItem('sso_plan', this.plan || '');
-        localStorage.setItem('sso_features', JSON.stringify(this.features));
+        storageSet('sso_user', JSON.stringify(userData));
+        storageSet('sso_permissions', JSON.stringify(this.permissions));
+        storageSet('sso_plan', this.plan || '');
+        storageSet('sso_features', JSON.stringify(this.features));
         this.status = 'authenticated';
-        localStorage.setItem('sso_status', 'authenticated');
+        storageSet('sso_status', 'authenticated');
       } catch (error) {
         this.handleAuthError(error);
       }
@@ -75,16 +119,16 @@ export const useAuthStore = defineStore('auth', {
       }
 
       this.status = 'loading';
-      localStorage.setItem('sso_status', 'loading');
+      storageSet('sso_status', 'loading');
       this.token = accessToken;
       this.refreshToken = refreshToken;
       this.claims = decodeJwt(accessToken);
       this.activeOrgRole = null;
 
-      localStorage.setItem('sso_access_token', accessToken);
-      localStorage.setItem('sso_refresh_token', refreshToken);
-      localStorage.setItem('sso_claims', JSON.stringify(this.claims));
-      localStorage.removeItem('sso_active_org_role');
+      storageSet('sso_access_token', accessToken);
+      storageSet('sso_refresh_token', refreshToken);
+      storageSet('sso_claims', JSON.stringify(this.claims));
+      storageRemove('sso_active_org_role');
 
       await sso.setSession({
         access_token: accessToken,
@@ -96,12 +140,12 @@ export const useAuthStore = defineStore('auth', {
       this.permissions = userData.permissions || [];
       this.plan = userData.plan || null;
       this.features = userData.features || [];
-      localStorage.setItem('sso_user', JSON.stringify(userData));
-      localStorage.setItem('sso_permissions', JSON.stringify(this.permissions));
-      localStorage.setItem('sso_plan', this.plan || '');
-      localStorage.setItem('sso_features', JSON.stringify(this.features));
+      storageSet('sso_user', JSON.stringify(userData));
+      storageSet('sso_permissions', JSON.stringify(this.permissions));
+      storageSet('sso_plan', this.plan || '');
+      storageSet('sso_features', JSON.stringify(this.features));
       this.status = 'authenticated';
-      localStorage.setItem('sso_status', 'authenticated');
+      storageSet('sso_status', 'authenticated');
     },
 
     async completeMfaChallenge(preauthToken, code, deviceCodeId = null) {
@@ -116,10 +160,10 @@ export const useAuthStore = defineStore('auth', {
       this.permissions = userData.permissions || [];
       this.plan = userData.plan || null;
       this.features = userData.features || [];
-      localStorage.setItem('sso_user', JSON.stringify(userData));
-      localStorage.setItem('sso_permissions', JSON.stringify(this.permissions));
-      localStorage.setItem('sso_plan', this.plan || '');
-      localStorage.setItem('sso_features', JSON.stringify(this.features));
+      storageSet('sso_user', JSON.stringify(userData));
+      storageSet('sso_permissions', JSON.stringify(this.permissions));
+      storageSet('sso_plan', this.plan || '');
+      storageSet('sso_features', JSON.stringify(this.features));
     },
 
     async updateTokens(accessToken, refreshToken, role = null) {
@@ -127,10 +171,10 @@ export const useAuthStore = defineStore('auth', {
       this.refreshToken = refreshToken;
       this.claims = decodeJwt(accessToken);
       this.activeOrgRole = role;
-      localStorage.setItem('sso_access_token', accessToken);
-      localStorage.setItem('sso_refresh_token', refreshToken);
-      localStorage.setItem('sso_claims', JSON.stringify(this.claims));
-      if (role) localStorage.setItem('sso_active_org_role', role);
+      storageSet('sso_access_token', accessToken);
+      storageSet('sso_refresh_token', refreshToken);
+      storageSet('sso_claims', JSON.stringify(this.claims));
+      if (role) storageSet('sso_active_org_role', role);
       sso.setAuthToken(accessToken);
       await sso.setSession({
         access_token: accessToken,
@@ -145,23 +189,24 @@ export const useAuthStore = defineStore('auth', {
       this.token = response.access_token;
       this.refreshToken = response.refresh_token;
       this.claims = decodeJwt(response.access_token);
-      localStorage.setItem('sso_access_token', response.access_token);
-      localStorage.setItem('sso_refresh_token', response.refresh_token);
-      localStorage.setItem('sso_claims', JSON.stringify(this.claims));
+      storageSet('sso_access_token', response.access_token);
+      storageSet('sso_refresh_token', response.refresh_token);
+      storageSet('sso_claims', JSON.stringify(this.claims));
       sso.setAuthToken(response.access_token);
       return response;
     },
 
     clearAuth() {
-      localStorage.removeItem('sso_access_token');
-      localStorage.removeItem('sso_refresh_token');
-      localStorage.removeItem('sso_user');
-      localStorage.removeItem('sso_claims');
-      localStorage.removeItem('sso_status');
-      localStorage.removeItem('sso_permissions');
-      localStorage.removeItem('sso_plan');
-      localStorage.removeItem('sso_features');
-      localStorage.removeItem('sso_active_org_role');
+      const authFlowStore = useAuthFlowStore();
+      storageRemove('sso_access_token');
+      storageRemove('sso_refresh_token');
+      storageRemove('sso_user');
+      storageRemove('sso_claims');
+      storageRemove('sso_status');
+      storageRemove('sso_permissions');
+      storageRemove('sso_plan');
+      storageRemove('sso_features');
+      storageRemove('sso_active_org_role');
       this.token = null;
       this.refreshToken = null;
       this.user = null;
@@ -170,6 +215,8 @@ export const useAuthStore = defineStore('auth', {
       this.plan = null;
       this.features = [];
       this.activeOrgRole = null;
+      authFlowStore.clearMfaChallenge();
+      clearPostLoginRedirect();
       sso.setAuthToken(null);
     },
 
@@ -181,7 +228,7 @@ export const useAuthStore = defineStore('auth', {
       } finally {
         this.clearAuth();
         this.status = 'idle';
-        localStorage.setItem('sso_status', 'idle');
+        storageSet('sso_status', 'idle');
       }
     },
 
@@ -189,14 +236,14 @@ export const useAuthStore = defineStore('auth', {
       console.error('Auth error:', error);
       this.clearAuth();
       this.status = 'idle';
-      localStorage.setItem('sso_status', 'idle');
+      storageSet('sso_status', 'idle');
 
       if (router.currentRoute.value.path !== '/') {
+        storePostLoginRedirect(router.currentRoute.value.fullPath);
         router.push({
           path: '/',
           query: {
             error: 'session_expired',
-            redirect: router.currentRoute.value.fullPath,
           },
         });
       }

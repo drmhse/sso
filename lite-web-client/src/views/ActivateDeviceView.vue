@@ -1,12 +1,6 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack">
-      <div>
-        <div class="eyebrow">Device flow</div>
-        <h1 class="title">{{ heading }}</h1>
-        <p class="muted">{{ description }}</p>
-      </div>
-
+  <AuthShell :title="heading" :description="description">
+    <div class="stack">
       <div v-if="errorMessage" class="alert alert-error">{{ errorMessage }}</div>
       <div v-if="successMessage" class="alert alert-success">{{ successMessage }}</div>
 
@@ -16,93 +10,66 @@
         </div>
       </template>
 
-      <template v-else-if="!loginContext && !isMfaState">
+      <template v-else-if="!loginContext">
         <div class="field">
           <label for="device-code">Activation code</label>
           <input
             id="device-code"
             v-model="userCode"
-            class="input code"
+            class="input input-code"
             maxlength="9"
             placeholder="ABCD-1234"
             @input="normalizeCode"
           />
         </div>
-        <BaseButton :loading="loading" @click="verifyCode">Continue</BaseButton>
+        <BaseButton :loading="loading" block @click="verifyCode">Continue</BaseButton>
       </template>
 
-      <template v-else-if="loginContext">
+      <template v-else>
         <div class="alert alert-warning">
           Continue sign-in for <strong>{{ loginContext.service_slug }}</strong> in <strong>{{ loginContext.org_slug }}</strong>.
         </div>
-        <div class="button-row">
-          <BaseButton v-for="provider in loginContext.available_providers" :key="provider" variant="secondary" @click="handleLogin(provider)">
+        <div class="auth-provider-grid">
+          <BaseButton
+            v-for="provider in loginContext.available_providers"
+            :key="provider"
+            variant="secondary"
+            block
+            @click="handleLogin(provider)"
+          >
             {{ providerLabel(provider) }}
           </BaseButton>
         </div>
       </template>
     </div>
-
-    <MfaChallengeModal
-      :is-open="showMfaChallenge"
-      :preauth-token="preauthToken"
-      :device-code-id="deviceCodeId"
-      @success="handleMfaSuccess"
-      @close="handleMfaClose"
-      @lost-device="router.push('/support')"
-    />
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
-import { sso } from '@/lib/api';
+import { useRoute } from 'vue-router';
+import AuthShell from '@/components/AuthShell.vue';
 import BaseButton from '@/components/BaseButton.vue';
-import MfaChallengeModal from '@/components/MfaChallengeModal.vue';
+import { sso } from '@/lib/api';
 
 const route = useRoute();
-const router = useRouter();
 const userCode = ref('');
 const loading = ref(false);
 const errorMessage = ref('');
 const loginContext = ref(null);
 const successMessage = ref('');
-const showMfaChallenge = ref(false);
-const preauthToken = ref('');
-const deviceCodeId = ref(null);
 
-const isMfaState = computed(() => route.path.startsWith('/activate/mfa-challenge'));
 const isSuccessState = computed(
   () => route.path.startsWith('/activate/success') || route.query.device_flow_status === 'success',
 );
-const heading = computed(() => {
-  if (isMfaState.value) return 'Complete verification';
-  if (isSuccessState.value) return 'Device authorized';
-  return 'Authorize a device';
-});
-const description = computed(() => {
-  if (isMfaState.value) {
-    return 'Finish the sign-in with your authenticator app or a backup code.';
-  }
-  if (isSuccessState.value) {
-    return 'The device flow finished successfully.';
-  }
-  return 'Enter the code from your CLI or desktop app.';
-});
+const heading = computed(() => (isSuccessState.value ? 'Device authorized' : 'Authorize a device'));
+const description = computed(() => (
+  isSuccessState.value
+    ? 'The device flow finished successfully.'
+    : 'Enter the code from your CLI or desktop app.'
+));
 
 onMounted(() => {
-  if (isMfaState.value) {
-    preauthToken.value = String(route.query.preauth_token || '');
-    deviceCodeId.value = route.query.device_code_id ? String(route.query.device_code_id) : null;
-    if (!preauthToken.value) {
-      errorMessage.value = 'This device authorization challenge is missing its verification token.';
-      return;
-    }
-    showMfaChallenge.value = true;
-    return;
-  }
-
   if (isSuccessState.value) {
     successMessage.value = 'You can return to the waiting device now.';
   }
@@ -146,33 +113,5 @@ function handleLogin(provider) {
       });
 
   window.location.href = loginUrl;
-}
-
-async function handleMfaSuccess({ code, deviceCodeId: currentDeviceCodeId }) {
-  loading.value = true;
-  errorMessage.value = '';
-
-  try {
-    await sso.http.post('/api/auth/mfa/verify', {
-      preauth_token: preauthToken.value,
-      code,
-      ...(currentDeviceCodeId || deviceCodeId.value
-        ? { device_code_id: currentDeviceCodeId || deviceCodeId.value }
-        : {}),
-    });
-    showMfaChallenge.value = false;
-    successMessage.value = 'The device is authorized. Return to your CLI or desktop app to continue.';
-    await router.replace('/activate/success');
-  } catch (error) {
-    errorMessage.value = error.message || 'MFA verification failed.';
-    showMfaChallenge.value = true;
-  } finally {
-    loading.value = false;
-  }
-}
-
-function handleMfaClose() {
-  showMfaChallenge.value = false;
-  router.push('/activate');
 }
 </script>

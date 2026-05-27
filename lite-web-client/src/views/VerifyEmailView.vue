@@ -1,45 +1,56 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack" style="text-align: center;">
-      <div>
-        <div class="eyebrow">Email verification</div>
-        <h1 class="title">Confirming your email</h1>
-      </div>
+  <AuthShell
+    title="Confirming your email"
+    description="We’re verifying the email address attached to this AuthOS account."
+  >
+    <div class="stack">
+      <AuthStatusPanel
+        :status="loading ? 'loading' : message ? 'success' : 'error'"
+        loading-text="Verifying your email address..."
+        :success-text="message"
+        :error-text="errorMessage"
+      />
 
-      <LoadingSpinner v-if="loading" text="Verifying your email address..." />
-      <div v-else-if="message" class="alert alert-success">{{ message }}</div>
-      <div v-else class="alert alert-error">{{ errorMessage }}</div>
-
-      <p class="muted">
+      <p class="muted auth-centered-copy">
         <router-link :to="authRouteWithContext(route, '/')">Back to sign in</router-link>
       </p>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import LoadingSpinner from '@/components/LoadingSpinner.vue';
+import AuthShell from '@/components/AuthShell.vue';
+import { formatResponseErrorPayload } from '@/features/auth/errors';
+import AuthStatusPanel from '@/features/auth/components/AuthStatusPanel.vue';
 import { authRouteWithContext } from '@/utils/authFlowContext';
+import { scrubCurrentUrl } from '@/utils/urlSecurity';
 
 const route = useRoute();
 const router = useRouter();
 const loading = ref(true);
 const message = ref('');
 const errorMessage = ref('');
+const token = Array.isArray(route.query.token) ? route.query.token[0] : route.query.token;
 
 onMounted(async () => {
-  const token = Array.isArray(route.query.token) ? route.query.token[0] : route.query.token;
   if (!token) {
     loading.value = false;
     errorMessage.value = 'Missing verification token.';
     return;
   }
 
+  scrubCurrentUrl({ queryKeys: ['token'] });
+
   try {
     const response = await fetch(`/auth/verify-email?token=${encodeURIComponent(String(token))}`);
-    if (!response.ok) throw new Error(await response.text() || 'Verification failed.');
+    if (!response.ok) {
+      const rawPayload = await response.text();
+      throw new Error(
+        formatResponseErrorPayload(rawPayload, 'This verification link is invalid or expired.'),
+      );
+    }
     message.value = 'Email verified. Redirecting to sign in...';
     setTimeout(() => router.push(authRouteWithContext(route, '/')), 1400);
   } catch (error) {

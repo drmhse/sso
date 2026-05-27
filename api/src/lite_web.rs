@@ -31,6 +31,7 @@ pub fn routes(_state: &AppState) -> Router<AppState> {
         .route("/callback", get(index))
         .route("/register", get(index))
         .route("/forgot-password", get(index))
+        .route("/mfa-challenge", get(index))
         .route("/reset-password", get(index))
         .route("/verify-email", get(index))
         .route("/auth/magic-link/verify", get(index))

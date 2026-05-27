@@ -80,6 +80,9 @@ pub enum AppError {
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
 
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -144,6 +147,7 @@ impl IntoResponse for AppError {
                 (StatusCode::FORBIDDEN, "Organization is not active")
             }
             AppError::TooManyRequests(ref msg) => (StatusCode::TOO_MANY_REQUESTS, msg.as_str()),
+            AppError::ServiceUnavailable(ref msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.as_str()),
             AppError::Io(ref e) => {
                 tracing::error!("IO error: {:?}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal IO error")
@@ -163,6 +167,7 @@ impl IntoResponse for AppError {
                 AppError::OrganizationNotActive => "ORGANIZATION_NOT_ACTIVE",
                 AppError::DeviceCodeExpired => "DEVICE_CODE_EXPIRED",
                 AppError::DeviceCodePending => "DEVICE_CODE_PENDING",
+                AppError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
                 AppError::NotFound(_) => "NOT_FOUND",
                 AppError::Unauthorized(_) => "UNAUTHORIZED",
                 AppError::Forbidden(_) => "FORBIDDEN",

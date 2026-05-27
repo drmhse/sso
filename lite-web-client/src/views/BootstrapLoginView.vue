@@ -1,23 +1,22 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack">
-      <div>
-        <div class="eyebrow">Bootstrap access</div>
-        <h1 class="title">Preparing your AuthOS setup session</h1>
-        <p class="muted" style="margin: 0;">This one-time link signs in the platform owner and opens the managed setup workspace.</p>
-      </div>
-
-      <LoadingSpinner v-if="status === 'loading'" text="Signing in..." />
-      <div v-else-if="status === 'error'" class="alert alert-error">{{ errorMessage }}</div>
-      <div v-else class="alert alert-success">Signed in. Redirecting to the setup workspace…</div>
-    </div>
-  </div>
+  <AuthShell
+    title="Preparing your setup session"
+    description="This one-time link signs in the platform owner and opens the managed setup workspace."
+  >
+    <AuthStatusPanel
+      :status="status"
+      loading-text="Signing in..."
+      success-text="Signed in. Redirecting to platform setup..."
+      :error-text="errorMessage"
+    />
+  </AuthShell>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import LoadingSpinner from '@/components/LoadingSpinner.vue';
+import AuthShell from '@/components/AuthShell.vue';
+import AuthStatusPanel from '@/features/auth/components/AuthStatusPanel.vue';
 import { useAuthStore } from '@/stores/auth';
 
 const route = useRoute();
@@ -53,7 +52,7 @@ onMounted(async () => {
 
     await authStore.handleLoginCallback(payload.access_token, payload.refresh_token);
     status.value = 'success';
-    await router.replace('/app#setup');
+    await router.replace('/app/platform-setup');
   } catch (error) {
     status.value = 'error';
     errorMessage.value = error.message || 'Bootstrap login failed.';

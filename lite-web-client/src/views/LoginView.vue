@@ -1,24 +1,23 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card">
-      <div class="eyebrow">Hosted auth</div>
-      <h1 class="title">Sign in to AuthOS</h1>
-      <p class="muted">
-        The embedded client handles end-user sign-in and the single-organization workspace.
-      </p>
-      <div style="margin-top: 24px;">
-        <LiteLoginForm />
+  <AuthShell>
+    <div class="stack">
+      <LiteLoginForm />
+
+      <div class="auth-inline-links auth-inline-links--between">
+        <router-link class="text-link" :to="authRouteWithContext(route, '/activate')">
+          Device Auth
+        </router-link>
+        <router-link class="text-link" :to="authRouteWithContext(route, '/register')">
+          Create account
+        </router-link>
       </div>
-      <p class="muted" style="margin: 24px 0 0;">
-        Need an account?
-        <router-link :to="authRouteWithContext(route, '/register')">Create one here</router-link>.
-      </p>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
 import { useRoute } from 'vue-router';
+import AuthShell from '@/components/AuthShell.vue';
 import LiteLoginForm from '@/components/LiteLoginForm.vue';
 import { authRouteWithContext } from '@/utils/authFlowContext';
 

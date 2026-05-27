@@ -1,5 +1,9 @@
 export function validateManagedConfig(config) {
   const errors = [];
+  const reservedOrgSlugs = new Set([
+    'api', 'www', 'mail', 'ftp', 'admin', 'root', 'support', 'help', 'docs', 'blog', 'news',
+    'status', 'health', 'ping', 'cdn', 'assets', 'static',
+  ]);
 
   if (!isValidEmail(config.platformOwner.email)) {
     errors.push('Platform owner email must be a valid email address.');
@@ -34,23 +38,38 @@ export function validateManagedConfig(config) {
   if (config.smtp.fromEmail && !isValidEmail(config.smtp.fromEmail)) {
     errors.push('SMTP from email must be a valid email address.');
   }
+  if (config.smtp.mode === 'smtp') {
+    if (!config.smtp.host) {
+      errors.push('SMTP host is required when SMTP mode is enabled.');
+    }
+    if (!Number.isInteger(Number(config.smtp.port)) || Number(config.smtp.port) < 1 || Number(config.smtp.port) > 65535) {
+      errors.push('SMTP port must be between 1 and 65535 when SMTP mode is enabled.');
+    }
+  }
 
-  const serviceSlugs = new Set();
+  const servicePairs = new Set();
   config.services.forEach((service, index) => {
     const label = `Service ${index + 1}`;
     if (!service.org) {
       errors.push(`${label}: organization slug is required.`);
+    } else if (!/^[a-z0-9_-]{3,50}$/.test(service.org)) {
+      errors.push(`${label}: organization slug must be 3-50 lowercase letters, digits, hyphens, or underscores.`);
+    } else if (reservedOrgSlugs.has(service.org)) {
+      errors.push(`${label}: organization slug "${service.org}" is reserved.`);
     }
     if (!service.service) {
       errors.push(`${label}: application slug is required.`);
+    } else if (!/^[A-Za-z0-9_-]{1,100}$/.test(service.service)) {
+      errors.push(`${label}: application slug must be 1-100 letters, digits, hyphens, or underscores.`);
     }
     if (!service.name) {
       errors.push(`${label}: application name is required.`);
     }
-    if (serviceSlugs.has(service.service)) {
-      errors.push(`${label}: application slug must be unique.`);
+    const servicePair = `${service.org}::${service.service}`;
+    if (servicePairs.has(servicePair)) {
+      errors.push(`${label}: organization/application combination must be unique.`);
     }
-    serviceSlugs.add(service.service);
+    servicePairs.add(servicePair);
     if (!service.redirectUris.length) {
       errors.push(`${label}: at least one redirect URI is required.`);
     }

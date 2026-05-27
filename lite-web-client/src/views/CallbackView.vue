@@ -1,45 +1,34 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack" style="text-align: center;">
-      <div>
-        <div class="eyebrow">OAuth callback</div>
-        <h1 class="title">Completing sign-in</h1>
-      </div>
-
-      <LoadingSpinner v-if="status === 'loading'" text="Finalizing your AuthOS session..." />
-      <div v-else-if="status === 'error'" class="alert alert-error">{{ errorMessage }}</div>
-      <div v-else class="alert alert-success">Signed in. Redirecting...</div>
-    </div>
-
-    <MfaChallengeModal
-      :is-open="showMfaChallenge"
-      :preauth-token="preauthToken"
-      :device-code-id="deviceCodeId"
-      @success="handleMfaSuccess"
-      @close="router.push('/')"
-      @lost-device="router.push(authRouteWithContext(route, '/support'))"
+  <AuthShell title="Completing sign-in" description="We’re finalizing your AuthOS session.">
+    <AuthStatusPanel
+      :status="status"
+      loading-text="Finalizing your AuthOS session..."
+      success-text="Signed in. Redirecting..."
+      :error-text="errorMessage"
     />
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import AuthShell from '@/components/AuthShell.vue';
+import AuthStatusPanel from '@/features/auth/components/AuthStatusPanel.vue';
+import { formatCallbackError } from '@/features/auth/errors';
 import { useAuthStore } from '@/stores/auth';
-import LoadingSpinner from '@/components/LoadingSpinner.vue';
-import MfaChallengeModal from '@/components/MfaChallengeModal.vue';
-import { appendTokensToRedirectUri, authRouteWithContext } from '@/utils/authFlowContext';
+import { useAuthFlowStore } from '@/stores/authFlow';
+import { authRouteWithContext, getAuthFlowContext } from '@/utils/authFlowContext';
 import { postLoginRedirect } from '@/utils/redirects';
+import { scrubCurrentUrl } from '@/utils/urlSecurity';
 
 const route = useRoute();
 const router = useRouter();
 const authStore = useAuthStore();
+const authFlowStore = useAuthFlowStore();
+const authContext = getAuthFlowContext(route);
 
 const status = ref('loading');
 const errorMessage = ref('');
-const showMfaChallenge = ref(false);
-const preauthToken = ref('');
-const deviceCodeId = ref(null);
 
 function readTokenPayload() {
   let accessToken;
@@ -57,10 +46,6 @@ function readTokenPayload() {
     preauth = params.get('preauth_token');
     deviceId = params.get('device_code_id');
     error = params.get('error');
-
-    if (accessToken || refreshToken || preauth) {
-      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
-    }
   }
 
   if (!accessToken && !refreshToken && !preauth && !error) {
@@ -70,6 +55,13 @@ function readTokenPayload() {
     preauth = Array.isArray(route.query.preauth_token) ? route.query.preauth_token[0] : route.query.preauth_token;
     deviceId = Array.isArray(route.query.device_code_id) ? route.query.device_code_id[0] : route.query.device_code_id;
     error = Array.isArray(route.query.error) ? route.query.error[0] : route.query.error;
+  }
+
+  if (accessToken || refreshToken || preauth || error) {
+    scrubCurrentUrl({
+      queryKeys: ['access_token', 'refresh_token', 'mfa_required', 'mfa_challenge', 'preauth_token', 'device_code_id', 'user_code', 'error'],
+      hashKeys: ['access_token', 'refresh_token', 'mfa_required', 'mfa_challenge', 'preauth_token', 'device_code_id', 'user_code', 'error'],
+    });
   }
 
   return { accessToken, refreshToken, mfaRequired, preauth, deviceId, error };
@@ -87,12 +79,17 @@ onMounted(async () => {
     }
 
     const { accessToken, refreshToken, mfaRequired, preauth, deviceId, error } = readTokenPayload();
-    if (error) throw new Error(String(error));
+    if (error) throw new Error(formatCallbackError(error));
 
     if (mfaRequired === 'true' && preauth) {
-      preauthToken.value = String(preauth);
-      deviceCodeId.value = deviceId ? String(deviceId) : null;
-      showMfaChallenge.value = true;
+      authFlowStore.setMfaChallenge({
+        preauthToken: String(preauth),
+        redirectUri: authContext.isServiceFlow ? authContext.redirectUri : '',
+        redirectPath: postLoginRedirect(route),
+        deviceCodeId: deviceId ? String(deviceId) : '',
+        supportPath: authRouteWithContext(route, '/support'),
+      });
+      await router.replace('/mfa-challenge');
       return;
     }
 
@@ -108,24 +105,4 @@ onMounted(async () => {
     errorMessage.value = error.message || 'Authentication failed.';
   }
 });
-
-async function handleMfaSuccess({ code, deviceCodeId: deviceId }) {
-  try {
-    await authStore.completeMfaChallenge(preauthToken.value, code, deviceId || deviceCodeId.value);
-    showMfaChallenge.value = false;
-    status.value = 'success';
-
-    const redirectUri = Array.isArray(route.query.redirect_uri) ? route.query.redirect_uri[0] : route.query.redirect_uri;
-    if (redirectUri && authStore.token && authStore.refreshToken) {
-      window.location.href = appendTokensToRedirectUri(redirectUri, authStore.token, authStore.refreshToken);
-      return;
-    }
-
-    completeRedirect();
-  } catch (error) {
-    status.value = 'error';
-    errorMessage.value = error.message || 'MFA verification failed.';
-    showMfaChallenge.value = false;
-  }
-}
 </script>

@@ -1,6 +1,10 @@
 export const DEFAULT_CONFIG = {
   deployment: {
+    project: 'authos',
     backend: 'sqlite',
+    image: 'authos-local:sqlite-bootstrap',
+    buildLocalImage: true,
+    platform: 'linux/amd64',
     apiPort: 3001,
     baseUrl: 'http://localhost:3001',
     platformBaseUrl: 'http://localhost:3001',
@@ -33,7 +37,11 @@ export const DEFAULT_CONFIG = {
     stripeWebhookTestMode: true,
   },
   smtp: {
-    mode: 'mailpit',
+    mode: 'disabled',
+    host: '',
+    port: 587,
+    username: '',
+    password: '',
     fromEmail: 'noreply@authos.local',
     fromName: 'AuthOS',
   },
@@ -69,6 +77,10 @@ export const DEFAULT_CONFIG = {
       ],
     },
   ],
+  outputs: {
+    directory: '.authos',
+    apiEnv: 'api/.env',
+  },
 };
 
 export const TOP_LEVEL_KEYS = [
@@ -80,10 +92,15 @@ export const TOP_LEVEL_KEYS = [
   'smtp',
   'oauth',
   'services',
+  'outputs',
 ];
 
 export const DEPLOYMENT_KEYS = [
+  'project',
   'backend',
+  'image',
+  'buildLocalImage',
+  'platform',
   'apiPort',
   'baseUrl',
   'platformBaseUrl',
@@ -100,8 +117,9 @@ export const STANDALONE_KEYS = ['dataDir'];
 export const CADDY_KEYS = ['enabled', 'install', 'domain', 'email', 'tls'];
 export const PLATFORM_OWNER_KEYS = ['email', 'password'];
 export const BILLING_KEYS = ['provider', 'stripeSecretKey', 'stripeWebhookSecret', 'stripeWebhookTestMode'];
-export const SMTP_KEYS = ['mode', 'fromEmail', 'fromName'];
+export const SMTP_KEYS = ['mode', 'host', 'port', 'username', 'password', 'fromEmail', 'fromName'];
 export const OAUTH_PROVIDER_KEYS = ['clientId', 'clientSecret'];
+export const OUTPUT_KEYS = ['directory', 'apiEnv'];
 export const SERVICE_KEYS = ['org', 'orgName', 'service', 'name', 'type', 'redirectUris', 'githubScopes', 'apiKeys'];
 export const API_KEY_KEYS = ['name', 'permissions', 'writeTo'];
 

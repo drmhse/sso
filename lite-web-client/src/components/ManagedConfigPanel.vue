@@ -1,10 +1,12 @@
 <template>
-  <section class="panel stack">
-    <div>
-      <h2>Setup</h2>
-      <p class="muted">
+  <section class="stack-lg managed-config-page">
+    <div class="stack">
+      <div>
+        <h2 class="section-title">Platform setup</h2>
+        <p class="section-copy">
         Manage the installed AuthOS configuration through structured fields, then reload the service from the lite admin workspace.
-      </p>
+        </p>
+      </div>
     </div>
 
     <div v-if="message" class="alert" :class="messageType === 'success' ? 'alert-success' : 'alert-error'">
@@ -37,16 +39,28 @@
       <ManagedConfigSmtpSection v-model:section="form.smtp" />
       <ManagedConfigOauthSection v-model:section="form.oauth" />
       <ManagedConfigServicesSection v-model:section="form.services" />
+      <ManagedConfigOutputsSection v-model:section="form.outputs" />
 
       <details class="panel-subtle">
         <summary>Advanced JSON preview</summary>
         <textarea :value="advancedJson" class="textarea code-block" readonly spellcheck="false" />
       </details>
 
-      <div class="button-row">
-        <BaseButton variant="secondary" :loading="refreshing" @click="loadConfig">Reload file</BaseButton>
-        <BaseButton variant="secondary" :loading="saving" @click="saveConfig">Save config</BaseButton>
-        <BaseButton :loading="applying" @click="saveAndApply">Save and reload AuthOS</BaseButton>
+      <div class="sticky-action-bar">
+        <div class="sticky-action-bar__copy">
+          <div class="sticky-action-bar__title">
+            {{ validationErrors.length ? 'Validation required' : 'Unsaved changes' }}
+          </div>
+          <div class="sticky-action-bar__subtitle">
+            {{ validationErrors.length ? validationErrors[0] : 'Validation passed. Ready to apply configuration.' }}
+          </div>
+        </div>
+
+        <div class="button-row">
+          <BaseButton variant="secondary" :loading="refreshing" @click="loadConfig">Reload file</BaseButton>
+          <BaseButton variant="secondary" :loading="saving" @click="saveConfig">Save config</BaseButton>
+          <BaseButton :loading="applying" @click="saveAndApply">Apply & Restart</BaseButton>
+        </div>
       </div>
     </template>
   </section>
@@ -61,6 +75,7 @@ import ManagedConfigCaddySection from '@/features/setup/components/ManagedConfig
 import ManagedConfigDeploymentSection from '@/features/setup/components/ManagedConfigDeploymentSection.vue';
 import ManagedConfigMeta from '@/features/setup/components/ManagedConfigMeta.vue';
 import ManagedConfigOauthSection from '@/features/setup/components/ManagedConfigOauthSection.vue';
+import ManagedConfigOutputsSection from '@/features/setup/components/ManagedConfigOutputsSection.vue';
 import ManagedConfigPlatformOwnerSection from '@/features/setup/components/ManagedConfigPlatformOwnerSection.vue';
 import ManagedConfigServicesSection from '@/features/setup/components/ManagedConfigServicesSection.vue';
 import ManagedConfigSmtpSection from '@/features/setup/components/ManagedConfigSmtpSection.vue';

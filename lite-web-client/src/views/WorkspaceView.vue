@@ -1,92 +1,136 @@
 <template>
-  <div class="page-shell workspace-page-shell">
-    <div class="workspace-shell split">
-      <WorkspaceSidebar
-        :user-email="authStore.userEmail"
-        :show-setup="showSetup"
-        :full-client-url="workspaceStore.fullClientUrl"
+  <div class="workspace-layout">
+    <button
+      v-if="mobileNavOpen"
+      type="button"
+      class="workspace-sidebar__scrim"
+      aria-label="Close navigation"
+      @click="closeMobileNav"
+    ></button>
+
+    <WorkspaceSidebar
+      :show-setup="showSetup"
+      :user-email="authStore.userEmail"
+      :user-role="authStore.activeOrgRole"
+      :full-client-url="workspaceStore.fullClientUrl"
+      :mobile-open="mobileNavOpen"
+      @logout="handleLogout"
+      @open-full-client="openFullClient"
+      @close="closeMobileNav"
+    />
+
+    <div class="workspace-main">
+      <WorkspaceTopbar
+        :title="pageTitle"
+        :badge-label="badgeLabel"
+        :badge-tone="badgeTone"
+        :org-label="orgLabel"
+        :org-interactive="orgInteractive"
         @refresh="reload"
-        @logout="authStore.logout"
         @open-full-client="openFullClient"
+        @toggle-sidebar="toggleMobileNav"
       />
 
-      <main class="section-list">
-        <WorkspaceOverviewPanel
-          :mode="workspaceStore.mode"
-          :error="workspaceStore.error"
-          :email="authStore.user?.email"
-          :org-name="workspaceStore.currentOrgName"
-          :org-status="workspaceStore.currentOrgStatus"
-          :role="authStore.activeOrgRole"
-          :full-client-url="workspaceStore.fullClientUrl"
-          @open-full-client="openFullClient"
-        />
-
-        <ManagedConfigPanel v-if="showSetup" id="setup" />
-
-        <WorkspaceOrganizationPanel :refresh-key="refreshKey" />
-
-        <ApplicationsPanel
-          id="application"
-          v-if="workspaceStore.mode === 'ready'"
-          :org-slug="workspaceStore.currentOrgSlug"
-          :can-manage="canEditOrg"
-          :refresh-key="refreshKey"
-          @services-loaded="updateServiceOptions"
-        />
-
-        <EndUsersPanel
-          id="users"
-          v-if="workspaceStore.mode === 'ready'"
-          :org-slug="workspaceStore.currentOrgSlug"
-          :service-options="serviceOptions"
-          :refresh-key="refreshKey"
-        />
-
-        <WorkspaceAccountPanel :refresh-key="refreshKey" />
-        <WorkspaceSecurityPanel :refresh-key="refreshKey" />
-        <WorkspaceInvitationsPanel :refresh-key="refreshKey" @workspace-changed="reload" />
+      <main class="workspace-content">
+        <router-view />
       </main>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue';
-import ApplicationsPanel from '@/components/ApplicationsPanel.vue';
-import EndUsersPanel from '@/components/EndUsersPanel.vue';
-import ManagedConfigPanel from '@/components/ManagedConfigPanel.vue';
-import WorkspaceAccountPanel from '@/features/workspace/components/WorkspaceAccountPanel.vue';
-import WorkspaceInvitationsPanel from '@/features/workspace/components/WorkspaceInvitationsPanel.vue';
-import WorkspaceOrganizationPanel from '@/features/workspace/components/WorkspaceOrganizationPanel.vue';
-import WorkspaceOverviewPanel from '@/features/workspace/components/WorkspaceOverviewPanel.vue';
-import WorkspaceSecurityPanel from '@/features/workspace/components/WorkspaceSecurityPanel.vue';
+import { computed, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import WorkspaceSidebar from '@/features/workspace/components/WorkspaceSidebar.vue';
+import WorkspaceTopbar from '@/features/workspace/components/WorkspaceTopbar.vue';
 import { useAuthStore } from '@/stores/auth';
 import { useWorkspaceStore } from '@/stores/workspace';
 
+const route = useRoute();
+const router = useRouter();
 const authStore = useAuthStore();
 const workspaceStore = useWorkspaceStore();
 
-const refreshKey = ref(0);
-const serviceOptions = ref([]);
+const refreshVersion = ref(0);
+const mobileNavOpen = ref(false);
 
-const canEditOrg = computed(() => ['owner', 'admin'].includes(authStore.activeOrgRole || ''));
+const pageTitle = computed(() => route.meta.workspaceTitle || 'Overview');
+const badgeLabel = computed(() => {
+  if (workspaceStore.mode === 'ready' && route.name === 'app-overview') {
+    return 'Systems Operational';
+  }
+
+  if (workspaceStore.mode === 'handoff') {
+    return 'Full client required';
+  }
+
+  return '';
+});
+const badgeTone = computed(() => (workspaceStore.mode === 'handoff' ? 'warning' : 'success'));
 const showSetup = computed(() => authStore.isPlatformOwner && workspaceStore.managedConfigEnabled);
+const orgLabel = computed(() => workspaceStore.currentOrgName || 'AuthOS Lite');
+const orgInteractive = computed(() => workspaceStore.mode === 'handoff' && Boolean(workspaceStore.fullClientUrl));
 
-onMounted(reload);
+provide('workspaceReload', reload);
+provide('workspaceRefreshVersion', refreshVersion);
+provide('workspaceOpenFullClient', openFullClient);
+
+watch(
+  () => route.fullPath,
+  () => {
+    closeMobileNav();
+  },
+);
+
+watch(mobileNavOpen, (open) => {
+  document.body.classList.toggle('body-lock', open);
+});
+
+onMounted(() => {
+  reload();
+  window.addEventListener('resize', handleResize);
+  window.addEventListener('keydown', handleKeydown);
+});
+
+onBeforeUnmount(() => {
+  document.body.classList.remove('body-lock');
+  window.removeEventListener('resize', handleResize);
+  window.removeEventListener('keydown', handleKeydown);
+});
 
 async function reload() {
   await workspaceStore.resolveWorkspace();
-  serviceOptions.value = [];
-  refreshKey.value += 1;
-}
-
-function updateServiceOptions(services) {
-  serviceOptions.value = services;
+  refreshVersion.value += 1;
 }
 
 function openFullClient() {
+  closeMobileNav();
   workspaceStore.redirectToFullClient('/home');
+}
+
+async function handleLogout() {
+  closeMobileNav();
+  await authStore.logout();
+  await router.push('/');
+}
+
+function toggleMobileNav() {
+  mobileNavOpen.value = !mobileNavOpen.value;
+}
+
+function closeMobileNav() {
+  mobileNavOpen.value = false;
+}
+
+function handleResize() {
+  if (window.innerWidth >= 1040) {
+    closeMobileNav();
+  }
+}
+
+function handleKeydown(event) {
+  if (event.key === 'Escape') {
+    closeMobileNav();
+  }
 }
 </script>

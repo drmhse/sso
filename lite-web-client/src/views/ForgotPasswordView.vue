@@ -1,34 +1,32 @@
 <template>
-  <div class="page-shell">
-    <div class="auth-card stack">
-      <div>
-        <div class="eyebrow">Password reset</div>
-        <h1 class="title">Reset your password</h1>
-        <p class="muted">We’ll send a reset link to your email address.</p>
-      </div>
-
+  <AuthShell
+    title="Reset your password"
+    description="We’ll send a password reset link to the email address on this account."
+  >
+    <div class="stack">
       <div v-if="message" class="alert alert-success">{{ message }}</div>
       <div v-if="errorMessage" class="alert alert-error">{{ errorMessage }}</div>
 
       <div class="field">
         <label for="email">Email address</label>
-        <input id="email" v-model="email" type="email" class="input" placeholder="you@example.com" />
+        <input id="email" v-model="email" type="email" class="input input-lg" placeholder="you@example.com" />
       </div>
 
-      <BaseButton :loading="loading" @click="handleSubmit">Send reset link</BaseButton>
+      <BaseButton :loading="loading" block @click="handleSubmit">Send reset link</BaseButton>
 
-      <p class="muted">
+      <p class="muted auth-centered-copy">
         <router-link :to="authRouteWithContext(route, '/')">Back to sign in</router-link>
       </p>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup>
 import { ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { sso } from '@/lib/api';
+import AuthShell from '@/components/AuthShell.vue';
 import BaseButton from '@/components/BaseButton.vue';
+import { sso } from '@/lib/api';
 import { authRouteWithContext, getAuthFlowContext } from '@/utils/authFlowContext';
 
 const route = useRoute();
@@ -54,8 +52,8 @@ async function handleSubmit() {
       payload.redirect_uri = ctx.redirectUri;
     }
 
-    await sso.auth.requestPasswordReset(payload);
-    message.value = `If ${email.value} exists, a reset link has been sent.`;
+    const response = await sso.auth.requestPasswordReset(payload);
+    message.value = response?.message || `If ${email.value} exists, a reset link has been sent.`;
   } catch (error) {
     errorMessage.value = error.message || 'Unable to send a reset email.';
   } finally {

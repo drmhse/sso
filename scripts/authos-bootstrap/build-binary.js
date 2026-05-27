@@ -61,6 +61,28 @@ async function maybePrintSectionProfile(binaryPath, cwd) {
   }
 }
 
+async function resolveBuildVersion() {
+  const explicit = process.env.AUTHOS_BUILD_VERSION?.trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  try {
+    const { stdout } = await run('git', ['describe', '--tags', '--exact-match'], ROOT, { quiet: true });
+    const tag = stdout.trim();
+    if (tag) {
+      return tag;
+    }
+  } catch (error) {
+    // Ignore; we raise a clearer distribution-time error below.
+  }
+
+  throw new Error(
+    'Standalone bundle builds require an exact git tag or AUTHOS_BUILD_VERSION. ' +
+      'Create a tag for the release commit or export AUTHOS_BUILD_VERSION before running authos:binary.',
+  );
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const backend = backends[args.backend];
@@ -75,8 +97,10 @@ async function main() {
   const archiveName = `authos-${args.backend}-linux-${target.archiveArch}.tar.gz`;
   const archivePath = path.join(outputDir, archiveName);
   const standaloneDir = path.join(releaseRoot, 'standalone');
+  const buildVersion = await resolveBuildVersion();
 
   console.log(`\nBuilding standalone AuthOS binary bundle for ${args.backend} on ${args.platform}...`);
+  console.log(`Embedding build version: ${buildVersion}`);
   await assertCommand('cargo', ['zigbuild', '--help'], apiDir);
   if (!args.skipUpx) {
     await assertCommand('upx', ['--version'], ROOT);
@@ -97,6 +121,9 @@ async function main() {
       backend.binary,
     ],
     apiDir,
+    {
+      env: { AUTHOS_BUILD_VERSION: buildVersion },
+    },
   );
 
   const builtBinary = path.join(apiDir, `target/${target.rustTarget}/release/${backend.binary}`);
