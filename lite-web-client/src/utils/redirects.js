@@ -14,6 +14,13 @@ export function storePostLoginRedirect(value) {
   return redirect;
 }
 
+export function loginRouteForProtectedTarget(value) {
+  const redirect = storePostLoginRedirect(value);
+  return redirect
+    ? { path: '/', query: { redirect } }
+    : { path: '/' };
+}
+
 export function clearPostLoginRedirect() {
   sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
 }

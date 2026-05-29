@@ -2,7 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router';
 import { useAuthStore } from '@/stores/auth';
 import { useAuthFlowStore } from '@/stores/authFlow';
 import { hasServiceAuthContext } from '@/utils/authFlowContext';
-import { defaultAuthenticatedRoute, storePostLoginRedirect } from '@/utils/redirects';
+import { defaultAuthenticatedRoute, loginRouteForProtectedTarget } from '@/utils/redirects';
 
 export const routes = [
   { path: '/', component: () => import('@/views/LoginView.vue') },
@@ -56,10 +56,7 @@ router.beforeEach(async (to, from, next) => {
   }
 
   if (to.meta.requiresAuth && !authStore.isAuthenticated) {
-    storePostLoginRedirect(to.fullPath);
-    next({
-      path: '/',
-    });
+    next(loginRouteForProtectedTarget(to.fullPath));
     return;
   }
 
