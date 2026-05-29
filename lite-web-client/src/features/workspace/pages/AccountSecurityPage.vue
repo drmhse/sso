@@ -1,55 +1,54 @@
 <template>
   <div class="workspace-page stack-lg">
+    <section v-if="returnTo" class="workspace-card workspace-return-card">
+      <div class="stack">
+        <p class="subsection-title">Application account security</p>
+        <h2 class="section-title">Manage your AuthOS factors</h2>
+      </div>
+      <BaseButton variant="secondary" @click="returnToApplication">
+        Return to application
+      </BaseButton>
+    </section>
+
     <div v-if="message" class="alert" :class="messageType === 'success' ? 'alert-success' : 'alert-error'">
       {{ message }}
     </div>
 
-    <section v-if="workspaceStore.mode === 'loading'" class="workspace-card">
-      <LoadingSpinner text="Loading account security..." />
-    </section>
-    <section v-else-if="workspaceStore.mode !== 'ready'" class="workspace-card stack">
-      <h2 class="section-title">Account security is not available</h2>
-      <p class="section-copy">
-        AuthOS Lite can only manage account security after a single active organization has been resolved.
-      </p>
-    </section>
-    <template v-else>
-      <AccountProfileCard
-        :account-email="accountEmail"
-        :password-form="passwordForm"
-        :account-saving="accountSaving"
-        :password-saving="passwordSaving"
-        @update:account-email="accountEmail = $event"
-        @update:password-form="passwordForm = $event"
-        @save-account="saveAccount"
-        @change-password="changePassword"
-      />
+    <AccountProfileCard
+      :account-email="accountEmail"
+      :password-form="passwordForm"
+      :account-saving="accountSaving"
+      :password-saving="passwordSaving"
+      @update:account-email="accountEmail = $event"
+      @update:password-form="passwordForm = $event"
+      @save-account="saveAccount"
+      @change-password="changePassword"
+    />
 
-      <SecurityMfaCard
-        :mfa-status="mfaStatus"
-        :mfa-setup="mfaSetup"
-        :mfa-code="mfaCode"
-        :backup-codes="backupCodes"
-        @update:mfa-code="mfaCode = $event"
-        @start-setup="startMfaSetup"
-        @complete-setup="completeMfaSetup"
-        @disable="openDisableMfaDialog"
-        @regenerate-backups="openRegenerateBackupDialog"
-      />
+    <SecurityMfaCard
+      :mfa-status="mfaStatus"
+      :mfa-setup="mfaSetup"
+      :mfa-code="mfaCode"
+      :backup-codes="backupCodes"
+      @update:mfa-code="mfaCode = $event"
+      @start-setup="startMfaSetup"
+      @complete-setup="completeMfaSetup"
+      @disable="openDisableMfaDialog"
+      @regenerate-backups="openRegenerateBackupDialog"
+    />
 
-      <SecurityPasskeysCard
-        :passkeys="passkeys"
-        @register="openRegisterPasskeyDialog"
-        @rename="openRenamePasskeyDialog"
-        @delete="openDeletePasskeyDialog"
-      />
+    <SecurityPasskeysCard
+      :passkeys="passkeys"
+      @register="openRegisterPasskeyDialog"
+      @rename="openRenamePasskeyDialog"
+      @delete="openDeletePasskeyDialog"
+    />
 
-      <SecurityDevicesCard
-        :devices="devices"
-        @rename="openRenameDeviceDialog"
-        @revoke="openRevokeDeviceDialog"
-      />
-    </template>
+    <SecurityDevicesCard
+      :devices="devices"
+      @rename="openRenameDeviceDialog"
+      @revoke="openRevokeDeviceDialog"
+    />
 
     <BaseDialog
       :open="dialog.open"
@@ -83,10 +82,10 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import BaseDialog from '@/components/BaseDialog.vue';
 import BaseButton from '@/components/BaseButton.vue';
-import LoadingSpinner from '@/components/LoadingSpinner.vue';
 import AccountProfileCard from '@/features/workspace/components/security/AccountProfileCard.vue';
 import SecurityDevicesCard from '@/features/workspace/components/security/SecurityDevicesCard.vue';
 import SecurityMfaCard from '@/features/workspace/components/security/SecurityMfaCard.vue';
@@ -95,11 +94,12 @@ import { useSecurityCenter } from '@/features/workspace/useSecurityCenter';
 import { useWorkspaceRuntime } from '@/features/workspace/useWorkspaceRuntime';
 import { sso } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth';
-import { useWorkspaceStore } from '@/stores/workspace';
+import { firstQueryValue } from '@/utils/authFlowContext';
 
 const authStore = useAuthStore();
-const workspaceStore = useWorkspaceStore();
+const route = useRoute();
 const { refreshVersion } = useWorkspaceRuntime();
+const returnTo = computed(() => normalizeReturnTo(firstQueryValue(route.query.return_to)));
 
 const accountEmail = ref('');
 const accountSaving = ref(false);
@@ -174,6 +174,23 @@ async function changePassword() {
     setError(error.message || 'Failed to change password.');
   } finally {
     passwordSaving.value = false;
+  }
+}
+
+function returnToApplication() {
+  if (returnTo.value) {
+    window.location.href = returnTo.value;
+  }
+}
+
+function normalizeReturnTo(value) {
+  if (!value) return '';
+
+  try {
+    const url = new URL(value, window.location.origin);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
+  } catch {
+    return '';
   }
 }
 </script>

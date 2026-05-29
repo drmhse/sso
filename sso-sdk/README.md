@@ -7,6 +7,8 @@ Core TypeScript SDK for AuthOS. It handles authentication flows, session persist
 
 Full documentation: [authos.dev/docs/sdk/](https://authos.dev/docs/sdk/)
 
+AI agent skills: [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-agent-skills/) and [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill)
+
 ## Install
 
 ```bash
@@ -45,13 +47,27 @@ const sso = new SsoClient({ baseURL: 'https://sso.example.com' });
 
 ### Tenant application
 
-Pass organization and service context when you need hosted auth, BYOO, or service-scoped tokens:
+Redirect users to AuthOS hosted login for the standard web flow. AuthOS handles provider selection, HRD, password, magic link, passkeys, MFA, and recovery before returning tokens to your callback:
 
 ```ts
-const loginUrl = sso.auth.getLoginUrl('github', {
+const loginUrl = sso.auth.getAuthorizeUrl({
   org: 'acme-corp',
   service: 'main-app',
   redirect_uri: 'https://app.acme.com/callback',
+});
+```
+
+Use `getLoginUrl(provider, ...)` only when you are intentionally building a custom provider-selection flow.
+
+### Account security
+
+Send users to the hosted account-security portal to manage MFA, passkeys, backup codes, and trusted devices on the AuthOS origin:
+
+```ts
+const securityUrl = sso.auth.getAccountSecurityUrl({
+  org: 'acme-corp',
+  service: 'main-app',
+  return_to: 'https://app.acme.com/settings',
 });
 ```
 

@@ -4,6 +4,7 @@ import { routes } from '@/router';
 describe('lite router map', () => {
   it('defines the MFA route and routed workspace children', () => {
     const paths = routes.map((route) => route.path);
+    expect(paths).toContain('/authorize');
     expect(paths).toContain('/mfa-challenge');
     expect(paths).toContain('/app');
     expect(paths).toContain('/home');

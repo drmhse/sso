@@ -6,6 +6,7 @@ import { defaultAuthenticatedRoute, storePostLoginRedirect } from '@/utils/redir
 
 export const routes = [
   { path: '/', component: () => import('@/views/LoginView.vue') },
+  { path: '/authorize', component: () => import('@/views/LoginView.vue') },
   { path: '/bootstrap-login', component: () => import('@/views/BootstrapLoginView.vue') },
   { path: '/callback', component: () => import('@/views/CallbackView.vue') },
   { path: '/register', component: () => import('@/views/RegisterView.vue') },

@@ -8,6 +8,7 @@ export function getAuthFlowContext(route) {
   const service = firstQueryValue(route?.query?.service);
   const redirectUri = firstQueryValue(route?.query?.redirect_uri);
   const redirect = firstQueryValue(route?.query?.redirect);
+  const returnTo = firstQueryValue(route?.query?.return_to);
   const isPlatformFlow = (!org || org === 'authos') && (!service || service === 'platform');
   const isServiceFlow = Boolean(org && service && !isPlatformFlow);
 
@@ -16,6 +17,7 @@ export function getAuthFlowContext(route) {
     service,
     redirectUri,
     redirect,
+    returnTo,
     isServiceFlow,
     serviceLabel: service || 'this application',
     orgLabel: org || 'your organization',
@@ -34,6 +36,7 @@ export function authRouteWithContext(route, path) {
   if (ctx.service) params.set('service', ctx.service);
   if (ctx.redirectUri) params.set('redirect_uri', ctx.redirectUri);
   if (ctx.redirect) params.set('redirect', ctx.redirect);
+  if (ctx.returnTo) params.set('return_to', ctx.returnTo);
 
   const query = params.toString();
   return query ? `${path}?${query}` : path;

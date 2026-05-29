@@ -8,6 +8,7 @@ describe('auth flow context helpers', () => {
         org: 'indie-blog',
         service: 'blog-app',
         redirect_uri: 'http://app.example.com/callback',
+        return_to: 'http://app.example.com/settings',
       },
     };
 
@@ -16,6 +17,7 @@ describe('auth flow context helpers', () => {
       org: 'indie-blog',
       service: 'blog-app',
       redirectUri: 'http://app.example.com/callback',
+      returnTo: 'http://app.example.com/settings',
       isServiceFlow: true,
     });
   });

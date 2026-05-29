@@ -1,10 +1,7 @@
 import { computed, ref, watch } from 'vue';
 import { sso } from '@/lib/api';
-import { useWorkspaceStore } from '@/stores/workspace';
 
 export function useSecurityCenter(refreshVersion) {
-  const workspaceStore = useWorkspaceStore();
-
   const message = ref('');
   const messageType = ref('success');
   const mfaStatus = ref(null);
@@ -21,11 +18,7 @@ export function useSecurityCenter(refreshVersion) {
   watch(
     () => refreshVersion.value,
     async () => {
-      if (workspaceStore.mode === 'ready') {
-        await Promise.all([loadMfaStatus(), loadPasskeys(), loadDevices()]);
-      } else {
-        clearSecurityState();
-      }
+      await Promise.all([loadMfaStatus(), loadPasskeys(), loadDevices()]);
     },
     { immediate: true },
   );
@@ -219,16 +212,6 @@ export function useSecurityCenter(refreshVersion) {
   }
 
   function closeDialog() {
-    dialog.value = resetDialog();
-  }
-
-  function clearSecurityState() {
-    mfaStatus.value = null;
-    mfaSetup.value = null;
-    mfaCode.value = '';
-    backupCodes.value = [];
-    passkeys.value = [];
-    devices.value = [];
     dialog.value = resetDialog();
   }
 

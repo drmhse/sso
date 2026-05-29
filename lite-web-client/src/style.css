@@ -785,6 +785,13 @@ select.input:focus {
   text-align: center;
 }
 
+.workspace-return-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
 .panel-subtle {
   padding: 18px 20px;
   background: var(--surface-subtle);

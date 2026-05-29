@@ -22,6 +22,8 @@ import {
   LookupEmailResponse,
   ResendVerificationRequest,
   ResendVerificationResponse,
+  AuthorizeUrlParams,
+  AccountSecurityUrlParams,
   AuthContextRequest,
   AuthContextResponse,
 } from '../types';
@@ -34,6 +36,53 @@ export class AuthModule {
     private http: HttpClient,
     private session: SessionManager
   ) { }
+
+  /**
+   * Constructs the hosted AuthOS login URL for an end-user application.
+   * AuthOS owns provider selection, HRD, password, magic-link, passkey, MFA,
+   * recovery, and callback token delivery for this flow.
+   *
+   * @param params Hosted authorize parameters (org, service, redirect_uri)
+   * @returns The full URL to redirect the user to
+   *
+   * @example
+   * ```typescript
+   * window.location.href = sso.auth.getAuthorizeUrl({
+   *   org: 'acme-corp',
+   *   service: 'main-app',
+   *   redirect_uri: 'https://app.acme.com/callback'
+   * });
+   * ```
+   */
+  public getAuthorizeUrl(params: AuthorizeUrlParams): string {
+    const baseURL = (this.http.defaults.baseURL || '').replace(/\/+$/, '');
+    const searchParams = new URLSearchParams({
+      org: params.org,
+      service: params.service,
+      redirect_uri: params.redirect_uri,
+    });
+
+    return `${baseURL}/authorize?${searchParams.toString()}`;
+  }
+
+  /**
+   * Constructs the hosted account-security URL for managing user factors.
+   * Use this for AuthOS-owned MFA, passkeys, backup codes, and trusted devices.
+   *
+   * @param params Optional tenant/application context and return URL
+   * @returns The full URL to open for account security management
+   */
+  public getAccountSecurityUrl(params: AccountSecurityUrlParams = {}): string {
+    const baseURL = (this.http.defaults.baseURL || '').replace(/\/+$/, '');
+    const searchParams = new URLSearchParams();
+
+    if (params.org) searchParams.append('org', params.org);
+    if (params.service) searchParams.append('service', params.service);
+    if (params.return_to) searchParams.append('return_to', params.return_to);
+
+    const query = searchParams.toString();
+    return `${baseURL}/app/account-security${query ? `?${query}` : ''}`;
+  }
 
   /**
    * Constructs the OAuth login URL for end-users.

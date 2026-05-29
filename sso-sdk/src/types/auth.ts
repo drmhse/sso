@@ -81,6 +81,46 @@ export interface LoginUrlParams {
 }
 
 /**
+ * Parameters for constructing the hosted AuthOS login URL.
+ */
+export interface AuthorizeUrlParams {
+  /**
+   * Organization slug
+   */
+  org: string;
+
+  /**
+   * Service slug
+   */
+  service: string;
+
+  /**
+   * Callback URI registered with the service
+   */
+  redirect_uri: string;
+}
+
+/**
+ * Parameters for constructing the hosted account-security URL.
+ */
+export interface AccountSecurityUrlParams {
+  /**
+   * Optional organization slug for tenant-aware branding/context
+   */
+  org?: string;
+
+  /**
+   * Optional service slug for application context
+   */
+  service?: string;
+
+  /**
+   * Optional URL to return to after managing account security
+   */
+  return_to?: string;
+}
+
+/**
  * Parameters for constructing admin login URL
  */
 export interface AdminLoginUrlParams {

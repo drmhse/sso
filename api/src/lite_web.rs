@@ -26,6 +26,7 @@ pub fn routes(_state: &AppState) -> Router<AppState> {
         .route("/api/public/web-config", get(public_web_config))
         .route("/api/public/bootstrap-login", post(bootstrap_login))
         .route("/assets/*path", get(asset))
+        .route("/authorize", get(index))
         .route("/", get(index))
         .route("/bootstrap-login", get(index))
         .route("/callback", get(index))
