@@ -3225,6 +3225,16 @@ pub fn get_authorization_url_for_client(
     (auth_url.to_string(), csrf_token, verifier_secret)
 }
 
+fn require_google_verified_email(verified_email: Option<bool>) -> Result<()> {
+    if verified_email == Some(true) {
+        return Ok(());
+    }
+
+    Err(AppError::OAuth(
+        "Google account email is not verified".to_string(),
+    ))
+}
+
 /// Get user info from provider (standalone, not using OAuth client for BYOO isolation)
 async fn get_provider_user_info(
     provider: Provider,
@@ -3295,6 +3305,8 @@ async fn get_provider_user_info(
                 id: String,
                 email: String,
                 name: Option<String>,
+                #[serde(alias = "email_verified")]
+                verified_email: Option<bool>,
             }
 
             let client = reqwest::Client::new();
@@ -3307,6 +3319,8 @@ async fn get_provider_user_info(
                 .json()
                 .await
                 .map_err(|e| AppError::OAuth(format!("Failed to parse user: {}", e)))?;
+
+            require_google_verified_email(user.verified_email)?;
 
             Ok(crate::auth::sso::UserInfo {
                 provider_user_id: user.id,
@@ -3466,6 +3480,13 @@ mod tests {
         let scopes = normalized_granted_scopes(Provider::Microsoft, &requested, &returned, None);
 
         assert!(!scopes.iter().any(|scope| scope == "offline_access"));
+    }
+
+    #[test]
+    fn google_email_must_be_verified() {
+        assert!(require_google_verified_email(Some(true)).is_ok());
+        assert!(require_google_verified_email(Some(false)).is_err());
+        assert!(require_google_verified_email(None).is_err());
     }
 
     #[test]
