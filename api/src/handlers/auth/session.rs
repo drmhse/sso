@@ -2,8 +2,8 @@ use crate::auth::jwt::JwtService;
 use crate::db::models::User;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use crate::store::{services::ServiceStore, sessions::SessionStore, users::UserStore, DB};
-use axum::{extract::State, response::IntoResponse, Json};
+use crate::store::{DB, services::ServiceStore, sessions::SessionStore, users::UserStore};
+use axum::{Json, extract::State, response::IntoResponse};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -98,12 +98,15 @@ pub async fn refresh_token(
     SessionStore::update_tokens(
         DB::Conn(&state.db),
         &session.id,
+        &req.refresh_token,
         &new_token_hash,
         new_access_expires_at.naive_utc(),
         &new_refresh_token,
         new_refresh_expires_at.naive_utc(),
     )
-    .await?;
+    .await?
+    .then_some(())
+    .ok_or_else(|| AppError::Unauthorized("Invalid refresh token".to_string()))?;
 
     Ok(Json(RefreshTokenResponse {
         access_token: new_access_token,

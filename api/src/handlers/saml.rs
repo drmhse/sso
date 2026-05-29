@@ -1,20 +1,20 @@
 use crate::db::models::{SamlCertificateInfo, User};
-use crate::error::{with_retrying_transaction, AppError, Json400, Result};
+use crate::error::{AppError, Json400, Result, with_retrying_transaction};
 use crate::middleware::{AuthUser, RequestInfo};
-use crate::services::permission_service::{PermissionService, CAP_SERVICES_MANAGE};
+use crate::services::permission_service::{CAP_SERVICES_MANAGE, PermissionService};
 use crate::services::tier_enforcement::TierService;
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
-    saml_signing_keys::SamlSigningKeysStore, saml_states::SamlStateStore, services::ServiceStore,
-    DB,
+    DB, memberships::MembershipStore, organizations::OrganizationStore,
+    permissions::PermissionsStore, saml_signing_keys::SamlSigningKeysStore,
+    saml_states::SamlStateStore, services::ServiceStore,
 };
 use axum::{
+    Json,
     extract::{Extension, Path, Query, State},
     response::{Html, IntoResponse, Redirect, Response},
-    Json,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
@@ -73,6 +73,15 @@ fn validate_xml_no_xxe(xml: &str) -> Result<()> {
     Ok(())
 }
 
+fn escape_html_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 // SAML Response Builder for deduplicating XML generation
 struct SamlResponseBuilder {
     assertion_id: String,
@@ -117,8 +126,8 @@ impl SamlResponseBuilder {
     }
 
     fn build_assertion(&self) -> String {
-        use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use quick_xml::Writer;
+        use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -206,8 +215,8 @@ impl SamlResponseBuilder {
     }
 
     fn build_response(&self, assertion_with_signature: &str) -> String {
-        use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use quick_xml::Writer;
+        use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -934,10 +943,7 @@ pub async fn generate_saml_certificate(
     let key_pair_pem = PKey::from_rsa(rsa_key)
         .and_then(|key| key.private_key_to_pem_pkcs8())
         .map_err(|e| {
-            AppError::InternalServerError(format!(
-                "Failed to encode RSA key to PKCS#8 PEM: {}",
-                e
-            ))
+            AppError::InternalServerError(format!("Failed to encode RSA key to PKCS#8 PEM: {}", e))
         })?;
 
     let private_key_pem = String::from_utf8(key_pair_pem).map_err(|e| {
@@ -1329,7 +1335,7 @@ pub async fn saml_sso(
         .ok_or_else(|| AppError::BadRequest("SAMLRequest parameter is required".into()))?;
 
     // Decode base64
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     let saml_request_bytes = BASE64
         .decode(&saml_request_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {}", e)))?;
@@ -1353,8 +1359,8 @@ pub async fn saml_sso(
         };
 
     // Parse XML to extract important fields
-    use quick_xml::events::Event;
     use quick_xml::Reader;
+    use quick_xml::events::Event;
 
     // Security Audit Item 7: Validate XML for XXE attacks before parsing
     validate_xml_no_xxe(&saml_request_xml)?;
@@ -1415,36 +1421,44 @@ pub async fn saml_sso(
         buf.clear();
     }
 
-    // Validate extracted data
-    let acs_url = acs_url_from_request
-        .or(service.saml_acs_url.clone())
-        .ok_or_else(|| {
-            AppError::BadRequest("No ACS URL found in request or service configuration".into())
-        })?;
+    let configured_acs_url = service
+        .saml_acs_url
+        .clone()
+        .ok_or_else(|| AppError::BadRequest("No ACS URL configured for this service".into()))?;
+
+    if let Some(ref requested_acs_url) = acs_url_from_request {
+        if requested_acs_url != &configured_acs_url {
+            return Err(AppError::BadRequest(
+                "SAMLRequest ACS URL does not match service configuration".into(),
+            ));
+        }
+    }
 
     // Validate destination if present
     if let Some(ref dest) = destination {
         let expected_sso_url = format!("{}/saml/{}/{}/sso", state.base_url, org_slug, service_slug);
         if dest != &expected_sso_url {
-            tracing::warn!(
-                "SAMLRequest destination mismatch: expected {}, got {}",
-                expected_sso_url,
-                dest
-            );
-            // Continue anyway - some SPs send incorrect destinations
+            return Err(AppError::BadRequest(
+                "SAMLRequest destination does not match this SSO endpoint".into(),
+            ));
         }
     }
 
-    // Validate issuer matches configured entity ID if both are present
-    if let (Some(ref req_issuer), Some(ref configured_issuer)) = (&issuer, &service.saml_entity_id)
-    {
-        if req_issuer != configured_issuer {
-            tracing::warn!(
-                "SAMLRequest issuer mismatch: expected {}, got {}",
-                configured_issuer,
-                req_issuer
-            );
-            // Continue anyway - use the issuer from request
+    let configured_issuer = service.saml_entity_id.clone().ok_or_else(|| {
+        AppError::BadRequest("No SAML entity ID configured for this service".into())
+    })?;
+
+    match issuer.as_deref() {
+        Some(req_issuer) if req_issuer == configured_issuer => {}
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "SAMLRequest issuer does not match service configuration".into(),
+            ));
+        }
+        None => {
+            return Err(AppError::BadRequest(
+                "SAMLRequest Issuer is required".into(),
+            ));
         }
     }
 
@@ -1459,9 +1473,9 @@ pub async fn saml_sso(
         &service.id,
         &saml_request_b64,
         query.relay_state.as_deref(),
-        &acs_url,
+        &configured_acs_url,
         request_id.as_deref(),
-        issuer.as_deref(),
+        Some(&configured_issuer),
         binding,
         &expires_at.naive_utc(),
     )
@@ -1744,6 +1758,7 @@ pub async fn saml_idp_login(
 pub async fn complete_saml_authentication(
     state: &AppState,
     saml_state_id: &str,
+    expected_service_id: Option<&str>,
     user: &User,
 ) -> Result<Response> {
     // Get SAML state
@@ -1751,8 +1766,17 @@ pub async fn complete_saml_authentication(
         .await?
         .ok_or_else(|| AppError::BadRequest("Invalid or expired SAML state".into()))?;
 
-    // Update state with user_id
-    SamlStateStore::update_user_id(DB::Conn(&state.db), saml_state_id, &user.id).await?;
+    if expected_service_id != Some(saml_state.service_id.as_str()) {
+        return Err(AppError::BadRequest(
+            "SAML state does not belong to the OAuth service context".into(),
+        ));
+    }
+
+    if !SamlStateStore::update_user_id(DB::Conn(&state.db), saml_state_id, &user.id).await? {
+        return Err(AppError::BadRequest(
+            "Invalid, expired, or already used SAML state".into(),
+        ));
+    }
 
     // Get service
     let service = ServiceStore::find_by_id(DB::Conn(&state.db), &saml_state.service_id)
@@ -1958,7 +1982,7 @@ pub async fn complete_saml_authentication(
     let relay_state_input = if let Some(ref relay_state) = saml_state.relay_state {
         format!(
             r#"<input type="hidden" name="RelayState" value="{}" />"#,
-            relay_state
+            escape_html_attr(relay_state)
         )
     } else {
         String::new()
@@ -1981,7 +2005,9 @@ pub async fn complete_saml_authentication(
     </form>
 </body>
 </html>"#,
-        saml_state.acs_url, saml_response_b64, relay_state_input
+        escape_html_attr(&saml_state.acs_url),
+        escape_html_attr(&saml_response_b64),
+        relay_state_input
     );
 
     // Clean up the SAML state
@@ -2057,8 +2083,6 @@ async fn process_saml_logout_request(
     relay_state: Option<&str>,
     is_deflated: bool,
 ) -> Result<Response> {
-    use crate::store::{sessions::SessionStore, users::UserStore};
-
     // Get organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
         .await?
@@ -2127,8 +2151,8 @@ async fn process_saml_logout_request(
     };
 
     // Parse XML to extract important fields
-    use quick_xml::events::Event;
     use quick_xml::Reader;
+    use quick_xml::events::Event;
 
     // Security Audit Item 7: Validate XML for XXE attacks before parsing
     validate_xml_no_xxe(&saml_request_xml)?;
@@ -2212,77 +2236,35 @@ async fn process_saml_logout_request(
     if let Some(ref dest) = destination {
         let expected_slo_url = format!("{}/saml/{}/{}/slo", state.base_url, org_slug, service_slug);
         if dest != &expected_slo_url {
-            tracing::warn!(
-                "SAML LogoutRequest destination mismatch: expected {}, got {}",
-                expected_slo_url,
-                dest
-            );
-            // Continue anyway - some SPs send incorrect destinations
+            return Err(AppError::BadRequest(
+                "SAML LogoutRequest destination does not match this SLO endpoint".into(),
+            ));
         }
     }
 
-    // Validate issuer matches configured entity ID if both are present
-    if let (Some(ref req_issuer), Some(ref configured_issuer)) = (&issuer, &service.saml_entity_id)
-    {
-        if req_issuer != configured_issuer {
-            tracing::warn!(
-                "SAML LogoutRequest issuer mismatch: expected {}, got {}",
-                configured_issuer,
-                req_issuer
-            );
-            // Continue anyway for flexibility
+    let configured_issuer = service.saml_entity_id.as_ref().ok_or_else(|| {
+        AppError::BadRequest("No SAML entity ID configured for this service".into())
+    })?;
+
+    match issuer.as_deref() {
+        Some(req_issuer) if req_issuer == configured_issuer => {}
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "SAML LogoutRequest issuer does not match service configuration".into(),
+            ));
+        }
+        None => {
+            return Err(AppError::BadRequest(
+                "SAML LogoutRequest Issuer is required".into(),
+            ));
         }
     }
 
-    // Find user by NameID (typically email)
-    // The NameID format determines how we interpret it
-    let user = match name_id_format.as_deref() {
-        Some("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress")
-        | Some("urn:oasis:names:tc:SAML:2.0:nameid-format:emailAddress")
-        | None => {
-            // Assume email format
-            UserStore::find_by_email(DB::Conn(&state.db), &name_id).await?
-        }
-        Some("urn:oasis:names:tc:SAML:2.0:nameid-format:persistent")
-        | Some("urn:oasis:names:tc:SAML:2.0:nameid-format:unspecified") => {
-            // Try to interpret as user ID or email
-            if name_id.contains('@') {
-                UserStore::find_by_email(DB::Conn(&state.db), &name_id).await?
-            } else {
-                // Could be a user ID
-                UserStore::find_by_id(DB::Conn(&state.db), &name_id).await?
-            }
-        }
-        Some(format) => {
-            tracing::warn!("Unsupported NameID format: {}", format);
-            // Try email as fallback
-            UserStore::find_by_email(DB::Conn(&state.db), &name_id).await?
-        }
-    };
-
-    // Invalidate user sessions for this service
-    let sessions_deleted = if let Some(user) = user {
-        tracing::info!(
-            "Processing SAML SLO for user {} in service {}",
-            user.email,
-            service.slug
-        );
-        SessionStore::delete_user_service_sessions(DB::Conn(&state.db), &user.id, &service.id)
-            .await?
-    } else {
-        tracing::warn!(
-            "User not found for SAML SLO NameID: {} (format: {:?})",
-            name_id,
-            name_id_format
-        );
-        0
-    };
-
-    tracing::info!(
-        "SAML SLO: Deleted {} sessions for NameID {} in service {}",
-        sessions_deleted,
-        name_id,
-        service.slug
+    tracing::warn!(
+        name_id = %name_id,
+        name_id_format = ?name_id_format,
+        service_id = %service.id,
+        "Skipping SAML LogoutRequest session invalidation because request signature verification is not implemented"
     );
 
     // Get signing key for response
@@ -2310,15 +2292,10 @@ async fn process_saml_logout_request(
     let issue_instant = Utc::now();
     let entity_id = format!("{}/saml/{}/{}", state.base_url, org_slug, service_slug);
 
-    // Determine SLO response URL
-    // Priority: Service's configured SLO URL, or use the issuer
     let slo_response_url = service
         .saml_slo_url
         .as_ref()
-        .or(issuer.as_ref())
-        .ok_or_else(|| {
-            AppError::BadRequest("No SLO URL configured and no issuer in request".into())
-        })?;
+        .ok_or_else(|| AppError::BadRequest("No SLO URL configured for this service".into()))?;
 
     // Build the SAML LogoutResponse
     let logout_response_xml = format!(
@@ -2364,7 +2341,7 @@ async fn process_saml_logout_request(
     let relay_state_input = if let Some(relay) = relay_state {
         format!(
             r#"<input type="hidden" name="RelayState" value="{}" />"#,
-            relay
+            escape_html_attr(relay)
         )
     } else {
         String::new()
@@ -2400,7 +2377,9 @@ async fn process_saml_logout_request(
     </form>
 </body>
 </html>"#,
-        slo_response_url, saml_response_b64, relay_state_input
+        escape_html_attr(slo_response_url),
+        escape_html_attr(&saml_response_b64),
+        relay_state_input
     );
 
     Ok(Html(html).into_response())

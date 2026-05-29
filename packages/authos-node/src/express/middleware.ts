@@ -46,6 +46,7 @@ export function createAuthMiddleware(options: AuthOSNodeOptions) {
    */
   function requireAuth(authOptions: RequireAuthOptions = {}): RequestHandler {
     const { getToken, ...verifyOptions } = authOptions;
+    const audience = verifyOptions.audience ?? options.audience;
 
     return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
       try {
@@ -60,7 +61,19 @@ export function createAuthMiddleware(options: AuthOSNodeOptions) {
           return;
         }
 
-        const verified = await verifier.verifyToken(token, verifyOptions);
+        if (!audience && options.allowMissingAudience !== true) {
+          res.status(401).json({
+            error: 'Unauthorized',
+            message: 'Missing expected token audience',
+            code: 'MISSING_AUDIENCE',
+          });
+          return;
+        }
+
+        const verified = await verifier.verifyToken(token, {
+          ...verifyOptions,
+          audience,
+        });
         req.auth = verified;
         next();
       } catch (err) {

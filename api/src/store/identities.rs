@@ -194,6 +194,8 @@ impl IdentityStore {
             .ok_or_else(|| AppError::NotFound("Identity not found".to_string()))?;
 
         let mut identity_active: identities::ActiveModel = identity.into();
+        identity_active.access_token = Set(None);
+        identity_active.refresh_token = Set(None);
         identity_active.access_token_encrypted = Set(access_token_encrypted);
         if let Some(refresh_token_encrypted) = refresh_token_encrypted {
             identity_active.refresh_token_encrypted = Set(Some(refresh_token_encrypted));
@@ -505,7 +507,11 @@ impl IdentityStore {
                         || e.to_string().contains("unique constraint")
                     {
                         // Race condition: another request created the identity, retry lookup by provider context
-                        tracing::debug!("Identity creation race condition detected, retrying lookup for provider: {}, provider_user_id: {}", provider, provider_user_id);
+                        tracing::debug!(
+                            "Identity creation race condition detected, retrying lookup for provider: {}, provider_user_id: {}",
+                            provider,
+                            provider_user_id
+                        );
 
                         // Try to find existing identity by provider and context
                         if let Some(existing_identity) = Self::find_by_provider_user_id_context(
@@ -519,8 +525,12 @@ impl IdentityStore {
                         {
                             // Check if this identity belongs to a different user (orphaned record)
                             if existing_identity.user_id != user_id {
-                                tracing::warn!("Found orphaned identity for provider {} with user_id {}, updating to correct user_id {}",
-                                    provider, existing_identity.user_id, user_id);
+                                tracing::warn!(
+                                    "Found orphaned identity for provider {} with user_id {}, updating to correct user_id {}",
+                                    provider,
+                                    existing_identity.user_id,
+                                    user_id
+                                );
 
                                 // Update the orphaned identity to the correct user
                                 let mut identity_active: identities::ActiveModel =

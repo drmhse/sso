@@ -75,4 +75,23 @@ impl ProviderTokenRequestStore {
         active.update(&db).await?;
         Ok(())
     }
+
+    pub async fn cancel_pending_for_user_service(
+        db: DB<'_>,
+        user_id: &str,
+        service_id: &str,
+    ) -> Result<u64> {
+        let result = ProviderTokenRequests::update_many()
+            .col_expr(
+                provider_token_requests::Column::Status,
+                sea_orm::sea_query::Expr::value("canceled"),
+            )
+            .filter(provider_token_requests::Column::UserId.eq(user_id))
+            .filter(provider_token_requests::Column::ServiceId.eq(service_id))
+            .filter(provider_token_requests::Column::Status.eq("pending"))
+            .exec(&db)
+            .await?;
+
+        Ok(result.rows_affected)
+    }
 }

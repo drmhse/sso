@@ -1,18 +1,19 @@
+use crate::entities::{memberships, users};
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, organizations::OrganizationStore,
-    user_passkeys::UserPasskeysStore, users::UserStore, DB,
+    DB, memberships::MembershipStore, organizations::OrganizationStore,
+    user_passkeys::UserPasskeysStore, users::UserStore,
 };
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
+use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
 
 #[derive(Debug, Deserialize)]
 pub struct ForgetUserRequest {
@@ -90,6 +91,49 @@ async fn verify_self_delete_authorization(
     Err(AppError::Forbidden(
         "Confirm account deletion with your current password or MFA code".to_string(),
     ))
+}
+
+async fn require_platform_owner_or_owner_in_all_target_orgs(
+    state: &AppState,
+    requesting_user: &users::Model,
+    target_user_id: &str,
+    action: &str,
+) -> Result<Vec<memberships::Model>> {
+    let memberships = MembershipStore::list_by_user(DB::Conn(&state.db), target_user_id).await?;
+
+    if requesting_user.is_platform_owner {
+        return Ok(memberships);
+    }
+
+    if memberships.is_empty() {
+        return Err(AppError::Forbidden(format!(
+            "You do not have permission to {} this user's data",
+            action
+        )));
+    }
+
+    for membership in &memberships {
+        let requesting_membership = MembershipStore::find_by_org_and_user(
+            DB::Conn(&state.db),
+            &membership.org_id,
+            &requesting_user.id,
+        )
+        .await?;
+
+        if !matches!(requesting_membership, Some(req_membership) if req_membership.role == "owner")
+        {
+            let org = OrganizationStore::find_by_id(DB::Conn(&state.db), &membership.org_id)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+            return Err(AppError::Forbidden(format!(
+                "You must be an owner of organization '{}' to {} this user's data",
+                org.slug, action
+            )));
+        }
+    }
+
+    Ok(memberships)
 }
 
 #[derive(Debug, Serialize)]
@@ -219,43 +263,13 @@ pub async fn forget_user(
         }));
     }
 
-    // Get all organizations the target user is a member of
-    let memberships = MembershipStore::list_by_user(DB::Conn(&state.db), &user_id).await?;
-
-    // Check if requesting user has owner permission in ALL organizations
-    // where the target user is a member
-    for membership in &memberships {
-        // Check if requesting user is owner of this organization
-        let requesting_membership = MembershipStore::find_by_org_and_user(
-            DB::Conn(&state.db),
-            &membership.org_id,
-            &requesting_user.id,
-        )
-        .await?;
-
-        match requesting_membership {
-            Some(req_membership) if req_membership.role == "owner" => {
-                // Requesting user is owner - allowed
-            }
-            _ => {
-                // Requesting user is not owner or not a member
-                // Check if they're platform owner
-                if !requesting_user.is_platform_owner {
-                    let org =
-                        OrganizationStore::find_by_id(DB::Conn(&state.db), &membership.org_id)
-                            .await?
-                            .ok_or_else(|| {
-                                AppError::NotFound("Organization not found".to_string())
-                            })?;
-
-                    return Err(AppError::Forbidden(format!(
-                        "You must be an owner of organization '{}' to anonymize this user",
-                        org.slug
-                    )));
-                }
-            }
-        }
-    }
+    let memberships = require_platform_owner_or_owner_in_all_target_orgs(
+        &state,
+        requesting_user,
+        &user_id,
+        "anonymize",
+    )
+    .await?;
 
     // Anonymize the user (includes transaction)
     UserStore::anonymize(DB::Conn(&state.db), &user_id).await?;
@@ -293,7 +307,8 @@ pub async fn forget_user(
 
 /// GDPR Right to Access - Export user data
 /// GET /api/privacy/export/{user_id}
-/// Requires: User must be requesting their own data OR be an org owner
+/// Requires: User must be requesting their own data, be a platform owner, or
+/// be an owner in every organization the target user belongs to.
 pub async fn export_user_data(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -301,41 +316,14 @@ pub async fn export_user_data(
 ) -> Result<Json<ExportUserDataResponse>> {
     let requesting_user = &auth_user.user;
 
-    // Users can export their own data
-    // Or platform owners can export any user's data
-    // Or org owners can export their members' data
-    let can_export = if requesting_user.id == user_id {
-        true
-    } else if requesting_user.is_platform_owner {
-        true
-    } else {
-        // Check if requesting user is owner in any org where target user is a member
-        let target_memberships =
-            MembershipStore::list_by_user(DB::Conn(&state.db), &user_id).await?;
-
-        let mut is_owner_anywhere = false;
-        for membership in &target_memberships {
-            if let Some(req_membership) = MembershipStore::find_by_org_and_user(
-                DB::Conn(&state.db),
-                &membership.org_id,
-                &requesting_user.id,
-            )
-            .await?
-            {
-                if req_membership.role == "owner" {
-                    is_owner_anywhere = true;
-                    break;
-                }
-            }
-        }
-
-        is_owner_anywhere
-    };
-
-    if !can_export {
-        return Err(AppError::Forbidden(
-            "You do not have permission to export this user's data".to_string(),
-        ));
+    if requesting_user.id != user_id {
+        require_platform_owner_or_owner_in_all_target_orgs(
+            &state,
+            requesting_user,
+            &user_id,
+            "export",
+        )
+        .await?;
     }
 
     // Find the target user

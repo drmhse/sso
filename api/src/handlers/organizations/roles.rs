@@ -1,14 +1,15 @@
+use crate::constants::VALID_ORG_ROLES;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
-use crate::services::permission_service::{PermissionService, CAP_ORG_ROLES_MANAGE};
+use crate::services::permission_service::{CAP_ORG_ROLES_MANAGE, PermissionService};
 use crate::state::AppState;
 use crate::store::{
-    organization_roles::OrganizationRoleStore, organizations::OrganizationStore, DB,
+    DB, organization_roles::OrganizationRoleStore, organizations::OrganizationStore,
 };
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -169,6 +170,12 @@ pub async fn create_role(
     {
         return Err(AppError::Forbidden(
             "Insufficient permissions to create roles".to_string(),
+        ));
+    }
+
+    if VALID_ORG_ROLES.contains(&req.slug.to_lowercase().as_str()) {
+        return Err(AppError::BadRequest(
+            "Custom role slug cannot use a built-in organization role".to_string(),
         ));
     }
 

@@ -1,20 +1,20 @@
 use crate::constants::{DEFAULT_MAX_USERS, DEFAULT_TIER_NAME, VALID_ORG_ROLES};
 use crate::entities::{memberships, users};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result, with_retrying_transaction};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::services::permission_service::{
-    PermissionService, CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE,
+    CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE, PermissionService,
 };
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, organization_roles::OrganizationRoleStore,
+    DB, memberships::MembershipStore, organization_roles::OrganizationRoleStore,
     organization_tiers::OrganizationTierStore, organizations::OrganizationStore,
-    permissions::PermissionsStore, services::ServiceStore, users::UserStore, DB,
+    permissions::PermissionsStore, services::ServiceStore, users::UserStore,
 };
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -207,10 +207,6 @@ pub async fn update_member_role(
         ));
     }
 
-    if req.role == "owner" {
-        crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
-    }
-
     validate_org_role(DB::Conn(&state.db), &organization.id, &req.role).await?;
 
     // Cannot change own role (prevent self-demotion from owner)
@@ -227,6 +223,10 @@ pub async fn update_member_role(
             .ok_or_else(|| {
                 AppError::NotFound("User is not a member of this organization".to_string())
             })?;
+
+    if matches!(membership.role.as_str(), "owner" | "admin") || req.role == "owner" {
+        crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
+    }
 
     // Update role
     MembershipStore::update_role(DB::Conn(&state.db), &membership.id, &req.role).await?;

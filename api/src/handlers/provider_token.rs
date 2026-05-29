@@ -6,12 +6,13 @@ use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
 use crate::store::{
-    identities::IdentityStore, organization_oauth_credentials::OrganizationOAuthCredentialsStore,
-    services::ServiceStore, token_refresh_locks::TokenRefreshLockStore, users::UserStore, DB,
+    DB, identities::IdentityStore,
+    organization_oauth_credentials::OrganizationOAuthCredentialsStore, services::ServiceStore,
+    token_refresh_locks::TokenRefreshLockStore, users::UserStore,
 };
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::DatabaseConnection;
@@ -20,6 +21,7 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub struct ProviderTokenResponse {
     pub access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     pub expires_at: Option<String>,
     pub scopes: Vec<String>,
@@ -100,14 +102,9 @@ pub async fn get_provider_token(
                 &refreshed_identity.access_token,
                 &refreshed_identity.access_token_encrypted,
             )?;
-            let refresh_token = decrypt_token(
-                &state,
-                &refreshed_identity.refresh_token,
-                &refreshed_identity.refresh_token_encrypted,
-            )?;
             return Ok(Json(ProviderTokenResponse {
                 access_token: access_token.unwrap_or_default(),
-                refresh_token,
+                refresh_token: None,
                 expires_at: refreshed_identity
                     .expires_at
                     .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
@@ -123,15 +120,10 @@ pub async fn get_provider_token(
         &identity.access_token,
         &identity.access_token_encrypted,
     )?;
-    let refresh_token = decrypt_token(
-        &state,
-        &identity.refresh_token,
-        &identity.refresh_token_encrypted,
-    )?;
 
     Ok(Json(ProviderTokenResponse {
         access_token: access_token.unwrap_or_default(),
-        refresh_token,
+        refresh_token: None,
         expires_at: identity
             .expires_at
             .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
@@ -176,10 +168,12 @@ async fn refresh_provider_token(
 ) -> Result<identities::Model> {
     let provider = Provider::from_str(&identity.provider)?;
 
-    let refresh_token = identity
-        .refresh_token
-        .as_ref()
-        .ok_or_else(|| AppError::OAuth("No refresh token available".to_string()))?;
+    let refresh_token = decrypt_token(
+        state,
+        &identity.refresh_token,
+        &identity.refresh_token_encrypted,
+    )?
+    .ok_or_else(|| AppError::OAuth("No refresh token available".to_string()))?;
 
     // 1. Determine which credentials to use (same logic as background job)
     let (client_id, client_secret) = if let Some(org_id) = &identity.issuing_org_id {
@@ -262,7 +256,7 @@ async fn refresh_provider_token(
             ));
         }
         Provider::Microsoft => {
-            token_refresher::refresh_microsoft_token(refresh_token, &client_id, &client_secret)
+            token_refresher::refresh_microsoft_token(&refresh_token, &client_id, &client_secret)
                 .await
                 .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?
         }
@@ -270,7 +264,7 @@ async fn refresh_provider_token(
             let config = crate::config::Config::from_env()
                 .map_err(|e| AppError::InternalServerError(e.to_string()))?;
             token_refresher::refresh_google_token(
-                refresh_token,
+                &refresh_token,
                 &client_id,
                 &client_secret,
                 config.platform_google_token_url.as_deref(),
@@ -281,26 +275,51 @@ async fn refresh_provider_token(
         Provider::Oidc => {
             return Err(AppError::OAuth(
                 "OIDC token refresh not supported yet".to_string(),
-            ))
+            ));
         }
         Provider::Password => {
             return Err(AppError::OAuth(
                 "Password token refresh not supported".to_string(),
-            ))
+            ));
         }
     };
 
     // Update identity in database
     let expires_at_naive = new_token.expires_at.map(|dt| dt.naive_utc());
 
-    IdentityStore::update_tokens(
-        DB::Conn(&state.db),
-        &identity.id,
-        Some(&new_token.access_token),
-        new_token.refresh_token.as_deref(),
-        expires_at_naive,
-    )
-    .await?;
+    if let Some(encryption) = state.encryption.as_ref() {
+        let access_token_encrypted = encryption.encrypt(&new_token.access_token).map_err(|e| {
+            AppError::InternalServerError(format!("Failed to encrypt access token: {}", e))
+        })?;
+        let refresh_token_encrypted = new_token
+            .refresh_token
+            .as_ref()
+            .map(|token| {
+                encryption.encrypt(token).map_err(|e| {
+                    AppError::InternalServerError(format!("Failed to encrypt refresh token: {}", e))
+                })
+            })
+            .transpose()?;
+
+        IdentityStore::update_tokens_encrypted(
+            DB::Conn(&state.db),
+            &identity.id,
+            Some(access_token_encrypted),
+            refresh_token_encrypted,
+            encryption.key_id(),
+            expires_at_naive,
+        )
+        .await?;
+    } else {
+        IdentityStore::update_tokens(
+            DB::Conn(&state.db),
+            &identity.id,
+            Some(&new_token.access_token),
+            new_token.refresh_token.as_deref(),
+            expires_at_naive,
+        )
+        .await?;
+    }
 
     // Fetch the updated identity
     let updated_identity = IdentityStore::find_by_id(DB::Conn(&state.db), &identity.id)

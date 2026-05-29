@@ -8,21 +8,21 @@ use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::state::AppState;
 use crate::store::{
-    connected_accounts::ConnectedAccountStore, identities::IdentityStore,
+    DB, connected_accounts::ConnectedAccountStore, identities::IdentityStore,
     oauth_states::OAuthStateStore,
     organization_oauth_credentials::OrganizationOAuthCredentialsStore,
     organizations::OrganizationStore, provider_token_requests::ProviderTokenRequestStore,
     service_provider_grants::ServiceProviderGrantStore, services::ServiceStore,
-    upstream_providers::UpstreamProviderStore, DB,
+    upstream_providers::UpstreamProviderStore,
 };
 use crate::utils::scopes::{parse_optional_scopes, parse_required_scopes};
 use axum::{
+    Json,
     extract::{Path, Query, State},
     response::Redirect,
-    Json,
 };
 use chrono::{DateTime, Utc};
-use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
+use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl, basic::BasicClient};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
@@ -143,10 +143,15 @@ fn choose_service_redirect_uri(
         .unwrap_or_default();
 
     if let Some(redirect_uri) = requested_redirect_uri {
-        if !redirect_uris.is_empty()
-            && !redirect_uris
-                .iter()
-                .any(|allowed_uri| allowed_uri == redirect_uri)
+        if redirect_uris.is_empty() {
+            return Err(AppError::BadRequest(
+                "No redirect URIs are registered for this service".to_string(),
+            ));
+        }
+
+        if !redirect_uris
+            .iter()
+            .any(|allowed_uri| allowed_uri == redirect_uri)
         {
             return Err(AppError::BadRequest(format!(
                 "redirect_uri '{}' is not registered for this service",
@@ -207,6 +212,10 @@ async fn ensure_user_belongs_to_service(
     user_id: &str,
     service_id: &str,
 ) -> Result<()> {
+    let service = ServiceStore::find_by_id(DB::Conn(&state.db), service_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
     let has_authenticated = IdentityStore::user_has_authenticated_with_service(
         DB::Conn(&state.db),
         user_id,
@@ -218,6 +227,16 @@ async fn ensure_user_belongs_to_service(
             "User has not authenticated with this service".to_string(),
         ));
     }
+
+    let user = crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    if user.org_id.as_deref() != Some(service.org_id.as_str()) {
+        return Err(AppError::Forbidden(
+            "User has not authenticated with this service".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -785,13 +804,15 @@ pub async fn complete_provider_token_request(
     let requested_scopes = parse_scopes_required(&request.requested_scopes);
 
     let candidate_accounts = if let Some(account_id) = req.connected_account_id.as_deref() {
-        vec![ConnectedAccountStore::find_active_by_id_for_user(
-            DB::Conn(&state.db),
-            account_id,
-            &auth_user.user.id,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("Connected account not found".to_string()))?]
+        vec![
+            ConnectedAccountStore::find_active_by_id_for_user(
+                DB::Conn(&state.db),
+                account_id,
+                &auth_user.user.id,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound("Connected account not found".to_string()))?,
+        ]
     } else {
         ConnectedAccountStore::list_by_user_and_provider(
             DB::Conn(&state.db),
@@ -974,6 +995,8 @@ pub async fn start_provider_token_request_reauth(
 
     // The provider-token request state is a short-lived bearer capability created
     // only after service API-key, service/user boundary, and scope checks pass.
+    ensure_user_belongs_to_service(&state, &request.user_id, &request.service_id).await?;
+
     let authorization_url =
         create_provider_token_request_oauth_state(&state, &request, &request.user_id).await?;
 
@@ -992,6 +1015,8 @@ pub async fn start_provider_token_request_link(
     )
     .await?
     .ok_or_else(|| AppError::NotFound("Provider token request not found".to_string()))?;
+    ensure_user_belongs_to_service(&state, &auth_user.user.id, &request.service_id).await?;
+
     let authorization_url =
         create_provider_token_request_oauth_state(&state, &request, &auth_user.user.id).await?;
 

@@ -68,34 +68,22 @@ impl MagicLinksStore {
         hasher.update(token.as_bytes());
         let token_hash = hex::encode(hasher.finalize());
 
-        let magic_link = MagicLinkTokens::find()
+        let result = MagicLinkTokens::delete_many()
             .filter(magic_link_tokens::Column::TokenHash.eq(&token_hash))
-            .one(&db)
+            .exec(&db)
             .await?;
 
-        if let Some(magic_link) = magic_link {
-            let active: magic_link_tokens::ActiveModel = magic_link.into();
-            active.delete(&db).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(result.rows_affected == 1)
     }
 
     /// Delete a magic link token by hash directly
     pub async fn delete_by_hash(db: DB<'_>, token_hash: &str) -> Result<bool> {
-        let magic_link = MagicLinkTokens::find()
+        let result = MagicLinkTokens::delete_many()
             .filter(magic_link_tokens::Column::TokenHash.eq(token_hash))
-            .one(&db)
+            .exec(&db)
             .await?;
 
-        if let Some(magic_link) = magic_link {
-            let active: magic_link_tokens::ActiveModel = magic_link.into();
-            active.delete(&db).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(result.rows_affected == 1)
     }
 
     /// Clean up expired magic link tokens (for background job)

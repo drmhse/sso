@@ -5,14 +5,13 @@ use crate::middleware::ServicePrincipal;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::state::AppState;
 use crate::store::{
-    connected_accounts::ConnectedAccountStore, identities::IdentityStore,
+    DB, connected_accounts::ConnectedAccountStore, identities::IdentityStore,
     organization_oauth_credentials::OrganizationOAuthCredentialsStore,
     provider_token_requests::ProviderTokenRequestStore,
     service_provider_grants::ServiceProviderGrantStore, upstream_providers::UpstreamProviderStore,
-    DB,
 };
 use crate::utils::scopes::{parse_optional_scopes, parse_required_scopes};
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -82,6 +81,14 @@ fn missing_scopes(available: &[String], requested: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn extra_scopes(available: &[String], boundary: &[String]) -> Vec<String> {
+    available
+        .iter()
+        .filter(|scope| !boundary.iter().any(|allowed_scope| allowed_scope == *scope))
+        .cloned()
+        .collect()
+}
+
 fn service_scope_config(
     service: &crate::entities::services::Model,
     provider: &str,
@@ -143,12 +150,20 @@ fn validate_redirect_uri(
     redirect_uri: &str,
     service: &crate::entities::services::Model,
 ) -> Result<()> {
-    let allowed_uris = service
-        .redirect_uris
-        .as_ref()
-        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
-        .unwrap_or_default();
-    if !allowed_uris.is_empty() && !allowed_uris.iter().any(|allowed| allowed == redirect_uri) {
+    let allowed_uris_json = service.redirect_uris.as_ref().ok_or_else(|| {
+        AppError::BadRequest("No redirect URIs are registered for this service".to_string())
+    })?;
+
+    let allowed_uris: Vec<String> = serde_json::from_str(allowed_uris_json)
+        .map_err(|e| AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e)))?;
+
+    if allowed_uris.is_empty() {
+        return Err(AppError::BadRequest(
+            "No redirect URIs are registered for this service".to_string(),
+        ));
+    }
+
+    if !allowed_uris.iter().any(|allowed| allowed == redirect_uri) {
         return Err(AppError::BadRequest(format!(
             "redirect_uri '{}' is not registered for this service",
             redirect_uri
@@ -293,12 +308,12 @@ async fn refresh_connected_account(
             Provider::Github => {
                 return Err(AppError::OAuth(
                     "GitHub token refresh is not supported".to_string(),
-                ))
+                ));
             }
             Provider::Oidc | Provider::Password => {
                 return Err(AppError::OAuth(
                     "Token refresh is not supported for this provider".to_string(),
-                ))
+                ));
             }
         }
     };
@@ -320,7 +335,7 @@ async fn refresh_connected_account(
         Provider::Github | Provider::Oidc | Provider::Password => {
             return Err(AppError::OAuth(
                 "Token refresh is not supported for this provider".to_string(),
-            ))
+            ));
         }
     };
 
@@ -448,6 +463,21 @@ pub async fn request_service_provider_token(
             return Ok(Json(response));
         }
 
+        let token_exceeds_grant = !extra_scopes(&account_scopes, &grant_scopes).is_empty();
+        let token_exceeds_service = !extra_scopes(&account_scopes, &allowed_scopes).is_empty();
+        if token_exceeds_grant || token_exceeds_service {
+            let response = action_required(
+                &state,
+                &service,
+                &req,
+                Some(&account.id),
+                "PROVIDER_REAUTH_REQUIRED",
+                vec![],
+            )
+            .await?;
+            return Ok(Json(response));
+        }
+
         let usable_account = if let Some(expires_at_naive) = account.expires_at {
             let expires_at = DateTime::<Utc>::from_naive_utc_and_offset(expires_at_naive, Utc);
             if expires_at < Utc::now() + Duration::minutes(5) {
@@ -499,7 +529,7 @@ pub async fn request_service_provider_token(
             expires_at: usable_account
                 .expires_at
                 .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
-            scopes: parse_scopes(&usable_account.scopes),
+            scopes: grant_scopes,
             provider: usable_account.provider.clone(),
             account: ProviderTokenAccount {
                 id: usable_account.id,

@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::services::safe_http::SafeHttpClient;
 use chrono::{DateTime, Utc};
 use oauth2::{
-    basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl, basic::BasicClient,
 };
 use serde::{Deserialize, Serialize};
 
@@ -387,21 +388,20 @@ impl OAuthClient {
 // Custom HTTP client wrapper for better OAuth error logging and GitHub error detection
 pub async fn oauth_http_client(
     request: oauth2::HttpRequest,
-) -> std::result::Result<oauth2::HttpResponse, reqwest::Error> {
+) -> std::result::Result<oauth2::HttpResponse, AppError> {
     tracing::debug!("OAuth request: {:?} {}", request.method, request.url);
 
-    let client = reqwest::Client::new();
-    let mut builder = client.request(
-        reqwest::Method::from_bytes(request.method.as_str().as_bytes())
-            .unwrap_or(reqwest::Method::GET),
-        request.url.as_str(),
-    );
-
-    for (name, value) in request.headers.iter() {
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
-
-    let response = builder.body(request.body).send().await?;
+    let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    let headers = request
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+        .collect();
+    let safe_client = SafeHttpClient::new()?;
+    let response = safe_client
+        .request_with_owned_headers(method, request.url.as_str(), request.body, headers)
+        .await?;
     let status_code = oauth2::http::StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(oauth2::http::StatusCode::INTERNAL_SERVER_ERROR);
     let mut headers = oauth2::http::HeaderMap::new();
@@ -413,7 +413,11 @@ pub async fn oauth_http_client(
             headers.insert(name, value);
         }
     }
-    let body = response.bytes().await?.to_vec();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("OAuth response read failed: {}", e)))?
+        .to_vec();
 
     let mut result = Ok(oauth2::HttpResponse {
         status_code,
@@ -443,8 +447,11 @@ pub async fn oauth_http_client(
                         .and_then(|d| d.as_str())
                         .unwrap_or(error);
 
-                    tracing::error!("OAuth provider returned error in success response: error={}, description={}",
-                        error, error_description);
+                    tracing::error!(
+                        "OAuth provider returned error in success response: error={}, description={}",
+                        error,
+                        error_description
+                    );
 
                     // Convert to a proper error by returning a 400 status
                     result = Ok(oauth2::HttpResponse {

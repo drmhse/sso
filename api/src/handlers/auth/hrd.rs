@@ -1,12 +1,12 @@
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::store::{
-    organizations::OrganizationStore, services::ServiceStore,
-    verified_domains::VerifiedDomainStore, DB,
+    DB, organizations::OrganizationStore, services::ServiceStore,
+    verified_domains::VerifiedDomainStore,
 };
 use axum::{
-    extract::{Query, State},
     Json,
+    extract::{Query, State},
 };
 use serde::{Deserialize, Serialize};
 
@@ -191,7 +191,7 @@ pub async fn get_auth_context(
                 .redirect_uris
                 .as_deref()
                 .and_then(|uris| serde_json::from_str::<Vec<String>>(uris).ok())
-                .map(|uris| uris.is_empty() || uris.iter().any(|uri| uri == redirect_uri))
+                .map(|uris| !uris.is_empty() && uris.iter().any(|uri| uri == redirect_uri))
                 .unwrap_or(false)
         });
 

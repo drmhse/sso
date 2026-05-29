@@ -5,14 +5,16 @@ use crate::db::models::User;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::store::{
-    device_codes::DeviceCodeStore, identities::IdentityStore, organizations::OrganizationStore,
+    DB, device_codes::DeviceCodeStore, identities::IdentityStore, organizations::OrganizationStore,
     services::ServiceStore, sessions::SessionStore, subscriptions::SubscriptionStore,
-    totp::TotpStore, DB,
+    totp::TotpStore,
 };
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+const PLATFORM_ADMIN_CLI_CLIENT_ID: &str = "platform-admin-cli";
 
 // Re-export common types for use in other modules
 pub use crate::auth::device_flow::DeviceFlowService;
@@ -117,7 +119,7 @@ pub async fn device_code(
     // Check if this is a platform-level device flow or service-level
     let verification_uri = if req.org == "platform"
         && req.service == "admin-cli"
-        && req.client_id.starts_with("platform-")
+        && req.client_id == PLATFORM_ADMIN_CLI_CLIENT_ID
     {
         // Platform-level device flow for admin CLI - use configured platform device activation URI
         format!("{}/activate", config.platform_dashboard_base_url)
@@ -340,6 +342,16 @@ pub async fn token_exchange(
         let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
         let refresh_expires_at = now + chrono::Duration::days(30);
 
+        if !DeviceCodeStore::consume_authorized(
+            DB::Conn(&state.db),
+            &device_code.id,
+            &req.client_id,
+        )
+        .await?
+        {
+            return Err(AppError::BadRequest("Invalid device code".to_string()));
+        }
+
         SessionStore::create(
             DB::Conn(&state.db),
             &user_id,
@@ -388,6 +400,12 @@ pub async fn token_exchange(
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
+
+    if !DeviceCodeStore::consume_authorized(DB::Conn(&state.db), &device_code.id, &req.client_id)
+        .await?
+    {
+        return Err(AppError::BadRequest("Invalid device code".to_string()));
+    }
 
     SessionStore::create(
         DB::Conn(&state.db),

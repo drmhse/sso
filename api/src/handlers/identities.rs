@@ -3,13 +3,13 @@ use crate::error::{AppError, Result};
 use crate::handlers::auth::get_authorization_url_for_client;
 use crate::state::AppState;
 use crate::store::{
-    identities::IdentityStore, oauth_states::OAuthStateStore,
+    DB, identities::IdentityStore, oauth_states::OAuthStateStore,
     organization_oauth_credentials::OrganizationOAuthCredentialsStore,
-    organizations::OrganizationStore, services::ServiceStore, DB,
+    organizations::OrganizationStore, services::ServiceStore,
 };
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use chrono::Utc;
 use sea_orm::DatabaseConnection;
@@ -37,19 +37,16 @@ async fn get_identity_context(
     auth_user: &crate::middleware::AuthUser,
 ) -> Result<(Option<String>, Option<String>)> {
     // Extract org and service from claims, treating empty strings as None
-    let org_slug =
-        auth_user
-            .claims
-            .org
-            .as_ref()
-            .and_then(|s| if s.is_empty() { None } else { Some(s.as_str()) });
-    let service_slug = auth_user.claims.service.as_ref().and_then(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s.as_str())
-        }
-    });
+    let org_slug = auth_user
+        .claims
+        .org
+        .as_ref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s.as_str()) });
+    let service_slug = auth_user
+        .claims
+        .service
+        .as_ref()
+        .and_then(|s| if s.is_empty() { None } else { Some(s.as_str()) });
 
     if let (Some(org_slug), Some(service_slug)) = (org_slug, service_slug) {
         // Service context - get org_id and service_id
@@ -200,10 +197,15 @@ pub async fn start_link(
 
         let base_redirect = match query.redirect_uri.as_deref() {
             Some(redirect_uri) => {
-                if !redirect_uris.is_empty()
-                    && !redirect_uris
-                        .iter()
-                        .any(|allowed_uri| allowed_uri == redirect_uri)
+                if redirect_uris.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "No redirect URIs are registered for this service".to_string(),
+                    ));
+                }
+
+                if !redirect_uris
+                    .iter()
+                    .any(|allowed_uri| allowed_uri == redirect_uri)
                 {
                     return Err(AppError::BadRequest(format!(
                         "redirect_uri '{}' is not registered for this service",

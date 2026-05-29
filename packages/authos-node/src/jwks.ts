@@ -179,7 +179,12 @@ function parseJWT(token: string): { header: { alg: string; kid?: string }; paylo
  * Create a token verifier instance
  */
 export function createTokenVerifier(options: AuthOSNodeOptions) {
-  const { baseURL, jwksCacheTTL = DEFAULT_CACHE_TTL } = options;
+  const {
+    baseURL,
+    jwksCacheTTL = DEFAULT_CACHE_TTL,
+    audience: defaultAudience,
+    issuer: defaultIssuer = baseURL.replace(/\/+$/, ''),
+  } = options;
 
   /**
    * Verify a JWT token using the JWKS from the AuthOS server
@@ -188,7 +193,11 @@ export function createTokenVerifier(options: AuthOSNodeOptions) {
     token: string,
     verifyOptions: VerifyTokenOptions = {}
   ): Promise<VerifiedToken> {
-    const { audience, issuer, clockTolerance = 0 } = verifyOptions;
+    const {
+      audience = defaultAudience,
+      issuer = defaultIssuer,
+      clockTolerance = 0,
+    } = verifyOptions;
 
     // Parse the token to get header and payload
     const { header, payload } = parseJWT(token);

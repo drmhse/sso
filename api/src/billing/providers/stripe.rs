@@ -17,6 +17,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
+const STRIPE_WEBHOOK_TOLERANCE_SECONDS: i64 = 300;
 
 pub struct StripeProvider {
     client: reqwest::Client,
@@ -162,7 +163,8 @@ impl StripeProvider {
             "customer.subscription.created" => self.parse_subscription_event(object, true),
             "customer.subscription.updated" => self.parse_subscription_event(object, false),
             "customer.subscription.deleted" => BillingEvent::SubscriptionDeleted {
-                external_customer_id: Self::expandable_id(object.get("customer")).unwrap_or_default(),
+                external_customer_id: Self::expandable_id(object.get("customer"))
+                    .unwrap_or_default(),
                 external_subscription_id: object
                     .get("id")
                     .and_then(Value::as_str)
@@ -170,10 +172,12 @@ impl StripeProvider {
                     .to_string(),
             },
             "invoice.payment_succeeded" => BillingEvent::PaymentSucceeded {
-                external_customer_id: Self::expandable_id(object.get("customer")).unwrap_or_default(),
+                external_customer_id: Self::expandable_id(object.get("customer"))
+                    .unwrap_or_default(),
             },
             "invoice.payment_failed" => BillingEvent::PaymentFailed {
-                external_customer_id: Self::expandable_id(object.get("customer")).unwrap_or_default(),
+                external_customer_id: Self::expandable_id(object.get("customer"))
+                    .unwrap_or_default(),
                 attempt_count: object
                     .get("attempt_count")
                     .and_then(Value::as_u64)
@@ -236,9 +240,17 @@ impl StripeProvider {
             }
         }
 
-        let timestamp = timestamp.ok_or_else(|| {
-            AppError::BadRequest("Missing Stripe webhook timestamp".to_string())
-        })?;
+        let timestamp = timestamp
+            .ok_or_else(|| AppError::BadRequest("Missing Stripe webhook timestamp".to_string()))?;
+        let timestamp_seconds = timestamp
+            .parse::<i64>()
+            .map_err(|_| AppError::BadRequest("Invalid Stripe webhook timestamp".to_string()))?;
+        let now = Utc::now().timestamp();
+        if (now - timestamp_seconds).abs() > STRIPE_WEBHOOK_TOLERANCE_SECONDS {
+            return Err(AppError::Billing(
+                "Webhook verification failed: timestamp outside tolerance".to_string(),
+            ));
+        }
         if signatures.is_empty() {
             return Err(AppError::BadRequest(
                 "Missing Stripe webhook signature".to_string(),

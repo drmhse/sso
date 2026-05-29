@@ -145,6 +145,29 @@ impl SessionStore {
         Ok(result.rows_affected)
     }
 
+    /// Delete sessions scoped to an organization slug or one of its services.
+    pub async fn delete_user_org_scoped_sessions(
+        db: DB<'_>,
+        user_id: &str,
+        org_slug: &str,
+        service_ids: &[String],
+    ) -> Result<u64> {
+        use sea_orm::Condition;
+
+        let mut scope = Condition::any().add(sessions::Column::OrgSlug.eq(org_slug));
+        if !service_ids.is_empty() {
+            scope = scope.add(sessions::Column::ServiceId.is_in(service_ids.iter().cloned()));
+        }
+
+        let result = Sessions::delete_many()
+            .filter(sessions::Column::UserId.eq(user_id))
+            .filter(scope)
+            .exec(&db)
+            .await?;
+
+        Ok(result.rows_affected)
+    }
+
     /// Delete expired sessions
     pub async fn delete_expired(db: DB<'_>) -> Result<u64> {
         let now = chrono::Utc::now().naive_utc();
@@ -186,23 +209,35 @@ impl SessionStore {
     pub async fn update_tokens(
         db: DB<'_>,
         session_id: &str,
+        current_refresh_token: &str,
         new_token_hash: &str,
         new_expires_at: NaiveDateTime,
         new_refresh_token: &str,
         new_refresh_expires_at: NaiveDateTime,
-    ) -> Result<()> {
-        let session = Self::find_by_id(db.clone(), session_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Session not found".to_string()))?;
+    ) -> Result<bool> {
+        let result = Sessions::update_many()
+            .filter(sessions::Column::Id.eq(session_id))
+            .filter(sessions::Column::RefreshToken.eq(current_refresh_token))
+            .col_expr(
+                sessions::Column::TokenHash,
+                sea_orm::sea_query::Expr::value(new_token_hash),
+            )
+            .col_expr(
+                sessions::Column::ExpiresAt,
+                sea_orm::sea_query::Expr::value(new_expires_at),
+            )
+            .col_expr(
+                sessions::Column::RefreshToken,
+                sea_orm::sea_query::Expr::value(new_refresh_token),
+            )
+            .col_expr(
+                sessions::Column::RefreshTokenExpiresAt,
+                sea_orm::sea_query::Expr::value(new_refresh_expires_at),
+            )
+            .exec(&db)
+            .await?;
 
-        let mut session_active: sessions::ActiveModel = session.into();
-        session_active.token_hash = Set(new_token_hash.to_string());
-        session_active.expires_at = Set(new_expires_at);
-        session_active.refresh_token = Set(Some(new_refresh_token.to_string()));
-        session_active.refresh_token_expires_at = Set(Some(new_refresh_expires_at));
-
-        session_active.update(&db).await?;
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 
     /// Delete all sessions for a user except the current session (for security after password change)

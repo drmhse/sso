@@ -1,18 +1,18 @@
 use crate::entities::permissions::{RelationTuple, SUBJECT_TYPE_USER};
 use crate::entities::{prelude::Users, users};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result, with_retrying_transaction};
 use crate::middleware::ScimAuth;
 use crate::services::job_queue::JobQueueService;
 use crate::services::scim_filter::{ScimFilterParser, ScimOperator};
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, permissions::PermissionsStore, users::UserStore, DB,
+    DB, memberships::MembershipStore, permissions::PermissionsStore, users::UserStore,
 };
 use axum::{
+    Json,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
@@ -64,6 +64,18 @@ fn user_to_scim(user: users::Model, base_url: &str) -> ScimUser {
         }]),
         active: user.deleted_at.is_none(), // Active if not soft-deleted
     }
+}
+
+fn ensure_scim_can_deprovision_membership(
+    membership: &crate::entities::memberships::Model,
+) -> Result<()> {
+    if matches!(membership.role.as_str(), "owner" | "admin") {
+        return Err(AppError::Forbidden(
+            "SCIM cannot deprovision organization owners or admins".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn scoped_email_conflict(
@@ -378,11 +390,13 @@ pub async fn patch_user(
         MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &scim_auth.org_id, &user.id)
             .await?;
 
-    if membership.is_none() {
+    let membership = if let Some(membership) = membership {
+        membership
+    } else {
         // User exists but not in this organization - return 404 for security
         let error = ScimError::not_found("User not found".to_string());
         return Ok((StatusCode::NOT_FOUND, Json(error)).into_response());
-    }
+    };
 
     let current_user_id = user.id.clone();
     let mut active_user: users::ActiveModel = user.into();
@@ -446,6 +460,7 @@ pub async fn patch_user(
                                     // Set active: clear deleted_at timestamp
                                     active_user.deleted_at = Set(None);
                                 } else {
+                                    ensure_scim_can_deprovision_membership(&membership)?;
                                     // Set disabled: set deleted_at timestamp
                                     active_user.deleted_at = Set(Some(Utc::now().naive_utc()));
                                 }
@@ -483,14 +498,27 @@ pub async fn delete_user(
         MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &scim_auth.org_id, &user.id)
             .await?;
 
-    if membership.is_none() {
+    let membership = if let Some(membership) = membership {
+        membership
+    } else {
         // User exists but not in this organization - return 404 for security
         let error = ScimError::not_found("User not found".to_string());
         return Ok((StatusCode::NOT_FOUND, Json(error)).into_response());
-    }
+    };
 
-    let active_user: users::ActiveModel = user.into();
-    active_user.delete(&state.db).await?;
+    ensure_scim_can_deprovision_membership(&membership)?;
+
+    MembershipStore::delete(DB::Conn(&state.db), &membership.id).await?;
+    PermissionsStore::revoke(
+        DB::Conn(&state.db),
+        "organization",
+        &scim_auth.org_id,
+        &membership.role,
+        SUBJECT_TYPE_USER,
+        &user.id,
+        None,
+    )
+    .await?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }

@@ -1,16 +1,16 @@
 use crate::auth::jwt::JwtService;
-use crate::auth::sso::{oauth_http_client, Provider};
+use crate::auth::sso::{Provider, oauth_http_client};
 use crate::constants::OAUTH_STATE_EXPIRE_MINUTES;
 use crate::db::models::{DeviceCode, Service, User};
 use crate::error::{AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    connected_accounts::ConnectedAccountStore, device_codes::DeviceCodeStore,
+    DB, connected_accounts::ConnectedAccountStore, device_codes::DeviceCodeStore,
     identities::IdentityStore, memberships::MembershipStore, oauth_states::OAuthStateStore,
     organizations::OrganizationStore, provider_token_requests::ProviderTokenRequestStore,
     service_provider_grants::ServiceProviderGrantStore, services::ServiceStore,
-    sessions::SessionStore, upstream_providers::UpstreamProviderStore, DB,
+    sessions::SessionStore, upstream_providers::UpstreamProviderStore,
 };
 use crate::utils::scopes::{normalize_scope_list, parse_optional_scopes, parse_required_scopes};
 use axum::{
@@ -20,8 +20,8 @@ use axum::{
 use chrono::Utc;
 use oauth2::url;
 use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, TokenUrl,
+    AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
+    TokenUrl, basic::BasicClient,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -495,6 +495,70 @@ async fn ensure_provider_account_can_link(
     ))
 }
 
+async fn ensure_provider_token_request_matches_provider_user(
+    state: &AppState,
+    request_state: Option<&str>,
+    target_user_id: &str,
+    target_service_id: &str,
+    provider: &str,
+    provider_email: &str,
+) -> Result<()> {
+    let Some(request_state) = request_state else {
+        return Ok(());
+    };
+
+    let request = ProviderTokenRequestStore::find_active_for_user(
+        DB::Conn(&state.db),
+        request_state,
+        target_user_id,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("Provider token request not found".to_string()))?;
+
+    if request.service_id != target_service_id || request.provider != provider {
+        return Err(AppError::BadRequest(
+            "Provider token request context mismatch".to_string(),
+        ));
+    }
+
+    let has_authenticated = IdentityStore::user_has_authenticated_with_service(
+        DB::Conn(&state.db),
+        target_user_id,
+        target_service_id,
+    )
+    .await?;
+    if !has_authenticated {
+        return Err(AppError::BadRequest(
+            "Provider token request is no longer valid for this service user".to_string(),
+        ));
+    }
+
+    let target_user =
+        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), target_user_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let service = ServiceStore::find_by_id(DB::Conn(&state.db), target_service_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+    if target_user.org_id.as_deref() != Some(service.org_id.as_str()) {
+        return Err(AppError::BadRequest(
+            "Provider token request is no longer valid for this service user".to_string(),
+        ));
+    }
+
+    if !target_user
+        .email
+        .trim()
+        .eq_ignore_ascii_case(provider_email.trim())
+    {
+        return Err(AppError::BadRequest(
+            "Provider account email does not match the requested user".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn resolve_upstream_oidc_config(
     provider_model: &crate::entities::upstream_providers::Model,
 ) -> Result<ResolvedUpstreamOidcConfig> {
@@ -509,9 +573,8 @@ pub(crate) async fn resolve_upstream_oidc_config(
             )
         })?;
 
-        let discovery_doc = reqwest::Client::new()
+        let discovery_doc = crate::services::safe_http::SafeHttpClient::new()?
             .get(discovery_url)
-            .send()
             .await
             .map_err(|e| {
                 AppError::InternalServerError(format!(
@@ -541,6 +604,17 @@ pub(crate) async fn resolve_upstream_oidc_config(
         if userinfo_url.is_none() {
             userinfo_url = discovery_doc.userinfo_endpoint;
         }
+    }
+
+    let safe_client = crate::services::safe_http::SafeHttpClient::new()?;
+    for (field, url) in [
+        ("authorization_url", authorization_url.as_deref()),
+        ("token_url", token_url.as_deref()),
+        ("userinfo_url", userinfo_url.as_deref()),
+    ] {
+        let url = url
+            .ok_or_else(|| AppError::BadRequest(format!("Missing {} for OIDC provider", field)))?;
+        safe_client.validate_external_url(url).await?;
     }
 
     Ok(ResolvedUpstreamOidcConfig {
@@ -1265,12 +1339,14 @@ async fn auth_callback_impl(
         let oidc_config = resolve_upstream_oidc_config(&provider_model).await?;
         let userinfo_url = oidc_config.userinfo_url;
 
-        // Use reqwest to fetch user info
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(&userinfo_url)
-            .bearer_auth(&token_details.access_token)
-            .send()
+        let resp = crate::services::safe_http::SafeHttpClient::new()?
+            .get_with_owned_headers(
+                &userinfo_url,
+                vec![(
+                    "Authorization".to_string(),
+                    format!("Bearer {}", token_details.access_token),
+                )],
+            )
             .await
             .map_err(|e| {
                 AppError::InternalServerError(format!("Failed to fetch user info: {}", e))
@@ -1320,6 +1396,23 @@ async fn auth_callback_impl(
     if let Some(ref oauth_ctx) = oauth_state {
         if let Some(ref linking_user_id) = oauth_ctx.user_id_for_linking {
             // This is a linking flow - link the new provider to the existing user
+            let provider_key = oauth_ctx
+                .upstream_connection_id
+                .as_deref()
+                .filter(|_| provider == Provider::Oidc)
+                .unwrap_or_else(|| provider.as_str());
+
+            if let Some(service_id) = issuing_service_id.as_deref() {
+                ensure_provider_token_request_matches_provider_user(
+                    &state,
+                    oauth_ctx.provider_token_request_state.as_deref(),
+                    linking_user_id,
+                    service_id,
+                    provider_key,
+                    &user_info.email,
+                )
+                .await?;
+            }
 
             ensure_provider_account_can_link(
                 &state,
@@ -1347,11 +1440,6 @@ async fn auth_callback_impl(
             )
             .await?;
 
-            let provider_key = oauth_ctx
-                .upstream_connection_id
-                .as_deref()
-                .filter(|_| provider == Provider::Oidc)
-                .unwrap_or_else(|| provider.as_str());
             let connected_account = upsert_connected_account_from_oauth(
                 &state,
                 linking_user_id,
@@ -1539,6 +1627,7 @@ async fn auth_callback_impl(
             return crate::handlers::saml::complete_saml_authentication(
                 &state,
                 saml_state_id,
+                oauth_ctx.service_id.as_deref(),
                 &user,
             )
             .await;
@@ -1554,21 +1643,13 @@ async fn auth_callback_impl(
             if let (Some(org_slug), Some(service_slug)) =
                 (&oauth_ctx.org_slug, &oauth_ctx.service_slug)
             {
-                // Find device code using the user_code if provided, otherwise fall back to most recent
+                let user_code = oauth_ctx.device_user_code.as_ref().ok_or_else(|| {
+                    AppError::BadRequest("Device flow requires user_code binding".to_string())
+                })?;
                 let device_code: Option<DeviceCode> =
-                    if let Some(ref user_code) = oauth_ctx.device_user_code {
-                        DeviceCodeStore::find_pending_by_user_code(DB::Conn(&state.db), user_code)
-                            .await?
-                            .map(Into::into)
-                    } else {
-                        DeviceCodeStore::find_latest_pending_by_org_service(
-                            DB::Conn(&state.db),
-                            org_slug,
-                            service_slug,
-                        )
+                    DeviceCodeStore::find_pending_by_user_code(DB::Conn(&state.db), user_code)
                         .await?
-                        .map(Into::into)
-                    };
+                        .map(Into::into);
 
                 if let Some(dc) = device_code {
                     // Check if user has MFA enabled
@@ -2422,6 +2503,16 @@ async fn handle_service_flow_via_admin_callback(
     let org_id = service.org_id.clone();
 
     if let Some(linking_user_id) = oauth_state.user_id_for_linking.as_deref() {
+        ensure_provider_token_request_matches_provider_user(
+            &state,
+            oauth_state.provider_token_request_state.as_deref(),
+            linking_user_id,
+            service_id,
+            provider.as_str(),
+            &user_info.email,
+        )
+        .await?;
+
         ensure_provider_account_can_link(
             &state,
             linking_user_id,
@@ -2738,7 +2829,7 @@ fn build_oauth_client(
     callback_uri: String,
     config: &crate::config::Config,
 ) -> Result<oauth2::basic::BasicClient> {
-    use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
+    use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl, basic::BasicClient};
 
     let (auth_url, token_url) = match provider {
         Provider::Github => (
@@ -2778,12 +2869,12 @@ fn build_oauth_client(
         Provider::Oidc => {
             return Err(AppError::InternalServerError(
                 "OIDC not supported in build_oauth_client".to_string(),
-            ))
+            ));
         }
         Provider::Password => {
             return Err(AppError::InternalServerError(
                 "Password provider not supported in build_oauth_client".to_string(),
-            ))
+            ));
         }
     };
 
@@ -2837,12 +2928,12 @@ fn create_admin_oauth_client(
         Provider::Oidc => {
             return Err(AppError::BadRequest(
                 "OIDC provider not supported for admin login".to_string(),
-            ))
+            ));
         }
         Provider::Password => {
             return Err(AppError::BadRequest(
                 "Password provider not supported for admin login".to_string(),
-            ))
+            ));
         }
     };
 
@@ -2970,17 +3061,24 @@ async fn exchange_custom_code(
 // Helper functions for BYOO (Bring Your Own OAuth)
 
 fn validate_redirect_uri(redirect_uri: &str, service: &crate::db::models::Service) -> Result<()> {
-    if let Some(allowed_uris_json) = service.redirect_uris.as_ref() {
-        let allowed_uris: Vec<String> = serde_json::from_str(allowed_uris_json).map_err(|e| {
-            AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e))
-        })?;
+    let allowed_uris_json = service.redirect_uris.as_ref().ok_or_else(|| {
+        AppError::BadRequest("No redirect URIs are registered for this service".to_string())
+    })?;
 
-        if !allowed_uris.is_empty() && !allowed_uris.contains(&redirect_uri.to_string()) {
-            return Err(AppError::BadRequest(format!(
-                "redirect_uri '{}' is not registered for this service",
-                redirect_uri
-            )));
-        }
+    let allowed_uris: Vec<String> = serde_json::from_str(allowed_uris_json)
+        .map_err(|e| AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e)))?;
+
+    if allowed_uris.is_empty() {
+        return Err(AppError::BadRequest(
+            "No redirect URIs are registered for this service".to_string(),
+        ));
+    }
+
+    if !allowed_uris.iter().any(|allowed| allowed == redirect_uri) {
+        return Err(AppError::BadRequest(format!(
+            "redirect_uri '{}' is not registered for this service",
+            redirect_uri
+        )));
     }
 
     Ok(())
@@ -3182,12 +3280,12 @@ async fn get_provider_user_info(
         Provider::Oidc => {
             return Err(AppError::BadRequest(
                 "OIDC not supported in generic get_provider_user_info".to_string(),
-            ))
+            ));
         }
         Provider::Password => {
             return Err(AppError::BadRequest(
                 "Password provider not supported in generic get_provider_user_info".to_string(),
-            ))
+            ));
         }
     }
 }

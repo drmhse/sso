@@ -64,16 +64,19 @@ impl SamlStateStore {
     }
 
     /// Update user_id for a SAML state
-    pub async fn update_user_id(db: DB<'_>, state_id: &str, user_id: &str) -> Result<()> {
+    pub async fn update_user_id(db: DB<'_>, state_id: &str, user_id: &str) -> Result<bool> {
         use sea_orm::sea_query::Expr;
+        let now = Utc::now().naive_utc();
 
-        SamlStates::update_many()
+        let result = SamlStates::update_many()
             .col_expr(saml_states::Column::UserId, Expr::value(user_id))
             .filter(saml_states::Column::StateId.eq(state_id))
+            .filter(saml_states::Column::ExpiresAt.gt(now))
+            .filter(saml_states::Column::UserId.is_null())
             .exec(&db)
             .await?;
 
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 
     /// Delete a SAML state by state_id

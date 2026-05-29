@@ -1,3 +1,4 @@
+use crate::auth::jwt::Claims;
 use crate::db::models::User;
 use crate::entities::users;
 use crate::error::{with_deadlock_retry, with_retrying_transaction, AppError, Result};
@@ -5,7 +6,8 @@ use crate::middleware::RequestInfo;
 use crate::services::audit_builder::MfaAuditBuilder;
 use crate::state::AppState;
 use crate::store::{
-    device_codes::DeviceCodeStore, services::ServiceStore, sessions::SessionStore, DB,
+    device_codes::DeviceCodeStore, distributed_locks::DistributedLockStore, services::ServiceStore,
+    sessions::SessionStore, DB,
 };
 use axum::{extract::State, Extension, Json};
 use chrono::Utc;
@@ -87,22 +89,43 @@ pub async fn verify_mfa_login(
 
     let user: User = user_entity.into();
 
+    consume_mfa_preauth_token(&state, &claims).await?;
+
     // Check if this MFA verification is part of a SAML authentication flow
     if let Some(saml_state_id) = &claims.saml_state {
+        let service_id = match (claims.org.as_deref(), claims.service.as_deref()) {
+            (Some(org_slug), Some(service_slug)) => {
+                let service = ServiceStore::find_by_org_slug_and_service_slug(
+                    DB::Conn(&state.db),
+                    org_slug,
+                    service_slug,
+                )
+                .await?
+                .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+                Some(service.id)
+            }
+            _ => None,
+        };
+
         // Complete SAML authentication instead of issuing JWT
         // Note: This returns HTML, not JSON, which is appropriate for SAML flows
-        return crate::handlers::saml::complete_saml_authentication(&state, saml_state_id, &user)
-            .await
-            .map(|_html_response| {
-                // Convert HTML response to JSON response
-                // This is a workaround - ideally SAML flows would use a different endpoint
-                // The frontend should handle SAML flows differently
-                Json(RefreshTokenResponse {
-                    access_token: "SAML_COMPLETE".to_string(),
-                    refresh_token: String::new(),
-                    expires_in: 0,
-                })
-            });
+        return crate::handlers::saml::complete_saml_authentication(
+            &state,
+            saml_state_id,
+            service_id.as_deref(),
+            &user,
+        )
+        .await
+        .map(|_html_response| {
+            // Convert HTML response to JSON response
+            // This is a workaround - ideally SAML flows would use a different endpoint
+            // The frontend should handle SAML flows differently
+            Json(RefreshTokenResponse {
+                access_token: "SAML_COMPLETE".to_string(),
+                refresh_token: String::new(),
+                expires_in: 0,
+            })
+        });
     }
 
     // Generate full session JWT
@@ -241,4 +264,27 @@ pub async fn verify_mfa_login(
         refresh_token,
         expires_in: state.config.jwt_expiration_hours * 3600,
     }))
+}
+
+async fn consume_mfa_preauth_token(state: &AppState, claims: &Claims) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let ttl_seconds = (claims.exp - now).max(1);
+    let lock_key = format!("mfa-preauth:{}", claims.jti);
+    let owner_id = format!("user:{}", claims.sub);
+
+    let consumed = DistributedLockStore::try_acquire_lock(
+        DB::Conn(&state.db),
+        &lock_key,
+        &owner_id,
+        ttl_seconds,
+    )
+    .await?;
+
+    if !consumed {
+        return Err(AppError::BadRequest(
+            "Invalid pre-authentication token".to_string(),
+        ));
+    }
+
+    Ok(())
 }

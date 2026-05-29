@@ -2,16 +2,16 @@ use crate::entities::users;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{
-    PermissionService, CAP_END_USERS_MANAGE, CAP_END_USERS_VIEW,
+    CAP_END_USERS_MANAGE, CAP_END_USERS_VIEW, PermissionService,
 };
 use crate::state::AppState;
 use crate::store::{
-    identities::IdentityStore, organizations::OrganizationStore, services::ServiceStore,
-    sessions::SessionStore, subscriptions::SubscriptionStore, users::UserStore, DB,
+    DB, identities::IdentityStore, organizations::OrganizationStore, services::ServiceStore,
+    sessions::SessionStore, subscriptions::SubscriptionStore, users::UserStore,
 };
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -501,9 +501,16 @@ pub async fn revoke_end_user_sessions(
         ));
     }
 
-    // Delete all active sessions for this user
-    let revoked_count =
-        SessionStore::delete_all_for_user(DB::Conn(&state.db), &end_user_id).await?;
+    let org_services = ServiceStore::list_by_org(DB::Conn(&state.db), &organization.id).await?;
+    let service_ids: Vec<String> = org_services.into_iter().map(|service| service.id).collect();
+
+    let revoked_count = SessionStore::delete_user_org_scoped_sessions(
+        DB::Conn(&state.db),
+        &end_user_id,
+        &org_slug,
+        &service_ids,
+    )
+    .await?;
 
     Ok(Json(serde_json::json!({
         "message": "Sessions revoked successfully",

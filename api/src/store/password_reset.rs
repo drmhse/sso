@@ -1,6 +1,6 @@
 use crate::entities::password_reset_tokens;
 use crate::entities::prelude::PasswordResetTokens;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::store::DB;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
@@ -41,15 +41,17 @@ impl PasswordResetStore {
     }
 
     /// Mark a password reset token as used
-    pub async fn mark_as_used(db: DB<'_>, token_hash: &str) -> Result<()> {
-        let token = Self::find_by_token_hash(db.clone(), token_hash)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Token not found".to_string()))?;
+    pub async fn mark_as_used(db: DB<'_>, token_hash: &str) -> Result<bool> {
+        let result = PasswordResetTokens::update_many()
+            .filter(password_reset_tokens::Column::TokenHash.eq(token_hash))
+            .filter(password_reset_tokens::Column::Used.eq(false))
+            .col_expr(
+                password_reset_tokens::Column::Used,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .exec(&db)
+            .await?;
 
-        let mut token_active: password_reset_tokens::ActiveModel = token.into();
-        token_active.used = Set(true);
-        token_active.update(&db).await?;
-
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 }

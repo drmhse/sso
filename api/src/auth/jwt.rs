@@ -37,6 +37,8 @@ pub struct Claims {
     pub act: Option<Actor>, // Actor claim for impersonation (RFC 8693)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>, // Audience - used for impersonation sessions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>, // Issuer - AuthOS API base URL
     pub exp: i64, // expiration timestamp
     pub iat: i64, // issued at timestamp
 }
@@ -46,6 +48,7 @@ pub struct JwtService {
     decoding_key: DecodingKey,
     expiration_hours: i64,
     key_id: String,
+    issuer: String,
 }
 
 impl JwtService {
@@ -54,6 +57,7 @@ impl JwtService {
         public_key_base64: &str,
         expiration_hours: i64,
         key_id: &str,
+        issuer: &str,
     ) -> Result<Self> {
         let private_key_pem = STANDARD.decode(private_key_base64).map_err(|e| {
             AppError::InternalServerError(format!("Failed to decode private key: {}", e))
@@ -74,7 +78,17 @@ impl JwtService {
             decoding_key,
             expiration_hours,
             key_id: key_id.to_string(),
+            issuer: issuer.trim_end_matches('/').to_string(),
         })
+    }
+
+    fn audience_for(org_slug: Option<&str>, service_slug: Option<&str>) -> Option<String> {
+        match (org_slug, service_slug) {
+            (Some(org), Some(service)) => Some(format!("service:{}/{}", org, service)),
+            (Some(org), None) => Some(format!("org:{}", org)),
+            (None, Some(service)) => Some(format!("service:{}", service)),
+            (None, None) => Some("platform".to_string()),
+        }
     }
 
     pub fn create_token(
@@ -102,7 +116,8 @@ impl JwtService {
             mfa_verified: None,
             saml_state: None,
             act: None,
-            aud: None,
+            aud: Self::audience_for(org_slug, service_slug),
+            iss: Some(self.issuer.clone()),
             exp: exp.timestamp(),
             iat: now.timestamp(),
         };
@@ -140,7 +155,8 @@ impl JwtService {
             mfa_verified: Some(false),
             saml_state: saml_state.map(|s| s.to_string()),
             act: None,
-            aud: None,
+            aud: Self::audience_for(org_slug, service_slug),
+            iss: Some(self.issuer.clone()),
             exp: exp.timestamp(),
             iat: now.timestamp(),
         };
@@ -154,6 +170,7 @@ impl JwtService {
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = true;
+        validation.validate_aud = false;
 
         let token_data =
             decode::<Claims>(token, &self.decoding_key, &validation).map_err(AppError::Jwt)?;
@@ -202,6 +219,7 @@ impl JwtService {
                 reason: reason.map(|s| s.to_string()),
             }),
             aud: Some("impersonation-session".to_string()),
+            iss: Some(self.issuer.clone()),
             exp: exp.timestamp(),
             iat: now.timestamp(),
         };
@@ -247,7 +265,14 @@ mod tests {
     fn test_jwt_creation_and_validation() {
         let private_key = "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUV2UUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQktjd2dnU2pBZ0VBQW9JQkFRQ0dlSHhCSHJkRE9wR3cKLzNOcGhkK2JhRTNEaGNac3F3cE83Tm0rZUxsMGNkWERINUc2eXBURW1oS25LLzYrRmM4UE95SnB1R0ZORll5NAoyUUd4VVBiekJyeTZ3ay80TWMwV09mNXlKOFh6djlLRGcyM0pObk1OLys1cExLT0UzTS9BbSs2aVpYd1ZUMGJ0ClR4aU9nNlppajlLS3hZck9ZSitqWEE3aE1xWHFwc1h5b2t4d3pKLzM3eG96QktpRnVycGtad2tGZzQ0cldHSTYKalovN0pxRWszSHM0djdUcGZiWUovWnRzcndhYnduMWdzZDA4enpLVXNQTURGelpuWTJwTGorUG5tNWJTd1ZuTgpWSDRxTjBMNWtYUWxQMVZmQ1VhTTV1YnVxenE0c3FPeVJ0aTFRYTI0dG1qMS9jeXJKRno2OFhtT1RyZm1Cbmc3CmZMa0IzdHM3QWdNQkFBRUNnZ0VBRCtLMlJHMGxWNUd1T2h1R0hna0hndnVkOVlOZFpHTmZzRFk3MGt3VWEwU3kKd2o1OXFwN3ZBZVlmczZtM1g1WlhvK1FucXhkSFFMZDkxeTBsRFl1cE9NbVZkeUg5d2k0dW5ROFVna0RmbWtMbQowc3d1ZStSQ1VGSSttYzhyc1hEeWhyMnZ3Y3M5RHVRUzFzc095c1hwQnpZWURjdkxjTzVVNkQ2M3IvUHZTaS9tCkFTM051VlMycWNYOFd1RGt0Q3hKRFRxQjREa2ZWRnpoUFV2NWJmaThHWVUwZ2Z3TmZMYUpHdmcyUTdSQzl6eC8KejBncVNZTnZaMllWem8zY3Jvckh2S2F1M0RhcVZpRG1sVTBubEtncFJxbXZCNG9IeHRYcVgxNnY0OEs4WGwxRAo5V3lFNUZYanJEUWhPZWNWazJ6NDJDdWp1TjZlVlppeUk5blpBV2JBM1FLQmdRQzV6eVZCMHE0bkNrNm9pWitSCnNkWkkvb3k1ajY3VkJ0T0ZhNUpzS092UGtYMjlQclA1ZlN0dXFNNklDUFNmMWVwTmI5REZrN2gwVENqbmhuRHEKYWpJeDZUMk5GWWJMTEo0L05iS0RnNDI3UHdzTzcrbFAxM0l1eDdvUi94R2RpZFExcUwzdVdVSlB5cFZKM2xXTgpPWkk2U1Z2dU4wY0wzNnFaUkdhREExWGFSd0tCZ1FDNVJKbGF1emx5MndpTUNxVFRlSUV6TGNibHV3eHFROVN1CkFQUDFoWkVxMVdMOERvbitqZUIyTkxwRTNUWG9QRzRncVNxSTFxS05vSTE0ekNVWjlyMTkvcjg2eEkvaGZ1UXYKRkxJZjQ2TnJ0MzdMZnNNTGxGL3dIQWxrc05JYU9TQTFkZ3ZORC80Rm9BNkwzeldYNGdyTFZjQVIvK2c4ZmlIKwpJTWNJelVJOWJRS0JnRGhWQ2VtYjB2cTVFRUhlZjRjdlVGVU8vMkVlbzVXb0hTYTlCMFpOWGJpdlZseXlqdVBiCncvZ25xMzNvb1NsNE5ESEg3WmFKQTRvV3NPd0lnV0ZBVXZsNHloVms2bG5jckJsajBUdzMvUmRBdEx5UmxiMkUKQnZVUnptSzRYd0hSRUlvNEgyVU1vS01LT3hxTEVvcmZZbXJUWk5DaTU2STg3RDdOVXZyelh1cnZBb0dBVk5tZApIcGZHdk5xaDlIbGZlZGFqM1l1bW4wcG1hamk4ckNDVm1xbmNqWENEVUF0Y21lL2lrR0NmdXJCUll4WmlIYVU4CmJNVllWMkxqeUNJL0Q4QVlreDdiK0E5VUVpTnFZRUdyUHIyajk4NW5UTTIyaUpRZ3lEZ2UrVFdlVkJJN3RTQm0KVVRsMHpxQzZhTWNHcFpRSis0dy9WajhNM3IrcDA5aXhMMC9LZVpVQ2dZRUFnTGQyeEJROE1Cam9POG44ci8ycgptTTl3cWpzTXpqa1JzN3l1Vi9tMEZEOXFEemI2aGlMMmpGZHBpeXh6Yzg4NzNmdmVkaGxZSGg0T2svN0JpdDk3CjV3Wjh0TVFaZ3BCUzBZMkZ5dGE3cnZzeXNQclhKRmk5bXZSSnNsWk9DZmtjaXdLYU03S1BXM2c1cktsWk1JV08KSzFGeXBzOXpRS1ZvSkRWdkJlQ3BaV289Ci0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0K";
         let public_key = "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQklqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FROEFNSUlCQ2dLQ0FRRUFobmg4UVI2M1F6cVJzUDl6YVlYZgptMmhOdzRYR2JLc0tUdXpadm5pNWRISFZ3eCtSdXNxVXhKb1NweXYrdmhYUER6c2lhYmhoVFJXTXVOa0JzVkQyCjh3YTh1c0pQK0RITkZqbitjaWZGODcvU2c0TnR5VFp6RGYvdWFTeWpoTnpQd0p2dW9tVjhGVTlHN1U4WWpvT20KWW8vU2lzV0t6bUNmbzF3TzRUS2w2cWJGOHFKTWNNeWY5KzhhTXdTb2hicTZaR2NKQllPT0sxaGlPbzJmK3lhaApKTng3T0wrMDZYMjJDZjJiYks4R204SjlZTEhkUE04eWxMRHpBeGMyWjJOcVM0L2o1NXVXMHNGWnpWUitLamRDCitaRjBKVDlWWHdsR2pPYm03cXM2dUxLanNrYll0VUd0dUxabzlmM01xeVJjK3ZGNWprNjM1Z1o0TzN5NUFkN2IKT3dJREFRQUIKLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg==";
-        let jwt_service = JwtService::new(private_key, public_key, 24, "test-key-id").unwrap();
+        let jwt_service = JwtService::new(
+            private_key,
+            public_key,
+            24,
+            "test-key-id",
+            "https://auth.example.com",
+        )
+        .unwrap();
 
         let token = jwt_service
             .create_token(
@@ -266,6 +291,8 @@ mod tests {
         assert!(!claims.is_platform_owner);
         assert_eq!(claims.org, Some("acme-corp".to_string()));
         assert_eq!(claims.service, Some("analytics".to_string()));
+        assert_eq!(claims.iss, Some("https://auth.example.com".to_string()));
+        assert_eq!(claims.aud, Some("service:acme-corp/analytics".to_string()));
     }
 
     #[test]

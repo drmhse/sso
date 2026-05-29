@@ -3,14 +3,15 @@ use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    magic_links::MagicLinksStore, memberships::MembershipStore, organizations::OrganizationStore,
-    services::ServiceStore, sessions::SessionStore, users::UserStore, DB,
+    DB, magic_links::MagicLinksStore, memberships::MembershipStore,
+    organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
+    users::UserStore,
 };
 use axum::{
-    extract::{Query, State},
-    http::{header, StatusCode},
-    response::IntoResponse,
     Extension, Json,
+    extract::{Query, State},
+    http::{StatusCode, header},
+    response::IntoResponse,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,33 @@ fn parse_magic_context(context: &str) -> (Option<String>, Option<String>, Option
     (Some(context.to_string()), None, None)
 }
 
+fn validate_service_redirect_uri(
+    service: &crate::entities::services::Model,
+    redirect_uri: &str,
+) -> Result<()> {
+    let allowed_uris_json = service.redirect_uris.as_ref().ok_or_else(|| {
+        AppError::BadRequest("No redirect URIs are registered for this service".to_string())
+    })?;
+
+    let allowed_uris: Vec<String> = serde_json::from_str(allowed_uris_json)
+        .map_err(|e| AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e)))?;
+
+    if allowed_uris.is_empty() {
+        return Err(AppError::BadRequest(
+            "No redirect URIs are registered for this service".to_string(),
+        ));
+    }
+
+    if !allowed_uris.iter().any(|allowed| allowed == redirect_uri) {
+        return Err(AppError::BadRequest(format!(
+            "redirect_uri '{}' is not registered for this service",
+            redirect_uri
+        )));
+    }
+
+    Ok(())
+}
+
 async fn resolve_magic_service_context(
     state: &AppState,
     org_slug: Option<&str>,
@@ -117,19 +145,7 @@ async fn resolve_magic_service_context(
                 .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
         if let Some(redirect_uri) = redirect_uri {
-            if let Some(allowed_uris_json) = service.redirect_uris.as_ref() {
-                let allowed_uris: Vec<String> =
-                    serde_json::from_str(allowed_uris_json).map_err(|e| {
-                        AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e))
-                    })?;
-
-                if !allowed_uris.is_empty() && !allowed_uris.contains(&redirect_uri.to_string()) {
-                    return Err(AppError::BadRequest(format!(
-                        "redirect_uri '{}' is not registered for this service",
-                        redirect_uri
-                    )));
-                }
-            }
+            validate_service_redirect_uri(&service, redirect_uri)?;
         }
 
         return Ok((Some(org.id), Some(service.id)));
@@ -295,7 +311,11 @@ pub async fn verify_magic_link(
     };
 
     // Delete the magic link token (one-time use)
-    MagicLinksStore::delete(DB::Conn(&state.db), &query.token).await?;
+    if !MagicLinksStore::delete(DB::Conn(&state.db), &query.token).await? {
+        return Err(AppError::BadRequest(
+            "Invalid or expired magic link".to_string(),
+        ));
+    }
 
     // Run risk engine evaluation
     use crate::services::risk_engine::RiskContext;
@@ -337,7 +357,10 @@ pub async fn verify_magic_link(
         parse_magic_context(&magic_link.context);
     let org_slug = org_slug_owned.as_deref();
     let service_slug = service_slug_owned.as_deref();
-    let redirect_uri = match (context_redirect_uri.as_deref(), query.redirect_uri.as_deref()) {
+    let redirect_uri = match (
+        context_redirect_uri.as_deref(),
+        query.redirect_uri.as_deref(),
+    ) {
         (Some(bound_redirect_uri), Some(requested_redirect_uri))
             if requested_redirect_uri != bound_redirect_uri =>
         {
@@ -371,19 +394,7 @@ pub async fn verify_magic_link(
                 .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
         if let Some(redirect_uri) = redirect_uri {
-            if let Some(allowed_uris_json) = service.redirect_uris.as_ref() {
-                let allowed_uris: Vec<String> =
-                    serde_json::from_str(allowed_uris_json).map_err(|e| {
-                        AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e))
-                    })?;
-
-                if !allowed_uris.is_empty() && !allowed_uris.contains(&redirect_uri.to_string()) {
-                    return Err(AppError::BadRequest(format!(
-                        "redirect_uri '{}' is not registered for this service",
-                        redirect_uri
-                    )));
-                }
-            }
+            validate_service_redirect_uri(&service, redirect_uri)?;
         }
 
         if !user.is_platform_owner {

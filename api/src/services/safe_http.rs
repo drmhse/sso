@@ -11,7 +11,13 @@
 
 use crate::error::{AppError, Result};
 use reqwest::Url;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+
+struct ValidatedUrl {
+    url: Url,
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
 
 /// A safe HTTP client that validates URLs before making requests.
 /// Blocks requests to private IP ranges to prevent SSRF attacks.
@@ -20,6 +26,21 @@ pub struct SafeHttpClient {
 }
 
 impl SafeHttpClient {
+    fn build_client_with_pinned_resolution(
+        host: &str,
+        addrs: &[SocketAddr],
+    ) -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .resolve_to_addrs(host, addrs)
+            .build()
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to create HTTP client: {}", e))
+            })
+    }
+
     /// Create a new SafeHttpClient with secure defaults:
     /// - No automatic redirect following (prevents open redirect bypasses)
     /// - Reasonable timeout
@@ -40,7 +61,7 @@ impl SafeHttpClient {
     }
 
     /// Validate a URL is safe to fetch (not pointing to internal/private IPs)
-    pub async fn validate_url(&self, url: &str) -> Result<Url> {
+    async fn validate_url(&self, url: &str) -> Result<ValidatedUrl> {
         let parsed =
             Url::parse(url).map_err(|e| AppError::BadRequest(format!("Invalid URL: {}", e)))?;
 
@@ -59,6 +80,7 @@ impl SafeHttpClient {
         let host = parsed
             .host_str()
             .ok_or_else(|| AppError::BadRequest("URL must have a valid host".to_string()))?;
+        let host_owned = host.to_string();
 
         // Resolve the hostname to IP addresses
         let port = parsed
@@ -70,8 +92,16 @@ impl SafeHttpClient {
                 AppError::BadRequest(format!("DNS resolution failed for '{}': {}", host, e))
             })?;
 
+        let addrs: Vec<SocketAddr> = addrs.collect();
+        if addrs.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "DNS resolution returned no addresses for '{}'",
+                host
+            )));
+        }
+
         // Check each resolved IP address
-        for addr in addrs {
+        for addr in &addrs {
             let ip = addr.ip();
             if is_private_or_reserved_ip(&ip) {
                 return Err(AppError::BadRequest(format!(
@@ -81,15 +111,74 @@ impl SafeHttpClient {
             }
         }
 
-        Ok(parsed)
+        Ok(ValidatedUrl {
+            url: parsed,
+            host: host_owned,
+            addrs,
+        })
+    }
+
+    /// Validate a URL without issuing a request.
+    pub async fn validate_external_url(&self, url: &str) -> Result<()> {
+        self.validate_url(url).await.map(|_| ())
     }
 
     /// Fetch a URL after validating it's safe (not a private IP)
     pub async fn get(&self, url: &str) -> Result<reqwest::Response> {
         let validated_url = self.validate_url(url).await?;
+        let client =
+            Self::build_client_with_pinned_resolution(&validated_url.host, &validated_url.addrs)?;
 
-        self.client
-            .get(validated_url.as_str())
+        client
+            .get(validated_url.url.as_str())
+            .send()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("HTTP request failed: {}", e)))
+    }
+
+    /// GET with custom headers after validating the destination.
+    pub async fn get_with_owned_headers(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<reqwest::Response> {
+        let validated_url = self.validate_url(url).await?;
+        let client =
+            Self::build_client_with_pinned_resolution(&validated_url.host, &validated_url.addrs)?;
+
+        let mut request = client.get(validated_url.url.as_str());
+
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+
+        request
+            .send()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("HTTP request failed: {}", e)))
+    }
+
+    /// Generic request helper for OAuth clients after validating the destination.
+    pub async fn request_with_owned_headers(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Vec<u8>,
+        headers: Vec<(String, Vec<u8>)>,
+    ) -> Result<reqwest::Response> {
+        let validated_url = self.validate_url(url).await?;
+        let client =
+            Self::build_client_with_pinned_resolution(&validated_url.host, &validated_url.addrs)?;
+
+        let mut request = client
+            .request(method, validated_url.url.as_str())
+            .body(body);
+
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value);
+        }
+
+        request
             .send()
             .await
             .map_err(|e| AppError::InternalServerError(format!("HTTP request failed: {}", e)))
@@ -98,9 +187,11 @@ impl SafeHttpClient {
     /// POST to a URL after validating it's safe (not a private IP)
     pub async fn post(&self, url: &str, body: String) -> Result<reqwest::Response> {
         let validated_url = self.validate_url(url).await?;
+        let client =
+            Self::build_client_with_pinned_resolution(&validated_url.host, &validated_url.addrs)?;
 
-        self.client
-            .post(validated_url.as_str())
+        client
+            .post(validated_url.url.as_str())
             .header("Content-Type", "application/json")
             .body(body)
             .send()
@@ -116,8 +207,10 @@ impl SafeHttpClient {
         headers: Vec<(&str, &str)>,
     ) -> Result<reqwest::Response> {
         let validated_url = self.validate_url(url).await?;
+        let client =
+            Self::build_client_with_pinned_resolution(&validated_url.host, &validated_url.addrs)?;
 
-        let mut request = self.client.post(validated_url.as_str()).body(body);
+        let mut request = client.post(validated_url.url.as_str()).body(body);
 
         for (name, value) in headers {
             request = request.header(name, value);
@@ -137,8 +230,10 @@ impl SafeHttpClient {
         headers: Vec<(String, String)>,
     ) -> Result<reqwest::Response> {
         let validated_url = self.validate_url(url).await?;
+        let client =
+            Self::build_client_with_pinned_resolution(&validated_url.host, &validated_url.addrs)?;
 
-        let mut request = self.client.post(validated_url.as_str()).body(body);
+        let mut request = client.post(validated_url.url.as_str()).body(body);
 
         for (name, value) in headers {
             request = request.header(name.as_str(), value.as_str());

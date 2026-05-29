@@ -383,6 +383,7 @@ async fn main() -> anyhow::Result<()> {
             &public_key,
             config.jwt_expiration_hours,
             &key_id,
+            &config.base_url,
         )
         .expect("Failed to initialize JWT service"),
     );

@@ -47,12 +47,12 @@ impl WebAuthnChallengeStore {
     }
 
     /// Delete a challenge by ID
-    pub async fn delete(db: DB<'_>, id: &str) -> Result<()> {
-        WebauthnChallenges::delete_many()
+    pub async fn delete(db: DB<'_>, id: &str) -> Result<bool> {
+        let result = WebauthnChallenges::delete_many()
             .filter(webauthn_challenges::Column::Id.eq(id))
             .exec(&db)
             .await?;
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 
     /// Delete expired challenges (cleanup job)

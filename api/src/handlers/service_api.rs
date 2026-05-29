@@ -2,12 +2,13 @@ use crate::error::{AppError, Result};
 use crate::middleware::ServicePrincipal;
 use crate::state::AppState;
 use crate::store::{
-    identities::IdentityStore, login_events::LoginEventStore, services::ServiceStore,
-    subscriptions::SubscriptionStore, users::UserStore, DB,
+    DB, identities::IdentityStore, login_events::LoginEventStore,
+    provider_token_requests::ProviderTokenRequestStore, services::ServiceStore,
+    subscriptions::SubscriptionStore, users::UserStore,
 };
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -701,24 +702,19 @@ pub async fn delete_user(
 ) -> Result<axum::http::StatusCode> {
     check_permission(&principal, "delete:users")?;
 
-    // Verify the user has authenticated with this service
-    let has_authenticated = IdentityStore::user_has_authenticated_with_service(
-        DB::Conn(&state.db),
-        &user_id,
-        &principal.service_id,
-    )
-    .await?;
-
-    if !has_authenticated {
-        return Err(AppError::NotFound(
-            "User not found or has not authenticated with this service".to_string(),
-        ));
-    }
+    service_linked_user(&state, &principal, &user_id).await?;
 
     // Security Audit Item 2: Delete only the identity link to this service
     // This prevents one service from deleting a user who belongs to multiple services
     IdentityStore::delete_by_user_and_service(DB::Conn(&state.db), &user_id, &principal.service_id)
         .await?;
+
+    ProviderTokenRequestStore::cancel_pending_for_user_service(
+        DB::Conn(&state.db),
+        &user_id,
+        &principal.service_id,
+    )
+    .await?;
 
     // Also delete any subscriptions for this user in this service
     let _ = SubscriptionStore::delete(DB::Conn(&state.db), &user_id, &principal.service_id).await;

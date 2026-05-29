@@ -1,13 +1,13 @@
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
-use crate::services::permission_service::{PermissionService, CAP_INTEGRATIONS_MANAGE};
+use crate::services::permission_service::{CAP_INTEGRATIONS_MANAGE, PermissionService};
 use crate::state::AppState;
 use crate::store::{
-    organizations::OrganizationStore, upstream_providers::UpstreamProviderStore, DB,
+    DB, organizations::OrganizationStore, upstream_providers::UpstreamProviderStore,
 };
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -87,7 +87,7 @@ pub async fn create_upstream_provider(
 
     require_integration_manager(&state, &organization.id, &auth_user.user.id).await?;
 
-    validate_upstream_provider_payload(&payload)?;
+    validate_upstream_provider_payload(&payload).await?;
 
     let encryption = state.encryption.as_ref().ok_or_else(|| {
         AppError::InternalServerError("Encryption service unavailable".to_string())
@@ -182,19 +182,19 @@ pub async fn delete_upstream_provider(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-fn validate_upstream_provider_payload(payload: &CreateUpstreamProviderRequest) -> Result<()> {
+async fn validate_upstream_provider_payload(payload: &CreateUpstreamProviderRequest) -> Result<()> {
     match payload.provider_type.as_str() {
         "oidc" | "oauth2" => {
             let has_discovery = payload.discovery_url.is_some();
 
             if let Some(url) = payload.authorization_url.as_deref() {
-                validate_provider_url(Some(url), "authorization_url")?;
+                validate_provider_url(Some(url), "authorization_url").await?;
             }
             if let Some(url) = payload.token_url.as_deref() {
-                validate_provider_url(Some(url), "token_url")?;
+                validate_provider_url(Some(url), "token_url").await?;
             }
             if let Some(url) = payload.userinfo_url.as_deref() {
-                validate_provider_url(Some(url), "userinfo_url")?;
+                validate_provider_url(Some(url), "userinfo_url").await?;
             }
 
             if !has_discovery
@@ -208,37 +208,33 @@ fn validate_upstream_provider_payload(payload: &CreateUpstreamProviderRequest) -
             }
         }
         "saml" => {
-            validate_provider_url(payload.authorization_url.as_deref(), "authorization_url")?;
+            validate_provider_url(payload.authorization_url.as_deref(), "authorization_url")
+                .await?;
         }
         _ => {
             return Err(AppError::BadRequest(
                 "Invalid provider_type. Must be 'oidc', 'oauth2', or 'saml'".to_string(),
-            ))
+            ));
         }
     }
 
     if let Some(url) = payload.discovery_url.as_deref() {
-        validate_provider_url(Some(url), "discovery_url")?;
+        validate_provider_url(Some(url), "discovery_url").await?;
     }
 
     Ok(())
 }
 
-fn validate_provider_url(url: Option<&str>, field: &str) -> Result<()> {
+async fn validate_provider_url(url: Option<&str>, field: &str) -> Result<()> {
     let url = url.ok_or_else(|| AppError::BadRequest(format!("Missing {}", field)))?;
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| AppError::BadRequest(format!("Invalid {} URL", field)))?;
 
-    match parsed.scheme() {
-        "https" => Ok(()),
-        "http" if is_loopback_host(parsed.host_str()) => Ok(()),
-        _ => Err(AppError::BadRequest(format!(
-            "{} must use https (http is only allowed for localhost testing)",
-            field
-        ))),
+    if parsed.scheme() != "https" {
+        return Err(AppError::BadRequest(format!("{} must use https", field)));
     }
-}
 
-fn is_loopback_host(host: Option<&str>) -> bool {
-    matches!(host, Some("localhost" | "127.0.0.1" | "::1"))
+    crate::services::safe_http::SafeHttpClient::new()?
+        .validate_external_url(url)
+        .await
 }

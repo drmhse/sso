@@ -210,4 +210,28 @@ impl DeviceCodeStore {
 
         Ok(num_updated)
     }
+
+    /// Atomically consume an authorized device code so token exchange is single-use.
+    pub async fn consume_authorized(
+        db: DB<'_>,
+        device_code_id: &str,
+        client_id: &str,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().naive_utc();
+        let rows_affected = DeviceCodes::update_many()
+            .filter(device_codes::Column::Id.eq(device_code_id))
+            .filter(device_codes::Column::ClientId.eq(client_id))
+            .filter(device_codes::Column::Status.eq("authorized"))
+            .filter(device_codes::Column::ExpiresAt.gt(now))
+            .filter(device_codes::Column::UserId.is_not_null())
+            .col_expr(
+                device_codes::Column::Status,
+                sea_orm::sea_query::Expr::value("consumed"),
+            )
+            .exec(&db)
+            .await?
+            .rows_affected;
+
+        Ok(rows_affected == 1)
+    }
 }

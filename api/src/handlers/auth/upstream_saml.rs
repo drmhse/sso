@@ -1,10 +1,10 @@
 use crate::db::models::UpstreamProvider;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
-use flate2::write::DeflateEncoder;
 use flate2::Compression;
+use flate2::write::DeflateEncoder;
 use std::io::Write;
 use uuid::Uuid;
 
@@ -59,14 +59,9 @@ pub async fn process_saml_response(
     // Security check: No XXE
     validate_xml_no_xxe(&saml_response_xml)?;
 
-    // Extract email from NameID or Attributes
-    // In a real implementation, we would also verify the signature here using the provider's certificate
-    let email = extract_email_from_saml(&saml_response_xml)?;
-
-    Ok(SamlUserInfo {
-        email,
-        provider_user_id: None, // Can be extracted from NameID
-    })
+    Err(AppError::BadRequest(
+        "Upstream SAML response signature verification is not implemented".to_string(),
+    ))
 }
 
 pub struct SamlUserInfo {
@@ -84,23 +79,4 @@ fn validate_xml_no_xxe(xml: &str) -> Result<()> {
         return Err(AppError::BadRequest("XXE detected in SAML XML".to_string()));
     }
     Ok(())
-}
-
-fn extract_email_from_saml(xml: &str) -> Result<String> {
-    // Simple regex-based extraction for the proof
-    // A real implementation would use a proper XML parser and handle namespaces correctly
-    let re = regex::Regex::new(r#"(?i)<saml:NameID[^>]*>([^<]+)</saml:NameID>"#).unwrap();
-    if let Some(caps) = re.captures(xml) {
-        return Ok(caps.get(1).unwrap().as_str().to_string());
-    }
-
-    // Fallback to searching for an email attribute
-    let re_attr = regex::Regex::new(r#"(?i)AttributeName="[^"]*email"[^>]*>\s*<saml:AttributeValue[^>]*>([^<]+)</saml:AttributeValue>"#).unwrap();
-    if let Some(caps) = re_attr.captures(xml) {
-        return Ok(caps.get(1).unwrap().as_str().to_string());
-    }
-
-    Err(AppError::BadRequest(
-        "Could not find email in SAMLResponse".to_string(),
-    ))
 }

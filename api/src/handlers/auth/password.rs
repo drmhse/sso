@@ -1,19 +1,19 @@
 #![allow(dead_code)]
 
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result, with_retrying_transaction};
 use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    email_verification::EmailVerificationStore, identities::IdentityStore,
+    DB, email_verification::EmailVerificationStore, identities::IdentityStore,
     invitations::InvitationStore, memberships::MembershipStore, organizations::OrganizationStore,
     password_reset::PasswordResetStore, services::ServiceStore, sessions::SessionStore,
-    totp::TotpStore, users::UserStore, DB,
+    totp::TotpStore, users::UserStore,
 };
 use axum::{
+    Extension, Json,
     extract::{Query, State},
     response::Html,
-    Extension, Json,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 // Argon2 password hashing imports
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 
 // Static dummy hash for timing attack mitigation (Security Audit Item 6)
@@ -136,17 +136,24 @@ fn validate_service_redirect_uri(
     redirect_uri: &str,
     service: &crate::db::models::Service,
 ) -> Result<()> {
-    if let Some(allowed_uris_json) = service.redirect_uris.as_ref() {
-        let allowed_uris: Vec<String> = serde_json::from_str(allowed_uris_json).map_err(|e| {
-            AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e))
-        })?;
+    let allowed_uris_json = service.redirect_uris.as_ref().ok_or_else(|| {
+        AppError::BadRequest("No redirect URIs are registered for this service".to_string())
+    })?;
 
-        if !allowed_uris.is_empty() && !allowed_uris.contains(&redirect_uri.to_string()) {
-            return Err(AppError::BadRequest(format!(
-                "redirect_uri '{}' is not registered for this service",
-                redirect_uri
-            )));
-        }
+    let allowed_uris: Vec<String> = serde_json::from_str(allowed_uris_json)
+        .map_err(|e| AppError::InternalServerError(format!("Invalid redirect_uris JSON: {}", e)))?;
+
+    if allowed_uris.is_empty() {
+        return Err(AppError::BadRequest(
+            "No redirect URIs are registered for this service".to_string(),
+        ));
+    }
+
+    if !allowed_uris.iter().any(|allowed| allowed == redirect_uri) {
+        return Err(AppError::BadRequest(format!(
+            "redirect_uri '{}' is not registered for this service",
+            redirect_uri
+        )));
     }
 
     Ok(())
@@ -1078,6 +1085,12 @@ pub async fn reset_password(
         return Err(AppError::BadRequest("Reset token has expired".to_string()));
     }
 
+    if !PasswordResetStore::mark_as_used(DB::Conn(&state.db), &token_hash).await? {
+        return Err(AppError::BadRequest(
+            "Reset token has already been used".to_string(),
+        ));
+    }
+
     // Hash new password
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -1089,9 +1102,6 @@ pub async fn reset_password(
     // Update user's password
     UserStore::update_password_hash(DB::Conn(&state.db), &token_record.user_id, &password_hash)
         .await?;
-
-    // Mark token as used
-    PasswordResetStore::mark_as_used(DB::Conn(&state.db), &token_hash).await?;
 
     // Revoke all existing sessions for security
     SessionStore::delete_all_for_user(DB::Conn(&state.db), &token_record.user_id).await?;

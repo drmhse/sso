@@ -7,7 +7,7 @@ use crate::entities::{platform_audit_log, users as users_entity};
 use crate::error::AppError;
 use crate::middleware::AuthUser;
 use crate::state::AppState;
-use crate::store::{memberships::MembershipStore, organizations::OrganizationStore, DB};
+use crate::store::{DB, memberships::MembershipStore, organizations::OrganizationStore};
 use axum::{
     extract::{Extension, Json, State},
     response::Json as AxumJson,
@@ -74,16 +74,23 @@ pub async fn impersonate_user(
         .await?
         .ok_or_else(|| AppError::NotFound("Target user not found".to_string()))?;
 
-    // Check authorization based on platform owner status or org admin status
-    let can_impersonate = if auth_user.user.is_platform_owner {
-        // Platform owners can impersonate any user
-        true
+    // Check authorization based on platform owner status or org admin status.
+    // Org admins are scoped to the shared organization they administer; they
+    // must not inherit a different tenant context from the target's memberships.
+    let (can_impersonate, impersonation_org) = if auth_user.user.is_platform_owner {
+        (true, None)
     } else {
+        if target_user.is_platform_owner {
+            return Err(AppError::Forbidden(
+                "Only platform owners can impersonate platform owners".to_string(),
+            ));
+        }
+
         // Check if target user is in the same organization and auth user is an org admin
         let target_memberships =
             MembershipStore::list_by_user(DB::Conn(db), &target_user.id).await?;
 
-        let mut is_admin_of_target = false;
+        let mut authorized_org = None;
 
         for membership in target_memberships {
             if let Some(caller_membership) = MembershipStore::find_by_org_and_user(
@@ -94,13 +101,14 @@ pub async fn impersonate_user(
             .await?
             {
                 if caller_membership.role == "owner" || caller_membership.role == "admin" {
-                    is_admin_of_target = true;
+                    authorized_org =
+                        OrganizationStore::find_by_id(DB::Conn(db), &membership.org_id).await?;
                     break;
                 }
             }
         }
 
-        is_admin_of_target
+        (authorized_org.is_some(), authorized_org)
     };
 
     if !can_impersonate {
@@ -112,7 +120,9 @@ pub async fn impersonate_user(
     // Get target user's organization and permission context
     let target_memberships = MembershipStore::list_by_user(DB::Conn(db), &target_user.id).await?;
 
-    let (org_slug, service_slug) = if let Some(first_membership) = target_memberships.first() {
+    let (org_slug, service_slug) = if let Some(org) = impersonation_org.as_ref() {
+        (Some(org.slug.clone()), None::<String>)
+    } else if let Some(first_membership) = target_memberships.first() {
         // Get org slug from first membership
         let org = OrganizationStore::find_by_id(DB::Conn(db), &first_membership.org_id).await?;
 
@@ -170,18 +180,19 @@ pub async fn impersonate_user(
     );
 
     // Prepare response data with org context
-    let (target_org_id, target_org_name) =
-        if let Some(first_membership) = target_memberships.first() {
-            if let Ok(Some(org)) =
-                OrganizationStore::find_by_id(DB::Conn(db), &first_membership.org_id).await
-            {
-                (Some(org.id), Some(org.name))
-            } else {
-                (None, None)
-            }
+    let (target_org_id, target_org_name) = if let Some(org) = impersonation_org {
+        (Some(org.id), Some(org.name))
+    } else if let Some(first_membership) = target_memberships.first() {
+        if let Ok(Some(org)) =
+            OrganizationStore::find_by_id(DB::Conn(db), &first_membership.org_id).await
+        {
+            (Some(org.id), Some(org.name))
         } else {
             (None, None)
-        };
+        }
+    } else {
+        (None, None)
+    };
 
     let target_user_info = UserInfo {
         id: target_user.id.clone(),

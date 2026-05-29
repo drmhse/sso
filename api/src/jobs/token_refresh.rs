@@ -1,5 +1,6 @@
 use crate::auth::sso::Provider;
 use crate::auth::token_refresher;
+use crate::constants::TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS;
 use crate::encryption::EncryptionService;
 use crate::entities::identities;
 use chrono::{Duration, Utc};
@@ -62,7 +63,7 @@ impl TokenRefreshJob {
     }
 
     async fn refresh_expiring_tokens(&self) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::store::{identities::IdentityStore, DB};
+        use crate::store::{DB, identities::IdentityStore};
 
         let threshold = Utc::now() + REFRESH_LOOKAHEAD;
         let threshold_str = threshold.to_rfc3339();
@@ -90,6 +91,50 @@ impl TokenRefreshJob {
         &self,
         identity: &identities::Model,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::store::{DB, token_refresh_locks::TokenRefreshLockStore};
+
+        let lock_acquired = TokenRefreshLockStore::acquire_lock(
+            DB::Conn(&self.db),
+            &identity.id,
+            TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS,
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+        if !lock_acquired {
+            tracing::debug!(
+                identity_id = %identity.id,
+                "Skipping token refresh because another worker holds the refresh lock"
+            );
+            return Ok(());
+        }
+
+        let refresh_error = self
+            .refresh_single_token_locked(identity)
+            .await
+            .err()
+            .map(|e| e.to_string());
+
+        if let Err(e) = TokenRefreshLockStore::release_lock(DB::Conn(&self.db), &identity.id).await
+        {
+            tracing::warn!(
+                identity_id = %identity.id,
+                error = %e,
+                "Failed to release token refresh lock"
+            );
+        }
+
+        if let Some(error) = refresh_error {
+            return Err(std::io::Error::other(error).into());
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_single_token_locked(
+        &self,
+        identity: &identities::Model,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let provider = Provider::from_str(&identity.provider)
             .map_err(|e| format!("Invalid provider: {}", e))?;
         if !matches!(provider, Provider::Google | Provider::Microsoft) {
@@ -106,7 +151,7 @@ impl TokenRefreshJob {
         let config = crate::config::Config::from_env().map_err(|e| e.to_string())?;
         let (client_id, client_secret) = if let Some(org_id) = &identity.issuing_org_id {
             use crate::store::{
-                organization_oauth_credentials::OrganizationOAuthCredentialsStore, DB,
+                DB, organization_oauth_credentials::OrganizationOAuthCredentialsStore,
             };
 
             if let Some(creds) = OrganizationOAuthCredentialsStore::find_by_org_and_provider(
@@ -166,7 +211,7 @@ impl TokenRefreshJob {
         };
 
         // 4. Update the identity in the database
-        use crate::store::{identities::IdentityStore, DB};
+        use crate::store::{DB, identities::IdentityStore};
 
         if let Some(ref enc) = self.encryption {
             let access_encrypted = enc.encrypt(&new_token.access_token)?;

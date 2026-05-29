@@ -13,6 +13,23 @@ export interface AuthOSNodeOptions {
    * Cache TTL for JWKS in milliseconds. Default: 1 hour (3600000ms)
    */
   jwksCacheTTL?: number;
+
+  /**
+   * Required audience (aud) claim for application tokens.
+   * Service tokens use the format `service:<org_slug>/<service_slug>`.
+   */
+  audience?: string;
+
+  /**
+   * Required issuer (iss) claim. Defaults to baseURL without a trailing slash.
+   */
+  issuer?: string;
+
+  /**
+   * Allow requireAuth() to run without an expected audience.
+   * This is intended only for legacy migrations.
+   */
+  allowMissingAudience?: boolean;
 }
 
 /**

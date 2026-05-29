@@ -1,20 +1,22 @@
-use crate::constants::{DEFAULT_MAX_USERS, INVITATION_EXPIRY_DAYS, VALID_INVITATION_ROLES};
+use crate::constants::{
+    DEFAULT_MAX_USERS, INVITATION_EXPIRY_DAYS, VALID_INVITATION_ROLES, VALID_ORG_ROLES,
+};
 use crate::entities::{organization_invitations, organizations, users};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result, with_retrying_transaction};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{
-    PermissionService, CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE,
+    CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE, PermissionService,
 };
 use crate::state::AppState;
 use crate::store::{
-    invitations::InvitationStore, memberships::MembershipStore,
+    DB, invitations::InvitationStore, memberships::MembershipStore,
     organization_roles::OrganizationRoleStore, organization_tiers::OrganizationTierStore,
-    organizations::OrganizationStore, users::UserStore, DB,
+    organizations::OrganizationStore, users::UserStore,
 };
 use axum::{
+    Json,
     extract::{Path, Query, State},
     response::Redirect,
-    Json,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -32,6 +34,12 @@ fn hash_invitation_token(token: &str) -> String {
 async fn validate_invitation_role(db: DB<'_>, org_id: &str, role: &str) -> Result<()> {
     if VALID_INVITATION_ROLES.contains(&role) {
         return Ok(());
+    }
+
+    if VALID_ORG_ROLES.contains(&role.to_lowercase().as_str()) {
+        return Err(AppError::BadRequest(
+            "Invalid role. Choose admin, member, or a custom organization role.".to_string(),
+        ));
     }
 
     if OrganizationRoleStore::find_by_org_and_slug(db, org_id, role)

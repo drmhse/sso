@@ -5,18 +5,18 @@ use crate::error::{AppError, Result};
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::services::webauthn::WebAuthnService;
 use crate::state::AppState;
+use crate::store::DB;
 use crate::store::users::UserStore;
 use crate::store::webauthn_challenges::WebAuthnChallengeStore;
-use crate::store::DB;
 use crate::store::{
     organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
     user_passkeys::UserPasskeysStore,
 };
 use axum::{
-    extract::{Path, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Json},
     Extension,
+    extract::{Path, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Json},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -123,7 +123,7 @@ fn redirect_uri_allowed(service: &crate::entities::services::Model, redirect_uri
         .redirect_uris
         .as_deref()
         .and_then(|uris| serde_json::from_str::<Vec<String>>(uris).ok())
-        .map(|uris| uris.is_empty() || uris.iter().any(|uri| uri == redirect_uri))
+        .map(|uris| !uris.is_empty() && uris.iter().any(|uri| uri == redirect_uri))
         .unwrap_or(false)
 }
 
@@ -216,6 +216,12 @@ pub async fn register_finish(
         return Err(AppError::BadRequest("Invalid challenge type".to_string()));
     }
 
+    if !WebAuthnChallengeStore::delete(db.clone(), &req.challenge_id).await? {
+        return Err(AppError::BadRequest(
+            "Invalid or expired challenge".to_string(),
+        ));
+    }
+
     let stored_registration: Result<StoredPasskeyRegistration> =
         serde_json::from_str(&challenge_record.challenge_state).map_err(|e| {
             AppError::InternalServerError(format!("Failed to deserialize challenge: {}", e))
@@ -250,8 +256,6 @@ pub async fn register_finish(
 
     let passkey_id =
         WebAuthnService::store_passkey(db.clone(), &user.id, &passkey, &passkey_name).await?;
-
-    WebAuthnChallengeStore::delete(db, &req.challenge_id).await?;
 
     tracing::info!(
         user_id = %user.id,
@@ -493,6 +497,12 @@ pub async fn authenticate_finish(
         return Err(AppError::BadRequest("Invalid challenge type".to_string()));
     }
 
+    if !WebAuthnChallengeStore::delete(db.clone(), &req.challenge_id).await? {
+        return Err(AppError::BadRequest(
+            "Invalid or expired challenge".to_string(),
+        ));
+    }
+
     let stored_auth: Result<StoredPasskeyAuthentication> =
         serde_json::from_str(&challenge_record.challenge_state).map_err(|e| {
             AppError::InternalServerError(format!("Failed to deserialize challenge: {}", e))
@@ -530,8 +540,6 @@ pub async fn authenticate_finish(
     let new_counter = auth_result.counter();
 
     WebAuthnService::update_passkey_counter(db.clone(), credential_id_str, new_counter).await?;
-
-    WebAuthnChallengeStore::delete(db.clone(), &req.challenge_id).await?;
 
     let user = UserStore::find_by_id(db.clone(), &challenge_record.user_id)
         .await?

@@ -1,13 +1,16 @@
-use crate::entities::{memberships, organizations, prelude::*};
+use crate::entities::{memberships, organizations, permissions::SUBJECT_TYPE_USER, prelude::*};
 use crate::error::{AppError, Result};
 use crate::middleware::ScimAuth;
 use crate::state::AppState;
-use crate::store::{memberships::MembershipStore, organizations::OrganizationStore, DB};
+use crate::store::{
+    DB, memberships::MembershipStore, organizations::OrganizationStore,
+    permissions::PermissionsStore,
+};
 use axum::{
+    Json,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::Response,
-    Json,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -98,6 +101,16 @@ async fn ensure_user_belongs_to_scim_org(
 
     if user.org_id.as_deref() != Some(org_id) {
         return Err(AppError::NotFound("User not found".to_string()));
+    }
+
+    Ok(())
+}
+
+fn ensure_scim_can_remove_membership(membership: &memberships::Model) -> Result<()> {
+    if matches!(membership.role.as_str(), "owner" | "admin") {
+        return Err(AppError::Forbidden(
+            "SCIM cannot remove organization owners or admins".to_string(),
+        ));
     }
 
     Ok(())
@@ -225,11 +238,10 @@ pub async fn update_group(
         let new_user_ids: Vec<String> = members.iter().map(|m| m.value.clone()).collect();
         for current_member in current_members {
             if !new_user_ids.contains(&current_member.user_id) {
+                ensure_scim_can_remove_membership(&current_member)?;
                 MembershipStore::delete(DB::Conn(&state.db), &current_member.id).await?;
 
                 // Revoke permission
-                use crate::entities::permissions::SUBJECT_TYPE_USER;
-                use crate::store::permissions::PermissionsStore;
                 PermissionsStore::revoke(
                     DB::Conn(&state.db),
                     "organization",
@@ -325,11 +337,10 @@ pub async fn patch_group(
                             .await?;
 
                             if let Some(m) = membership {
+                                ensure_scim_can_remove_membership(&m)?;
                                 MembershipStore::delete(DB::Conn(&state.db), &m.id).await?;
 
                                 // Revoke permission
-                                use crate::entities::permissions::SUBJECT_TYPE_USER;
-                                use crate::store::permissions::PermissionsStore;
                                 PermissionsStore::revoke(
                                     DB::Conn(&state.db),
                                     "organization",

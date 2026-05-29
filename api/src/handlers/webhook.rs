@@ -1,9 +1,9 @@
 //! Webhook handlers for billing provider events
 
 use crate::billing::{BillingEvent, BillingProvider, BillingProviderType, SubscriptionStatus};
-use crate::entities::{billing_customers, subscriptions};
+use crate::entities::{billing_customers, services, subscriptions};
 use crate::error::{AppError, Result};
-use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, body::Bytes, extract::State, http::StatusCode, response::IntoResponse};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::json;
 use std::sync::Arc;
@@ -332,7 +332,7 @@ async fn find_subscriptions_by_customer(
     external_customer_id: &str,
 ) -> Result<Vec<subscriptions::Model>> {
     // Find the organization by billing customer ID
-    let _billing_customer = billing_customers::Entity::find()
+    let billing_customer = billing_customers::Entity::find()
         .filter(billing_customers::Column::Provider.eq(provider.to_string()))
         .filter(billing_customers::Column::ExternalCustomerId.eq(external_customer_id))
         .one(pool)
@@ -344,9 +344,13 @@ async fn find_subscriptions_by_customer(
             ))
         })?;
 
-    // Find all subscriptions - simplified approach
-    // In production, you'd want to filter by org_id through memberships
-    let org_subscriptions = subscriptions::Entity::find().all(pool).await?;
+    use sea_orm::{JoinType, QuerySelect, RelationTrait};
+
+    let org_subscriptions = subscriptions::Entity::find()
+        .join(JoinType::InnerJoin, subscriptions::Relation::Services.def())
+        .filter(services::Column::OrgId.eq(&billing_customer.org_id))
+        .all(pool)
+        .await?;
 
     Ok(org_subscriptions)
 }
