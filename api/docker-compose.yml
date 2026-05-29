@@ -83,7 +83,7 @@ x-common-env: &common-env
   JOB_PROCESSOR_BATCH_SIZE: ${JOB_PROCESSOR_BATCH_SIZE:-10}
 
 # Common app configuration (resources, restart policy)
-# Note: Image tags use format: editoredit/sso:<backend>-latest or editoredit/sso:latest (sqlite default)
+# Note: release-pinned image tags use format: editoredit/sso:<backend>-vX.Y.Z or editoredit/sso:vX.Y.Z (sqlite default)
 x-common-app: &common-app
   env_file:
     - .env
@@ -109,7 +109,7 @@ services:
   # --------------------------------------------------------------------------
   sso:
     <<: *common-app
-    image: editoredit/sso:latest  # SQLite is the default
+    image: editoredit/sso:v0.1.46  # SQLite is the default
     container_name: sso-sqlite
     profiles: ["", "sqlite"]  # Runs by default (empty profile) or with --profile sqlite
     environment:
@@ -134,7 +134,7 @@ services:
   # --------------------------------------------------------------------------
   sso-postgres:
     <<: *common-app
-    image: editoredit/sso:psql-latest
+    image: editoredit/sso:psql-v0.1.46
     container_name: sso-postgres
     profiles: ["postgres"]
     environment:
@@ -176,7 +176,7 @@ services:
   # --------------------------------------------------------------------------
   sso-mysql:
     <<: *common-app
-    image: editoredit/sso:mysql-latest
+    image: editoredit/sso:mysql-v0.1.46
     container_name: sso-mysql
     profiles: ["mysql"]
     environment:

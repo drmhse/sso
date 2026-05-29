@@ -70,7 +70,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: editoredit/sso:psql-latest
+    image: editoredit/sso:psql-v0.1.46
     container_name: sso-postgres
     environment:
       <<: *common-env

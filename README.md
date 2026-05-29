@@ -33,6 +33,13 @@ It covers:
 
 It does not expose the full internal multi-tenant operations surface.
 
+## AI Agent Skills
+
+AuthOS maintains source-verified Agent Skills for integration and operations workflows:
+
+- [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill)
+- [skills.sh/drmhse/authos_skill](https://skills.sh/drmhse/authos_skill)
+
 ## Standalone Linux Bundles
 
 AuthOS can run without Docker and without Node.js on the target server.
@@ -75,7 +82,7 @@ extracts it, and runs the bundled installer.
 If you want a specific release instead of the latest one:
 
 ```bash
-AUTHOS_VERSION=v0.1.41
+AUTHOS_VERSION=v0.1.46
 curl -fsSL -o install.sh "https://github.com/drmhse/AuthOS/releases/download/${AUTHOS_VERSION}/install.sh"
 chmod +x install.sh
 sudo AUTHOS_RELEASE_TAG="${AUTHOS_VERSION}" ./install.sh
