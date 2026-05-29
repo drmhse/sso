@@ -1,0 +1,190 @@
+{
+    "tiers": [
+        {
+            "id": "tier_free",
+            "name": "free",
+            "display_name": "Free Tier",
+            "default_max_services": 3,
+            "default_max_users": 100,
+            "price_cents": 0,
+            "currency": "USD",
+            "features": "[\"basic_auth\"]"
+        },
+        {
+            "id": "tier_pro",
+            "name": "pro",
+            "display_name": "Pro Tier",
+            "default_max_services": 10,
+            "default_max_users": 1000,
+            "price_cents": 2900,
+            "currency": "USD",
+            "features": "[\"basic_auth\", \"mfa\", \"api_keys\"]"
+        },
+        {
+            "id": "tier_enterprise",
+            "name": "enterprise",
+            "display_name": "Enterprise Tier",
+            "default_max_services": 100,
+            "default_max_users": 10000,
+            "price_cents": 29900,
+            "currency": "USD",
+            "features": "[\"basic_auth\", \"mfa\", \"api_keys\", \"saml\", \"byoo\", \"hrd\", \"scim\", \"custom_domain\", \"branding\", \"audit_logs\", \"log_streaming\"]"
+        }
+    ],
+    "organizations": [
+        {
+            "id": "org_acme",
+            "slug": "acme-corp",
+            "name": "Acme Corp",
+            "status": "active",
+            "tier_id": "tier_enterprise",
+            "custom_domain": "acme.com",
+            "domain_verified": true
+        },
+        {
+            "id": "org_beta",
+            "slug": "beta-startup",
+            "name": "Beta Startup",
+            "status": "pending",
+            "tier_id": "tier_free"
+        },
+        {
+            "id": "org_gamma",
+            "slug": "gamma-inc",
+            "name": "Gamma Inc",
+            "status": "active",
+            "tier_id": "tier_pro"
+        }
+    ],
+    "users": [
+        {
+            "id": "user_platform_owner",
+            "email": "platform-owner@dev.local",
+            "password": "dev-password-123",
+            "is_platform_owner": true,
+            "email_verified": true
+        },
+        {
+            "id": "user_acme_admin",
+            "email": "admin@acme.com",
+            "password": "password-123",
+            "is_platform_owner": false,
+            "email_verified": true,
+            "memberships": [
+                {
+                    "org_id": "org_acme",
+                    "role": "owner"
+                }
+            ]
+        },
+        {
+            "id": "user_acme_member",
+            "email": "user@acme.com",
+            "password": "password-123",
+            "is_platform_owner": false,
+            "email_verified": true,
+            "mfa_enabled": true,
+            "memberships": [
+                {
+                    "org_id": "org_acme",
+                    "role": "member"
+                }
+            ]
+        },
+        {
+            "id": "user_beta_admin",
+            "email": "admin@beta.com",
+            "password": "password-123",
+            "is_platform_owner": false,
+            "email_verified": true,
+            "memberships": [
+                {
+                    "org_id": "org_beta",
+                    "role": "owner"
+                }
+            ]
+        }
+    ],
+    "services": [
+        {
+            "id": "ser_acme_main",
+            "org_id": "org_acme",
+            "slug": "main-app",
+            "name": "Acme Main App",
+            "service_type": "oidc",
+            "client_id": "acme_client_id",
+            "client_secret": "acme_client_secret_hash",
+            "redirect_uris": "https://app.acme.com/callback"
+        },
+        {
+            "id": "ser_acme_salesforce",
+            "org_id": "org_acme",
+            "slug": "salesforce",
+            "name": "Salesforce",
+            "service_type": "saml",
+            "client_id": "salesforce_client_id",
+            "client_secret": "salesforce_client_secret_hash",
+            "saml_enabled": true,
+            "saml_entity_id": "https://saml.salesforce.com",
+            "saml_acs_url": "https://acme.my.salesforce.com?so=acme"
+        }
+    ],
+    "byoo_credentials": [
+        {
+            "id": "byoo_acme_github",
+            "org_id": "org_acme",
+            "provider": "github",
+            "client_id": "github_client_id",
+            "client_secret": "github_client_secret"
+        }
+    ],
+    "upstream_providers": [
+        {
+            "id": "up_acme_okta",
+            "org_id": "org_acme",
+            "connection_id": "con_okta_123",
+            "name": "Acme Okta",
+            "provider_type": "oidc",
+            "client_id": "okta_client_id",
+            "client_secret": "okta_client_secret",
+            "issuer": "https://acme.okta.com",
+            "enabled": true
+        }
+    ],
+    "verified_domains": [
+        {
+            "id": "dom_acme_com",
+            "org_id": "org_acme",
+            "domain": "acme.com",
+            "verified": true,
+            "upstream_provider_id": "up_acme_okta"
+        }
+    ],
+    "saml_signing_keys": [
+        {
+            "id": "saml_key_acme_salesforce",
+            "service_id": "ser_acme_salesforce",
+            "public_key": "-----BEGIN CERTIFICATE-----\nMIIDezCCAmOgAwIBAgIU...\n-----END CERTIFICATE-----",
+            "private_key": "dummy_private_key"
+        }
+    ],
+    "api_keys": [
+        {
+            "id": "key_acme_main_prod",
+            "service_id": "ser_acme_main",
+            "name": "Production Key",
+            "prefix": "authos_live_",
+            "key": "test_api_key_value_123",
+            "permissions": "[\"read:users\", \"write:users\"]",
+            "created_by": "user_acme_admin"
+        }
+    ],
+    "subscriptions": [
+        {
+            "id": "sub_acme_main_pro",
+            "user_id": "user_acme_member",
+            "service_id": "ser_acme_main",
+            "plan_slug": "free"
+        }
+    ]
+}

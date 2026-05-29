@@ -63,7 +63,7 @@ impl TokenRefreshJob {
     }
 
     async fn refresh_expiring_tokens(&self) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::store::{DB, identities::IdentityStore};
+        use crate::store::{identities::IdentityStore, DB};
 
         let threshold = Utc::now() + REFRESH_LOOKAHEAD;
         let threshold_str = threshold.to_rfc3339();
@@ -91,7 +91,7 @@ impl TokenRefreshJob {
         &self,
         identity: &identities::Model,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::store::{DB, token_refresh_locks::TokenRefreshLockStore};
+        use crate::store::{token_refresh_locks::TokenRefreshLockStore, DB};
 
         let lock_acquired = TokenRefreshLockStore::acquire_lock(
             DB::Conn(&self.db),
@@ -151,7 +151,7 @@ impl TokenRefreshJob {
         let config = crate::config::Config::from_env().map_err(|e| e.to_string())?;
         let (client_id, client_secret) = if let Some(org_id) = &identity.issuing_org_id {
             use crate::store::{
-                DB, organization_oauth_credentials::OrganizationOAuthCredentialsStore,
+                organization_oauth_credentials::OrganizationOAuthCredentialsStore, DB,
             };
 
             if let Some(creds) = OrganizationOAuthCredentialsStore::find_by_org_and_provider(
@@ -211,7 +211,7 @@ impl TokenRefreshJob {
         };
 
         // 4. Update the identity in the database
-        use crate::store::{DB, identities::IdentityStore};
+        use crate::store::{identities::IdentityStore, DB};
 
         if let Some(ref enc) = self.encryption {
             let access_encrypted = enc.encrypt(&new_token.access_token)?;

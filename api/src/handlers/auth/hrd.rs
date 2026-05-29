@@ -1,12 +1,12 @@
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::store::{
-    DB, organizations::OrganizationStore, services::ServiceStore,
-    verified_domains::VerifiedDomainStore,
+    organizations::OrganizationStore, services::ServiceStore,
+    verified_domains::VerifiedDomainStore, DB,
 };
 use axum::{
-    Json,
     extract::{Query, State},
+    Json,
 };
 use serde::{Deserialize, Serialize};
 

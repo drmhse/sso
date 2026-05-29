@@ -1,18 +1,18 @@
 use crate::entities::permissions::{RelationTuple, SUBJECT_TYPE_USER};
 use crate::entities::{prelude::Users, users};
-use crate::error::{AppError, Result, with_retrying_transaction};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::ScimAuth;
 use crate::services::job_queue::JobQueueService;
 use crate::services::scim_filter::{ScimFilterParser, ScimOperator};
 use crate::state::AppState;
 use crate::store::{
-    DB, memberships::MembershipStore, permissions::PermissionsStore, users::UserStore,
+    memberships::MembershipStore, permissions::PermissionsStore, users::UserStore, DB,
 };
 use axum::{
-    Json,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};

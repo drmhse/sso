@@ -4,10 +4,7 @@ use crate::handlers::auth::session::RefreshTokenResponse;
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::state::AppState;
 use crate::store::{sessions::SessionStore, users::UserStore, DB};
-use axum::{
-    extract::State,
-    Extension, Json,
-};
+use axum::{extract::State, Extension, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -70,11 +67,10 @@ pub async fn apply_managed_config(
     require_platform_owner(&auth_user)?;
 
     let paths = managed_paths(&state)?;
-    let request_path = state
-        .config
-        .managed_request_path
-        .clone()
-        .ok_or_else(|| AppError::NotFound("Managed apply queue is not configured".to_string()))?;
+    let request_path =
+        state.config.managed_request_path.clone().ok_or_else(|| {
+            AppError::NotFound("Managed apply queue is not configured".to_string())
+        })?;
 
     let queued_status = json!({
         "status": "queued",
@@ -95,7 +91,8 @@ pub async fn apply_managed_config(
 
     Ok(Json(ApplyManagedConfigResponse {
         scheduled: true,
-        message: "AuthOS reload queued. Refresh this page after the service comes back.".to_string(),
+        message: "AuthOS reload queued. Refresh this page after the service comes back."
+            .to_string(),
     }))
 }
 
@@ -105,7 +102,9 @@ pub async fn bootstrap_login(
     Json(req): Json<BootstrapLoginRequest>,
 ) -> Result<Json<RefreshTokenResponse>> {
     if req.token.trim().is_empty() {
-        return Err(AppError::BadRequest("Bootstrap token is required".to_string()));
+        return Err(AppError::BadRequest(
+            "Bootstrap token is required".to_string(),
+        ));
     }
 
     let paths = managed_paths(&state)?;
@@ -120,7 +119,9 @@ pub async fn bootstrap_login(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Unauthorized("Bootstrap login is not available".to_string()))?;
     if stored_token != req.token {
-        return Err(AppError::Unauthorized("Invalid bootstrap login token".to_string()));
+        return Err(AppError::Unauthorized(
+            "Invalid bootstrap login token".to_string(),
+        ));
     }
 
     if token_state.get("used_at").and_then(Value::as_str).is_some() {
@@ -139,11 +140,9 @@ pub async fn bootstrap_login(
         }
     }
 
-    let owner_email = state
-        .config
-        .platform_owner_email
-        .as_ref()
-        .ok_or_else(|| AppError::Unauthorized("Platform owner email is not configured".to_string()))?;
+    let owner_email = state.config.platform_owner_email.as_ref().ok_or_else(|| {
+        AppError::Unauthorized("Platform owner email is not configured".to_string())
+    })?;
     let user = UserStore::find_by_email_with_context(DB::Conn(&state.db), owner_email, None)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Platform owner user does not exist".to_string()))?;
@@ -158,8 +157,8 @@ pub async fn bootstrap_login(
         .jwt_service
         .create_token(&user.id, &user.email, true, None, None)?;
     let refresh_token = Uuid::new_v4().to_string();
-    let expires_at = (Utc::now() + chrono::Duration::hours(state.config.jwt_expiration_hours))
-        .naive_utc();
+    let expires_at =
+        (Utc::now() + chrono::Duration::hours(state.config.jwt_expiration_hours)).naive_utc();
     let refresh_expires_at = (Utc::now() + chrono::Duration::days(30)).naive_utc();
 
     SessionStore::create(
@@ -261,8 +260,12 @@ fn validate_managed_config(value: &Value, current: &Value) -> Result<()> {
         }
     }
     reject_protected_change(
-        current.get("standalone").and_then(|value| value.get("dataDir")),
-        object.get("standalone").and_then(|value| value.get("dataDir")),
+        current
+            .get("standalone")
+            .and_then(|value| value.get("dataDir")),
+        object
+            .get("standalone")
+            .and_then(|value| value.get("dataDir")),
         "standalone.dataDir",
     )?;
     reject_protected_change(
@@ -273,7 +276,11 @@ fn validate_managed_config(value: &Value, current: &Value) -> Result<()> {
     Ok(())
 }
 
-fn reject_protected_change(current: Option<&Value>, proposed: Option<&Value>, field: &str) -> Result<()> {
+fn reject_protected_change(
+    current: Option<&Value>,
+    proposed: Option<&Value>,
+    field: &str,
+) -> Result<()> {
     if current == proposed {
         return Ok(());
     }
@@ -303,9 +310,18 @@ fn write_json_file(path: &str, value: &Value) -> Result<()> {
             ))
         })?;
     }
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value).map_err(|error| {
-        AppError::InternalServerError(format!("Failed to serialize managed config: {}", error))
-    })?))
+    fs::write(
+        path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(value).map_err(|error| {
+                AppError::InternalServerError(format!(
+                    "Failed to serialize managed config: {}",
+                    error
+                ))
+            })?
+        ),
+    )
     .map_err(|error| {
         AppError::InternalServerError(format!("Failed to write {}: {}", path, error))
     })?;

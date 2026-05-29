@@ -5,11 +5,11 @@ use crate::db::models::User;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::store::{
-    DB, device_codes::DeviceCodeStore, identities::IdentityStore, organizations::OrganizationStore,
+    device_codes::DeviceCodeStore, identities::IdentityStore, organizations::OrganizationStore,
     services::ServiceStore, sessions::SessionStore, subscriptions::SubscriptionStore,
-    totp::TotpStore,
+    totp::TotpStore, DB,
 };
-use axum::{Json, extract::State};
+use axum::{extract::State, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

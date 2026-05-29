@@ -1,20 +1,20 @@
 use crate::db::models::{SamlCertificateInfo, User};
-use crate::error::{AppError, Json400, Result, with_retrying_transaction};
+use crate::error::{with_retrying_transaction, AppError, Json400, Result};
 use crate::middleware::{AuthUser, RequestInfo};
-use crate::services::permission_service::{CAP_SERVICES_MANAGE, PermissionService};
+use crate::services::permission_service::{PermissionService, CAP_SERVICES_MANAGE};
 use crate::services::tier_enforcement::TierService;
 use crate::state::AppState;
 use crate::store::{
-    DB, memberships::MembershipStore, organizations::OrganizationStore,
-    permissions::PermissionsStore, saml_signing_keys::SamlSigningKeysStore,
-    saml_states::SamlStateStore, services::ServiceStore,
+    memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
+    saml_signing_keys::SamlSigningKeysStore, saml_states::SamlStateStore, services::ServiceStore,
+    DB,
 };
 use axum::{
-    Json,
     extract::{Extension, Path, Query, State},
     response::{Html, IntoResponse, Redirect, Response},
+    Json,
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{Duration, Utc};
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
@@ -126,8 +126,8 @@ impl SamlResponseBuilder {
     }
 
     fn build_assertion(&self) -> String {
-        use quick_xml::Writer;
         use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+        use quick_xml::Writer;
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -215,8 +215,8 @@ impl SamlResponseBuilder {
     }
 
     fn build_response(&self, assertion_with_signature: &str) -> String {
-        use quick_xml::Writer;
         use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+        use quick_xml::Writer;
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -1335,7 +1335,7 @@ pub async fn saml_sso(
         .ok_or_else(|| AppError::BadRequest("SAMLRequest parameter is required".into()))?;
 
     // Decode base64
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     let saml_request_bytes = BASE64
         .decode(&saml_request_b64)
         .map_err(|e| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {}", e)))?;
@@ -1359,8 +1359,8 @@ pub async fn saml_sso(
         };
 
     // Parse XML to extract important fields
-    use quick_xml::Reader;
     use quick_xml::events::Event;
+    use quick_xml::Reader;
 
     // Security Audit Item 7: Validate XML for XXE attacks before parsing
     validate_xml_no_xxe(&saml_request_xml)?;
@@ -2151,8 +2151,8 @@ async fn process_saml_logout_request(
     };
 
     // Parse XML to extract important fields
-    use quick_xml::Reader;
     use quick_xml::events::Event;
+    use quick_xml::Reader;
 
     // Security Audit Item 7: Validate XML for XXE attacks before parsing
     validate_xml_no_xxe(&saml_request_xml)?;

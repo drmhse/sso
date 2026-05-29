@@ -103,6 +103,7 @@ export function useLoginFlow(route, router) {
       ctx.redirectUri,
       authStore.token,
       authStore.refreshToken,
+      { state: ctx.state },
     );
     return true;
   }
@@ -156,6 +157,7 @@ export function useLoginFlow(route, router) {
           org,
           service,
           redirect_uri: ctx.redirectUri,
+          state: ctx.state,
           connection_id: providedConnectionId,
         });
 
@@ -185,6 +187,7 @@ export function useLoginFlow(route, router) {
         payload.org_slug = ctx.org;
         payload.service_slug = ctx.service;
         payload.redirect_uri = ctx.redirectUri;
+        payload.state = ctx.state;
       }
 
       const response = await sso.auth.login(payload);
@@ -209,6 +212,7 @@ export function useLoginFlow(route, router) {
         payload.org_slug = ctx.org;
         payload.service_slug = ctx.service;
         payload.redirect_uri = ctx.redirectUri;
+        payload.state = ctx.state;
       }
 
       const response = await sso.magicLinks.request(payload);
@@ -234,6 +238,7 @@ export function useLoginFlow(route, router) {
               org_slug: ctx.org,
               service_slug: ctx.service,
               redirect_uri: ctx.redirectUri,
+              state: ctx.state,
             }
           : undefined,
       );
@@ -245,6 +250,7 @@ export function useLoginFlow(route, router) {
           ctx.redirectUri,
           response.access_token,
           response.refresh_token,
+          { state: ctx.state },
         );
         return;
       }
@@ -273,6 +279,7 @@ export function useLoginFlow(route, router) {
         redirectUri: ctx.redirectUri,
         redirectPath: postLoginRedirect(route),
         supportPath: authRouteWithContext(route, '/support'),
+        state: ctx.state,
       });
       await router.push('/mfa-challenge');
       return;
@@ -285,6 +292,7 @@ export function useLoginFlow(route, router) {
         ctx.redirectUri,
         response.access_token,
         response.refresh_token,
+        { state: ctx.state },
       );
       return;
     }

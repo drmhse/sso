@@ -2,16 +2,16 @@ use crate::entities::users;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{
-    CAP_END_USERS_MANAGE, CAP_END_USERS_VIEW, PermissionService,
+    PermissionService, CAP_END_USERS_MANAGE, CAP_END_USERS_VIEW,
 };
 use crate::state::AppState;
 use crate::store::{
-    DB, identities::IdentityStore, organizations::OrganizationStore, services::ServiceStore,
-    sessions::SessionStore, subscriptions::SubscriptionStore, users::UserStore,
+    identities::IdentityStore, organizations::OrganizationStore, services::ServiceStore,
+    sessions::SessionStore, subscriptions::SubscriptionStore, users::UserStore, DB,
 };
 use axum::{
-    Json,
     extract::{Path, Query, State},
+    Json,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};

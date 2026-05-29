@@ -13,6 +13,7 @@ mod m20260104_000001_scope_existing_users;
 mod m20260110_000001_add_plan_description_and_default;
 mod m20260509_000001_linked_provider_grants;
 mod m20260510_000001_oauth_state_provider_token_metadata;
+mod m20260529_000001_oauth_state_client_state;
 
 pub struct Migrator;
 
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260110_000001_add_plan_description_and_default::Migration),
             Box::new(m20260509_000001_linked_provider_grants::Migration),
             Box::new(m20260510_000001_oauth_state_provider_token_metadata::Migration),
+            Box::new(m20260529_000001_oauth_state_client_state::Migration),
         ]
     }
 }

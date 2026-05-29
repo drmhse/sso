@@ -7,7 +7,7 @@ use crate::entities::{platform_audit_log, users as users_entity};
 use crate::error::AppError;
 use crate::middleware::AuthUser;
 use crate::state::AppState;
-use crate::store::{DB, memberships::MembershipStore, organizations::OrganizationStore};
+use crate::store::{memberships::MembershipStore, organizations::OrganizationStore, DB};
 use axum::{
     extract::{Extension, Json, State},
     response::Json as AxumJson,

@@ -9,6 +9,7 @@ describe('auth flow context helpers', () => {
         service: 'blog-app',
         redirect_uri: 'http://app.example.com/callback',
         return_to: 'http://app.example.com/settings',
+        state: 'caller-state',
       },
     };
 
@@ -18,6 +19,7 @@ describe('auth flow context helpers', () => {
       service: 'blog-app',
       redirectUri: 'http://app.example.com/callback',
       returnTo: 'http://app.example.com/settings',
+      state: 'caller-state',
       isServiceFlow: true,
     });
   });

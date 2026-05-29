@@ -8,21 +8,21 @@ use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::state::AppState;
 use crate::store::{
-    DB, connected_accounts::ConnectedAccountStore, identities::IdentityStore,
+    connected_accounts::ConnectedAccountStore, identities::IdentityStore,
     oauth_states::OAuthStateStore,
     organization_oauth_credentials::OrganizationOAuthCredentialsStore,
     organizations::OrganizationStore, provider_token_requests::ProviderTokenRequestStore,
     service_provider_grants::ServiceProviderGrantStore, services::ServiceStore,
-    upstream_providers::UpstreamProviderStore,
+    upstream_providers::UpstreamProviderStore, DB,
 };
 use crate::utils::scopes::{parse_optional_scopes, parse_required_scopes};
 use axum::{
-    Json,
     extract::{Path, Query, State},
     response::Redirect,
+    Json,
 };
 use chrono::{DateTime, Utc};
-use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl, basic::BasicClient};
+use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
@@ -620,6 +620,7 @@ pub async fn start_linked_account(
         upstream_connection_id.as_deref(),
         Some(&scopes),
         None,
+        None,
         &expires_at,
     )
     .await?;
@@ -804,15 +805,13 @@ pub async fn complete_provider_token_request(
     let requested_scopes = parse_scopes_required(&request.requested_scopes);
 
     let candidate_accounts = if let Some(account_id) = req.connected_account_id.as_deref() {
-        vec![
-            ConnectedAccountStore::find_active_by_id_for_user(
-                DB::Conn(&state.db),
-                account_id,
-                &auth_user.user.id,
-            )
-            .await?
-            .ok_or_else(|| AppError::NotFound("Connected account not found".to_string()))?,
-        ]
+        vec![ConnectedAccountStore::find_active_by_id_for_user(
+            DB::Conn(&state.db),
+            account_id,
+            &auth_user.user.id,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("Connected account not found".to_string()))?]
     } else {
         ConnectedAccountStore::list_by_user_and_provider(
             DB::Conn(&state.db),
@@ -977,6 +976,7 @@ async fn create_provider_token_request_oauth_state(
         None,
         upstream_connection_id.as_deref(),
         Some(&requested_scopes),
+        None,
         Some(&request.state),
         &expires_at,
     )

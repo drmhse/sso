@@ -2,13 +2,13 @@ use crate::error::{AppError, Result};
 use crate::middleware::ServicePrincipal;
 use crate::state::AppState;
 use crate::store::{
-    DB, identities::IdentityStore, login_events::LoginEventStore,
+    identities::IdentityStore, login_events::LoginEventStore,
     provider_token_requests::ProviderTokenRequestStore, services::ServiceStore,
-    subscriptions::SubscriptionStore, users::UserStore,
+    subscriptions::SubscriptionStore, users::UserStore, DB,
 };
 use axum::{
-    Json,
     extract::{Path, Query, State},
+    Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

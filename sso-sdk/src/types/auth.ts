@@ -68,6 +68,11 @@ export interface LoginUrlParams {
   redirect_uri?: string;
 
   /**
+   * Optional caller state to return to the service callback.
+   */
+  state?: string;
+
+  /**
    * Optional user code for device flow authorization
    */
   user_code?: string;
@@ -98,6 +103,11 @@ export interface AuthorizeUrlParams {
    * Callback URI registered with the service
    */
   redirect_uri: string;
+
+  /**
+   * Optional caller state to return to the service callback.
+   */
+  state?: string;
 }
 
 /**
@@ -186,6 +196,11 @@ export interface RegisterRequest {
    * Optional service callback URI to preserve the original app return path in the verification link.
    */
   redirect_uri?: string;
+
+  /**
+   * Optional caller state to return to hosted service callbacks.
+   */
+  state?: string;
 }
 
 /**
@@ -218,6 +233,10 @@ export interface LoginRequest {
    * against the service before tokens are returned to the hosted UI.
    */
   redirect_uri?: string;
+  /**
+   * Optional caller state to return to hosted service callbacks.
+   */
+  state?: string;
 }
 
 /**
@@ -228,6 +247,7 @@ export interface ForgotPasswordRequest {
   org_slug?: string; // Optional: use organization-specific SMTP
   service_slug?: string;
   redirect_uri?: string;
+  state?: string;
 }
 
 /**
@@ -260,6 +280,7 @@ export interface ResendVerificationRequest {
   org_slug?: string;
   service_slug?: string;
   redirect_uri?: string;
+  state?: string;
 }
 
 /**

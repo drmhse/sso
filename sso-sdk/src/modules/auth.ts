@@ -61,6 +61,7 @@ export class AuthModule {
       service: params.service,
       redirect_uri: params.redirect_uri,
     });
+    if (params.state) searchParams.append('state', params.state);
 
     return `${baseURL}/authorize?${searchParams.toString()}`;
   }
@@ -124,6 +125,9 @@ export class AuthModule {
 
     if (params.redirect_uri) {
       searchParams.append('redirect_uri', params.redirect_uri);
+    }
+    if (params.state) {
+      searchParams.append('state', params.state);
     }
 
     if (params.user_code) {

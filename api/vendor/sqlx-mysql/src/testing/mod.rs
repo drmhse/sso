@@ -152,7 +152,7 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<MySql>, Error> {
             -- BLOB/TEXT columns can only be used as index keys with a prefix length:
             -- https://dev.mysql.com/doc/refman/8.4/en/column-indexes.html#column-indexes-prefix
             primary key(db_name(63))
-        );        
+        );
     "#,
     )
     .await?;

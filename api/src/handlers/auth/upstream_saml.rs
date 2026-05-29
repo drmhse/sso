@@ -1,10 +1,10 @@
 use crate::db::models::UpstreamProvider;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
-use flate2::Compression;
 use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use std::io::Write;
 use uuid::Uuid;
 

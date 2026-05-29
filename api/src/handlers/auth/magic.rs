@@ -3,15 +3,14 @@ use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    DB, magic_links::MagicLinksStore, memberships::MembershipStore,
-    organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
-    users::UserStore,
+    magic_links::MagicLinksStore, memberships::MembershipStore, organizations::OrganizationStore,
+    services::ServiceStore, sessions::SessionStore, users::UserStore, DB,
 };
 use axum::{
-    Extension, Json,
     extract::{Query, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::IntoResponse,
+    Extension, Json,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -27,6 +26,7 @@ pub struct MagicLinkRequest {
     pub org_slug: Option<String>, // Optional: for organization context
     pub service_slug: Option<String>,
     pub redirect_uri: Option<String>,
+    pub state: Option<String>,
 }
 
 // Magic Link Response
@@ -41,14 +41,16 @@ pub struct VerifyMagicLinkQuery {
     pub token: String,
     #[allow(dead_code)]
     pub redirect_uri: Option<String>, // Optional: where to redirect after success
+    pub state: Option<String>,
 }
 
 fn build_magic_context(
     org_slug: Option<&str>,
     service_slug: Option<&str>,
     redirect_uri: Option<&str>,
+    state: Option<&str>,
 ) -> String {
-    if org_slug.is_none() && service_slug.is_none() && redirect_uri.is_none() {
+    if org_slug.is_none() && service_slug.is_none() && redirect_uri.is_none() && state.is_none() {
         return "default".to_string();
     }
 
@@ -56,13 +58,21 @@ fn build_magic_context(
         "org_slug": org_slug,
         "service_slug": service_slug,
         "redirect_uri": redirect_uri,
+        "state": state,
     })
     .to_string()
 }
 
-fn parse_magic_context(context: &str) -> (Option<String>, Option<String>, Option<String>) {
+fn parse_magic_context(
+    context: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     if context == "default" || context.is_empty() {
-        return (None, None, None);
+        return (None, None, None, None);
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(context) {
@@ -78,11 +88,15 @@ fn parse_magic_context(context: &str) -> (Option<String>, Option<String>, Option
             .get("redirect_uri")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        return (org_slug, service_slug, redirect_uri);
+        let state = value
+            .get("state")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        return (org_slug, service_slug, redirect_uri, state);
     }
 
     // Backward compatibility for older tokens where context was just org_slug.
-    (Some(context.to_string()), None, None)
+    (Some(context.to_string()), None, None, None)
 }
 
 fn validate_service_redirect_uri(
@@ -190,6 +204,7 @@ pub async fn request_magic_link(
         req.org_slug.as_deref(),
         req.service_slug.as_deref(),
         req.redirect_uri.as_deref(),
+        req.state.as_deref(),
     );
     let (issuing_org_id, issuing_service_id) = resolve_magic_service_context(
         &state,
@@ -227,6 +242,15 @@ pub async fn request_magic_link(
         params.append_pair("token", &token);
         if let Some(redirect_uri) = req.redirect_uri.as_deref() {
             params.append_pair("redirect_uri", redirect_uri);
+        }
+        if let Some(org_slug) = req.org_slug.as_deref() {
+            params.append_pair("org", org_slug);
+        }
+        if let Some(service_slug) = req.service_slug.as_deref() {
+            params.append_pair("service", service_slug);
+        }
+        if let Some(state) = req.state.as_deref() {
+            params.append_pair("state", state);
         }
 
         format!(
@@ -353,7 +377,7 @@ pub async fn verify_magic_link(
         "Magic link authentication successful"
     );
 
-    let (org_slug_owned, service_slug_owned, context_redirect_uri) =
+    let (org_slug_owned, service_slug_owned, context_redirect_uri, context_state) =
         parse_magic_context(&magic_link.context);
     let org_slug = org_slug_owned.as_deref();
     let service_slug = service_slug_owned.as_deref();
@@ -370,6 +394,15 @@ pub async fn verify_magic_link(
         }
         (Some(bound_redirect_uri), _) => Some(bound_redirect_uri),
         (None, requested_redirect_uri) => requested_redirect_uri,
+    };
+    let callback_state = match (context_state.as_deref(), query.state.as_deref()) {
+        (Some(bound_state), Some(requested_state)) if requested_state != bound_state => {
+            return Err(AppError::BadRequest(
+                "state does not match the issued magic link".to_string(),
+            ));
+        }
+        (Some(bound_state), _) => Some(bound_state),
+        (None, requested_state) => requested_state,
     };
 
     if service_slug.is_some() && org_slug.is_none() {
@@ -531,6 +564,7 @@ pub async fn verify_magic_link(
                 Json(serde_json::json!({
                     "requires_mfa": true,
                     "preauth_token": preauth_token,
+                    "state": callback_state,
                     "message": "Additional verification required"
                 })),
             )

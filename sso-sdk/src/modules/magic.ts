@@ -13,6 +13,8 @@ export interface MagicLinkRequest {
   service_slug?: string;
   /** Optional service callback URI */
   redirect_uri?: string;
+  /** Optional caller state to return to hosted service callbacks */
+  state?: string;
 }
 
 /**
@@ -31,6 +33,8 @@ export interface MagicLinkVerifyQuery {
   token: string;
   /** Optional where to redirect after successful verification */
   redirectUri?: string;
+  /** Optional caller state to return to hosted service callbacks */
+  state?: string;
 }
 
 /**
@@ -62,10 +66,13 @@ export class MagicLinks {
    * @param redirectUri Optional where to redirect after success
    * @returns URL to redirect to for verification
    */
-  getVerificationUrl(token: string, redirectUri?: string): string {
+  getVerificationUrl(token: string, redirectUri?: string, state?: string): string {
     const params = new URLSearchParams({ token });
     if (redirectUri) {
       params.append('redirect_uri', redirectUri);
+    }
+    if (state) {
+      params.append('state', state);
     }
     return `/api/auth/magic-link/verify?${params.toString()}`;
   }
@@ -78,10 +85,13 @@ export class MagicLinks {
    * @param redirectUri Optional redirect URI
    * @returns Promise resolving to authentication response
    */
-  async verify(token: string, redirectUri?: string): Promise<any> {
+  async verify(token: string, redirectUri?: string, state?: string): Promise<any> {
     const params = new URLSearchParams({ token });
     if (redirectUri) {
       params.append('redirect_uri', redirectUri);
+    }
+    if (state) {
+      params.append('state', state);
     }
 
     const response = await this.http.get(`/api/auth/magic-link/verify?${params.toString()}`);
@@ -95,8 +105,8 @@ export class MagicLinks {
    * @param redirectUri Optional redirect URI
    * @returns Complete magic link URL
    */
-  constructMagicLink(token: string, redirectUri?: string): string {
-    return this.getVerificationUrl(token, redirectUri);
+  constructMagicLink(token: string, redirectUri?: string, state?: string): string {
+    return this.getVerificationUrl(token, redirectUri, state);
   }
 }
 

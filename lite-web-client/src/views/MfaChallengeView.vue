@@ -114,7 +114,9 @@ async function handleVerify() {
     authFlowStore.clearMfaChallenge();
 
     if (redirectUri && authStore.token && authStore.refreshToken) {
-      window.location.href = appendTokensToRedirectUri(redirectUri, authStore.token, authStore.refreshToken);
+      window.location.href = appendTokensToRedirectUri(redirectUri, authStore.token, authStore.refreshToken, {
+        state: challenge.value.state,
+      });
       return;
     }
 

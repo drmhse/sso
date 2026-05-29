@@ -1,13 +1,13 @@
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
-use crate::services::permission_service::{CAP_INTEGRATIONS_MANAGE, PermissionService};
+use crate::services::permission_service::{PermissionService, CAP_INTEGRATIONS_MANAGE};
 use crate::state::AppState;
 use crate::store::{
-    DB, organizations::OrganizationStore, upstream_providers::UpstreamProviderStore,
+    organizations::OrganizationStore, upstream_providers::UpstreamProviderStore, DB,
 };
 use axum::{
-    Json,
     extract::{Path, State},
+    Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

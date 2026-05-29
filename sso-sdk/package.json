@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/sso-sdk",
-  "version": "0.5.0",
+  "version": "0.5.2",
   "description": "Zero-dependency TypeScript SDK for AuthOS, the multi-tenant authentication platform",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -19,8 +19,7 @@
   },
   "files": [
     "dist",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --clean",

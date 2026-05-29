@@ -19,6 +19,7 @@ function normalizeChallenge(rawChallenge) {
     redirectPath: rawChallenge.redirectPath || '',
     deviceCodeId: rawChallenge.deviceCodeId || '',
     supportPath: rawChallenge.supportPath || '/support',
+    state: rawChallenge.state || '',
     createdAt,
   };
 }
@@ -67,6 +68,7 @@ export const useAuthFlowStore = defineStore('authFlow', {
         redirectPath: payload.redirectPath || '',
         deviceCodeId: payload.deviceCodeId || '',
         supportPath: payload.supportPath || '/support',
+        state: payload.state || '',
         createdAt: Date.now(),
       };
       persistState(this.mfaChallenge);

@@ -55,6 +55,7 @@ onMounted(async () => {
         redirectUri,
         redirectPath: postLoginRedirect(route),
         supportPath: authRouteWithContext(route, '/support'),
+        state: authContext.state,
       });
       await router.replace('/mfa-challenge');
       return;
@@ -68,7 +69,9 @@ onMounted(async () => {
     status.value = 'success';
 
     if (redirectUri) {
-      window.location.href = appendTokensToRedirectUri(redirectUri, response.access_token, response.refresh_token);
+      window.location.href = appendTokensToRedirectUri(redirectUri, response.access_token, response.refresh_token, {
+        state: authContext.state,
+      });
       return;
     }
 

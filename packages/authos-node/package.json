@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-node",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "description": "Node.js server adapter for AuthOS authentication - Express middleware and token verification",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -29,8 +29,7 @@
   },
   "files": [
     "dist",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
   "scripts": {
     "build": "tsup",

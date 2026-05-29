@@ -3,14 +3,14 @@ use crate::error::{AppError, Result};
 use crate::middleware::ScimAuth;
 use crate::state::AppState;
 use crate::store::{
-    DB, memberships::MembershipStore, organizations::OrganizationStore,
-    permissions::PermissionsStore,
+    memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
+    DB,
 };
 use axum::{
-    Json,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::Response,
+    Json,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};

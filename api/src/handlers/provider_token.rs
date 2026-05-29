@@ -6,13 +6,12 @@ use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
 use crate::store::{
-    DB, identities::IdentityStore,
-    organization_oauth_credentials::OrganizationOAuthCredentialsStore, services::ServiceStore,
-    token_refresh_locks::TokenRefreshLockStore, users::UserStore,
+    identities::IdentityStore, organization_oauth_credentials::OrganizationOAuthCredentialsStore,
+    services::ServiceStore, token_refresh_locks::TokenRefreshLockStore, users::UserStore, DB,
 };
 use axum::{
-    Json,
     extract::{Path, State},
+    Json,
 };
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::DatabaseConnection;

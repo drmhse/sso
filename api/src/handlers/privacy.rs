@@ -3,17 +3,17 @@ use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
 use crate::store::{
-    DB, memberships::MembershipStore, organizations::OrganizationStore,
-    user_passkeys::UserPasskeysStore, users::UserStore,
+    memberships::MembershipStore, organizations::OrganizationStore,
+    user_passkeys::UserPasskeysStore, users::UserStore, DB,
 };
 use axum::{
-    Json,
     extract::{Path, State},
+    Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
+use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
 
 #[derive(Debug, Deserialize)]
 pub struct ForgetUserRequest {

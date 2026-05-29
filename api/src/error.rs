@@ -147,7 +147,9 @@ impl IntoResponse for AppError {
                 (StatusCode::FORBIDDEN, "Organization is not active")
             }
             AppError::TooManyRequests(ref msg) => (StatusCode::TOO_MANY_REQUESTS, msg.as_str()),
-            AppError::ServiceUnavailable(ref msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.as_str()),
+            AppError::ServiceUnavailable(ref msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, msg.as_str())
+            }
             AppError::Io(ref e) => {
                 tracing::error!("IO error: {:?}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal IO error")

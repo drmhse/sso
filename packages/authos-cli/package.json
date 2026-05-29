@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-cli",
-  "version": "0.1.7",
+  "version": "0.1.9",
   "description": "CLI tool for scaffolding AuthOS integrations",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,8 +9,7 @@
   },
   "files": [
     "dist",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
   "scripts": {
     "build": "tsup",

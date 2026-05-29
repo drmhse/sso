@@ -223,6 +223,7 @@ export class PasskeysModule {
     org_slug?: string;
     service_slug?: string;
     redirect_uri?: string;
+    state?: string;
   }): Promise<PasskeyAuthStartResponse> {
     const response = await this.http.post<PasskeyAuthStartResponse>(
       '/api/auth/passkeys/authenticate/start',
@@ -254,6 +255,7 @@ export class PasskeysModule {
     org_slug?: string;
     service_slug?: string;
     redirect_uri?: string;
+    state?: string;
   }): Promise<PasskeyAuthFinishResponse> {
     if (!this.isSupported()) {
       throw new Error('WebAuthn is not supported in this browser');

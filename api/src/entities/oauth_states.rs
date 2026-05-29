@@ -30,6 +30,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub requested_scopes: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub client_state: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub provider_token_request_state: Option<String>,
     pub created_at: DateTime,
     pub expires_at: DateTime,

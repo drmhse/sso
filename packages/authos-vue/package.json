@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-vue",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "description": "Vue and Nuxt adapter for AuthOS authentication",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -29,8 +29,7 @@
   },
   "files": [
     "dist",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
   "scripts": {
     "build": "tsup",

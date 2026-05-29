@@ -10,7 +10,8 @@ fn main() {
     let package_json = workspace_dir.join("package.json");
     let vite_config = workspace_dir.join("vite.config.js");
     let entry_html = workspace_dir.join("index.html");
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is not set"));
     let staged_dist_dir = out_dir.join("lite-web-dist");
 
@@ -27,7 +28,10 @@ fn main() {
         "cargo:rustc-env=AUTHOS_BUILD_VERSION={}",
         resolve_build_version(&manifest_dir)
     );
-    println!("cargo:rustc-env=LITE_WEB_DIST_DIR={}", staged_dist_dir.display());
+    println!(
+        "cargo:rustc-env=LITE_WEB_DIST_DIR={}",
+        staged_dist_dir.display()
+    );
 }
 
 fn emit_rerun_if_changed(path: &Path) {
@@ -174,9 +178,7 @@ fn stage_dist(source_dir: &Path, staged_dir: &Path) -> std::io::Result<()> {
 </html>
 "#,
     )?;
-    println!(
-        "cargo:warning=lite-web-client/dist is missing; embedding a placeholder page instead"
-    );
+    println!("cargo:warning=lite-web-client/dist is missing; embedding a placeholder page instead");
     Ok(())
 }
 

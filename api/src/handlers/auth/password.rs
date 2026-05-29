@@ -1,19 +1,19 @@
 #![allow(dead_code)]
 
-use crate::error::{AppError, Result, with_retrying_transaction};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    DB, email_verification::EmailVerificationStore, identities::IdentityStore,
+    email_verification::EmailVerificationStore, identities::IdentityStore,
     invitations::InvitationStore, memberships::MembershipStore, organizations::OrganizationStore,
     password_reset::PasswordResetStore, services::ServiceStore, sessions::SessionStore,
-    totp::TotpStore, users::UserStore,
+    totp::TotpStore, users::UserStore, DB,
 };
 use axum::{
-    Extension, Json,
     extract::{Query, State},
     response::Html,
+    Extension, Json,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 // Argon2 password hashing imports
 use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 
 // Static dummy hash for timing attack mitigation (Security Audit Item 6)
@@ -61,6 +61,8 @@ pub struct RegisterRequest {
     pub service_slug: Option<String>,
     /// Service callback URI to preserve app return context in verification links.
     pub redirect_uri: Option<String>,
+    /// Caller state to preserve through hosted service callbacks.
+    pub state: Option<String>,
 }
 
 // Register Response
@@ -86,6 +88,8 @@ pub struct LoginRequest {
     pub service_slug: Option<String>,
     /// Service callback URI for hosted password login. Validated before tokens are returned.
     pub redirect_uri: Option<String>,
+    /// Caller state to preserve through hosted service callbacks.
+    pub state: Option<String>,
     pub saml_state: Option<String>,
 }
 
@@ -96,6 +100,7 @@ pub struct ForgotPasswordRequest {
     pub org_slug: Option<String>, // Optional: use organization-specific SMTP
     pub service_slug: Option<String>,
     pub redirect_uri: Option<String>,
+    pub state: Option<String>,
 }
 
 // Forgot Password Response
@@ -124,6 +129,7 @@ pub struct ResendVerificationRequest {
     pub org_slug: Option<String>,
     pub service_slug: Option<String>,
     pub redirect_uri: Option<String>,
+    pub state: Option<String>,
 }
 
 // Resend Verification Response
@@ -167,6 +173,7 @@ fn build_auth_link(
     org_slug: Option<&str>,
     service_slug: Option<&str>,
     redirect_uri: Option<&str>,
+    state: Option<&str>,
 ) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.append_pair(token_name, token);
@@ -181,6 +188,10 @@ fn build_auth_link(
 
     if let Some(redirect_uri) = redirect_uri {
         serializer.append_pair("redirect_uri", redirect_uri);
+    }
+
+    if let Some(state) = state {
+        serializer.append_pair("state", state);
     }
 
     format!(
@@ -403,6 +414,7 @@ pub async fn register(
         req.org_slug.as_deref(),
         req.service_slug.as_deref(),
         req.redirect_uri.as_deref(),
+        req.state.as_deref(),
     );
     let email_subject = "Verify Your Email Address";
     let email_body = format!(
@@ -1022,6 +1034,7 @@ pub async fn forgot_password(
         req.org_slug.as_deref(),
         req.service_slug.as_deref(),
         req.redirect_uri.as_deref(),
+        req.state.as_deref(),
     );
     let email_subject = "Reset Your Password";
     let email_body = format!(
@@ -1197,6 +1210,7 @@ pub async fn resend_verification(
         req.org_slug.as_deref(),
         req.service_slug.as_deref(),
         req.redirect_uri.as_deref(),
+        req.state.as_deref(),
     );
     let email_subject = "Verify Your Email Address";
     let email_body = format!(

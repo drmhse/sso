@@ -7,6 +7,8 @@ React and Next.js adapter for AuthOS.
 
 Full documentation: [authos.dev/docs/packages/authos-react/](https://authos.dev/docs/packages/authos-react/)
 
+AI agent skills: [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-agent-skills/) and [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill)
+
 ## Install
 
 ```bash

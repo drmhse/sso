@@ -41,6 +41,7 @@ export interface PasskeyAuthStartRequest {
   org_slug?: string;
   service_slug?: string;
   redirect_uri?: string;
+  state?: string;
 }
 
 /**

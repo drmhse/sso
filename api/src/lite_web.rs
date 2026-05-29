@@ -45,9 +45,7 @@ pub fn routes(_state: &AppState) -> Router<AppState> {
         .route("/home", get(home_redirect))
 }
 
-async fn public_web_config(
-    State(state): State<AppState>,
-) -> Json<PublicWebConfigResponse> {
+async fn public_web_config(State(state): State<AppState>) -> Json<PublicWebConfigResponse> {
     Json(PublicWebConfigResponse {
         full_client_url: state.full_web_client_url.clone(),
         managed_config_enabled: state.config.managed_config_path.is_some(),
@@ -57,9 +55,7 @@ async fn public_web_config(
 async fn asset(Path(path): Path<String>) -> Response {
     match LITE_WEB_DIST.get_file(format!("assets/{}", path)) {
         Some(file) => {
-            let mime = from_path(file.path())
-                .first_or_octet_stream()
-                .to_string();
+            let mime = from_path(file.path()).first_or_octet_stream().to_string();
             (
                 StatusCode::OK,
                 [

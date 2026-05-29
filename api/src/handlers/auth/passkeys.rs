@@ -5,18 +5,18 @@ use crate::error::{AppError, Result};
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::services::webauthn::WebAuthnService;
 use crate::state::AppState;
-use crate::store::DB;
 use crate::store::users::UserStore;
 use crate::store::webauthn_challenges::WebAuthnChallengeStore;
+use crate::store::DB;
 use crate::store::{
     organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
     user_passkeys::UserPasskeysStore,
 };
 use axum::{
-    Extension,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{IntoResponse, Json},
+    Extension,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ pub struct PasskeyAuthStartRequest {
     pub org_slug: Option<String>,
     pub service_slug: Option<String>,
     pub redirect_uri: Option<String>,
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +111,7 @@ struct PasskeyAuthContext {
     org_slug: Option<String>,
     service_slug: Option<String>,
     redirect_uri: Option<String>,
+    state: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -421,6 +423,7 @@ pub async fn authenticate_start(
             org_slug: Some(org_slug.to_string()),
             service_slug: Some(service_slug.to_string()),
             redirect_uri: req.redirect_uri.clone(),
+            state: req.state.clone(),
         })
     } else {
         None

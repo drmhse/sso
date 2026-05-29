@@ -1,16 +1,16 @@
 use crate::auth::jwt::JwtService;
-use crate::auth::sso::{Provider, oauth_http_client};
+use crate::auth::sso::{oauth_http_client, Provider};
 use crate::constants::OAUTH_STATE_EXPIRE_MINUTES;
 use crate::db::models::{DeviceCode, Service, User};
 use crate::error::{AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    DB, connected_accounts::ConnectedAccountStore, device_codes::DeviceCodeStore,
+    connected_accounts::ConnectedAccountStore, device_codes::DeviceCodeStore,
     identities::IdentityStore, memberships::MembershipStore, oauth_states::OAuthStateStore,
     organizations::OrganizationStore, provider_token_requests::ProviderTokenRequestStore,
     service_provider_grants::ServiceProviderGrantStore, services::ServiceStore,
-    sessions::SessionStore, upstream_providers::UpstreamProviderStore,
+    sessions::SessionStore, upstream_providers::UpstreamProviderStore, DB,
 };
 use crate::utils::scopes::{normalize_scope_list, parse_optional_scopes, parse_required_scopes};
 use axum::{
@@ -20,8 +20,8 @@ use axum::{
 use chrono::Utc;
 use oauth2::url;
 use oauth2::{
-    AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
-    TokenUrl, basic::BasicClient,
+    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, TokenUrl,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -636,6 +636,7 @@ pub struct AuthRequest {
     pub org: String,
     pub service: String,
     pub redirect_uri: Option<String>,
+    pub state: Option<String>,
     pub user_code: Option<String>,
     pub saml_state: Option<String>,
     pub connection_id: Option<String>,
@@ -877,6 +878,7 @@ pub async fn auth_provider(
         params.saml_state.as_deref(),
         upstream_conn_id.as_deref(),
         Some(&scopes),
+        params.state.as_deref(),
         None,
         &expires_at.naive_utc(),
     )
@@ -1008,6 +1010,7 @@ pub async fn auth_saml_callback(
     // Redirect to frontend callback URL
     let redirect_uri = oauth_state
         .redirect_uri
+        .clone()
         .ok_or_else(|| AppError::BadRequest("Missing redirect_uri in OAuth state".to_string()))?;
 
     // ISSUANCE LOGIC - Simplified for SAML proof
@@ -1016,10 +1019,12 @@ pub async fn auth_saml_callback(
 
     // We need to actually handle the login to make the test pass
     // For now, let's return a redirect to the app
-    let redirect_url = format!(
-        "{}#access_token=SAML_MOCK_TOKEN&refresh_token=SAML_MOCK_REFRESH",
-        redirect_uri
-    );
+    let redirect_url = service_token_redirect_uri(
+        &redirect_uri,
+        "SAML_MOCK_TOKEN",
+        "SAML_MOCK_REFRESH",
+        oauth_state.client_state.as_deref(),
+    )?;
 
     Ok(Redirect::to(&redirect_url).into_response())
 }
@@ -1791,10 +1796,11 @@ async fn auth_callback_impl(
                         )?;
 
                         // Redirect with pre-auth token and mfa_required flag
-                        let redirect_url = format!(
-                            "{}#preauth_token={}&mfa_required=true",
-                            redirect_uri, preauth_token
-                        );
+                        let redirect_url = service_mfa_redirect_uri(
+                            redirect_uri,
+                            &preauth_token,
+                            oauth_ctx.client_state.as_deref(),
+                        )?;
                         return Ok(Redirect::to(&redirect_url).into_response());
                     }
                     RiskAction::Block => {
@@ -1841,10 +1847,11 @@ async fn auth_callback_impl(
                 )?;
 
                 // Redirect with pre-auth token and mfa_required flag
-                let redirect_url = format!(
-                    "{}#preauth_token={}&mfa_required=true",
-                    redirect_uri, preauth_token
-                );
+                let redirect_url = service_mfa_redirect_uri(
+                    redirect_uri,
+                    &preauth_token,
+                    oauth_ctx.client_state.as_deref(),
+                )?;
                 return Ok(Redirect::to(&redirect_url).into_response());
             }
 
@@ -1922,10 +1929,12 @@ async fn auth_callback_impl(
             // SECURITY FIX: Use Fragment (#) instead of Query (?)
             // This prevents tokens from being sent to the server in the redirect request
             // and keeps them strictly client-side.
-            let redirect_url = format!(
-                "{}#access_token={}&refresh_token={}",
-                redirect_uri, jwt, refresh_token
-            );
+            let redirect_url = service_token_redirect_uri(
+                redirect_uri,
+                &jwt,
+                &refresh_token,
+                oauth_ctx.client_state.as_deref(),
+            )?;
             return Ok(Redirect::to(&redirect_url).into_response());
         }
     }
@@ -1994,6 +2003,7 @@ pub async fn auth_admin_provider(
         None, // saml_state_id
         None, // upstream_connection_id
         Some(&scopes),
+        None, // client_state
         None,
         &expires_at.naive_utc(),
     )
@@ -2711,10 +2721,11 @@ async fn handle_service_flow_via_admin_callback(
                     oauth_state.saml_state_id.as_deref(),
                 )?;
 
-                let redirect_url = format!(
-                    "{}#preauth_token={}&mfa_required=true",
-                    redirect_uri, preauth_token
-                );
+                let redirect_url = service_mfa_redirect_uri(
+                    redirect_uri,
+                    &preauth_token,
+                    oauth_state.client_state.as_deref(),
+                )?;
                 return Ok(Redirect::to(&redirect_url).into_response());
             }
             RiskAction::Block => {
@@ -2745,10 +2756,11 @@ async fn handle_service_flow_via_admin_callback(
             oauth_state.saml_state_id.as_deref(),
         )?;
 
-        let redirect_url = format!(
-            "{}#preauth_token={}&mfa_required=true",
-            redirect_uri, preauth_token
-        );
+        let redirect_url = service_mfa_redirect_uri(
+            redirect_uri,
+            &preauth_token,
+            oauth_state.client_state.as_deref(),
+        )?;
         return Ok(Redirect::to(&redirect_url).into_response());
     }
 
@@ -2811,10 +2823,12 @@ async fn handle_service_flow_via_admin_callback(
     }
 
     // Redirect to service's redirect_uri with tokens in fragment
-    let redirect_url = format!(
-        "{}#access_token={}&refresh_token={}",
-        redirect_uri, jwt, refresh_token
-    );
+    let redirect_url = service_token_redirect_uri(
+        redirect_uri,
+        &jwt,
+        &refresh_token,
+        oauth_state.client_state.as_deref(),
+    )?;
     Ok(Redirect::to(&redirect_url).into_response())
 }
 
@@ -2829,7 +2843,7 @@ fn build_oauth_client(
     callback_uri: String,
     config: &crate::config::Config,
 ) -> Result<oauth2::basic::BasicClient> {
-    use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl, basic::BasicClient};
+    use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
 
     let (auth_url, token_url) = match provider {
         Provider::Github => (
@@ -3082,6 +3096,61 @@ fn validate_redirect_uri(redirect_uri: &str, service: &crate::db::models::Servic
     }
 
     Ok(())
+}
+
+fn redirect_uri_with_fragment(redirect_uri: &str, pairs: &[(&str, &str)]) -> Result<String> {
+    let mut url = url::Url::parse(redirect_uri)
+        .map_err(|_| AppError::BadRequest("Invalid redirect_uri".to_string()))?;
+    let mut existing: Vec<(String, String)> = url
+        .fragment()
+        .map(|fragment| {
+            url::form_urlencoded::parse(fragment.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    existing.retain(|(key, _)| !pairs.iter().any(|(pair_key, _)| pair_key == key));
+    existing.extend(
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+    );
+
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in existing {
+        serializer.append_pair(&key, &value);
+    }
+    url.set_fragment(Some(&serializer.finish()));
+    Ok(url.to_string())
+}
+
+fn service_token_redirect_uri(
+    redirect_uri: &str,
+    access_token: &str,
+    refresh_token: &str,
+    client_state: Option<&str>,
+) -> Result<String> {
+    let mut pairs = vec![
+        ("access_token", access_token),
+        ("refresh_token", refresh_token),
+    ];
+    if let Some(client_state) = client_state {
+        pairs.push(("state", client_state));
+    }
+    redirect_uri_with_fragment(redirect_uri, &pairs)
+}
+
+fn service_mfa_redirect_uri(
+    redirect_uri: &str,
+    preauth_token: &str,
+    client_state: Option<&str>,
+) -> Result<String> {
+    let mut pairs = vec![("preauth_token", preauth_token), ("mfa_required", "true")];
+    if let Some(client_state) = client_state {
+        pairs.push(("state", client_state));
+    }
+    redirect_uri_with_fragment(redirect_uri, &pairs)
 }
 
 fn redirect_oauth_error_to_uri(
