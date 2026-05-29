@@ -169,6 +169,10 @@ export class AuthModule {
       searchParams.append('user_code', params.user_code);
     }
 
+    if (params?.return_to) {
+      searchParams.append('return_to', params.return_to);
+    }
+
     const queryString = searchParams.toString();
     return `${baseURL}/auth/admin/${provider}${queryString ? `?${queryString}` : ''}`;
   }

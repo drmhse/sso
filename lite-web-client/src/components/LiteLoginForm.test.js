@@ -4,14 +4,15 @@ import { createPinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import LiteLoginForm from '@/components/LiteLoginForm.vue';
+import { sso } from '@/lib/api';
 import { clearBrowserStorage } from '@/test/storage';
 
 vi.mock('@/lib/api', () => ({
   sso: {
     auth: {
       lookupEmail: vi.fn().mockResolvedValue({ auth_method: 'password' }),
-      getAdminLoginUrl: vi.fn().mockReturnValue('/oauth'),
-      getLoginUrl: vi.fn().mockReturnValue('/oauth'),
+      getAdminLoginUrl: vi.fn().mockReturnValue('#oauth'),
+      getLoginUrl: vi.fn().mockReturnValue('#oauth'),
     },
     magicLinks: {},
     passkeys: {
@@ -38,6 +39,7 @@ async function flush() {
 }
 
 afterEach(() => {
+  vi.clearAllMocks();
   clearBrowserStorage();
 });
 
@@ -62,5 +64,24 @@ describe('LiteLoginForm', () => {
     expect(wrapper.text()).toContain('Password');
     expect(wrapper.text()).toContain('alice@example.com');
     expect(wrapper.find('#login-password').exists()).toBe(true);
+  });
+
+  it('passes the protected Lite return path through admin OAuth', async () => {
+    const router = createTestRouter();
+    const returnTo = '/app/account-security?org=queuezero&service=flux&return_to=https%3A%2F%2Fflux.example.com%2Fsettings';
+    router.push({ path: '/', query: { redirect: returnTo } });
+    await router.isReady();
+
+    const wrapper = mount(LiteLoginForm, {
+      global: {
+        plugins: [createPinia(), router],
+      },
+    });
+
+    const githubButton = wrapper.findAll('button').find((button) => button.text().includes('Github'));
+    expect(githubButton).toBeTruthy();
+    await githubButton.trigger('click');
+
+    expect(sso.auth.getAdminLoginUrl).toHaveBeenCalledWith('github', { return_to: returnTo });
   });
 });

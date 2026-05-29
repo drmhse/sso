@@ -142,6 +142,10 @@ export interface AdminLoginUrlParams {
    * Optional user code for device flow authorization
    */
   user_code?: string;
+  /**
+   * Optional internal Lite client path to return to after admin OAuth.
+   */
+  return_to?: string;
 }
 
 /**

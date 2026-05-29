@@ -5,6 +5,7 @@ import { useAuthStore } from '@/stores/auth';
 import { useAuthFlowStore } from '@/stores/authFlow';
 import { appendTokensToRedirectUri, authRouteWithContext, getAuthFlowContext } from '@/utils/authFlowContext';
 import {
+  normalizeInternalRedirect,
   postLoginRedirect,
   storePostLoginRedirect,
 } from '@/utils/redirects';
@@ -151,8 +152,9 @@ export function useLoginFlow(route, router) {
 
     const org = ctx.org || 'authos';
     const service = ctx.service || 'platform';
+    const returnTo = normalizeInternalRedirect(route.query.redirect);
     const loginUrl = org === 'authos' && service === 'platform' && !providedConnectionId
-      ? sso.auth.getAdminLoginUrl(provider)
+      ? sso.auth.getAdminLoginUrl(provider, returnTo ? { return_to: returnTo } : undefined)
       : sso.auth.getLoginUrl(provider, {
           org,
           service,

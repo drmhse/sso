@@ -647,6 +647,7 @@ pub struct AuthRequest {
 pub struct AdminAuthRequest {
     pub org_slug: Option<String>,
     pub user_code: Option<String>,
+    pub return_to: Option<String>,
 }
 
 // SSO Callback Query Parameters
@@ -1980,6 +1981,8 @@ pub async fn auth_admin_provider(
     let (auth_url, csrf_token, pkce_verifier) =
         get_admin_authorization_url(&admin_oauth_client, provider, scopes.clone());
 
+    let lite_return_to = normalize_lite_return_to(params.return_to.as_deref())?;
+
     // Store OAuth state with is_admin_flow = true
     let expires_at = Utc::now() + chrono::Duration::minutes(OAUTH_STATE_EXPIRE_MINUTES);
     let pkce_value = if !pkce_verifier.is_empty() {
@@ -2003,7 +2006,7 @@ pub async fn auth_admin_provider(
         None, // saml_state_id
         None, // upstream_connection_id
         Some(&scopes),
-        None, // client_state
+        lite_return_to.as_deref(), // client_state
         None,
         &expires_at.naive_utc(),
     )
@@ -2075,6 +2078,11 @@ async fn auth_admin_callback_impl(
 
     let oauth_state =
         oauth_state.ok_or_else(|| AppError::BadRequest("Invalid state parameter".to_string()))?;
+    let lite_return_to = if oauth_state.is_admin_flow {
+        normalize_lite_return_to(oauth_state.client_state.as_deref())?
+    } else {
+        None
+    };
 
     if let Some((error, description)) = callback.oauth_error() {
         if let Some(ref state_param) = callback.state {
@@ -2085,6 +2093,10 @@ async fn auth_admin_callback_impl(
             if let Some(ref redirect_uri) = oauth_state.redirect_uri {
                 return redirect_oauth_error_to_uri(redirect_uri, error, description);
             }
+        }
+
+        if let Some(return_to) = lite_return_to.as_deref() {
+            return redirect_oauth_error_to_lite(&state.base_url, return_to, error, description);
         }
 
         return redirect_oauth_error_to_platform(&config, error, description);
@@ -2349,10 +2361,18 @@ async fn auth_admin_callback_impl(
         )?;
 
         // Redirect with pre-auth token and mfa_required flag
-        let redirect_url = format!(
-            "{}/callback#preauth_token={}&mfa_required=true",
-            config.platform_dashboard_base_url, preauth_token
-        );
+        let redirect_url = if let Some(return_to) = lite_return_to.as_deref() {
+            lite_callback_redirect_uri(
+                &state.base_url,
+                Some(return_to),
+                &[("preauth_token", &preauth_token), ("mfa_required", "true")],
+            )?
+        } else {
+            format!(
+                "{}/callback#preauth_token={}&mfa_required=true",
+                config.platform_dashboard_base_url, preauth_token
+            )
+        };
         return Ok(Redirect::to(&redirect_url).into_response());
     }
 
@@ -2446,10 +2466,18 @@ async fn auth_admin_callback_impl(
 
     // SECURITY FIX: Use Fragment (#) instead of Query (?)
     // Redirect to platform admin frontend with both tokens in fragment
-    let redirect_url = format!(
-        "{}/callback#access_token={}&refresh_token={}",
-        config.platform_dashboard_base_url, jwt, refresh_token
-    );
+    let redirect_url = if let Some(return_to) = lite_return_to.as_deref() {
+        lite_callback_redirect_uri(
+            &state.base_url,
+            Some(return_to),
+            &[("access_token", &jwt), ("refresh_token", &refresh_token)],
+        )?
+    } else {
+        format!(
+            "{}/callback#access_token={}&refresh_token={}",
+            config.platform_dashboard_base_url, jwt, refresh_token
+        )
+    };
     Ok(Redirect::to(&redirect_url).into_response())
 }
 
@@ -3178,6 +3206,60 @@ fn redirect_oauth_error_to_platform(
     redirect_oauth_error_to_uri(&redirect_base, error, description)
 }
 
+fn redirect_oauth_error_to_lite(
+    base_url: &str,
+    return_to: &str,
+    error: &str,
+    description: Option<&str>,
+) -> Result<Response> {
+    let redirect_base = format!("{}/callback", base_url.trim_end_matches('/'));
+    let mut redirect_url = url::Url::parse(&redirect_base)
+        .map_err(|_| AppError::InternalServerError("Invalid Lite callback URI".to_string()))?;
+
+    redirect_url
+        .query_pairs_mut()
+        .append_pair("redirect", return_to)
+        .append_pair("error", error)
+        .append_pair("error_description", description.unwrap_or(error));
+
+    Ok(Redirect::to(redirect_url.as_str()).into_response())
+}
+
+fn normalize_lite_return_to(value: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let is_internal_path = value.starts_with('/') && !value.starts_with("//");
+    let has_control_chars = value.chars().any(|ch| matches!(ch, '\0' | '\n' | '\r'));
+    if !is_internal_path || has_control_chars {
+        return Err(AppError::BadRequest("Invalid return_to path".to_string()));
+    }
+
+    Ok(Some(value.to_string()))
+}
+
+fn lite_callback_redirect_uri(
+    base_url: &str,
+    return_to: Option<&str>,
+    pairs: &[(&str, &str)],
+) -> Result<String> {
+    let redirect_base = format!("{}/callback", base_url.trim_end_matches('/'));
+    let mut url = url::Url::parse(&redirect_base)
+        .map_err(|_| AppError::InternalServerError("Invalid Lite callback URI".to_string()))?;
+
+    if let Some(return_to) = return_to {
+        url.query_pairs_mut().append_pair("redirect", return_to);
+    }
+
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(key, value);
+    }
+    url.set_fragment(Some(&serializer.finish()));
+    Ok(url.to_string())
+}
+
 fn oauth_error_message(error: &AppError) -> String {
     match error {
         AppError::OAuth(message)
@@ -3526,6 +3608,50 @@ mod tests {
         assert_eq!(
             params.get("state").map(|value| value.as_ref()),
             Some("client-state")
+        );
+    }
+
+    #[test]
+    fn lite_return_to_accepts_internal_paths_only() {
+        assert_eq!(
+            normalize_lite_return_to(Some("/app/account-security?org=queuezero"))
+                .unwrap()
+                .as_deref(),
+            Some("/app/account-security?org=queuezero")
+        );
+        assert!(normalize_lite_return_to(Some("//evil.example")).is_err());
+        assert!(normalize_lite_return_to(Some("https://evil.example")).is_err());
+        assert!(normalize_lite_return_to(Some("/app/account-security\nbad")).is_err());
+    }
+
+    #[test]
+    fn lite_callback_redirect_keeps_return_path_in_query_and_tokens_in_fragment() {
+        let redirect = lite_callback_redirect_uri(
+            "https://athapi.authos.dev/",
+            Some("/app/account-security?org=queuezero&service=flux"),
+            &[("access_token", "access"), ("refresh_token", "refresh")],
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&redirect).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        let fragment: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(parsed.fragment().unwrap().as_bytes()).collect();
+
+        assert_eq!(
+            parsed.as_str().split('?').next(),
+            Some("https://athapi.authos.dev/callback")
+        );
+        assert_eq!(
+            query.get("redirect").map(|value| value.as_ref()),
+            Some("/app/account-security?org=queuezero&service=flux")
+        );
+        assert_eq!(
+            fragment.get("access_token").map(|value| value.as_ref()),
+            Some("access")
+        );
+        assert_eq!(
+            fragment.get("refresh_token").map(|value| value.as_ref()),
+            Some("refresh")
         );
     }
 }
