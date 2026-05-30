@@ -1069,6 +1069,22 @@ select.input:focus {
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
 }
 
+.backup-code-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.backup-code-toolbar .alert {
+  flex: 1 1 320px;
+}
+
+.backup-code-actions {
+  flex: 0 0 auto;
+}
+
 .backup-code-tile {
   padding: 14px;
   border-radius: 18px;
