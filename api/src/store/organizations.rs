@@ -1,4 +1,4 @@
-use crate::auth::sso::Provider;
+use crate::auth::sso::{configured_basic_client, ConfiguredBasicClient, Provider};
 use crate::config::Config;
 use crate::entities::prelude::{LoginEvents, Memberships, Organizations, Services};
 use crate::entities::{login_events, memberships, organizations, services, users};
@@ -763,7 +763,7 @@ impl OrganizationStore {
         org_id: &str,
         provider: Provider,
         encryption_service: &crate::encryption::EncryptionService,
-    ) -> Result<oauth2::basic::BasicClient> {
+    ) -> Result<ConfiguredBasicClient> {
         let provider_str = provider.as_str();
 
         // Get organization's OAuth credentials
@@ -828,7 +828,7 @@ fn create_custom_oauth_client(
     provider: Provider,
     client_id: &str,
     client_secret: &str,
-) -> Result<oauth2::basic::BasicClient> {
+) -> Result<ConfiguredBasicClient> {
     let callback_uri = format!("{}/auth/{}/callback", config.base_url, provider.as_str());
     build_oauth_client(
         provider,
@@ -847,14 +847,7 @@ fn build_oauth_client(
     client_secret: String,
     callback_uri: String,
     config: &Config,
-) -> Result<oauth2::basic::BasicClient> {
-    use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
-
-    let client_id = ClientId::new(client_id);
-    let client_secret = ClientSecret::new(client_secret);
-    let redirect_url = RedirectUrl::new(callback_uri)
-        .map_err(|e| AppError::InternalServerError(format!("Invalid redirect URL: {}", e)))?;
-
+) -> Result<ConfiguredBasicClient> {
     // Use config OAuth URLs (defaults to real provider URLs if not set)
     let (auth_url, token_url) = match provider {
         Provider::Github => {
@@ -866,14 +859,7 @@ fn build_oauth_client(
                 .platform_github_token_url
                 .as_deref()
                 .unwrap_or("https://github.com/login/oauth/access_token");
-            (
-                AuthUrl::new(auth.to_string()).map_err(|e| {
-                    AppError::InternalServerError(format!("Invalid GitHub auth URL: {}", e))
-                })?,
-                TokenUrl::new(token.to_string()).map_err(|e| {
-                    AppError::InternalServerError(format!("Invalid GitHub token URL: {}", e))
-                })?,
-            )
+            (auth.to_string(), token.to_string())
         }
         Provider::Google => {
             let auth = config
@@ -884,14 +870,7 @@ fn build_oauth_client(
                 .platform_google_token_url
                 .as_deref()
                 .unwrap_or("https://oauth2.googleapis.com/token");
-            (
-                AuthUrl::new(auth.to_string()).map_err(|e| {
-                    AppError::InternalServerError(format!("Invalid Google auth URL: {}", e))
-                })?,
-                TokenUrl::new(token.to_string()).map_err(|e| {
-                    AppError::InternalServerError(format!("Invalid Google token URL: {}", e))
-                })?,
-            )
+            (auth.to_string(), token.to_string())
         }
         Provider::Microsoft => {
             let auth = config
@@ -902,14 +881,7 @@ fn build_oauth_client(
                 .platform_microsoft_token_url
                 .as_deref()
                 .unwrap_or("https://login.microsoftonline.com/common/oauth2/v2.0/token");
-            (
-                AuthUrl::new(auth.to_string()).map_err(|e| {
-                    AppError::InternalServerError(format!("Invalid Microsoft auth URL: {}", e))
-                })?,
-                TokenUrl::new(token.to_string()).map_err(|e| {
-                    AppError::InternalServerError(format!("Invalid Microsoft token URL: {}", e))
-                })?,
-            )
+            (auth.to_string(), token.to_string())
         }
         Provider::Oidc => {
             return Err(AppError::InternalServerError(
@@ -923,10 +895,7 @@ fn build_oauth_client(
         }
     };
 
-    Ok(
-        BasicClient::new(client_id, Some(client_secret), auth_url, Some(token_url))
-            .set_redirect_uri(redirect_url),
-    )
+    configured_basic_client(client_id, client_secret, auth_url, token_url, callback_uri)
 }
 
 /// Result structure for organization with owner details

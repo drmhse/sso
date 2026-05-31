@@ -1,5 +1,7 @@
 use crate::auth::jwt::JwtService;
-use crate::auth::sso::{oauth_http_client, Provider};
+use crate::auth::sso::{
+    configured_basic_client, oauth_http_client, ConfiguredBasicClient, Provider,
+};
 use crate::constants::OAUTH_STATE_EXPIRE_MINUTES;
 use crate::db::models::{DeviceCode, Service, User};
 use crate::error::{AppError, Result};
@@ -19,10 +21,7 @@ use axum::{
 };
 use chrono::Utc;
 use oauth2::url;
-use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, TokenUrl,
-};
+use oauth2::{CsrfToken, PkceCodeChallenge, PkceCodeVerifier};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     Set,
@@ -787,20 +786,13 @@ pub async fn auth_provider(
                 })?;
 
             // Create OIDC client for this upstream provider
-            let client = BasicClient::new(
-                ClientId::new(provider_model.client_id.clone()),
-                Some(ClientSecret::new(secret)),
-                AuthUrl::new(oidc_config.authorization_url)
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new(oidc_config.token_url)
-                        .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(format!("{}/auth/oidc/callback", state.base_url))
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-            );
+            let client = configured_basic_client(
+                provider_model.client_id.clone(),
+                secret,
+                oidc_config.authorization_url,
+                oidc_config.token_url,
+                format!("{}/auth/oidc/callback", state.base_url),
+            )?;
 
             let upstream_scopes: Vec<String> = provider_model
                 .scopes
@@ -1175,20 +1167,13 @@ async fn auth_callback_impl(
                     AppError::InternalServerError(format!("Failed to decrypt secret: {}", e))
                 })?;
 
-            let client = BasicClient::new(
-                ClientId::new(provider_model.client_id.clone()),
-                Some(ClientSecret::new(secret)),
-                AuthUrl::new(oidc_config.authorization_url)
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-                Some(
-                    TokenUrl::new(oidc_config.token_url)
-                        .map_err(|e| AppError::OAuth(e.to_string()))?,
-                ),
-            )
-            .set_redirect_uri(
-                RedirectUrl::new(format!("{}/auth/oidc/callback", state.base_url))
-                    .map_err(|e| AppError::OAuth(e.to_string()))?,
-            );
+            let client = configured_basic_client(
+                provider_model.client_id.clone(),
+                secret,
+                oidc_config.authorization_url,
+                oidc_config.token_url,
+                format!("{}/auth/oidc/callback", state.base_url),
+            )?;
 
             let details =
                 exchange_custom_code(&client, Provider::Oidc, &callback_code, pkce_verifier)
@@ -2870,9 +2855,7 @@ fn build_oauth_client(
     client_secret: String,
     callback_uri: String,
     config: &crate::config::Config,
-) -> Result<oauth2::basic::BasicClient> {
-    use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
-
+) -> Result<ConfiguredBasicClient> {
     let (auth_url, token_url) = match provider {
         Provider::Github => (
             config
@@ -2920,19 +2903,13 @@ fn build_oauth_client(
         }
     };
 
-    Ok(BasicClient::new(
-        ClientId::new(client_id),
-        Some(ClientSecret::new(client_secret)),
-        AuthUrl::new(auth_url.to_string()).map_err(|e| AppError::OAuth(e.to_string()))?,
-        Some(TokenUrl::new(token_url.to_string()).map_err(|e| AppError::OAuth(e.to_string()))?),
-    )
-    .set_redirect_uri(RedirectUrl::new(callback_uri).map_err(|e| AppError::OAuth(e.to_string()))?))
+    configured_basic_client(client_id, client_secret, auth_url, token_url, callback_uri)
 }
 
 fn create_admin_oauth_client(
     config: &crate::config::Config,
     provider: Provider,
-) -> Result<oauth2::basic::BasicClient> {
+) -> Result<ConfiguredBasicClient> {
     let (client_id, client_secret) = match provider {
         Provider::Github => {
             let client_id = config.platform_github_client_id.as_ref()
@@ -2990,7 +2967,7 @@ fn create_admin_oauth_client(
 }
 
 fn get_admin_authorization_url(
-    client: &oauth2::basic::BasicClient,
+    client: &ConfiguredBasicClient,
     provider: Provider,
     scopes: Vec<String>,
 ) -> (String, CsrfToken, String) {
@@ -3027,7 +3004,7 @@ fn get_admin_authorization_url(
 }
 
 async fn exchange_admin_code(
-    client: &oauth2::basic::BasicClient,
+    client: &ConfiguredBasicClient,
     _provider: Provider,
     code: &str,
     pkce_verifier: Option<&str>,
@@ -3042,7 +3019,7 @@ async fn exchange_admin_code(
     }
 
     let token = token_request
-        .request_async(oauth_http_client)
+        .request_async(&oauth_http_client)
         .await
         .map_err(|e| AppError::OAuth(format!("Token exchange failed: {}", e)))?;
 
@@ -3064,7 +3041,7 @@ async fn exchange_admin_code(
 }
 
 async fn exchange_custom_code(
-    client: &oauth2::basic::BasicClient,
+    client: &ConfiguredBasicClient,
     _provider: Provider,
     code: &str,
     pkce_verifier: Option<&str>,
@@ -3079,7 +3056,7 @@ async fn exchange_custom_code(
     }
 
     let token = token_request
-        .request_async(oauth_http_client)
+        .request_async(&oauth_http_client)
         .await
         .map_err(|e| AppError::OAuth(format!("Token exchange failed: {}", e)))?;
 
@@ -3271,7 +3248,7 @@ fn oauth_error_message(error: &AppError) -> String {
 }
 
 pub fn get_authorization_url_for_client(
-    client: &oauth2::basic::BasicClient,
+    client: &ConfiguredBasicClient,
     provider: Provider,
     scopes: Vec<String>,
 ) -> (String, CsrfToken, String) {

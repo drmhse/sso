@@ -4,7 +4,8 @@ use crate::services::safe_http::SafeHttpClient;
 use chrono::{DateTime, Utc};
 use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    EndpointNotSet, EndpointSet, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,10 +56,29 @@ pub struct TokenDetails {
     pub scopes: Vec<String>,
 }
 
+pub type ConfiguredBasicClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
+pub fn configured_basic_client(
+    client_id: String,
+    client_secret: String,
+    auth_url: String,
+    token_url: String,
+    redirect_uri: String,
+) -> Result<ConfiguredBasicClient> {
+    Ok(BasicClient::new(ClientId::new(client_id))
+        .set_client_secret(ClientSecret::new(client_secret))
+        .set_auth_uri(AuthUrl::new(auth_url).map_err(|e| AppError::OAuth(e.to_string()))?)
+        .set_token_uri(TokenUrl::new(token_url).map_err(|e| AppError::OAuth(e.to_string()))?)
+        .set_redirect_uri(
+            RedirectUrl::new(redirect_uri).map_err(|e| AppError::OAuth(e.to_string()))?,
+        ))
+}
+
 pub struct OAuthClient {
-    github_client: Option<BasicClient>,
-    google_client: Option<BasicClient>,
-    microsoft_client: Option<BasicClient>,
+    github_client: Option<ConfiguredBasicClient>,
+    google_client: Option<ConfiguredBasicClient>,
+    microsoft_client: Option<ConfiguredBasicClient>,
 }
 
 fn platform_redirect_uri(
@@ -97,22 +117,13 @@ impl OAuthClient {
                     config.platform_github_redirect_uri.as_ref(),
                 );
 
-                Some(
-                    BasicClient::new(
-                        ClientId::new(client_id.clone()),
-                        Some(ClientSecret::new(client_secret.clone())),
-                        AuthUrl::new(github_auth_url)
-                            .map_err(|e| AppError::OAuth(e.to_string()))?,
-                        Some(
-                            TokenUrl::new(github_token_url)
-                                .map_err(|e| AppError::OAuth(e.to_string()))?,
-                        ),
-                    )
-                    .set_redirect_uri(
-                        RedirectUrl::new(redirect_uri)
-                            .map_err(|e| AppError::OAuth(e.to_string()))?,
-                    ),
-                )
+                Some(configured_basic_client(
+                    client_id.clone(),
+                    client_secret.clone(),
+                    github_auth_url,
+                    github_token_url,
+                    redirect_uri,
+                )?)
             }
             _ => None,
         };
@@ -137,22 +148,13 @@ impl OAuthClient {
                     config.platform_google_redirect_uri.as_ref(),
                 );
 
-                Some(
-                    BasicClient::new(
-                        ClientId::new(client_id.clone()),
-                        Some(ClientSecret::new(client_secret.clone())),
-                        AuthUrl::new(google_auth_url)
-                            .map_err(|e| AppError::OAuth(e.to_string()))?,
-                        Some(
-                            TokenUrl::new(google_token_url)
-                                .map_err(|e| AppError::OAuth(e.to_string()))?,
-                        ),
-                    )
-                    .set_redirect_uri(
-                        RedirectUrl::new(redirect_uri)
-                            .map_err(|e| AppError::OAuth(e.to_string()))?,
-                    ),
-                )
+                Some(configured_basic_client(
+                    client_id.clone(),
+                    client_secret.clone(),
+                    google_auth_url,
+                    google_token_url,
+                    redirect_uri,
+                )?)
             }
             _ => None,
         };
@@ -183,22 +185,13 @@ impl OAuthClient {
                     config.platform_microsoft_redirect_uri.as_ref(),
                 );
 
-                Some(
-                    BasicClient::new(
-                        ClientId::new(client_id.clone()),
-                        Some(ClientSecret::new(client_secret.clone())),
-                        AuthUrl::new(microsoft_auth_url)
-                            .map_err(|e| AppError::OAuth(e.to_string()))?,
-                        Some(
-                            TokenUrl::new(microsoft_token_url)
-                                .map_err(|e| AppError::OAuth(e.to_string()))?,
-                        ),
-                    )
-                    .set_redirect_uri(
-                        RedirectUrl::new(redirect_uri)
-                            .map_err(|e| AppError::OAuth(e.to_string()))?,
-                    ),
-                )
+                Some(configured_basic_client(
+                    client_id.clone(),
+                    client_secret.clone(),
+                    microsoft_auth_url,
+                    microsoft_token_url,
+                    redirect_uri,
+                )?)
             }
             _ => None,
         };
@@ -210,7 +203,7 @@ impl OAuthClient {
         })
     }
 
-    pub fn get_client(&self, provider: Provider) -> Option<&BasicClient> {
+    pub fn get_client(&self, provider: Provider) -> Option<&ConfiguredBasicClient> {
         match provider {
             Provider::Github => self.github_client.as_ref(),
             Provider::Google => self.google_client.as_ref(),
@@ -335,7 +328,7 @@ impl OAuthClient {
         })?;
         let token = client
             .exchange_code(AuthorizationCode::new(code.to_string()))
-            .request_async(oauth_http_client)
+            .request_async(&oauth_http_client)
             .await
             .map_err(|e| AppError::OAuth(format!("Token exchange failed: {}", e)))?;
 
@@ -363,7 +356,7 @@ impl OAuthClient {
         }
 
         let token = token_request
-            .request_async(oauth_http_client)
+            .request_async(&oauth_http_client)
             .await
             .map_err(|e| AppError::OAuth(format!("Token exchange failed: {}", e)))?;
 
@@ -389,28 +382,30 @@ impl OAuthClient {
 pub async fn oauth_http_client(
     request: oauth2::HttpRequest,
 ) -> std::result::Result<oauth2::HttpResponse, AppError> {
-    tracing::debug!("OAuth request: {:?} {}", request.method, request.url);
+    tracing::debug!("OAuth request: {:?} {}", request.method(), request.uri());
 
-    let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
+    let method = reqwest::Method::from_bytes(request.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
     let headers = request
-        .headers
+        .headers()
         .iter()
         .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
         .collect();
+    let url = request.uri().to_string();
+    let body = request.body().clone();
     let safe_client = SafeHttpClient::new()?;
     let response = safe_client
-        .request_with_owned_headers(method, request.url.as_str(), request.body, headers)
+        .request_with_owned_headers(method, &url, body, headers)
         .await?;
     let status_code = oauth2::http::StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(oauth2::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let mut headers = oauth2::http::HeaderMap::new();
+    let mut response_builder = oauth2::http::Response::builder().status(status_code);
     for (name, value) in response.headers().iter() {
         if let (Ok(name), Ok(value)) = (
             oauth2::http::HeaderName::from_bytes(name.as_str().as_bytes()),
             oauth2::http::HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            headers.insert(name, value);
+            response_builder = response_builder.header(name, value);
         }
     }
     let body = response
@@ -419,24 +414,22 @@ pub async fn oauth_http_client(
         .map_err(|e| AppError::InternalServerError(format!("OAuth response read failed: {}", e)))?
         .to_vec();
 
-    let mut result = Ok(oauth2::HttpResponse {
-        status_code,
-        headers,
-        body,
-    });
+    let mut result = response_builder
+        .body(body)
+        .map_err(|e| AppError::InternalServerError(format!("OAuth response build failed: {}", e)));
 
     // GitHub returns errors with 200 OK status but with JSON containing "error" field
     // We need to detect this and convert it to a proper error response
     if let Ok(ref response) = result {
         tracing::debug!(
             "OAuth response: status={}, body_len={}",
-            response.status_code,
-            response.body.len()
+            response.status(),
+            response.body().len()
         );
 
-        let body_str = String::from_utf8_lossy(&response.body);
+        let body_str = String::from_utf8_lossy(response.body());
 
-        if response.status_code.is_success() {
+        if response.status().is_success() {
             tracing::debug!("OAuth success response body: {}", body_str);
 
             // Check if the response body contains an error (GitHub's quirk)
@@ -454,17 +447,23 @@ pub async fn oauth_http_client(
                     );
 
                     // Convert to a proper error by returning a 400 status
-                    result = Ok(oauth2::HttpResponse {
-                        status_code: oauth2::http::StatusCode::BAD_REQUEST,
-                        headers: response.headers.clone(),
-                        body: response.body.clone(),
+                    let mut response_builder = oauth2::http::Response::builder()
+                        .status(oauth2::http::StatusCode::BAD_REQUEST);
+                    for (name, value) in response.headers() {
+                        response_builder = response_builder.header(name, value);
+                    }
+                    result = response_builder.body(response.body().clone()).map_err(|e| {
+                        AppError::InternalServerError(format!(
+                            "OAuth error response build failed: {}",
+                            e
+                        ))
                     });
                 }
             }
         } else {
             tracing::error!(
                 "OAuth error response: status={}, body={}",
-                response.status_code,
+                response.status(),
                 body_str
             );
         }

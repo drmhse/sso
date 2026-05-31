@@ -1,4 +1,4 @@
-use crate::auth::sso::Provider;
+use crate::auth::sso::{configured_basic_client, ConfiguredBasicClient, Provider};
 use crate::error::{AppError, Result};
 use crate::handlers::auth::{
     get_authorization_url_for_client, is_supported_upstream_oauth_type,
@@ -22,7 +22,6 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
@@ -307,7 +306,7 @@ fn built_in_provider_from_key(provider: &str) -> Option<Provider> {
 async fn build_upstream_oauth_client(
     state: &AppState,
     provider: &crate::entities::upstream_providers::Model,
-) -> Result<BasicClient> {
+) -> Result<ConfiguredBasicClient> {
     if !provider.enabled {
         return Err(AppError::BadRequest(
             "Upstream provider is disabled".to_string(),
@@ -329,16 +328,13 @@ async fn build_upstream_oauth_client(
         .decrypt(&provider.client_secret_encrypted)
         .map_err(|e| AppError::InternalServerError(format!("Failed to decrypt secret: {}", e)))?;
 
-    Ok(BasicClient::new(
-        ClientId::new(provider.client_id.clone()),
-        Some(ClientSecret::new(secret)),
-        AuthUrl::new(oidc_config.authorization_url).map_err(|e| AppError::OAuth(e.to_string()))?,
-        Some(TokenUrl::new(oidc_config.token_url).map_err(|e| AppError::OAuth(e.to_string()))?),
+    configured_basic_client(
+        provider.client_id.clone(),
+        secret,
+        oidc_config.authorization_url,
+        oidc_config.token_url,
+        format!("{}/auth/oidc/callback", state.base_url),
     )
-    .set_redirect_uri(
-        RedirectUrl::new(format!("{}/auth/oidc/callback", state.base_url))
-            .map_err(|e| AppError::OAuth(e.to_string()))?,
-    ))
 }
 
 async fn provider_registry(
