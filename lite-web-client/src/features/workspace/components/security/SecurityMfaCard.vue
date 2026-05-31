@@ -3,7 +3,7 @@
     <div class="section-header">
       <div>
         <h2 class="section-title">Multi-Factor Authentication (MFA)</h2>
-        <p class="section-copy">Protect this operator account with an authenticator app and one-time backup codes.</p>
+        <p class="section-copy">Protect this account with an authenticator app and one-time backup codes.</p>
       </div>
       <span class="status-chip" :class="mfaStatus?.enabled ? 'status-chip--success' : 'status-chip--neutral'">
         {{ mfaStatus?.enabled ? 'Enabled' : 'Disabled' }}

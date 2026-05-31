@@ -1,8 +1,23 @@
 import { createRouter, createWebHistory } from 'vue-router';
 import { useAuthStore } from '@/stores/auth';
 import { useAuthFlowStore } from '@/stores/authFlow';
-import { hasServiceAuthContext } from '@/utils/authFlowContext';
+import { firstQueryValue, hasServiceAuthContext } from '@/utils/authFlowContext';
 import { defaultAuthenticatedRoute, loginRouteForProtectedTarget } from '@/utils/redirects';
+
+export const FOCUSED_ACCOUNT_SECURITY_PATH = '/account/security';
+export const WORKSPACE_ACCOUNT_SECURITY_PATH = '/app/account-security';
+
+export function focusedAccountSecurityRedirect(to) {
+  if (to.path !== WORKSPACE_ACCOUNT_SECURITY_PATH || !firstQueryValue(to.query?.return_to)) {
+    return null;
+  }
+
+  return {
+    path: FOCUSED_ACCOUNT_SECURITY_PATH,
+    query: to.query,
+    replace: true,
+  };
+}
 
 export const routes = [
   { path: '/', component: () => import('@/views/LoginView.vue') },
@@ -19,6 +34,7 @@ export const routes = [
   { path: '/activate/success', component: () => import('@/views/ActivateDeviceView.vue') },
   { path: '/activate/mfa-challenge', component: () => import('@/views/MfaChallengeView.vue'), meta: { deviceFlow: true } },
   { path: '/support', component: () => import('@/views/SupportView.vue') },
+  { path: FOCUSED_ACCOUNT_SECURITY_PATH, name: 'account-security', component: () => import('@/views/HostedAccountSecurityView.vue'), meta: { requiresAuth: true } },
   {
     path: '/app',
     component: () => import('@/views/WorkspaceView.vue'),
@@ -46,6 +62,12 @@ const router = createRouter({
 router.beforeEach(async (to, from, next) => {
   const authStore = useAuthStore();
   const authFlowStore = useAuthFlowStore();
+  const accountSecurityRedirect = focusedAccountSecurityRedirect(to);
+
+  if (accountSecurityRedirect) {
+    next(accountSecurityRedirect);
+    return;
+  }
 
   if (authStore.status === 'idle' && localStorage.getItem('sso_access_token')) {
     try {

@@ -3,7 +3,7 @@
     <div class="section-header">
       <div>
         <h2 class="section-title">Trusted Devices</h2>
-        <p class="section-copy">Rename or revoke remembered devices tied to this operator account.</p>
+        <p class="section-copy">Rename or revoke remembered devices tied to this account.</p>
       </div>
     </div>
 

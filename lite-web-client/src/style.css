@@ -87,6 +87,11 @@ input.code {
   gap: 16px;
 }
 
+.stack-sm {
+  display: grid;
+  gap: 8px;
+}
+
 .stack-lg {
   display: grid;
   gap: 24px;
@@ -404,7 +409,7 @@ select.input:focus {
 }
 
 .auth-shell__inner {
-  width: min(100%, 760px);
+  width: min(100%, 1040px);
   display: grid;
   justify-items: center;
   gap: 28px;
@@ -453,6 +458,11 @@ select.input:focus {
 
 .auth-panel--md {
   max-width: 620px;
+}
+
+.auth-panel--lg {
+  width: min(100%, 960px);
+  max-width: 960px;
 }
 
 .auth-status-panel {
@@ -783,6 +793,24 @@ select.input:focus {
 .workspace-card--centered {
   justify-items: center;
   text-align: center;
+}
+
+.hosted-security-page {
+  width: 100%;
+}
+
+.hosted-security-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.hosted-security-header__actions {
+  justify-content: flex-end;
 }
 
 .workspace-return-card {

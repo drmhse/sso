@@ -29,6 +29,9 @@ import { authRouteWithContext } from '@/utils/authFlowContext';
 const route = useRoute();
 const accountSecurityRedirect = computed(() => {
   const redirect = Array.isArray(route.query.redirect) ? route.query.redirect[0] : route.query.redirect;
-  return typeof redirect === 'string' && redirect.startsWith('/app/account-security');
+  return typeof redirect === 'string' && (
+    redirect.startsWith('/account/security') ||
+    redirect.startsWith('/app/account-security')
+  );
 });
 </script>

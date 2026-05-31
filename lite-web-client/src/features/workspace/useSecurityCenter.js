@@ -63,7 +63,7 @@ export function useSecurityCenter(refreshVersion) {
       open: true,
       kind: 'disable-mfa',
       title: 'Disable MFA?',
-      description: 'This removes the extra authentication factor from the current operator account.',
+      description: 'This removes the extra authentication factor from the current account.',
       confirmLabel: 'Disable MFA',
       destructive: true,
       inputLabel: '',

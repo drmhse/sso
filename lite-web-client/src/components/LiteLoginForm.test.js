@@ -68,7 +68,7 @@ describe('LiteLoginForm', () => {
 
   it('passes the protected Lite return path through admin OAuth', async () => {
     const router = createTestRouter();
-    const returnTo = '/app/account-security?org=queuezero&service=flux&return_to=https%3A%2F%2Fflux.example.com%2Fsettings';
+    const returnTo = '/account/security?org=queuezero&service=flux&return_to=https%3A%2F%2Fflux.example.com%2Fsettings';
     router.push({ path: '/', query: { redirect: returnTo } });
     await router.isReady();
 

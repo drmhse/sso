@@ -25,7 +25,7 @@ describe('redirect helpers', () => {
   });
 
   it('builds a visible login redirect for protected account security routes', () => {
-    const target = '/app/account-security?org=queuezero&service=flux&return_to=https%3A%2F%2Fflux.example.com%2Fsettings';
+    const target = '/account/security?org=queuezero&service=flux&return_to=https%3A%2F%2Fflux.example.com%2Fsettings';
 
     expect(loginRouteForProtectedTarget(target)).toEqual({
       path: '/',
