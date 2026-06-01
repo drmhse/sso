@@ -15,7 +15,7 @@ mime_guess = "2.0"
 
 # Database - STRICTLY Rustls
 # WebAuthn forces OpenSSL, so we vendor it for static linking
-openssl = { version = "0.10", features = ["vendored"] }
+openssl = { version = "0.10.80", features = ["vendored"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "chrono", "migrate", "sqlite", "postgres", "mysql"] }
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
 migration = { path = "migration" }
@@ -68,7 +68,7 @@ totp-rs = { version = "5.5", features = ["gen_secret", "qr"] }
 qrcode = "0.14"
 
 # WebAuthn - DISABLE defaults to avoid OpenSSL
-webauthn-rs = { version = "0.5", default-features = false, features = ["danger-allow-state-serialisation"] }
+webauthn-rs = { version = "0.5.5", default-features = false, features = ["danger-allow-state-serialisation"] }
 
 # DNS
 hickory-resolver = "0.26"
@@ -104,7 +104,7 @@ rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 flate2 = "1.0"
 pkcs1 = "0.7.5"
 pkcs8 = "0.10"
-tar = "0.4"
+tar = "0.4.46"
 
 [[bin]]
 name = "sso_sqlite"
