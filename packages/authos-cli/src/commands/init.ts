@@ -65,7 +65,7 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
     type: 'text',
     name: 'baseUrl',
     message: 'Enter your AuthOS base URL:',
-    initial: 'https://auth.example.com',
+    initial: 'http://localhost:3001',
     validate: (value) => {
       try {
         new URL(value);
@@ -103,7 +103,7 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
   // Create/update .env file
   const envPath = path.join(cwd, '.env');
   const envLocalPath = path.join(cwd, '.env.local');
-  const envContent = `AUTHOS_BASE_URL=${baseUrl}\n`;
+  const envContent = envContentForFramework(framework, baseUrl);
 
   // Prefer .env.local for Next.js/Nuxt
   const targetEnvPath = framework === 'next' || framework === 'nuxt' ? envLocalPath : envPath;
@@ -126,7 +126,11 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
     console.log('  1. Wrap your app with AuthOSProvider:\n');
     console.log('     import { AuthOSProvider } from "@drmhse/authos-react";');
     console.log('');
-    console.log('     <AuthOSProvider baseURL={process.env.AUTHOS_BASE_URL}>');
+    if (framework === 'next') {
+      console.log('     <AuthOSProvider config={{ baseURL: process.env.NEXT_PUBLIC_AUTHOS_URL! }}>');
+    } else {
+      console.log('     <AuthOSProvider config={{ baseURL: import.meta.env.VITE_AUTHOS_BASE_URL }}>');
+    }
     console.log('       <App />');
     console.log('     </AuthOSProvider>\n');
   } else if (framework === 'vue' || framework === 'nuxt') {
@@ -134,7 +138,11 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
     console.log('     import { createAuthOS } from "@drmhse/authos-vue";');
     console.log('');
     console.log('     app.use(createAuthOS({');
-    console.log('       baseURL: import.meta.env.VITE_AUTHOS_BASE_URL,');
+    if (framework === 'nuxt') {
+      console.log('       baseURL: useRuntimeConfig().public.authosBaseUrl,');
+    } else {
+      console.log('       baseURL: import.meta.env.VITE_AUTHOS_BASE_URL,');
+    }
     console.log('     }));\n');
   }
 
@@ -159,6 +167,20 @@ function detectPackageManager(cwd: string): 'npm' | 'yarn' | 'pnpm' | 'bun' {
     return 'yarn';
   }
   return 'npm';
+}
+
+function envContentForFramework(framework: Framework, baseUrl: string): string {
+  switch (framework) {
+    case 'next':
+      return `AUTHOS_BASE_URL=${baseUrl}\nNEXT_PUBLIC_AUTHOS_URL=${baseUrl}\n`;
+    case 'nuxt':
+      return `AUTHOS_BASE_URL=${baseUrl}\nNUXT_PUBLIC_AUTHOS_BASE_URL=${baseUrl}\n`;
+    case 'react':
+    case 'vue':
+      return `AUTHOS_BASE_URL=${baseUrl}\nVITE_AUTHOS_BASE_URL=${baseUrl}\n`;
+    default:
+      return `AUTHOS_BASE_URL=${baseUrl}\n`;
+  }
 }
 
 /**

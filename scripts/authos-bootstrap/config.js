@@ -60,16 +60,26 @@ function normalizeConfig(input) {
 }
 
 function normalizeBilling(billing) {
-  return {
-    provider: billing.provider || 'stripe',
-    stripeSecretKey: billing.stripeSecretKey || 'sk_test_bootstrap_placeholder',
-    stripeWebhookSecret: billing.stripeWebhookSecret || 'whsec_bootstrap_placeholder',
+  const normalized = {
+    provider: billing.provider || 'none',
+    stripeSecretKey: billing.stripeSecretKey || '',
+    stripeWebhookSecret: billing.stripeWebhookSecret || '',
     stripeApiBaseUrl: billing.stripeApiBaseUrl || '',
     stripeWebhookTestMode: billing.stripeWebhookTestMode !== false,
     polarApiKey: billing.polarApiKey || '',
     polarWebhookSecret: billing.polarWebhookSecret || '',
     polarApiBaseUrl: billing.polarApiBaseUrl || '',
   };
+  if (!['none', 'stripe', 'polar'].includes(normalized.provider)) {
+    throw new Error('billing.provider must be one of none, stripe, or polar');
+  }
+  if (normalized.provider === 'stripe' && (!normalized.stripeSecretKey || !normalized.stripeWebhookSecret)) {
+    throw new Error('Stripe billing requires billing.stripeSecretKey and billing.stripeWebhookSecret');
+  }
+  if (normalized.provider === 'polar' && (!normalized.polarApiKey || !normalized.polarWebhookSecret)) {
+    throw new Error('Polar billing requires billing.polarApiKey and billing.polarWebhookSecret');
+  }
+  return normalized;
 }
 
 function normalizeSmtp(smtp) {

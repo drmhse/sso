@@ -7,7 +7,7 @@ pub(crate) fn ensure_email_delivery_configured(state: &AppState, flow_name: &str
     }
 
     Err(AppError::ServiceUnavailable(format!(
-        "Email delivery is not configured on this AuthOS instance, so {} is unavailable until SMTP is configured.",
+        "Email delivery is not configured on this AuthOS instance, so {} is unavailable. Use the bootstrap owner link to open Platform Setup and configure SMTP before enabling this flow.",
         flow_name
     )))
 }

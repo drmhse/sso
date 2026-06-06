@@ -94,6 +94,26 @@ Two supported bootstrap modes:
 2. File-driven install: copy `authos.config.example.json` to `authos.config.json`, edit it, then run `sudo ./install.sh --config ./authos.config.json`.
 
 The setup workspace writes back to the managed `config.json` on disk and can queue a reload of the running service after changes are saved.
+The zero-config install starts with billing disabled and email delivery disabled, so a solo developer can create the first app without Stripe or SMTP credentials. Configure Email in Platform Setup before using hosted sign-up, verification emails, password reset, invitations, or magic-link sign-in. Configure Billing only when you are ready to connect Stripe.
+
+If installation is interrupted after state has been written, the installer prints the managed config, state, status paths, a retry command, and any still-valid bootstrap login link. You can retry the managed apply step with:
+
+```bash
+sudo authos-apply apply --bundle-dir /opt/authos
+```
+
+After the setup workspace provisions the demo app, copy the generated client ID from Applications and add the relevant AuthOS URL to your app:
+
+```bash
+# Next.js
+NEXT_PUBLIC_AUTHOS_URL=http://YOUR_AUTHOS_HOST:3001
+
+# Vite React/Vue
+VITE_AUTHOS_BASE_URL=http://YOUR_AUTHOS_HOST:3001
+
+# Server-side Node.js
+AUTHOS_BASE_URL=http://YOUR_AUTHOS_HOST:3001
+```
 
 ### Optional Caddy
 

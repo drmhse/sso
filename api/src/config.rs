@@ -41,8 +41,8 @@ pub struct Config {
     pub platform_microsoft_user_api_url: Option<String>,
 
     // Stripe
-    pub stripe_secret_key: String,
-    pub stripe_webhook_secret: String,
+    pub stripe_secret_key: Option<String>,
+    pub stripe_webhook_secret: Option<String>,
     pub stripe_api_base_url: Option<String>,
 
     // Server
@@ -127,10 +127,8 @@ impl Config {
             platform_microsoft_token_url: env_var_optional("PLATFORM_MICROSOFT_TOKEN_URL"),
             platform_microsoft_user_api_url: env_var_optional("PLATFORM_MICROSOFT_USER_API_URL"),
 
-            stripe_secret_key: env::var("STRIPE_SECRET_KEY")
-                .map_err(|_| "STRIPE_SECRET_KEY must be set")?,
-            stripe_webhook_secret: env::var("STRIPE_WEBHOOK_SECRET")
-                .map_err(|_| "STRIPE_WEBHOOK_SECRET must be set")?,
+            stripe_secret_key: env_var_optional("STRIPE_SECRET_KEY"),
+            stripe_webhook_secret: env_var_optional("STRIPE_WEBHOOK_SECRET"),
             stripe_api_base_url: env_var_optional("STRIPE_API_BASE_URL"),
 
             server_host: env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),

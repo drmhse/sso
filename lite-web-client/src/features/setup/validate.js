@@ -46,6 +46,25 @@ export function validateManagedConfig(config) {
       errors.push('SMTP port must be between 1 and 65535 when SMTP mode is enabled.');
     }
   }
+  if (!['none', 'stripe', 'polar'].includes(config.billing.provider)) {
+    errors.push('Billing provider must be None, Stripe, or Polar.');
+  }
+  if (config.billing.provider === 'stripe') {
+    if (!config.billing.stripeSecretKey) {
+      errors.push('Stripe secret key is required when billing provider is Stripe.');
+    }
+    if (!config.billing.stripeWebhookSecret) {
+      errors.push('Stripe webhook secret is required when billing provider is Stripe.');
+    }
+  }
+  if (config.billing.provider === 'polar') {
+    if (!config.billing.polarApiKey) {
+      errors.push('Polar API key is required when billing provider is Polar.');
+    }
+    if (!config.billing.polarWebhookSecret) {
+      errors.push('Polar webhook secret is required when billing provider is Polar.');
+    }
+  }
 
   const servicePairs = new Set();
   config.services.forEach((service, index) => {

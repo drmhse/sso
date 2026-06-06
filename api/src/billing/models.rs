@@ -9,6 +9,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BillingProviderType {
+    Disabled,
     Stripe,
     Polar,
 }
@@ -16,6 +17,7 @@ pub enum BillingProviderType {
 impl std::fmt::Display for BillingProviderType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BillingProviderType::Disabled => write!(f, "none"),
             BillingProviderType::Stripe => write!(f, "stripe"),
             BillingProviderType::Polar => write!(f, "polar"),
         }
@@ -27,6 +29,7 @@ impl std::str::FromStr for BillingProviderType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "none" | "disabled" => Ok(BillingProviderType::Disabled),
             "stripe" => Ok(BillingProviderType::Stripe),
             "polar" => Ok(BillingProviderType::Polar),
             _ => Err(format!("Unknown billing provider: {}", s)),

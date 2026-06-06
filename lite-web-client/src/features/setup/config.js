@@ -144,6 +144,10 @@ export function serializeManagedConfig(form) {
       stripeSecretKey: trimString(config.billing?.stripeSecretKey),
       stripeWebhookSecret: trimString(config.billing?.stripeWebhookSecret),
       stripeWebhookTestMode: Boolean(config.billing?.stripeWebhookTestMode),
+      stripeApiBaseUrl: trimString(config.billing?.stripeApiBaseUrl),
+      polarApiKey: trimString(config.billing?.polarApiKey),
+      polarWebhookSecret: trimString(config.billing?.polarWebhookSecret),
+      polarApiBaseUrl: trimString(config.billing?.polarApiBaseUrl),
     },
   );
 

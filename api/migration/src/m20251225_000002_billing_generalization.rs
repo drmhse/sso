@@ -104,7 +104,11 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(OrganizationTiers::Table)
-                    .add_column(ColumnDef::new(OrganizationTiers::ExternalMapping).text().null())
+                    .add_column(
+                        ColumnDef::new(OrganizationTiers::ExternalMapping)
+                            .text()
+                            .null(),
+                    )
                     .to_owned(),
             )
             .await?;

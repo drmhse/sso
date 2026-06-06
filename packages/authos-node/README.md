@@ -29,7 +29,7 @@ import { createAuthMiddleware } from '@drmhse/authos-node/express';
 
 const app = express();
 const { requireAuth, requirePermission } = createAuthMiddleware({
-  baseURL: 'https://sso.example.com',
+  baseURL: process.env.AUTHOS_BASE_URL || 'http://localhost:3001',
 });
 
 app.get('/profile', requireAuth(), (req, res) => {

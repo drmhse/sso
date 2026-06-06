@@ -31,10 +31,14 @@ export const DEFAULT_CONFIG = {
     password: '',
   },
   billing: {
-    provider: 'stripe',
+    provider: 'none',
     stripeSecretKey: '',
     stripeWebhookSecret: '',
     stripeWebhookTestMode: true,
+    stripeApiBaseUrl: '',
+    polarApiKey: '',
+    polarWebhookSecret: '',
+    polarApiBaseUrl: '',
   },
   smtp: {
     mode: 'disabled',
@@ -116,7 +120,16 @@ export const DEPLOYMENT_KEYS = [
 export const STANDALONE_KEYS = ['dataDir'];
 export const CADDY_KEYS = ['enabled', 'install', 'domain', 'email', 'tls'];
 export const PLATFORM_OWNER_KEYS = ['email', 'password'];
-export const BILLING_KEYS = ['provider', 'stripeSecretKey', 'stripeWebhookSecret', 'stripeWebhookTestMode'];
+export const BILLING_KEYS = [
+  'provider',
+  'stripeSecretKey',
+  'stripeWebhookSecret',
+  'stripeWebhookTestMode',
+  'stripeApiBaseUrl',
+  'polarApiKey',
+  'polarWebhookSecret',
+  'polarApiBaseUrl',
+];
 export const SMTP_KEYS = ['mode', 'host', 'port', 'username', 'password', 'fromEmail', 'fromName'];
 export const OAUTH_PROVIDER_KEYS = ['clientId', 'clientSecret'];
 export const OUTPUT_KEYS = ['directory', 'apiEnv'];

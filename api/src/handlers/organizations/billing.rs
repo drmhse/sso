@@ -65,6 +65,11 @@ pub async fn create_portal_session(
 
     // 4. Get billing customer for this organization
     let provider_type = state.billing_provider.provider_type();
+    if provider_type == crate::billing::BillingProviderType::Disabled {
+        return Err(AppError::ServiceUnavailable(
+            "Billing is disabled for this AuthOS instance.".to_string(),
+        ));
+    }
 
     let billing_customer = billing_customers::Entity::find()
         .filter(billing_customers::Column::OrgId.eq(&org.id))
@@ -131,6 +136,12 @@ pub async fn get_billing_info(
 
     // Check for billing customer
     let provider_type = state.billing_provider.provider_type();
+    if provider_type == crate::billing::BillingProviderType::Disabled {
+        return Ok(Json(BillingInfoResponse {
+            has_billing_account: false,
+            provider: None,
+        }));
+    }
 
     let billing_customer = billing_customers::Entity::find()
         .filter(billing_customers::Column::OrgId.eq(&org.id))
@@ -155,6 +166,11 @@ pub async fn create_billing_customer(
 
     let provider = &state.billing_provider;
     let provider_type = provider.provider_type();
+    if provider_type == crate::billing::BillingProviderType::Disabled {
+        return Err(AppError::ServiceUnavailable(
+            "Billing is disabled for this AuthOS instance.".to_string(),
+        ));
+    }
 
     // Check if customer already exists
     let existing = billing_customers::Entity::find()

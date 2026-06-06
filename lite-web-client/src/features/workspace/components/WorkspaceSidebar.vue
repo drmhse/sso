@@ -1,5 +1,9 @@
 <template>
-  <aside class="workspace-sidebar" :class="{ 'workspace-sidebar--open': mobileOpen }">
+  <aside
+    class="workspace-sidebar"
+    :class="{ 'workspace-sidebar--open': mobileOpen }"
+    :style="mobileOpen ? { left: '0px' } : null"
+  >
     <div class="workspace-sidebar__brand">
       <div class="workspace-sidebar__brand-lockup">
         <LiteBrand compact size="sm" />

@@ -78,6 +78,7 @@ def main() -> int:
     except Exception as exc:
         write_failure_status(str(exc))
         print(f"AuthOS standalone error: {exc}", file=sys.stderr)
+        print_failure_recovery_hint()
         return 1
 
 
@@ -130,6 +131,12 @@ def apply(bundle_dir: Path, print_link: bool, start_service: bool) -> None:
     ensure_apply_request_file(paths)
 
     state = ensure_state(load_json(paths["state_path"], {}))
+    original_bootstrap = None
+    provisioning_bootstrap = None
+    if start_service and config.get("services"):
+        original_bootstrap = json.loads(json.dumps(state.get("bootstrap_login") or {}))
+        provisioning_bootstrap = new_bootstrap_login(ttl=timedelta(minutes=10))
+        state["bootstrap_login"] = provisioning_bootstrap
     write_status(paths["status_path"], {
         "status": "running",
         "message": "Applying AuthOS configuration.",
@@ -161,10 +168,20 @@ def apply(bundle_dir: Path, print_link: bool, start_service: bool) -> None:
     provision_report = []
 
     if start_service:
-        run(["systemctl", "restart", "authos.service"])
-        wait_for_systemd("authos.service")
-        wait_for_http_readiness(config["deployment"]["baseUrl"])
-        provision_report = provision_resources(config, state, paths)
+        try:
+            run(["systemctl", "restart", "authos.service"])
+            wait_for_systemd("authos.service")
+            wait_for_http_readiness(config["deployment"]["baseUrl"])
+            provision_report = provision_resources(
+                config,
+                state,
+                paths,
+                bootstrap_token=provisioning_bootstrap["token"] if provisioning_bootstrap else None,
+            )
+        finally:
+            if original_bootstrap is not None:
+                state["bootstrap_login"] = original_bootstrap
+                persist_state(paths, state)
 
     login_url = bootstrap_login_url(config, state)
     status_payload = {
@@ -318,14 +335,26 @@ def normalize_config(config: dict, install_state: dict | None = None) -> dict:
     platform_owner.setdefault("password", "")
 
     billing = config.setdefault("billing", {})
-    billing.setdefault("provider", "stripe")
-    billing.setdefault("stripeSecretKey", "sk_test_bootstrap_placeholder")
-    billing.setdefault("stripeWebhookSecret", "whsec_bootstrap_placeholder")
+    billing.setdefault("provider", "none")
+    billing.setdefault("stripeSecretKey", "")
+    billing.setdefault("stripeWebhookSecret", "")
     billing.setdefault("stripeWebhookTestMode", True)
     billing.setdefault("stripeApiBaseUrl", "")
     billing.setdefault("polarApiKey", "")
     billing.setdefault("polarWebhookSecret", "")
     billing.setdefault("polarApiBaseUrl", "")
+    if billing["provider"] not in {"none", "stripe", "polar"}:
+        raise RuntimeError("billing.provider must be one of none, stripe, or polar")
+    if billing["provider"] == "stripe":
+        if not str(billing.get("stripeSecretKey") or "").strip():
+            raise RuntimeError("billing.stripeSecretKey is required when billing.provider=stripe")
+        if not str(billing.get("stripeWebhookSecret") or "").strip():
+            raise RuntimeError("billing.stripeWebhookSecret is required when billing.provider=stripe")
+    if billing["provider"] == "polar":
+        if not str(billing.get("polarApiKey") or "").strip():
+            raise RuntimeError("billing.polarApiKey is required when billing.provider=polar")
+        if not str(billing.get("polarWebhookSecret") or "").strip():
+            raise RuntimeError("billing.polarWebhookSecret is required when billing.provider=polar")
 
     smtp = config.setdefault("smtp", {})
     smtp.setdefault("mode", "disabled")
@@ -412,12 +441,7 @@ def ensure_state(state: dict) -> dict:
     jwt = state.get("jwt") or generate_jwt_keys()
     bootstrap_login = state.get("bootstrap_login") or {}
     if not bootstrap_login.get("token"):
-        bootstrap_login = {
-            "token": secrets.token_urlsafe(32),
-            "created_at": now_rfc3339(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
-            "used_at": None,
-        }
+        bootstrap_login = new_bootstrap_login(ttl=timedelta(days=7))
 
     return {
         "version": STATE_VERSION,
@@ -426,6 +450,15 @@ def ensure_state(state: dict) -> dict:
         "encryptionKey": state.get("encryptionKey") or secrets.token_hex(32),
         "deviceTrustSecret": state.get("deviceTrustSecret") or secrets.token_hex(32),
         "bootstrap_login": bootstrap_login,
+    }
+
+
+def new_bootstrap_login(ttl: timedelta) -> dict:
+    return {
+        "token": secrets.token_urlsafe(32),
+        "created_at": now_rfc3339(),
+        "expires_at": (datetime.now(timezone.utc) + ttl).isoformat(),
+        "used_at": None,
     }
 
 
@@ -476,8 +509,6 @@ def build_env(config: dict, state: dict, paths: dict) -> dict:
         "JWT_KID": state["jwt"]["kid"],
         "JWT_EXPIRATION_HOURS": "24",
         "BILLING_PROVIDER": billing["provider"],
-        "STRIPE_SECRET_KEY": billing["stripeSecretKey"],
-        "STRIPE_WEBHOOK_SECRET": billing["stripeWebhookSecret"],
         "SERVER_HOST": deployment["serverHost"],
         "SERVER_PORT": str(deployment["apiPort"]),
         "BASE_URL": deployment["baseUrl"],
@@ -502,6 +533,9 @@ def build_env(config: dict, state: dict, paths: dict) -> dict:
 
     if deployment.get("fullWebClientBaseUrl"):
         env["FULL_WEB_CLIENT_BASE_URL"] = deployment["fullWebClientBaseUrl"]
+    if billing.get("provider") == "stripe":
+        add_if(env, "STRIPE_SECRET_KEY", billing.get("stripeSecretKey"))
+        add_if(env, "STRIPE_WEBHOOK_SECRET", billing.get("stripeWebhookSecret"))
     if billing.get("stripeApiBaseUrl"):
         env["STRIPE_API_BASE_URL"] = billing["stripeApiBaseUrl"]
     if billing.get("polarApiKey"):
@@ -531,13 +565,13 @@ def build_env(config: dict, state: dict, paths: dict) -> dict:
     return env
 
 
-def provision_resources(config: dict, state: dict, paths: dict) -> list[dict]:
+def provision_resources(config: dict, state: dict, paths: dict, bootstrap_token: str | None = None) -> list[dict]:
     services = config.get("services") or []
     if not services:
         return []
 
     base_url = config["deployment"]["baseUrl"]
-    token = acquire_management_token(base_url, state, paths)
+    token = acquire_management_token(base_url, state, paths, bootstrap_token=bootstrap_token)
     client = StandaloneAuthOsClient(base_url, token)
     report = []
 
@@ -564,31 +598,32 @@ def provision_resources(config: dict, state: dict, paths: dict) -> list[dict]:
     return report
 
 
-def acquire_management_token(base_url: str, state: dict, paths: dict) -> str:
-    original_bootstrap = json.loads(json.dumps(state.get("bootstrap_login") or {}))
-    temporary_bootstrap = {
-        "token": secrets.token_urlsafe(32),
-        "created_at": now_rfc3339(),
-        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
-        "used_at": None,
-    }
-
-    state["bootstrap_login"] = temporary_bootstrap
-    persist_state(paths, state)
-
-    try:
-        response = request_json(
-            f"{base_url}/api/public/bootstrap-login",
-            method="POST",
-            body={"token": temporary_bootstrap["token"]},
-        )
-        access_token = str(response.get("access_token") or "").strip()
-        if not access_token:
-            raise RuntimeError("Bootstrap login did not return an access token")
-        return access_token
-    finally:
-        state["bootstrap_login"] = original_bootstrap
+def acquire_management_token(base_url: str, state: dict, paths: dict, bootstrap_token: str | None = None) -> str:
+    if not bootstrap_token:
+        bootstrap_login = new_bootstrap_login(ttl=timedelta(minutes=10))
+        state["bootstrap_login"] = bootstrap_login
         persist_state(paths, state)
+        bootstrap_token = bootstrap_login["token"]
+    else:
+        current_state = load_json(paths["state_path"], {})
+        current_token = (
+            current_state.get("bootstrap_login", {})
+            .get("token")
+            if isinstance(current_state, dict)
+            else None
+        )
+        if current_token:
+            bootstrap_token = current_token
+
+    response = request_json(
+        f"{base_url}/api/public/bootstrap-login",
+        method="POST",
+        body={"token": bootstrap_token},
+    )
+    access_token = str(response.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("Bootstrap login did not return an access token")
+    return access_token
 
 
 class StandaloneAuthOsClient:
@@ -1228,6 +1263,26 @@ def write_failure_status(message: str) -> None:
             "message": message,
             "updated_at": now_rfc3339(),
         })
+    except Exception:
+        pass
+
+
+def print_failure_recovery_hint() -> None:
+    try:
+        paths = managed_paths()
+        print("", file=sys.stderr)
+        print("AuthOS saved its managed state before the failure.", file=sys.stderr)
+        print(f"Config: {paths['config_path']}", file=sys.stderr)
+        print(f"State: {paths['state_path']}", file=sys.stderr)
+        print(f"Status: {paths['status_path']}", file=sys.stderr)
+        print("Retry after fixing the issue with: sudo authos-apply apply --bundle-dir /opt/authos", file=sys.stderr)
+
+        config = load_json(paths["config_path"], {})
+        state = load_json(paths["state_path"], {})
+        login_url = bootstrap_login_url(config, state) if config and state else ""
+        if login_url:
+            print(f"Bootstrap login link after the service is healthy: {login_url}", file=sys.stderr)
+        print("", file=sys.stderr)
     except Exception:
         pass
 

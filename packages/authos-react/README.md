@@ -40,6 +40,18 @@ export function App() {
 }
 ```
 
+For Next.js client components, expose the AuthOS origin with a public env var:
+
+```env
+NEXT_PUBLIC_AUTHOS_URL=http://localhost:3001
+```
+
+```tsx
+<AuthOSProvider config={{ baseURL: process.env.NEXT_PUBLIC_AUTHOS_URL! }}>
+  {children}
+</AuthOSProvider>
+```
+
 ## Scoped tenant usage
 
 ```tsx

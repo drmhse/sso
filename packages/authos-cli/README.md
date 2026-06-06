@@ -30,6 +30,7 @@ authos init
 ```
 
 This command detects the framework, installs the relevant adapter package, and sets up the base AuthOS configuration.
+For Next.js it writes both `AUTHOS_BASE_URL` and `NEXT_PUBLIC_AUTHOS_URL` to `.env.local`; for Vite React/Vue it writes `AUTHOS_BASE_URL` and `VITE_AUTHOS_BASE_URL`.
 
 ### Add a component template
 
@@ -57,5 +58,7 @@ This command idempotently bootstraps the ACT organization, service, redirect URI
 authos init
 authos add login-form
 ```
+
+For a fresh standalone AuthOS install, use the URL printed by `sudo ./install.sh` or shown in the lite Platform Setup workspace. The default local URL is usually `http://localhost:3001` on the AuthOS host.
 
 See the docs site for supported frameworks, template behavior, and troubleshooting.

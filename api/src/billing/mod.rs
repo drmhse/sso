@@ -9,5 +9,5 @@ pub mod providers;
 pub mod traits;
 
 pub use models::*;
-pub use providers::{PolarProvider, StripeProvider};
+pub use providers::{DisabledBillingProvider, PolarProvider, StripeProvider};
 pub use traits::BillingProvider;

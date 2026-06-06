@@ -205,18 +205,18 @@ pub async fn create_organization(
     )
     .await?;
 
-    // Create billing customer
-    // We ignore errors here as we don't want to fail org creation if billing setup fails
-    // The user can try accessing the billing portal later which should trigger creation on demand (TODO)
-    // or they can contact support.
-    if let Err(e) =
-        super::billing::create_billing_customer(&state, &organization.id, &organization.name).await
-    {
-        tracing::error!(
-            "Failed to create billing customer for org {}: {}",
-            organization.id,
-            e
-        );
+    if state.billing_provider.provider_type() != crate::billing::BillingProviderType::Disabled {
+        // We ignore errors here as we don't want to fail org creation if billing setup fails.
+        if let Err(e) =
+            super::billing::create_billing_customer(&state, &organization.id, &organization.name)
+                .await
+        {
+            tracing::error!(
+                "Failed to create billing customer for org {}: {}",
+                organization.id,
+                e
+            );
+        }
     }
 
     // Generate JWT with organization context

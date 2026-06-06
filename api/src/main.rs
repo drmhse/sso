@@ -19,7 +19,9 @@ mod utils;
 
 use crate::auth::jwt::JwtService;
 use crate::auth::sso::OAuthClient;
-use crate::billing::{BillingProvider, BillingProviderType, PolarProvider, StripeProvider};
+use crate::billing::{
+    BillingProvider, BillingProviderType, DisabledBillingProvider, PolarProvider, StripeProvider,
+};
 use crate::config::Config;
 use crate::encryption::EncryptionService;
 use crate::handlers::health::readiness;
@@ -44,8 +46,8 @@ use base64::{
 use openssl::pkey::PKey;
 use sea_orm::DatabaseConnection;
 use serde::Serialize;
-use std::env;
 use std::sync::Arc;
+use std::{env, net::IpAddr};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use webauthn_rs::prelude::*;
@@ -194,6 +196,18 @@ async fn jwks_handler() -> Result<Json<JwksResponse>, axum::http::StatusCode> {
     };
 
     Ok(Json(JwksResponse { keys: vec![jwk] }))
+}
+
+fn webauthn_rp_id(base_url: &str) -> Option<String> {
+    let parsed_url = Url::parse(base_url).ok()?;
+    let host = parsed_url.host_str()?.to_string();
+    if host == "localhost" {
+        return Some(host);
+    }
+    if host.parse::<IpAddr>().is_ok() || parsed_url.scheme() != "https" {
+        return None;
+    }
+    Some(host)
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -388,24 +402,40 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to initialize JWT service"),
     );
     // Initialize billing provider based on BILLING_PROVIDER env var
-    let billing_provider_type = std::env::var("BILLING_PROVIDER")
-        .unwrap_or_else(|_| "stripe".to_string())
+    let billing_provider_name =
+        std::env::var("BILLING_PROVIDER").unwrap_or_else(|_| "none".to_string());
+    let billing_provider_type = billing_provider_name
         .parse::<BillingProviderType>()
-        .unwrap_or(BillingProviderType::Stripe);
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Invalid BILLING_PROVIDER '{}': {}",
+                billing_provider_name,
+                err
+            )
+        })?;
 
     let billing_provider: Arc<dyn BillingProvider> = match billing_provider_type {
+        BillingProviderType::Disabled => {
+            tracing::info!("Billing provider: disabled");
+            Arc::new(DisabledBillingProvider::new())
+        }
         BillingProviderType::Stripe => {
+            let stripe_secret_key = config
+                .stripe_secret_key
+                .clone()
+                .expect("STRIPE_SECRET_KEY must be set when BILLING_PROVIDER=stripe");
+            let stripe_webhook_secret = config
+                .stripe_webhook_secret
+                .clone()
+                .expect("STRIPE_WEBHOOK_SECRET must be set when BILLING_PROVIDER=stripe");
             let provider = if let Some(ref base_url) = config.stripe_api_base_url {
                 StripeProvider::new_with_base_url(
-                    config.stripe_secret_key.clone(),
-                    config.stripe_webhook_secret.clone(),
+                    stripe_secret_key,
+                    stripe_webhook_secret,
                     base_url,
                 )
             } else {
-                StripeProvider::new(
-                    config.stripe_secret_key.clone(),
-                    config.stripe_webhook_secret.clone(),
-                )
+                StripeProvider::new(stripe_secret_key, stripe_webhook_secret)
             };
             tracing::info!("Billing provider: Stripe");
             Arc::new(provider)
@@ -452,33 +482,27 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("GeoIP features explicitly disabled via GEOIP_DISABLED=true");
     }
 
-    // Initialize WebAuthn service if base URL is available
-    let webauthn_service = if !config.base_url.is_empty() {
-        // Extract the host from base_url to use as rp_id
-        let rp_id = match Url::parse(&config.base_url) {
-            Ok(parsed_url) => parsed_url.host_str().unwrap_or("localhost").to_string(),
-            Err(_) => {
-                tracing::warn!(
-                    "Invalid base_url format for WebAuthn service: {}",
-                    config.base_url
-                );
-                "localhost".to_string()
-            }
-        };
-
-        match crate::services::webauthn::WebAuthnService::new(
-            &rp_id,
-            &config.base_url,
-            Some("SSO Platform"),
-        ) {
-            Ok(service) => Some(Arc::new(service)),
-            Err(e) => {
-                tracing::warn!("Failed to initialize WebAuthn service: {}", e);
-                None
+    // Initialize WebAuthn service only when the configured origin can be a valid RP.
+    let webauthn_service = match webauthn_rp_id(&config.base_url) {
+        Some(rp_id) => {
+            match crate::services::webauthn::WebAuthnService::new(
+                &rp_id,
+                &config.base_url,
+                Some("SSO Platform"),
+            ) {
+                Ok(service) => Some(Arc::new(service)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize WebAuthn service: {}", e);
+                    None
+                }
             }
         }
-    } else {
-        None
+        None => {
+            tracing::info!(
+                "WebAuthn passkeys disabled because BASE_URL is not a domain-backed HTTPS or localhost origin"
+            );
+            None
+        }
     };
 
     // Initialize permission cache

@@ -31,9 +31,9 @@
     "password": ""
   },
   "billing": {
-    "provider": "stripe",
-    "stripeSecretKey": "sk_test_bootstrap_placeholder",
-    "stripeWebhookSecret": "whsec_bootstrap_placeholder",
+    "provider": "none",
+    "stripeSecretKey": "",
+    "stripeWebhookSecret": "",
     "stripeWebhookTestMode": true
   },
   "smtp": {

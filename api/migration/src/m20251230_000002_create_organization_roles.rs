@@ -21,7 +21,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(OrganizationRoles::Slug).string().not_null())
                     .col(ColumnDef::new(OrganizationRoles::Name).string().not_null())
                     .col(ColumnDef::new(OrganizationRoles::Description).string())
-                    .col(ColumnDef::new(OrganizationRoles::Permissions).json().not_null())
+                    .col(
+                        ColumnDef::new(OrganizationRoles::Permissions)
+                            .json()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(OrganizationRoles::CreatedAt)
                             .date_time()

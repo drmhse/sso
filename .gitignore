@@ -23,6 +23,7 @@ dist-ssr/
 !.env.example
 authos.config.json
 .authos/
+.artifacts/
 latest_npm_token.txt
 ssh-*.txt
 .npmrc

@@ -17,8 +17,16 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(ConnectedAccounts::UserId).string_len(36).not_null())
-                    .col(ColumnDef::new(ConnectedAccounts::Provider).string_len(100).not_null())
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::UserId)
+                            .string_len(36)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::Provider)
+                            .string_len(100)
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(ConnectedAccounts::ProviderUserId)
                             .string_len(255)
@@ -31,7 +39,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(ConnectedAccounts::AccessTokenEncrypted).blob())
                     .col(ColumnDef::new(ConnectedAccounts::RefreshTokenEncrypted).blob())
                     .col(ColumnDef::new(ConnectedAccounts::EncryptionKeyId).string())
-                    .col(ColumnDef::new(ConnectedAccounts::ExpiresAt).date_time().null())
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::ExpiresAt)
+                            .date_time()
+                            .null(),
+                    )
                     .col(ColumnDef::new(ConnectedAccounts::Scopes).text())
                     .col(
                         ColumnDef::new(ConnectedAccounts::LastRefreshedAt)
@@ -56,7 +68,11 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(Expr::current_timestamp()),
                     )
-                    .col(ColumnDef::new(ConnectedAccounts::RevokedAt).date_time().null())
+                    .col(
+                        ColumnDef::new(ConnectedAccounts::RevokedAt)
+                            .date_time()
+                            .null(),
+                    )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_connected_accounts_user")
@@ -132,7 +148,11 @@ impl MigrationTrait for Migration {
                             .string_len(100)
                             .not_null(),
                     )
-                    .col(ColumnDef::new(ServiceProviderGrants::Scopes).text().not_null())
+                    .col(
+                        ColumnDef::new(ServiceProviderGrants::Scopes)
+                            .text()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(ServiceProviderGrants::Status)
                             .string_len(50)
@@ -165,7 +185,10 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_service_provider_grants_service")
-                            .from(ServiceProviderGrants::Table, ServiceProviderGrants::ServiceId)
+                            .from(
+                                ServiceProviderGrants::Table,
+                                ServiceProviderGrants::ServiceId,
+                            )
                             .to(Services::Table, Services::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
@@ -242,7 +265,11 @@ impl MigrationTrait for Migration {
                             .text()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(ProviderTokenRequests::RedirectUri).text().not_null())
+                    .col(
+                        ColumnDef::new(ProviderTokenRequests::RedirectUri)
+                            .text()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(ProviderTokenRequests::ClientState).text())
                     .col(
                         ColumnDef::new(ProviderTokenRequests::Status)
@@ -276,7 +303,10 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_provider_token_requests_service")
-                            .from(ProviderTokenRequests::Table, ProviderTokenRequests::ServiceId)
+                            .from(
+                                ProviderTokenRequests::Table,
+                                ProviderTokenRequests::ServiceId,
+                            )
                             .to(Services::Table, Services::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
