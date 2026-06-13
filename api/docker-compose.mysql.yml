@@ -70,7 +70,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: editoredit/sso:mysql-v0.1.48
+    image: editoredit/sso:mysql-v0.1.55
     container_name: sso-mysql
     environment:
       <<: *common-env
