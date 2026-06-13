@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-react",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "React and Next.js adapter for AuthOS authentication",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -32,8 +32,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
+    "build": "tsdown",
+    "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts,.tsx",
     "prepublishOnly": "npm run build"
@@ -57,7 +57,7 @@
     "next": "^15.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "tsup": "^8.3.5",
+    "tsdown": "^0.22.2",
     "typescript": "^5.7.2"
   },
   "repository": {

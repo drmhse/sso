@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/sso-sdk",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Zero-dependency TypeScript SDK for AuthOS, the multi-tenant authentication platform",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -22,8 +22,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
-    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "build": "tsdown",
+    "dev": "tsdown --watch",
     "test": "npm run build && node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
@@ -50,7 +50,7 @@
     "@typescript-eslint/eslint-plugin": "^8.59.4",
     "@typescript-eslint/parser": "^8.59.4",
     "eslint": "^8.56.0",
-    "tsup": "^8.0.1",
+    "tsdown": "^0.22.2",
     "typescript": "^5.3.3"
   },
   "repository": {

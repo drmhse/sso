@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-cli",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "CLI tool for scaffolding AuthOS integrations",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,8 +12,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
+    "build": "tsdown",
+    "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
     "prepublishOnly": "npm run build"
@@ -39,7 +39,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/prompts": "^2.4.9",
-    "tsup": "^8.3.5",
+    "tsdown": "^0.22.2",
     "typescript": "^5.7.2"
   },
   "repository": {

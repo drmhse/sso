@@ -1,4 +1,4 @@
-import { defineConfig } from 'tsup';
+import { defineConfig } from 'tsdown';
 
 export default defineConfig([
   // Library entry (no shebang)
@@ -9,6 +9,7 @@ export default defineConfig([
     clean: true,
     treeshake: true,
     splitting: false,
+    fixedExtension: false,
   },
   // CLI binary entry (with shebang)
   {
@@ -17,6 +18,7 @@ export default defineConfig([
     dts: true,
     treeshake: true,
     splitting: false,
+    fixedExtension: false,
     banner: {
       js: '#!/usr/bin/env node',
     },
