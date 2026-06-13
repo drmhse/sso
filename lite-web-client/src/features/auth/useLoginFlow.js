@@ -10,6 +10,8 @@ import {
   storePostLoginRedirect,
 } from '@/utils/redirects';
 
+export const DEFAULT_AUTH_METHOD_ORDER = Object.freeze(['password', 'magic_link', 'passkey']);
+
 export function useLoginFlow(route, router) {
   const authStore = useAuthStore();
   const authFlowStore = useAuthFlowStore();
@@ -33,11 +35,12 @@ export function useLoginFlow(route, router) {
     label: providerLabel(provider),
     icon: iconForProvider(provider),
   })));
+  const authMethods = computed(() => publicAuthContext.value?.auth_methods || DEFAULT_AUTH_METHOD_ORDER);
   const serviceDisplayName = computed(() => publicAuthContext.value?.service?.name || authContext.value.serviceLabel);
   const orgDisplayName = computed(() => publicAuthContext.value?.organization?.name || authContext.value.orgLabel);
   const redirectInvalid = computed(() => publicAuthContext.value?.service?.redirect_uri_valid === false);
-  const canUseMagicLink = computed(() => (publicAuthContext.value?.auth_methods || ['password', 'magic_link']).includes('magic_link'));
-  const canUsePasskey = computed(() => (publicAuthContext.value?.auth_methods || ['password', 'passkey']).includes('passkey') && sso.passkeys.isSupported());
+  const canUseMagicLink = computed(() => authMethods.value.includes('magic_link'));
+  const canUsePasskey = computed(() => authMethods.value.includes('passkey') && sso.passkeys.isSupported());
   const statusClass = computed(() => statusType.value === 'success' ? 'alert-success' : statusType.value === 'warning' ? 'alert-warning' : 'alert-error');
   const upstreamProvider = computed(() => hrdData.value?.provider_name || '');
   const connectionId = computed(() => hrdData.value?.connection_id || '');

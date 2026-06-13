@@ -130,6 +130,7 @@ impl ServiceStore {
         google_scopes: Option<&str>,
         redirect_uris: Option<&str>,
         device_activation_uri: Option<&str>,
+        resource_uris: Option<&str>,
     ) -> Result<services::Model> {
         let new_service = services::ActiveModel {
             id: Set(service_id.to_string()),
@@ -144,6 +145,7 @@ impl ServiceStore {
             google_scopes: Set(google_scopes.map(|s| s.to_string())),
             redirect_uris: Set(redirect_uris.map(|s| s.to_string())),
             device_activation_uri: Set(device_activation_uri.map(|s| s.to_string())),
+            resource_uris: Set(resource_uris.map(|s| s.to_string())),
             ..Default::default()
         };
 
@@ -311,6 +313,7 @@ impl ServiceStore {
         google_scopes: Option<&str>,
         redirect_uris: Option<&str>,
         device_activation_uri: Option<&str>,
+        resource_uris: Option<&str>,
     ) -> Result<services::Model> {
         let service = Self::find_by_org_and_slug(db.clone(), org_id, slug)
             .await?
@@ -338,6 +341,9 @@ impl ServiceStore {
         }
         if let Some(dau) = device_activation_uri {
             service_active.device_activation_uri = Set(Some(dau.to_string()));
+        }
+        if let Some(resources) = resource_uris {
+            service_active.resource_uris = Set(Some(resources.to_string()));
         }
 
         let updated_service = service_active.update(&db).await?;

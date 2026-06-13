@@ -5,10 +5,18 @@ use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
-    email_verification::EmailVerificationStore, identities::IdentityStore,
-    invitations::InvitationStore, memberships::MembershipStore, organizations::OrganizationStore,
-    password_reset::PasswordResetStore, services::ServiceStore, sessions::SessionStore,
-    totp::TotpStore, users::UserStore, DB,
+    email_verification::EmailVerificationStore,
+    identities::IdentityStore,
+    invitations::InvitationStore,
+    memberships::MembershipStore,
+    organizations::OrganizationStore,
+    password_reset::PasswordResetStore,
+    services::ServiceStore,
+    sessions::SessionStore,
+    totp::TotpStore,
+    users::UserStore,
+    verified_domains::{VerifiedDomainStore, DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY},
+    DB,
 };
 use axum::{
     extract::{Query, State},
@@ -216,6 +224,35 @@ async fn resolve_org_id_from_slug(
     }
 }
 
+pub(crate) async fn reject_upstream_only_local_auth(
+    state: &AppState,
+    email: &str,
+    context_org_id: Option<&str>,
+    auth_method: &str,
+) -> Result<()> {
+    let Some(domain) =
+        VerifiedDomainStore::find_verified_by_email_domain(DB::Conn(&state.db), email).await?
+    else {
+        return Ok(());
+    };
+
+    let applies_to_context = context_org_id
+        .map(|org_id| org_id == domain.org_id)
+        .unwrap_or(true);
+
+    if applies_to_context
+        && domain.login_policy == DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY
+        && domain.upstream_provider_id.is_some()
+    {
+        return Err(AppError::Forbidden(format!(
+            "{} is disabled for this managed domain. Use your organization's identity provider.",
+            auth_method
+        )));
+    }
+
+    Ok(())
+}
+
 /// POST /api/auth/register - Register a new user with email and password
 pub async fn register(
     State(state): State<AppState>,
@@ -296,6 +333,14 @@ pub async fn register(
     } else {
         (None, None)
     };
+
+    reject_upstream_only_local_auth(
+        &state,
+        &req.email,
+        issuing_org_id.as_deref(),
+        "Password registration",
+    )
+    .await?;
 
     // Check if user already exists (scoped to tenant if org_id is present)
     let existing_user = UserStore::find_by_email_with_context(
@@ -495,10 +540,19 @@ pub async fn login(
         let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
         Some(org.id)
     } else {
         None
     };
+
+    reject_upstream_only_local_auth(
+        &state,
+        &req.email,
+        context_org_id.as_deref(),
+        "Password login",
+    )
+    .await?;
 
     // Find user by email (scoped to tenant context)
     // - If org_slug provided: WHERE email=? AND org_id=?
@@ -648,7 +702,7 @@ pub async fn login(
     use crate::services::risk_engine::RiskContext;
     let risk_ctx = RiskContext {
         user_id: &user.id,
-        org_id: None, // Will be set after org verification
+        org_id: context_org_id.as_deref(),
         ip_address: &request_info.ip_address,
         user_agent: &request_info.user_agent,
         device_cookie: None, // No device cookie available during login
@@ -848,6 +902,7 @@ pub async fn login(
     let helper_token_hash = token_hash.clone();
     let helper_refresh_token = refresh_token.clone();
     let helper_org_slug = req.org_slug.clone();
+    let helper_service_id = login_event_service_id.clone();
     let helper_ip = request_info.ip_address.clone();
     let helper_risk_action = risk_assessment.action.clone();
 
@@ -866,6 +921,7 @@ pub async fn login(
             let token_hash = helper_token_hash.clone();
             let refresh_token = helper_refresh_token.clone();
             let org_slug = helper_org_slug.clone();
+            let service_id = helper_service_id.clone();
             let ip_address = helper_ip.clone();
             let risk_action = helper_risk_action.clone();
             let device_token = helper_device_token.clone();
@@ -884,6 +940,7 @@ pub async fn login(
                     Some(&refresh_token),
                     Some(refresh_expires_at_naive),
                     org_slug.as_deref(),
+                    service_id.as_deref(),
                     None,
                     None,
                     None,
@@ -972,6 +1029,8 @@ pub async fn forgot_password(
     }
 
     let org_id = resolve_org_id_from_slug(&state, req.org_slug.as_deref()).await?;
+    reject_upstream_only_local_auth(&state, &req.email, org_id.as_deref(), "Password reset")
+        .await?;
 
     if let (Some(org_slug), Some(service_slug), Some(redirect_uri)) = (
         req.org_slug.as_deref(),
@@ -1097,6 +1156,17 @@ pub async fn reset_password(
     if expires_at < Utc::now() {
         return Err(AppError::BadRequest("Reset token has expired".to_string()));
     }
+
+    let reset_user = UserStore::find_by_id(DB::Conn(&state.db), &token_record.user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    reject_upstream_only_local_auth(
+        &state,
+        &reset_user.email,
+        reset_user.org_id.as_deref(),
+        "Password reset",
+    )
+    .await?;
 
     if !PasswordResetStore::mark_as_used(DB::Conn(&state.db), &token_hash).await? {
         return Err(AppError::BadRequest(
@@ -1239,4 +1309,498 @@ pub async fn resend_verification(
         message: "If an account with that email exists and is not verified, a verification link has been sent."
             .to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        identities::IdentityStore,
+        memberships::MembershipStore,
+        organizations::OrganizationStore,
+        services::ServiceStore,
+        sessions::SessionStore,
+        upstream_providers::UpstreamProviderStore,
+        verified_domains::{VerifiedDomainStore, DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY},
+    };
+    use axum::{extract::State, Extension, Json};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use openssl::rsa::Rsa;
+    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
+    use std::sync::Arc;
+
+    struct PasswordLoginFixture {
+        state: AppState,
+        org_id: String,
+        org_slug: String,
+        service_id: String,
+        service_slug: String,
+        email: String,
+        password: String,
+    }
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_to_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_to_pem()
+                .expect("encode public key pem for tests"),
+        );
+
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    async fn setup_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    fn hash_password(password: &str) -> String {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .expect("hash test password")
+            .to_string()
+    }
+
+    async fn create_verified_org_user(
+        db: &DatabaseConnection,
+        org_id: &str,
+        email: &str,
+        password: &str,
+    ) -> users::Model {
+        users::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            email: Set(email.to_string()),
+            org_id: Set(Some(org_id.to_string())),
+            is_platform_owner: Set(false),
+            password_hash: Set(Some(hash_password(password))),
+            email_verified_at: Set(Some(Utc::now().naive_utc())),
+            created_at: Set(Utc::now().naive_utc()),
+            updated_at: Set(None),
+            deleted_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("create verified org user")
+    }
+
+    async fn setup_password_login_fixture() -> PasswordLoginFixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "owner@example.com",
+            crate::store::users::UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        let service = ServiceStore::create(
+            DB::Conn(&db),
+            &org.id,
+            "portal",
+            "Portal",
+            "web",
+            "client-portal",
+        )
+        .await
+        .expect("create service");
+        let password = "CorrectHorseBatteryStaple1!";
+        let email = "member@example.com";
+        let user = create_verified_org_user(&db, &org.id, email, password).await;
+        MembershipStore::create(DB::Conn(&db), &org.id, &user.id, "member")
+            .await
+            .expect("create org membership");
+        IdentityStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "password",
+            email,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&service.id),
+        )
+        .await
+        .expect("create service-scoped password identity");
+
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        PasswordLoginFixture {
+            state,
+            org_id: org.id,
+            org_slug: org.slug,
+            service_id: service.id,
+            service_slug: service.slug,
+            email: email.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    async fn password_login(
+        fixture: &PasswordLoginFixture,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+    ) -> Result<RefreshTokenResponse> {
+        let Json(response) = login(
+            State(fixture.state.clone()),
+            Extension(RequestInfo {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "password-login-test".to_string(),
+            }),
+            Json400(LoginRequest {
+                email: fixture.email.clone(),
+                password: fixture.password.clone(),
+                org_slug: org_slug.map(str::to_string),
+                service_slug: service_slug.map(str::to_string),
+                redirect_uri: None,
+                state: None,
+                saml_state: None,
+            }),
+        )
+        .await?;
+
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn org_scoped_password_login_issues_org_claims_and_session_scope() {
+        let fixture = setup_password_login_fixture().await;
+        let response = password_login(&fixture, Some(&fixture.org_slug), None)
+            .await
+            .expect("org-scoped password login succeeds");
+
+        let claims = fixture
+            .state
+            .jwt_service
+            .validate_token(&response.access_token)
+            .expect("validate login token");
+        assert_eq!(claims.email, fixture.email);
+        assert_eq!(claims.org.as_deref(), Some(fixture.org_slug.as_str()));
+        assert_eq!(claims.service, None);
+        assert_eq!(claims.aud.as_deref(), Some("org:acme"));
+
+        let session = SessionStore::find_by_token_hash(
+            DB::Conn(&fixture.state.db),
+            &hash_token(&response.access_token),
+        )
+        .await
+        .expect("query login session")
+        .expect("login session exists");
+        assert_eq!(session.org_slug.as_deref(), Some(fixture.org_slug.as_str()));
+        assert_eq!(session.service_id, None);
+    }
+
+    #[tokio::test]
+    async fn service_scoped_password_login_issues_service_claims_and_session_scope() {
+        let fixture = setup_password_login_fixture().await;
+        let response = password_login(
+            &fixture,
+            Some(&fixture.org_slug),
+            Some(&fixture.service_slug),
+        )
+        .await
+        .expect("service-scoped password login succeeds");
+
+        let claims = fixture
+            .state
+            .jwt_service
+            .validate_token(&response.access_token)
+            .expect("validate login token");
+        assert_eq!(claims.org.as_deref(), Some(fixture.org_slug.as_str()));
+        assert_eq!(
+            claims.service.as_deref(),
+            Some(fixture.service_slug.as_str())
+        );
+        assert_eq!(claims.aud.as_deref(), Some("service:acme/portal"));
+
+        let session = SessionStore::find_by_token_hash(
+            DB::Conn(&fixture.state.db),
+            &hash_token(&response.access_token),
+        )
+        .await
+        .expect("query login session")
+        .expect("login session exists");
+        assert_eq!(session.org_slug.as_deref(), Some(fixture.org_slug.as_str()));
+        assert_eq!(
+            session.service_id.as_deref(),
+            Some(fixture.service_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_inactive_org_context() {
+        let fixture = setup_password_login_fixture().await;
+        OrganizationStore::update_status(DB::Conn(&fixture.state.db), &fixture.org_id, "suspended")
+            .await
+            .expect("suspend org");
+
+        let error = password_login(&fixture, Some(&fixture.org_slug), None)
+            .await
+            .expect_err("suspended org login should fail");
+
+        assert!(matches!(
+            error,
+            AppError::Forbidden(ref message) if message.contains("Organization is not active")
+        ));
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_upstream_only_managed_domain() {
+        let fixture = setup_password_login_fixture().await;
+        let provider = UpstreamProviderStore::create(
+            DB::Conn(&fixture.state.db),
+            "provider-1",
+            &fixture.org_id,
+            "acme-oidc",
+            "Acme OIDC",
+            "oidc",
+            "client-id",
+            Vec::new(),
+            "test-key",
+            Some("https://idp.example.com/authorize"),
+            Some("https://idp.example.com/token"),
+            Some("https://idp.example.com/userinfo"),
+            None,
+            Some("openid email profile"),
+            Some("https://idp.example.com"),
+            None,
+        )
+        .await
+        .expect("create upstream provider");
+        let domain = VerifiedDomainStore::create(
+            DB::Conn(&fixture.state.db),
+            "domain-1",
+            &fixture.org_id,
+            "example.com",
+            "verify-token",
+            Some(&provider.id),
+            Some(DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY),
+        )
+        .await
+        .expect("create managed domain");
+        VerifiedDomainStore::mark_verified(DB::Conn(&fixture.state.db), &domain.id)
+            .await
+            .expect("verify managed domain");
+
+        let error = password_login(&fixture, Some(&fixture.org_slug), None)
+            .await
+            .expect_err("upstream-only managed domain should reject password login");
+
+        assert!(matches!(
+            error,
+            AppError::Forbidden(ref message) if message.contains("Password login is disabled")
+        ));
+    }
+
+    async fn create_upstream_only_domain(fixture: &PasswordLoginFixture) {
+        let provider = UpstreamProviderStore::create(
+            DB::Conn(&fixture.state.db),
+            &Uuid::new_v4().to_string(),
+            &fixture.org_id,
+            "acme-oidc",
+            "Acme OIDC",
+            "oidc",
+            "client-id",
+            Vec::new(),
+            "test-key",
+            Some("https://idp.example.com/authorize"),
+            Some("https://idp.example.com/token"),
+            Some("https://idp.example.com/userinfo"),
+            None,
+            Some("openid email profile"),
+            Some("https://idp.example.com"),
+            None,
+        )
+        .await
+        .expect("create upstream provider");
+        let domain = VerifiedDomainStore::create(
+            DB::Conn(&fixture.state.db),
+            &Uuid::new_v4().to_string(),
+            &fixture.org_id,
+            "example.com",
+            "verify-token",
+            Some(&provider.id),
+            Some(DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY),
+        )
+        .await
+        .expect("create managed domain");
+        VerifiedDomainStore::mark_verified(DB::Conn(&fixture.state.db), &domain.id)
+            .await
+            .expect("verify managed domain");
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_upstream_only_managed_domain() {
+        let fixture = setup_password_login_fixture().await;
+        create_upstream_only_domain(&fixture).await;
+        let user = UserStore::find_by_email_with_context(
+            DB::Conn(&fixture.state.db),
+            &fixture.email,
+            Some(&fixture.org_id),
+        )
+        .await
+        .expect("find fixture user")
+        .expect("fixture user exists");
+        let reset_token = "reset-token";
+        PasswordResetStore::create(
+            DB::Conn(&fixture.state.db),
+            &user.id,
+            &hash_token(reset_token),
+            &(Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+        )
+        .await
+        .expect("create reset token");
+
+        let error = reset_password(
+            State(fixture.state.clone()),
+            Json400(ResetPasswordRequest {
+                token: reset_token.to_string(),
+                new_password: "NewCorrectHorseBatteryStaple1!".to_string(),
+            }),
+        )
+        .await
+        .expect_err("upstream-only managed domain should reject password reset");
+
+        assert!(matches!(
+            error,
+            AppError::Forbidden(ref message) if message.contains("Password reset is disabled")
+        ));
+    }
+
+    #[tokio::test]
+    async fn magic_link_guard_rejects_upstream_only_managed_domain() {
+        let fixture = setup_password_login_fixture().await;
+        create_upstream_only_domain(&fixture).await;
+
+        let error = reject_upstream_only_local_auth(
+            &fixture.state,
+            &fixture.email,
+            Some(&fixture.org_id),
+            "Magic-link sign-in",
+        )
+        .await
+        .expect_err("upstream-only managed domain should reject magic-link sign-in");
+
+        assert!(matches!(
+            error,
+            AppError::Forbidden(ref message) if message.contains("Magic-link sign-in is disabled")
+        ));
+    }
 }

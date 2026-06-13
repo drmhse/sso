@@ -260,6 +260,7 @@ pub async fn create_organization(
                     Some(refresh_expires_at.naive_utc()),
                     Some(&org_slug),
                     None, // service_id
+                    None, // resource
                     None, // user_agent
                     None, // ip_address
                 )
@@ -540,6 +541,7 @@ pub async fn select_organization(
                     Some(refresh_expires_at.naive_utc()),
                     Some(&org_slug),
                     None, // service_id
+                    None, // resource
                     None, // user_agent
                     None, // ip_address
                 )
@@ -649,6 +651,296 @@ pub fn validate_organization_name(name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use openssl::rsa::Rsa;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    struct OrgSwitchFixture {
+        state: AppState,
+        auth_user: AuthUser,
+        alpha_slug: String,
+        beta_id: String,
+        beta_slug: String,
+        gamma_slug: String,
+    }
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_to_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_to_pem()
+                .expect("encode public key pem for tests"),
+        );
+
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    async fn setup_org_switch_fixture() -> OrgSwitchFixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+
+        let user = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "multi@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create switching user")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "other@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+
+        let (alpha, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "alpha",
+            "Alpha",
+            &user.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create alpha org");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "beta",
+            "Beta",
+            &user.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create beta org");
+        let (gamma, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "gamma",
+            "Gamma",
+            &other_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create gamma org");
+        for org in [&alpha, &beta, &gamma] {
+            OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+                .await
+                .expect("activate org");
+        }
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let current_token = state
+            .jwt_service
+            .create_token(&user.id, &user.email, false, Some(&alpha.slug), None)
+            .expect("create initial org token");
+        let claims = state
+            .jwt_service
+            .validate_token(&current_token)
+            .expect("validate initial org token");
+        let auth_user = AuthUser {
+            claims,
+            user,
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "org-switch-test".to_string(),
+            current_session_id: None,
+        };
+
+        OrgSwitchFixture {
+            state,
+            auth_user,
+            alpha_slug: alpha.slug,
+            beta_id: beta.id,
+            beta_slug: beta.slug,
+            gamma_slug: gamma.slug,
+        }
+    }
+
+    #[tokio::test]
+    async fn select_organization_switches_multi_org_member_and_persists_session_scope() {
+        let fixture = setup_org_switch_fixture().await;
+        let Json(response) = select_organization(
+            State(fixture.state.clone()),
+            fixture.auth_user.clone(),
+            Path(fixture.beta_slug.clone()),
+        )
+        .await
+        .expect("switch organization");
+
+        assert_eq!(response.organization.slug, fixture.beta_slug);
+        assert_eq!(response.membership.org_id, fixture.beta_id);
+
+        let claims = fixture
+            .state
+            .jwt_service
+            .validate_token(&response.access_token)
+            .expect("validate selected org token");
+        assert_eq!(claims.org.as_deref(), Some(fixture.beta_slug.as_str()));
+        assert_eq!(claims.service, None);
+        assert_eq!(claims.aud.as_deref(), Some("org:beta"));
+
+        let session = SessionStore::find_by_token_hash(
+            DB::Conn(&fixture.state.db),
+            &JwtService::hash_token(&response.access_token),
+        )
+        .await
+        .expect("query selected org session")
+        .expect("selected org session exists");
+        assert_eq!(
+            session.org_slug.as_deref(),
+            Some(fixture.beta_slug.as_str())
+        );
+        assert_eq!(session.service_id, None);
+    }
+
+    #[tokio::test]
+    async fn select_organization_rejects_inactive_target_org() {
+        let fixture = setup_org_switch_fixture().await;
+        OrganizationStore::update_status(
+            DB::Conn(&fixture.state.db),
+            &fixture.beta_id,
+            "suspended",
+        )
+        .await
+        .expect("suspend beta org");
+
+        let error = select_organization(
+            State(fixture.state.clone()),
+            fixture.auth_user.clone(),
+            Path(fixture.beta_slug.clone()),
+        )
+        .await
+        .expect_err("inactive org switch should fail");
+
+        assert!(matches!(
+            error,
+            AppError::Forbidden(ref message) if message.contains("Organization is not active")
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_organization_rejects_non_member_target_org() {
+        let fixture = setup_org_switch_fixture().await;
+        let error = select_organization(
+            State(fixture.state.clone()),
+            fixture.auth_user.clone(),
+            Path(fixture.gamma_slug.clone()),
+        )
+        .await
+        .expect_err("non-member org switch should fail");
+
+        assert!(matches!(
+            error,
+            AppError::Forbidden(ref message) if message.contains("not a member")
+        ));
+    }
 }
 
 pub fn validate_email(email: &str) -> Result<()> {

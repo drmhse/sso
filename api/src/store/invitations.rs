@@ -242,3 +242,118 @@ impl InvitationStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{organization_invitations, prelude::OrganizationInvitations};
+    use crate::store::{
+        memberships::MembershipStore, organizations::OrganizationStore,
+        permissions::PermissionsStore, users::UserStore, DB,
+    };
+    use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+
+    async fn setup_db() -> sea_orm::DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    async fn create_user(
+        db: &sea_orm::DatabaseConnection,
+        email: &str,
+    ) -> crate::entities::users::Model {
+        UserStore::find_or_create_with_options(
+            DB::Conn(db),
+            email,
+            crate::store::users::UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create user")
+        .0
+    }
+
+    async fn create_invitation(
+        db: &sea_orm::DatabaseConnection,
+        org_id: &str,
+        invited_by: &str,
+        email: &str,
+        role: &str,
+    ) -> organization_invitations::Model {
+        organization_invitations::ActiveModel {
+            id: Set(format!("invitation-{role}")),
+            org_id: Set(org_id.to_string()),
+            email: Set(email.to_string()),
+            role: Set(role.to_string()),
+            invited_by: Set(invited_by.to_string()),
+            status: Set("pending".to_string()),
+            token: Set(format!("token-{role}")),
+            expires_at: Set((Utc::now() + Duration::days(1)).naive_utc()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("create invitation")
+    }
+
+    #[tokio::test]
+    async fn accepting_pending_invitation_applies_role_and_consumes_invitation_once() {
+        let db = setup_db().await;
+        let owner = create_user(&db, "owner@example.com").await;
+        let invitee = create_user(&db, "invitee@example.com").await;
+        let (org, _owner_membership) =
+            OrganizationStore::create_with_owner(DB::Conn(&db), "acme", "Acme", &owner.id, None)
+                .await
+                .expect("create org");
+        let invitation =
+            create_invitation(&db, &org.id, &owner.id, &invitee.email, "billing-admin").await;
+
+        InvitationStore::accept_all_pending_for_email(DB::Conn(&db), &invitee.email, &invitee.id)
+            .await
+            .expect("accept invitation");
+        InvitationStore::accept_all_pending_for_email(DB::Conn(&db), &invitee.email, &invitee.id)
+            .await
+            .expect("second accept is idempotent");
+
+        let membership = MembershipStore::find_by_org_and_user(DB::Conn(&db), &org.id, &invitee.id)
+            .await
+            .expect("find membership")
+            .expect("membership exists");
+        assert_eq!(membership.role, "billing-admin");
+
+        let member_count = MembershipStore::count_by_org(DB::Conn(&db), &org.id, None)
+            .await
+            .expect("count members");
+        assert_eq!(member_count, 2);
+
+        assert!(PermissionsStore::check(
+            DB::Conn(&db),
+            "organization",
+            &org.id,
+            "billing-admin",
+            &invitee.id,
+        )
+        .await
+        .expect("check permission"));
+
+        let stored_invitation = OrganizationInvitations::find_by_id(invitation.id)
+            .one(&db)
+            .await
+            .expect("load invitation")
+            .expect("invitation exists");
+        assert_eq!(stored_invitation.status, "accepted");
+
+        let pending_count =
+            InvitationStore::count_pending_by_org_and_email(DB::Conn(&db), &org.id, &invitee.email)
+                .await
+                .expect("count pending invitations");
+        assert_eq!(pending_count, 0);
+    }
+}

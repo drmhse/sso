@@ -407,6 +407,7 @@ pub async fn authenticate_start(
         let org = OrganizationStore::find_by_slug(db.clone(), org_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
         let service = ServiceStore::find_by_org_and_slug(db.clone(), &org.id, service_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
@@ -436,6 +437,7 @@ pub async fn authenticate_start(
         let org = OrganizationStore::find_by_slug(db.clone(), org_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
         UserStore::find_by_email_with_context(db.clone(), &req.email, Some(&org.id))
             .await?
@@ -564,6 +566,7 @@ pub async fn authenticate_finish(
             let org = OrganizationStore::find_by_slug(db.clone(), org_slug)
                 .await?
                 .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+            crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
             let service = ServiceStore::find_by_org_and_slug(db.clone(), &org.id, service_slug)
                 .await?
                 .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
@@ -700,6 +703,7 @@ pub async fn authenticate_finish(
             .as_ref()
             .and_then(|ctx| ctx.org_slug.as_deref()),
         service_id_owned.as_deref(),
+        None,
         Some(&request_info.user_agent),
         Some(&request_info.ip_address),
     )
@@ -770,5 +774,355 @@ pub async fn authenticate_finish(
             .into_response())
     } else {
         Ok((StatusCode::OK, Json(response)).into_response())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        organizations::OrganizationStore,
+        services::ServiceStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use openssl::rsa::Rsa;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_to_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_to_pem()
+                .expect("encode public key pem for tests"),
+        );
+
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    async fn setup_passkey_state_with_suspended_org() -> AppState {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "owner@example.com",
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "suspended")
+            .await
+            .expect("suspend org");
+        ServiceStore::create(
+            DB::Conn(&db),
+            &org.id,
+            "portal",
+            "Portal",
+            "web",
+            "client-portal",
+        )
+        .await
+        .expect("create service");
+
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+        AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_passkey_auth_start_rejects_inactive_org_before_challenge() {
+        let state = setup_passkey_state_with_suspended_org().await;
+
+        let result = authenticate_start(
+            State(state),
+            Json(PasskeyAuthStartRequest {
+                email: "member@example.com".to_string(),
+                org_slug: Some("acme".to_string()),
+                service_slug: Some("portal".to_string()),
+                redirect_uri: None,
+                state: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Forbidden(ref message))
+                if message.contains("Organization is not active")
+        ));
+    }
+
+    fn auth_user_for(user: crate::entities::users::Model) -> AuthUser {
+        let now = Utc::now();
+        AuthUser {
+            claims: crate::auth::jwt::Claims {
+                sub: user.id.clone(),
+                email: user.email.clone(),
+                is_platform_owner: user.is_platform_owner,
+                jti: uuid::Uuid::new_v4().to_string(),
+                org: None,
+                service: None,
+                mfa_required: None,
+                mfa_verified: None,
+                saml_state: None,
+                act: None,
+                aud: Some("platform".to_string()),
+                iss: Some("http://localhost:3001".to_string()),
+                exp: (now + chrono::Duration::hours(1)).timestamp(),
+                iat: now.timestamp(),
+            },
+            user,
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "test".to_string(),
+            current_session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn passkey_management_lists_renames_and_deletes_owned_passkeys() {
+        let state = setup_passkey_state_with_suspended_org().await;
+        let owner = UserStore::find_by_email(DB::Conn(&state.db), "owner@example.com")
+            .await
+            .expect("find owner")
+            .expect("owner exists");
+        let passkey = UserPasskeysStore::create(
+            DB::Conn(&state.db),
+            &owner.id,
+            "credential-1",
+            "public-key",
+            None,
+            "Laptop",
+            true,
+            false,
+            Some(r#"["internal"]"#.to_string()),
+        )
+        .await
+        .expect("create passkey");
+        let auth_user = auth_user_for(owner);
+
+        let listed = list_passkeys(State(state.clone()), Extension(auth_user.clone()))
+            .await
+            .expect("list passkeys")
+            .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, passkey.id);
+        assert_eq!(listed[0].name, "Laptop");
+        assert!(listed[0].backup_eligible);
+
+        let renamed = update_passkey_name(
+            State(state.clone()),
+            Extension(auth_user.clone()),
+            Path(passkey.id.clone()),
+            Json(UpdatePasskeyNameRequest {
+                name: " Work laptop ".to_string(),
+            }),
+        )
+        .await
+        .expect("rename passkey")
+        .0;
+        assert_eq!(renamed.name, "Work laptop");
+
+        let deleted = delete_passkey(
+            State(state.clone()),
+            Extension(auth_user.clone()),
+            Path(passkey.id.clone()),
+        )
+        .await
+        .expect("delete passkey")
+        .0;
+        assert!(deleted.success);
+
+        let listed_after_delete = list_passkeys(State(state), Extension(auth_user))
+            .await
+            .expect("list after delete")
+            .0;
+        assert!(listed_after_delete.is_empty());
+    }
+
+    #[tokio::test]
+    async fn passkey_management_rejects_invalid_or_unowned_mutations() {
+        let state = setup_passkey_state_with_suspended_org().await;
+        let owner = UserStore::find_by_email(DB::Conn(&state.db), "owner@example.com")
+            .await
+            .expect("find owner")
+            .expect("owner exists");
+        let other = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "other@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other user")
+        .0;
+        let passkey = UserPasskeysStore::create(
+            DB::Conn(&state.db),
+            &owner.id,
+            "credential-owned",
+            "public-key",
+            None,
+            "Owner key",
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("create owner passkey");
+        let owner_auth = auth_user_for(owner);
+        let other_auth = auth_user_for(other);
+
+        let blank_name = update_passkey_name(
+            State(state.clone()),
+            Extension(owner_auth.clone()),
+            Path(passkey.id.clone()),
+            Json(UpdatePasskeyNameRequest {
+                name: "   ".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            blank_name,
+            Err(AppError::BadRequest(ref message))
+                if message.contains("cannot be empty")
+        ));
+
+        let unowned_rename = update_passkey_name(
+            State(state.clone()),
+            Extension(other_auth.clone()),
+            Path(passkey.id.clone()),
+            Json(UpdatePasskeyNameRequest {
+                name: "Stolen key".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            unowned_rename,
+            Err(AppError::NotFound(ref message)) if message == "Passkey not found"
+        ));
+
+        let unowned_delete = delete_passkey(
+            State(state.clone()),
+            Extension(other_auth),
+            Path(passkey.id.clone()),
+        )
+        .await;
+        assert!(matches!(
+            unowned_delete,
+            Err(AppError::NotFound(ref message)) if message == "Passkey not found"
+        ));
+
+        let still_present = UserPasskeysStore::find_by_id(DB::Conn(&state.db), &passkey.id)
+            .await
+            .expect("find passkey after rejected mutations")
+            .expect("passkey remains");
+        assert_eq!(still_present.name, "Owner key");
     }
 }

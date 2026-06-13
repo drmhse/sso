@@ -68,6 +68,7 @@ impl SessionStore {
         refresh_token_expires_at: Option<NaiveDateTime>,
         org_slug: Option<&str>,
         service_id: Option<&str>,
+        resource: Option<&str>,
         user_agent: Option<&str>,
         ip_address: Option<&str>,
     ) -> Result<sessions::Model> {
@@ -80,6 +81,7 @@ impl SessionStore {
             refresh_token_expires_at: Set(refresh_token_expires_at),
             org_slug: Set(org_slug.map(|s| s.to_string())),
             service_id: Set(service_id.map(|s| s.to_string())),
+            resource: Set(resource.map(|s| s.to_string())),
             user_agent: Set(user_agent.map(|s| s.to_string())),
             ip_address: Set(ip_address.map(|s| s.to_string())),
             ..Default::default()

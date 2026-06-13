@@ -30,6 +30,8 @@ pub struct Model {
     pub redirect_uris: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub device_activation_uri: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub resource_uris: Option<String>,
     pub saml_enabled: bool,
     #[sea_orm(column_type = "Text", nullable)]
     pub saml_entity_id: Option<String>,

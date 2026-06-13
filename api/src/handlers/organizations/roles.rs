@@ -349,3 +349,254 @@ pub async fn delete_role(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::{Claims, JwtService};
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        permission_service::CAP_SERVICES_MANAGE, risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        memberships::MembershipStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use axum::Extension;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use openssl::rsa::Rsa;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_to_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_to_pem()
+                .expect("encode public key pem for tests"),
+        );
+
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    async fn setup_state_owner_org() -> (AppState, AuthUser, String, String) {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) =
+            OrganizationStore::create_with_owner(DB::Conn(&db), "acme", "Acme", &owner.id, None)
+                .await
+                .expect("create org");
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+        let auth_user = AuthUser {
+            claims: Claims {
+                sub: owner.id.clone(),
+                email: owner.email.clone(),
+                is_platform_owner: false,
+                jti: Uuid::new_v4().to_string(),
+                org: Some(org.slug.clone()),
+                service: None,
+                mfa_required: None,
+                mfa_verified: None,
+                saml_state: None,
+                act: None,
+                aud: Some(format!("org:{}", org.slug)),
+                iss: Some(state.base_url.clone()),
+                exp: chrono::Utc::now().timestamp() + 3600,
+                iat: chrono::Utc::now().timestamp(),
+            },
+            user: owner,
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "roles-test".to_string(),
+            current_session_id: None,
+        };
+
+        (state, auth_user, org.id, org.slug)
+    }
+
+    async fn create_custom_role(
+        state: &AppState,
+        auth_user: &AuthUser,
+        org_slug: &str,
+        slug: &str,
+    ) -> Result<RoleResponse> {
+        let Json(role) = create_role(
+            State(state.clone()),
+            Path(org_slug.to_string()),
+            Extension(auth_user.clone()),
+            Json(CreateRoleRequest {
+                slug: slug.to_string(),
+                name: "Service Manager".to_string(),
+                description: Some("Can manage services".to_string()),
+                permissions: vec![CAP_SERVICES_MANAGE.to_string()],
+            }),
+        )
+        .await?;
+        Ok(role)
+    }
+
+    #[tokio::test]
+    async fn create_role_rejects_builtin_and_duplicate_slugs() {
+        let (state, auth_user, _org_id, org_slug) = setup_state_owner_org().await;
+
+        let builtin_error = create_custom_role(&state, &auth_user, &org_slug, "admin")
+            .await
+            .expect_err("built-in role slug should fail");
+        assert!(matches!(
+            builtin_error,
+            AppError::BadRequest(ref message)
+                if message.contains("built-in organization role")
+        ));
+
+        let created = create_custom_role(&state, &auth_user, &org_slug, "service-manager")
+            .await
+            .expect("create custom role");
+        assert_eq!(created.slug, "service-manager");
+
+        let duplicate_error = create_custom_role(&state, &auth_user, &org_slug, "service-manager")
+            .await
+            .expect_err("duplicate role slug should fail");
+        assert!(matches!(
+            duplicate_error,
+            AppError::BadRequest(ref message) if message.contains("already exists")
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_role_grants_configured_capability() {
+        let (state, auth_user, org_id, org_slug) = setup_state_owner_org().await;
+        create_custom_role(&state, &auth_user, &org_slug, "service-manager")
+            .await
+            .expect("create custom role");
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "member@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create member")
+        .0;
+        MembershipStore::create(DB::Conn(&state.db), &org_id, &member.id, "service-manager")
+            .await
+            .expect("create custom-role membership");
+
+        assert!(PermissionService::check(
+            DB::Conn(&state.db),
+            &org_id,
+            &member.id,
+            CAP_SERVICES_MANAGE,
+        )
+        .await
+        .expect("check custom-role capability"));
+        assert!(!PermissionService::check(
+            DB::Conn(&state.db),
+            &org_id,
+            &member.id,
+            CAP_ORG_ROLES_MANAGE,
+        )
+        .await
+        .expect("check ungranted capability"));
+    }
+}

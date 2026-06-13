@@ -40,6 +40,11 @@ AuthOS maintains source-verified Agent Skills for integration and operations wor
 - [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill)
 - [skills.sh/drmhse/authos_skill](https://skills.sh/drmhse/authos_skill)
 
+## Operations Guides
+
+- [SCIM provisioning setup](./docs/scim-provisioning.md)
+- [Organization roles and permissions](./docs/organization-roles.md)
+
 ## Standalone Linux Bundles
 
 AuthOS can run without Docker and without Node.js on the target server.

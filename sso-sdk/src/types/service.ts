@@ -16,6 +16,7 @@ export interface Service {
   google_scopes: string[];
   redirect_uris: string[];
   device_activation_uri?: string;
+  resource_uris?: string[];
   saml_enabled: boolean;
   saml_entity_id?: string;
   saml_acs_url?: string;
@@ -89,6 +90,7 @@ export interface CreateServicePayload {
   google_scopes?: string[];
   redirect_uris: string[];
   device_activation_uri?: string;
+  resource_uris?: string[];
 }
 
 /**
@@ -120,6 +122,7 @@ export interface UpdateServicePayload {
   google_scopes?: string[];
   redirect_uris?: string[];
   device_activation_uri?: string;
+  resource_uris?: string[];
 }
 
 /**

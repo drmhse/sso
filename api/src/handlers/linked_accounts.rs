@@ -617,6 +617,7 @@ pub async fn start_linked_account(
         Some(&scopes),
         None,
         None,
+        None,
         &expires_at,
     )
     .await?;
@@ -974,6 +975,7 @@ async fn create_provider_token_request_oauth_state(
         Some(&requested_scopes),
         None,
         Some(&request.state),
+        None,
         &expires_at,
     )
     .await?;

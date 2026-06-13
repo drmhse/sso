@@ -15,6 +15,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub upstream_provider_id: Option<String>,
     #[sea_orm(column_type = "Text")]
+    pub login_policy: String,
+    #[sea_orm(column_type = "Text")]
     pub verification_token: String,
     pub verified: bool,
     pub verified_at: Option<DateTime>,

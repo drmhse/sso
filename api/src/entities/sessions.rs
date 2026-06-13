@@ -21,6 +21,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub service_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub resource: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub user_agent: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub ip_address: Option<String>,

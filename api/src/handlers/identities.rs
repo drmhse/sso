@@ -360,6 +360,7 @@ pub async fn start_link(
         Some(&scopes),
         None, // client_state
         None, // provider_token_request_state
+        None, // resource
         &expires_at,
     )
     .await?;

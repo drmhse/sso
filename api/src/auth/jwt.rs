@@ -82,7 +82,10 @@ impl JwtService {
         })
     }
 
-    fn audience_for(org_slug: Option<&str>, service_slug: Option<&str>) -> Option<String> {
+    pub(crate) fn audience_for(
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+    ) -> Option<String> {
         match (org_slug, service_slug) {
             (Some(org), Some(service)) => Some(format!("service:{}/{}", org, service)),
             (Some(org), None) => Some(format!("org:{}", org)),
@@ -99,10 +102,32 @@ impl JwtService {
         org_slug: Option<&str>,
         service_slug: Option<&str>,
     ) -> Result<String> {
+        self.create_token_with_resource(
+            user_id,
+            email,
+            is_platform_owner,
+            org_slug,
+            service_slug,
+            None,
+        )
+    }
+
+    pub fn create_token_with_resource(
+        &self,
+        user_id: &str,
+        email: &str,
+        is_platform_owner: bool,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+        resource: Option<&str>,
+    ) -> Result<String> {
         use uuid::Uuid;
 
         let now = Utc::now();
         let exp = now + Duration::hours(self.expiration_hours);
+        let aud = resource
+            .map(|resource| resource.to_string())
+            .or_else(|| Self::audience_for(org_slug, service_slug));
 
         let claims = Claims {
             sub: user_id.to_string(),
@@ -116,7 +141,7 @@ impl JwtService {
             mfa_verified: None,
             saml_state: None,
             act: None,
-            aud: Self::audience_for(org_slug, service_slug),
+            aud,
             iss: Some(self.issuer.clone()),
             exp: exp.timestamp(),
             iat: now.timestamp(),
@@ -139,10 +164,34 @@ impl JwtService {
         service_slug: Option<&str>,
         saml_state: Option<&str>,
     ) -> Result<String> {
+        self.create_mfa_preauth_token_with_resource(
+            user_id,
+            email,
+            is_platform_owner,
+            org_slug,
+            service_slug,
+            saml_state,
+            None,
+        )
+    }
+
+    pub fn create_mfa_preauth_token_with_resource(
+        &self,
+        user_id: &str,
+        email: &str,
+        is_platform_owner: bool,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+        saml_state: Option<&str>,
+        resource: Option<&str>,
+    ) -> Result<String> {
         use uuid::Uuid;
 
         let now = Utc::now();
         let exp = now + Duration::minutes(5);
+        let aud = resource
+            .map(|resource| resource.to_string())
+            .or_else(|| Self::audience_for(org_slug, service_slug));
 
         let claims = Claims {
             sub: user_id.to_string(),
@@ -155,7 +204,7 @@ impl JwtService {
             mfa_verified: Some(false),
             saml_state: saml_state.map(|s| s.to_string()),
             act: None,
-            aud: Self::audience_for(org_slug, service_slug),
+            aud,
             iss: Some(self.issuer.clone()),
             exp: exp.timestamp(),
             iat: now.timestamp(),
@@ -293,6 +342,37 @@ mod tests {
         assert_eq!(claims.service, Some("analytics".to_string()));
         assert_eq!(claims.iss, Some("https://auth.example.com".to_string()));
         assert_eq!(claims.aud, Some("service:acme-corp/analytics".to_string()));
+    }
+
+    #[test]
+    fn test_jwt_resource_audience_override() {
+        let private_key = "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUV2UUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQktjd2dnU2pBZ0VBQW9JQkFRQ0dlSHhCSHJkRE9wR3cKLzNOcGhkK2JhRTNEaGNac3F3cE83Tm0rZUxsMGNkWERINUc2eXBURW1oS25LLzYrRmM4UE95SnB1R0ZORll5NAoyUUd4VVBiekJyeTZ3ay80TWMwV09mNXlKOFh6djlLRGcyM0pObk1OLys1cExLT0UzTS9BbSs2aVpYd1ZUMGJ0ClR4aU9nNlppajlLS3hZck9ZSitqWEE3aE1xWHFwc1h5b2t4d3pKLzM3eG96QktpRnVycGtad2tGZzQ0cldHSTYKalovN0pxRWszSHM0djdUcGZiWUovWnRzcndhYnduMWdzZDA4enpLVXNQTURGelpuWTJwTGorUG5tNWJTd1ZuTgpWSDRxTjBMNWtYUWxQMVZmQ1VhTTV1YnVxenE0c3FPeVJ0aTFRYTI0dG1qMS9jeXJKRno2OFhtT1RyZm1Cbmc3CmZMa0IzdHM3QWdNQkFBRUNnZ0VBRCtLMlJHMGxWNUd1T2h1R0hna0hndnVkOVlOZFpHTmZzRFk3MGt3VWEwU3kKd2o1OXFwN3ZBZVlmczZtM1g1WlhvK1FucXhkSFFMZDkxeTBsRFl1cE9NbVZkeUg5d2k0dW5ROFVna0RmbWtMbQowc3d1ZStSQ1VGSSttYzhyc1hEeWhyMnZ3Y3M5RHVRUzFzc095c1hwQnpZWURjdkxjTzVVNkQ2M3IvUHZTaS9tCkFTM051VlMycWNYOFd1RGt0Q3hKRFRxQjREa2ZWRnpoUFV2NWJmaThHWVUwZ2Z3TmZMYUpHdmcyUTdSQzl6eC8KejBncVNZTnZaMllWem8zY3Jvckh2S2F1M0RhcVZpRG1sVTBubEtncFJxbXZCNG9IeHRYcVgxNnY0OEs4WGwxRAo5V3lFNUZYanJEUWhPZWNWazJ6NDJDdWp1TjZlVlppeUk5blpBV2JBM1FLQmdRQzV6eVZCMHE0bkNrNm9pWitSCnNkWkkvb3k1ajY3VkJ0T0ZhNUpzS092UGtYMjlQclA1ZlN0dXFNNklDUFNmMWVwTmI5REZrN2gwVENqbmhuRHEKYWpJeDZUMk5GWWJMTEo0L05iS0RnNDI3UHdzTzcrbFAxM0l1eDdvUi94R2RpZFExcUwzdVdVSlB5cFZKM2xXTgpPWkk2U1Z2dU4wY0wzNnFaUkdhREExWGFSd0tCZ1FDNVJKbGF1emx5MndpTUNxVFRlSUV6TGNibHV3eHFROVN1CkFQUDFoWkVxMVdMOERvbitqZUIyTkxwRTNUWG9QRzRncVNxSTFxS05vSTE0ekNVWjlyMTkvcjg2eEkvaGZ1UXYKRkxJZjQ2TnJ0MzdMZnNNTGxGL3dIQWxrc05JYU9TQTFkZ3ZORC80Rm9BNkwzeldYNGdyTFZjQVIvK2c4ZmlIKwpJTWNJelVJOWJRS0JnRGhWQ2VtYjB2cTVFRUhlZjRjdlVGVU8vMkVlbzVXb0hTYTlCMFpOWGJpdlZseXlqdVBiCncvZ25xMzNvb1NsNE5ESEg3WmFKQTRvV3NPd0lnV0ZBVXZsNHloVms2bG5jckJsajBUdzMvUmRBdEx5UmxiMkUKQnZVUnptSzRYd0hSRUlvNEgyVU1vS01LT3hxTEVvcmZZbXJUWk5DaTU2STg3RDdOVXZyelh1cnZBb0dBVk5tZApIcGZHdk5xaDlIbGZlZGFqM1l1bW4wcG1hamk4ckNDVm1xbmNqWENEVUF0Y21lL2lrR0NmdXJCUll4WmlIYVU4CmJNVllWMkxqeUNJL0Q4QVlreDdiK0E5VUVpTnFZRUdyUHIyajk4NW5UTTIyaUpRZ3lEZ2UrVFdlVkJJN3RTQm0KVVRsMHpxQzZhTWNHcFpRSis0dy9WajhNM3IrcDA5aXhMMC9LZVpVQ2dZRUFnTGQyeEJROE1Cam9POG44ci8ycgptTTl3cWpzTXpqa1JzN3l1Vi9tMEZEOXFEemI2aGlMMmpGZHBpeXh6Yzg4NzNmdmVkaGxZSGg0T2svN0JpdDk3CjV3Wjh0TVFaZ3BCUzBZMkZ5dGE3cnZzeXNQclhKRmk5bXZSSnNsWk9DZmtjaXdLYU03S1BXM2c1cktsWk1JV08KSzFGeXBzOXpRS1ZvSkRWdkJlQ3BaV289Ci0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0K";
+        let public_key = "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQklqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FROEFNSUlCQ2dLQ0FRRUFobmg4UVI2M1F6cVJzUDl6YVlYZgptMmhOdzRYR2JLc0tUdXpadm5pNWRISFZ3eCtSdXNxVXhKb1NweXYrdmhYUER6c2lhYmhoVFJXTXVOa0JzVkQyCjh3YTh1c0pQK0RITkZqbitjaWZGODcvU2c0TnR5VFp6RGYvdWFTeWpoTnpQd0p2dW9tVjhGVTlHN1U4WWpvT20KWW8vU2lzV0t6bUNmbzF3TzRUS2w2cWJGOHFKTWNNeWY5KzhhTXdTb2hicTZaR2NKQllPT0sxaGlPbzJmK3lhaApKTng3T0wrMDZYMjJDZjJiYks4R204SjlZTEhkUE04eWxMRHpBeGMyWjJOcVM0L2o1NXVXMHNGWnpWUitLamRDCitaRjBKVDlWWHdsR2pPYm03cXM2dUxLanNrYll0VUd0dUxabzlmM01xeVJjK3ZGNWprNjM1Z1o0TzN5NUFkN2IKT3dJREFRQUIKLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg==";
+        let jwt_service = JwtService::new(
+            private_key,
+            public_key,
+            24,
+            "test-key-id",
+            "https://auth.example.com",
+        )
+        .unwrap();
+
+        let token = jwt_service
+            .create_token_with_resource(
+                "user_123",
+                "user@example.com",
+                false,
+                Some("acme-corp"),
+                Some("analytics"),
+                Some("https://api.example.com/mcp"),
+            )
+            .unwrap();
+
+        let claims = jwt_service.validate_token(&token).unwrap();
+
+        assert_eq!(claims.org, Some("acme-corp".to_string()));
+        assert_eq!(claims.service, Some("analytics".to_string()));
+        assert_eq!(claims.aud, Some("https://api.example.com/mcp".to_string()));
     }
 
     #[test]

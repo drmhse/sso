@@ -170,6 +170,7 @@ pub async fn bootstrap_login(
         Some(refresh_expires_at),
         None,
         None,
+        None,
         Some(&request_info.user_agent),
         Some(&request_info.ip_address),
     )

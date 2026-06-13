@@ -43,6 +43,11 @@ export interface SsoClientOptions {
    * Prefix for storage keys. Default: 'sso_'
    */
   storagePrefix?: string;
+
+  /**
+   * Refresh access tokens this many seconds before expiry. Default: 30.
+   */
+  tokenRefreshMinValiditySeconds?: number;
 }
 
 /**
@@ -135,7 +140,10 @@ export class SsoClient {
         const res = await this.http.post('/api/auth/refresh', { refresh_token: refreshToken });
         return res.data;
       },
-      { storageKeyPrefix: options.storagePrefix || 'sso_' }
+      {
+        storageKeyPrefix: options.storagePrefix || 'sso_',
+        minValiditySeconds: options.tokenRefreshMinValiditySeconds,
+      }
     );
 
     // Link HTTP client to Session Manager

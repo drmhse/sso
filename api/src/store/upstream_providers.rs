@@ -1,12 +1,17 @@
 use crate::entities::prelude::UpstreamProviders;
-use crate::entities::upstream_providers;
+use crate::entities::{upstream_providers, verified_domains};
 use crate::error::{AppError, Result};
 use crate::store::DB;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, JoinType, QueryFilter, QuerySelect, RelationTrait,
+    Set,
+};
 
 pub struct UpstreamProviderStore;
 
 impl UpstreamProviderStore {
+    pub const METADATA_ALLOW_DOMAIN_BINDINGS: &str = "allow_domain_bindings";
+
     /// Find an upstream provider by ID
     pub async fn find_by_id(db: DB<'_>, id: &str) -> Result<Option<upstream_providers::Model>> {
         let result = UpstreamProviders::find_by_id(id)
@@ -31,6 +36,42 @@ impl UpstreamProviderStore {
             .map_err(|e| AppError::InternalServerError(format!("Database error: {}", e)))?;
 
         Ok(result)
+    }
+
+    /// Resolve a provider that is bound to an organization's verified domain route.
+    /// This supports explicitly shared upstream providers reused by many tenant orgs.
+    pub async fn find_domain_routed_by_connection_id(
+        db: DB<'_>,
+        org_id: &str,
+        connection_id: &str,
+    ) -> Result<Option<upstream_providers::Model>> {
+        let result = UpstreamProviders::find()
+            .join_rev(
+                JoinType::InnerJoin,
+                verified_domains::Relation::UpstreamProviders.def(),
+            )
+            .filter(verified_domains::Column::OrgId.eq(org_id))
+            .filter(verified_domains::Column::Verified.eq(true))
+            .filter(upstream_providers::Column::ConnectionId.eq(connection_id))
+            .filter(upstream_providers::Column::Enabled.eq(true))
+            .one(&db)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("Database error: {}", e)))?;
+
+        Ok(result.filter(Self::allows_domain_bindings))
+    }
+
+    pub fn allows_domain_bindings(provider: &upstream_providers::Model) -> bool {
+        provider
+            .metadata
+            .as_deref()
+            .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+            .and_then(|metadata| {
+                metadata
+                    .get(Self::METADATA_ALLOW_DOMAIN_BINDINGS)
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false)
     }
 
     /// Find all upstream providers for an organization
@@ -142,5 +183,120 @@ impl UpstreamProviderStore {
         })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{
+        organizations::OrganizationStore,
+        users::{UserCreationOptions, UserStore},
+        verified_domains::VerifiedDomainStore,
+    };
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn domain_route_can_resolve_explicitly_shared_provider_from_another_org() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let provider_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "provider-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create provider owner")
+        .0;
+        let tenant_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "tenant-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create tenant owner")
+        .0;
+        let (provider_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "identity-hub",
+            "Identity Hub",
+            &provider_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create provider org");
+        let (tenant_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &tenant_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create tenant org");
+        let provider = UpstreamProviderStore::create(
+            DB::Conn(&db),
+            &Uuid::new_v4().to_string(),
+            &provider_org.id,
+            "okta-main",
+            "Okta Main",
+            "oidc",
+            "client",
+            Vec::new(),
+            "test-key",
+            Some("https://idp.example.com/authorize"),
+            Some("https://idp.example.com/token"),
+            Some("https://idp.example.com/userinfo"),
+            None,
+            Some("openid email profile"),
+            Some("https://idp.example.com"),
+            Some(r#"{"allow_domain_bindings":true}"#),
+        )
+        .await
+        .expect("create shared provider");
+        let domain = VerifiedDomainStore::create(
+            DB::Conn(&db),
+            &Uuid::new_v4().to_string(),
+            &tenant_org.id,
+            "acme.com",
+            "verify-token",
+            Some(&provider.id),
+            None,
+        )
+        .await
+        .expect("create domain route");
+        VerifiedDomainStore::mark_verified(DB::Conn(&db), &domain.id)
+            .await
+            .expect("verify domain");
+
+        assert!(UpstreamProviderStore::find_by_connection_id(
+            DB::Conn(&db),
+            &tenant_org.id,
+            "okta-main"
+        )
+        .await
+        .expect("lookup same-org provider")
+        .is_none());
+
+        let resolved = UpstreamProviderStore::find_domain_routed_by_connection_id(
+            DB::Conn(&db),
+            &tenant_org.id,
+            "okta-main",
+        )
+        .await
+        .expect("resolve domain-routed provider")
+        .expect("shared provider should resolve");
+
+        assert_eq!(resolved.id, provider.id);
     }
 }

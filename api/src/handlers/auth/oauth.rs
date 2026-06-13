@@ -14,6 +14,7 @@ use crate::store::{
     service_provider_grants::ServiceProviderGrantStore, services::ServiceStore,
     sessions::SessionStore, upstream_providers::UpstreamProviderStore, DB,
 };
+use crate::utils::resource_indicators::validate_requested_resource;
 use crate::utils::scopes::{normalize_scope_list, parse_optional_scopes, parse_required_scopes};
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -100,6 +101,39 @@ async fn grant_connected_account_to_service(
         state.audit_actor.log_org(event).await;
     }
     Ok(())
+}
+
+async fn resolve_upstream_provider_for_org(
+    state: &AppState,
+    org_id: &str,
+    connection_id: &str,
+) -> Result<crate::entities::upstream_providers::Model> {
+    if let Some(provider) =
+        UpstreamProviderStore::find_by_connection_id(DB::Conn(&state.db), org_id, connection_id)
+            .await?
+    {
+        return Ok(provider);
+    }
+
+    UpstreamProviderStore::find_domain_routed_by_connection_id(
+        DB::Conn(&state.db),
+        org_id,
+        connection_id,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))
+}
+
+fn ensure_upstream_provider_enabled(
+    provider: &crate::entities::upstream_providers::Model,
+) -> Result<()> {
+    if provider.enabled {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "Upstream provider is disabled".to_string(),
+        ))
+    }
 }
 
 /// Public clients (mobile/desktop) cannot securely store secrets
@@ -636,6 +670,7 @@ pub struct AuthRequest {
     pub service: String,
     pub redirect_uri: Option<String>,
     pub state: Option<String>,
+    pub resource: Option<String>,
     pub user_code: Option<String>,
     pub saml_state: Option<String>,
     pub connection_id: Option<String>,
@@ -706,6 +741,7 @@ pub async fn auth_provider(
         google_scopes: service_entity.google_scopes,
         redirect_uris: service_entity.redirect_uris,
         device_activation_uri: service_entity.device_activation_uri,
+        resource_uris: service_entity.resource_uris,
         saml_enabled: service_entity.saml_enabled,
         saml_entity_id: service_entity.saml_entity_id,
         saml_acs_url: service_entity.saml_acs_url,
@@ -716,6 +752,9 @@ pub async fn auth_provider(
         saml_sign_response: service_entity.saml_sign_response,
         created_at: chrono::DateTime::from_naive_utc_and_offset(service_entity.created_at, Utc),
     };
+
+    let requested_resource =
+        validate_requested_resource(params.resource.as_deref(), service.resource_uris.as_deref())?;
 
     // Validate redirect_uri against allowed URIs
     if let Some(redirect_uri) = &params.redirect_uri {
@@ -733,19 +772,10 @@ pub async fn auth_provider(
         &params.connection_id
     {
         // Upstream Enterprise SSO (HRD) flow
-        let provider_model = UpstreamProviderStore::find_by_connection_id(
-            DB::Conn(&state.db),
-            &organization.id,
-            conn_id,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
+        let provider_model =
+            resolve_upstream_provider_for_org(&state, &organization.id, conn_id).await?;
 
-        if !provider_model.enabled {
-            return Err(AppError::BadRequest(
-                "Upstream provider is disabled".to_string(),
-            ));
-        }
+        ensure_upstream_provider_enabled(&provider_model)?;
 
         if provider_model.provider_type == "saml" {
             // Upstream SAML SP flow
@@ -873,6 +903,7 @@ pub async fn auth_provider(
         Some(&scopes),
         params.state.as_deref(),
         None,
+        requested_resource.as_deref(),
         &expires_at.naive_utc(),
     )
     .await?;
@@ -962,13 +993,7 @@ pub async fn auth_saml_callback(
     .await?
     .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    let provider = UpstreamProviderStore::find_by_connection_id(
-        DB::Conn(&state.db),
-        &organization.id,
-        conn_id,
-    )
-    .await?
-    .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
+    let provider = resolve_upstream_provider_for_org(&state, &organization.id, conn_id).await?;
 
     // 4. Process SAML Response
     let provider_model_struct: crate::db::models::UpstreamProvider = provider.into();
@@ -1143,19 +1168,10 @@ async fn auth_callback_impl(
             .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-            let provider_model = UpstreamProviderStore::find_by_connection_id(
-                DB::Conn(&state.db),
-                &organization.id,
-                conn_id,
-            )
-            .await?
-            .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
+            let provider_model =
+                resolve_upstream_provider_for_org(&state, &organization.id, conn_id).await?;
 
-            if !provider_model.enabled {
-                return Err(AppError::BadRequest(
-                    "Upstream provider is disabled".to_string(),
-                ));
-            }
+            ensure_upstream_provider_enabled(&provider_model)?;
 
             let oidc_config = resolve_upstream_oidc_config(&provider_model).await?;
             let encryption = state.encryption.as_ref().ok_or_else(|| {
@@ -1312,19 +1328,10 @@ async fn auth_callback_impl(
             .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-        let provider_model = UpstreamProviderStore::find_by_connection_id(
-            DB::Conn(&state.db),
-            &organization.id,
-            conn_id,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
+        let provider_model =
+            resolve_upstream_provider_for_org(&state, &organization.id, conn_id).await?;
 
-        if !provider_model.enabled {
-            return Err(AppError::BadRequest(
-                "Upstream provider is disabled".to_string(),
-            ));
-        }
+        ensure_upstream_provider_enabled(&provider_model)?;
 
         // Fetch user info using provider's userinfo_url
         let oidc_config = resolve_upstream_oidc_config(&provider_model).await?;
@@ -1656,14 +1663,16 @@ async fn auth_callback_impl(
 
                         // Redirect to MFA challenge with device flow context
                         // Create pre-auth token with device context
-                        let preauth_token = state.jwt_service.create_mfa_preauth_token(
-                            &user.id,
-                            &user.email,
-                            user.is_platform_owner,
-                            Some(org_slug),
-                            Some(service_slug),
-                            oauth_ctx.saml_state_id.as_deref(),
-                        )?;
+                        let preauth_token =
+                            state.jwt_service.create_mfa_preauth_token_with_resource(
+                                &user.id,
+                                &user.email,
+                                user.is_platform_owner,
+                                Some(org_slug),
+                                Some(service_slug),
+                                oauth_ctx.saml_state_id.as_deref(),
+                                oauth_ctx.resource.as_deref(),
+                            )?;
 
                         // Get the device activation URI for redirect
                         let service = ServiceStore::find_by_org_slug_and_service_slug(
@@ -1772,14 +1781,16 @@ async fn auth_callback_impl(
                 match risk_assessment.action {
                     RiskAction::ChallengeMFA => {
                         // Risk engine demands MFA challenge
-                        let preauth_token = state.jwt_service.create_mfa_preauth_token(
-                            &user.id,
-                            &user.email,
-                            user.is_platform_owner,
-                            oauth_ctx.org_slug.as_deref(),
-                            service_slug.as_deref(),
-                            oauth_ctx.saml_state_id.as_deref(),
-                        )?;
+                        let preauth_token =
+                            state.jwt_service.create_mfa_preauth_token_with_resource(
+                                &user.id,
+                                &user.email,
+                                user.is_platform_owner,
+                                oauth_ctx.org_slug.as_deref(),
+                                service_slug.as_deref(),
+                                oauth_ctx.saml_state_id.as_deref(),
+                                oauth_ctx.resource.as_deref(),
+                            )?;
 
                         // Redirect with pre-auth token and mfa_required flag
                         let redirect_url = service_mfa_redirect_uri(
@@ -1823,13 +1834,14 @@ async fn auth_callback_impl(
 
             if mfa_enabled {
                 // User has MFA enabled - create pre-auth token instead of full session
-                let preauth_token = state.jwt_service.create_mfa_preauth_token(
+                let preauth_token = state.jwt_service.create_mfa_preauth_token_with_resource(
                     &user.id,
                     &user.email,
                     user.is_platform_owner,
                     oauth_ctx.org_slug.as_deref(),
                     service_slug.as_deref(),
                     oauth_ctx.saml_state_id.as_deref(),
+                    oauth_ctx.resource.as_deref(),
                 )?;
 
                 // Redirect with pre-auth token and mfa_required flag
@@ -1853,12 +1865,13 @@ async fn auth_callback_impl(
             }
 
             // Create JWT
-            let jwt = state.jwt_service.create_token(
+            let jwt = state.jwt_service.create_token_with_resource(
                 &user.id,
                 &user.email,
                 user.is_platform_owner,
                 oauth_ctx.org_slug.as_deref(),
                 service_slug.as_deref(),
+                oauth_ctx.resource.as_deref(),
             )?;
 
             // Generate refresh token
@@ -1879,6 +1892,7 @@ async fn auth_callback_impl(
                 Some(refresh_expires_at.naive_utc()),
                 oauth_ctx.org_slug.as_deref(),
                 oauth_ctx.service_id.as_deref(),
+                oauth_ctx.resource.as_deref(),
                 None, // user_agent
                 None, // ip_address
             )
@@ -1992,6 +2006,7 @@ pub async fn auth_admin_provider(
         None, // upstream_connection_id
         Some(&scopes),
         lite_return_to.as_deref(), // client_state
+        None,
         None,
         &expires_at.naive_utc(),
     )
@@ -2423,6 +2438,7 @@ async fn auth_admin_callback_impl(
         None,
         None,
         None,
+        None,
     )
     .await?;
 
@@ -2725,13 +2741,14 @@ async fn handle_service_flow_via_admin_callback(
         use crate::services::risk_engine::RiskAction;
         match risk_assessment.action {
             RiskAction::ChallengeMFA => {
-                let preauth_token = state.jwt_service.create_mfa_preauth_token(
+                let preauth_token = state.jwt_service.create_mfa_preauth_token_with_resource(
                     &user.id,
                     &user.email,
                     user.is_platform_owner,
                     oauth_state.org_slug.as_deref(),
                     oauth_state.service_slug.as_deref(),
                     oauth_state.saml_state_id.as_deref(),
+                    oauth_state.resource.as_deref(),
                 )?;
 
                 let redirect_url = service_mfa_redirect_uri(
@@ -2760,13 +2777,14 @@ async fn handle_service_flow_via_admin_callback(
     }
 
     if mfa_enabled {
-        let preauth_token = state.jwt_service.create_mfa_preauth_token(
+        let preauth_token = state.jwt_service.create_mfa_preauth_token_with_resource(
             &user.id,
             &user.email,
             user.is_platform_owner,
             oauth_state.org_slug.as_deref(),
             oauth_state.service_slug.as_deref(),
             oauth_state.saml_state_id.as_deref(),
+            oauth_state.resource.as_deref(),
         )?;
 
         let redirect_url = service_mfa_redirect_uri(
@@ -2779,12 +2797,13 @@ async fn handle_service_flow_via_admin_callback(
 
     // Issue JWT with org/service claims
     let service_slug = oauth_state.service_slug.as_deref();
-    let jwt = state.jwt_service.create_token(
+    let jwt = state.jwt_service.create_token_with_resource(
         &user.id,
         &user.email,
         user.is_platform_owner,
         oauth_state.org_slug.as_deref(),
         service_slug,
+        oauth_state.resource.as_deref(),
     )?;
 
     // Generate refresh token
@@ -2805,6 +2824,7 @@ async fn handle_service_flow_via_admin_callback(
         Some(refresh_expires_at.naive_utc()),
         oauth_state.org_slug.as_deref(),
         Some(service_id),
+        oauth_state.resource.as_deref(),
         None, // user_agent
         None, // ip_address
     )
@@ -3502,8 +3522,334 @@ async fn is_mfa_enabled(pool: &DatabaseConnection, user_id: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
     use crate::entities::provider_token_requests;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        users::{UserCreationOptions, UserStore},
+        verified_domains::VerifiedDomainStore,
+    };
+    use axum::http::header::LOCATION;
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use openssl::rsa::Rsa;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: Some("github-client".to_string()),
+            platform_github_client_secret: Some("github-secret".to_string()),
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: Some("https://idp.example.com/github/authorize".to_string()),
+            platform_github_token_url: Some("https://idp.example.com/github/token".to_string()),
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_to_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_to_pem()
+                .expect("encode public key pem for tests"),
+        );
+
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    async fn setup_oauth_state() -> AppState {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+
+        AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        }
+    }
+
+    async fn create_org_service(
+        state: &AppState,
+        org_slug: &str,
+        org_name: &str,
+        service_slug: &str,
+        redirect_uris: Option<&str>,
+        resource_uris: Option<&str>,
+    ) -> (
+        crate::entities::organizations::Model,
+        crate::entities::services::Model,
+    ) {
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            &format!("owner-{}@example.com", org_slug),
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&state.db),
+            org_slug,
+            org_name,
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create org");
+        let service = ServiceStore::create_with_options(
+            DB::Conn(&state.db),
+            &Uuid::new_v4().to_string(),
+            &org.id,
+            service_slug,
+            "Portal",
+            "web",
+            &format!("client-{}", service_slug),
+            "secret-hash",
+            None,
+            None,
+            None,
+            redirect_uris,
+            None,
+            resource_uris,
+        )
+        .await
+        .expect("create service");
+
+        (org, service)
+    }
+
+    fn oauth_state_from_redirect(location: &str) -> String {
+        let parsed = url::Url::parse(location).expect("parse redirect");
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| {
+                (key == "state" || key == "RelayState").then(|| value.into_owned())
+            })
+            .expect("state in redirect")
+    }
+
+    #[tokio::test]
+    async fn service_authorize_persists_resource_indicator_in_oauth_state() {
+        let state = setup_oauth_state().await;
+        create_org_service(
+            &state,
+            "acme",
+            "Acme",
+            "portal",
+            Some(r#"["https://portal.example.com/callback"]"#),
+            Some(r#"["https://api.example.com/mcp"]"#),
+        )
+        .await;
+
+        let response = auth_provider(
+            State(state.clone()),
+            Path("github".to_string()),
+            Query(AuthRequest {
+                org: "acme".to_string(),
+                service: "portal".to_string(),
+                redirect_uri: Some("https://portal.example.com/callback".to_string()),
+                state: Some("caller-state".to_string()),
+                resource: Some("https://api.example.com/mcp".to_string()),
+                user_code: None,
+                saml_state: None,
+                connection_id: None,
+            }),
+        )
+        .await
+        .expect("authorize service oauth");
+
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .expect("redirect location")
+            .to_str()
+            .expect("location is string");
+        let oauth_state = oauth_state_from_redirect(location);
+        let persisted = OAuthStateStore::find_by_state(DB::Conn(&state.db), &oauth_state)
+            .await
+            .expect("load oauth state")
+            .expect("oauth state persisted");
+
+        assert_eq!(persisted.org_slug.as_deref(), Some("acme"));
+        assert_eq!(persisted.service_slug.as_deref(), Some("portal"));
+        assert_eq!(
+            persisted.redirect_uri.as_deref(),
+            Some("https://portal.example.com/callback")
+        );
+        assert_eq!(persisted.client_state.as_deref(), Some("caller-state"));
+        assert_eq!(
+            persisted.resource.as_deref(),
+            Some("https://api.example.com/mcp")
+        );
+        assert!(persisted.pkce_verifier.is_some());
+    }
+
+    #[tokio::test]
+    async fn service_authorize_persists_shared_upstream_connection_for_callback_resolution() {
+        let state = setup_oauth_state().await;
+        let (provider_org, _) =
+            create_org_service(&state, "idp-owner", "IdP Owner", "admin", None, None).await;
+        let (tenant_org, _) = create_org_service(
+            &state,
+            "acme",
+            "Acme",
+            "portal",
+            Some(r#"["https://portal.example.com/callback"]"#),
+            None,
+        )
+        .await;
+        let provider = UpstreamProviderStore::create(
+            DB::Conn(&state.db),
+            &Uuid::new_v4().to_string(),
+            &provider_org.id,
+            "okta-main",
+            "Okta Main",
+            "saml",
+            "sp-entity-id",
+            Vec::new(),
+            "test-key",
+            Some("https://idp.example.com/sso"),
+            None,
+            None,
+            None,
+            None,
+            Some("https://idp.example.com"),
+            Some(r#"{"allow_domain_bindings":true}"#),
+        )
+        .await
+        .expect("create shared saml provider");
+        let domain = VerifiedDomainStore::create(
+            DB::Conn(&state.db),
+            &Uuid::new_v4().to_string(),
+            &tenant_org.id,
+            "acme.com",
+            "verify-token",
+            Some(&provider.id),
+            None,
+        )
+        .await
+        .expect("create domain route");
+        VerifiedDomainStore::mark_verified(DB::Conn(&state.db), &domain.id)
+            .await
+            .expect("verify domain");
+
+        let response = auth_provider(
+            State(state.clone()),
+            Path("oidc".to_string()),
+            Query(AuthRequest {
+                org: "acme".to_string(),
+                service: "portal".to_string(),
+                redirect_uri: Some("https://portal.example.com/callback".to_string()),
+                state: Some("caller-state".to_string()),
+                resource: None,
+                user_code: None,
+                saml_state: None,
+                connection_id: Some("okta-main".to_string()),
+            }),
+        )
+        .await
+        .expect("authorize shared upstream provider");
+
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .expect("redirect location")
+            .to_str()
+            .expect("location is string");
+        let oauth_state = oauth_state_from_redirect(location);
+        let persisted = OAuthStateStore::find_by_state(DB::Conn(&state.db), &oauth_state)
+            .await
+            .expect("load oauth state")
+            .expect("oauth state persisted");
+
+        assert_eq!(persisted.org_slug.as_deref(), Some("acme"));
+        assert_eq!(persisted.service_slug.as_deref(), Some("portal"));
+        assert_eq!(
+            persisted.upstream_connection_id.as_deref(),
+            Some("okta-main")
+        );
+        assert_eq!(persisted.client_state.as_deref(), Some("caller-state"));
+    }
 
     #[test]
     fn microsoft_offline_access_is_persisted_when_refresh_token_returned() {

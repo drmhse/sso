@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-react",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "React and Next.js adapter for AuthOS authentication",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

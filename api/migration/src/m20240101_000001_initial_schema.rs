@@ -1567,6 +1567,12 @@ impl Migration {
                     .col(ColumnDef::new(VerifiedDomains::Domain).string().not_null())
                     .col(ColumnDef::new(VerifiedDomains::UpstreamProviderId).string())
                     .col(
+                        ColumnDef::new(VerifiedDomains::LoginPolicy)
+                            .string()
+                            .not_null()
+                            .default("password_allowed"),
+                    )
+                    .col(
                         ColumnDef::new(VerifiedDomains::VerificationToken)
                             .string()
                             .not_null(),
@@ -3319,6 +3325,7 @@ enum VerifiedDomains {
     OrgId,
     Domain,
     UpstreamProviderId,
+    LoginPolicy,
     VerificationToken,
     Verified,
     VerifiedAt,

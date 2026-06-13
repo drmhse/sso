@@ -25,10 +25,26 @@ export const PasskeySignIn = defineComponent({
       type: Boolean,
       default: true,
     },
+    orgSlug: {
+      type: String,
+      default: undefined,
+    },
+    serviceSlug: {
+      type: String,
+      default: undefined,
+    },
+    redirectUri: {
+      type: String,
+      default: undefined,
+    },
+    state: {
+      type: String,
+      default: undefined,
+    },
   },
   emits: ['success', 'error'],
   setup(props, { emit, slots }) {
-    const { client } = useAuthOS();
+    const { client, options } = useAuthOS();
     
     const email = ref('');
     const isLoading = ref(false);
@@ -45,8 +61,19 @@ export const PasskeySignIn = defineComponent({
       isLoading.value = true;
 
       try {
+        const org = props.orgSlug ?? options.org;
+        const service = props.serviceSlug ?? options.service;
+        const passkeyContext = org && service
+          ? {
+              org_slug: org,
+              service_slug: service,
+              redirect_uri: props.redirectUri ?? options.redirectUri,
+              state: props.state,
+            }
+          : undefined;
+
         // Use the SDK's convenient login method which handles the full WebAuthn flow
-        await client.passkeys.login(email.value);
+        await client.passkeys.login(email.value, passkeyContext);
         emit('success');
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Passkey authentication failed';

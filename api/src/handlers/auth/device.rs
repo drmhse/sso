@@ -58,6 +58,7 @@ pub struct TokenRequest {
     pub client_id: String,
     pub device_code: String,
     pub grant_type: String,
+    pub resource: Option<String>,
 }
 
 // Token Response
@@ -361,6 +362,7 @@ pub async fn token_exchange(
             Some(refresh_expires_at.naive_utc()),
             None, // org_slug
             None, // service_id
+            None, // resource
             None, // user_agent
             None, // ip_address
         )
@@ -382,14 +384,22 @@ pub async fn token_exchange(
     )
     .await?
     .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+    let service = ServiceStore::find_by_id(DB::Conn(&state.db), &result.service_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+    let requested_resource = crate::utils::resource_indicators::validate_requested_resource(
+        req.resource.as_deref(),
+        service.resource_uris.as_deref(),
+    )?;
 
     // Generate JWT
-    let token = state.jwt_service.create_token(
+    let token = state.jwt_service.create_token_with_resource(
         &user.id,
         &user.email,
         user.is_platform_owner,
         Some(&result.org_slug),
         Some(&result.service_slug),
+        requested_resource.as_deref(),
     )?;
 
     // Generate refresh token
@@ -416,6 +426,7 @@ pub async fn token_exchange(
         Some(refresh_expires_at.naive_utc()),
         Some(&result.org_slug),
         Some(&result.service_id),
+        requested_resource.as_deref(),
         None, // user_agent
         None, // ip_address
     )
@@ -480,4 +491,230 @@ async fn record_login_event(
 
     // Non-blocking: queues to actor, doesn't wait for DB
     audit_actor.log_login(event_model).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        organizations::OrganizationStore,
+        services::ServiceStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use axum::extract::State;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use openssl::rsa::Rsa;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_to_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_to_pem()
+                .expect("encode public key pem for tests"),
+        );
+
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    async fn setup_state() -> AppState {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+
+        AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        }
+    }
+
+    #[tokio::test]
+    async fn token_exchange_accepts_only_registered_resource() {
+        let state = setup_state().await;
+        let user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "device-user@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create user")
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&state.db),
+            "acme",
+            "Acme",
+            &user.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create org");
+        let service = ServiceStore::create(
+            DB::Conn(&state.db),
+            &org.id,
+            "portal",
+            "Portal",
+            "web",
+            "client-portal",
+        )
+        .await
+        .expect("create service");
+        let resource = "https://api.example.com/mcp";
+        let resource_json = serde_json::to_string(&vec![resource]).unwrap();
+        ServiceStore::update_dynamic(
+            DB::Conn(&state.db),
+            &org.id,
+            &service.slug,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&resource_json),
+        )
+        .await
+        .expect("set resource URIs");
+        let expires_at = (Utc::now() + chrono::Duration::minutes(10)).naive_utc();
+        let device_code = DeviceCodeStore::create(
+            DB::Conn(&state.db),
+            "device-code",
+            "USER-CODE",
+            "client-portal",
+            &org.slug,
+            &service.slug,
+            &expires_at,
+        )
+        .await
+        .expect("create device code");
+        DeviceCodeStore::authorize(DB::Conn(&state.db), &device_code.id, &user.id)
+            .await
+            .expect("authorize device code");
+
+        let invalid = token_exchange(
+            State(state.clone()),
+            Json(TokenRequest {
+                client_id: "client-portal".to_string(),
+                device_code: "device-code".to_string(),
+                grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+                resource: Some("https://other.example.com/mcp".to_string()),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            invalid,
+            Err(AppError::BadRequest(ref message)) if message.contains("invalid_target")
+        ));
+
+        let Json(response) = token_exchange(
+            State(state.clone()),
+            Json(TokenRequest {
+                client_id: "client-portal".to_string(),
+                device_code: "device-code".to_string(),
+                grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+                resource: Some(resource.to_string()),
+            }),
+        )
+        .await
+        .expect("exchange token");
+        let claims = state
+            .jwt_service
+            .validate_token(&response.access_token)
+            .expect("validate token");
+        assert_eq!(claims.org.as_deref(), Some("acme"));
+        assert_eq!(claims.service.as_deref(), Some("portal"));
+        assert_eq!(claims.aud.as_deref(), Some(resource));
+    }
 }

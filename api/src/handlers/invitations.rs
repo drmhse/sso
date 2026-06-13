@@ -468,17 +468,13 @@ async fn accept_invitation_internal(
                         return Err(AppError::BadRequest("Team limit reached".to_string()));
                     }
 
-                    // Create membership
-                    use crate::entities::memberships;
-                    let new_membership = memberships::ActiveModel {
-                        id: Set(Uuid::new_v4().to_string()),
-                        org_id: Set(invitation.org_id.clone()),
-                        user_id: Set(user.id.clone()),
-                        role: Set(invitation.role.clone()),
-                        created_at: Set(Utc::now().naive_utc()),
-                        ..Default::default()
-                    };
-                    new_membership.insert(&db).await?;
+                    MembershipStore::create(
+                        db.clone(),
+                        &invitation.org_id,
+                        &user.id,
+                        &invitation.role,
+                    )
+                    .await?;
 
                     // Grant organization permission for the new member
                     use crate::entities::permissions::RelationTuple;
@@ -495,11 +491,21 @@ async fn accept_invitation_internal(
                     .await?;
                 }
 
-                // Update invitation status
-                let mut invitation_active: organization_invitations::ActiveModel =
-                    invitation.into();
-                invitation_active.status = Set(new_status);
-                invitation_active.update(&db).await?;
+                let update_result = OrganizationInvitations::update_many()
+                    .filter(organization_invitations::Column::Id.eq(&invitation.id))
+                    .filter(organization_invitations::Column::Status.eq("pending"))
+                    .set(organization_invitations::ActiveModel {
+                        status: Set(new_status),
+                        ..Default::default()
+                    })
+                    .exec(&db)
+                    .await?;
+
+                if update_result.rows_affected != 1 {
+                    return Err(AppError::NotFound(
+                        "Invitation not found or already processed".to_string(),
+                    ));
+                }
 
                 Ok(affected_user_id)
             })
@@ -659,4 +665,383 @@ async fn find_or_create_user_internal(db: DB<'_>, email: &str) -> Result<users::
 
     let user = new_user.insert(&db).await?;
     Ok(user)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::prelude::OrganizationInvitations;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        memberships::MembershipStore,
+        organizations::OrganizationStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use openssl::rsa::Rsa;
+    use sea_orm::{Database, DatabaseConnection, EntityTrait};
+    use std::sync::Arc;
+
+    struct InvitationFixture {
+        state: AppState,
+        org_id: String,
+        owner_id: String,
+    }
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_to_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_to_pem()
+                .expect("encode public key pem for tests"),
+        );
+
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    async fn setup_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    async fn setup_fixture() -> InvitationFixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "owner@example.com",
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) =
+            OrganizationStore::create_with_owner(DB::Conn(&db), "acme", "Acme", &owner.id, None)
+                .await
+                .expect("create org");
+
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        InvitationFixture {
+            state,
+            org_id: org.id,
+            owner_id: owner.id,
+        }
+    }
+
+    async fn create_invitation(
+        db: &DatabaseConnection,
+        org_id: &str,
+        owner_id: &str,
+        email: &str,
+        role: &str,
+        token: &str,
+    ) -> organization_invitations::Model {
+        organization_invitations::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            org_id: Set(org_id.to_string()),
+            email: Set(email.to_string()),
+            role: Set(role.to_string()),
+            invited_by: Set(owner_id.to_string()),
+            status: Set("pending".to_string()),
+            token: Set(hash_invitation_token(token)),
+            expires_at: Set((Utc::now() + ChronoDuration::days(1)).naive_utc()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("create invitation")
+    }
+
+    async fn accept_by_token(
+        fixture: &InvitationFixture,
+        token: &str,
+        expected_email: Option<&str>,
+    ) -> Result<Json<()>> {
+        accept_invitation_internal(
+            State(fixture.state.clone()),
+            InvitationLookup::Token(token.to_string()),
+            "accepted",
+            expected_email.map(str::to_string),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn token_invitation_acceptance_is_single_use() {
+        let fixture = setup_fixture().await;
+        let invite = create_invitation(
+            &fixture.state.db,
+            &fixture.org_id,
+            &fixture.owner_id,
+            "invitee@example.com",
+            "member",
+            "plain-token",
+        )
+        .await;
+
+        let _ = accept_by_token(&fixture, "plain-token", Some("invitee@example.com"))
+            .await
+            .expect("first accept succeeds");
+        let second = accept_by_token(&fixture, "plain-token", Some("invitee@example.com"))
+            .await
+            .expect_err("second accept fails");
+
+        assert!(matches!(
+            second,
+            AppError::NotFound(ref message)
+                if message.contains("Invitation not found or already processed")
+        ));
+
+        let stored = OrganizationInvitations::find_by_id(invite.id)
+            .one(&fixture.state.db)
+            .await
+            .expect("query invitation")
+            .expect("invitation exists");
+        assert_eq!(stored.status, "accepted");
+        let member_count =
+            MembershipStore::count_by_org(DB::Conn(&fixture.state.db), &fixture.org_id, None)
+                .await
+                .expect("count members");
+        assert_eq!(member_count, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_token_invitation_acceptance_consumes_once() {
+        let fixture = setup_fixture().await;
+        let invite = create_invitation(
+            &fixture.state.db,
+            &fixture.org_id,
+            &fixture.owner_id,
+            "race@example.com",
+            "member",
+            "race-token",
+        )
+        .await;
+
+        let (first, second) = tokio::join!(
+            accept_by_token(&fixture, "race-token", Some("race@example.com")),
+            accept_by_token(&fixture, "race-token", Some("race@example.com"))
+        );
+        let successes = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        let failures = [first, second]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+
+        assert_eq!(successes, 1);
+        assert_eq!(failures.len(), 1);
+        assert!(matches!(
+            failures.first(),
+            Some(AppError::NotFound(message))
+                if message.contains("Invitation not found or already processed")
+        ));
+
+        let stored = OrganizationInvitations::find_by_id(invite.id)
+            .one(&fixture.state.db)
+            .await
+            .expect("query invitation")
+            .expect("invitation exists");
+        assert_eq!(stored.status, "accepted");
+        let member_count =
+            MembershipStore::count_by_org(DB::Conn(&fixture.state.db), &fixture.org_id, None)
+                .await
+                .expect("count members");
+        assert_eq!(member_count, 2);
+    }
+
+    #[tokio::test]
+    async fn id_invitation_acceptance_is_single_use() {
+        let fixture = setup_fixture().await;
+        let invite = create_invitation(
+            &fixture.state.db,
+            &fixture.org_id,
+            &fixture.owner_id,
+            "id-invitee@example.com",
+            "member",
+            "id-token",
+        )
+        .await;
+
+        let _ = accept_invitation_internal(
+            State(fixture.state.clone()),
+            InvitationLookup::Id(invite.id.clone()),
+            "accepted",
+            Some("id-invitee@example.com".to_string()),
+            None,
+        )
+        .await
+        .expect("first id accept succeeds");
+        let second = accept_invitation_internal(
+            State(fixture.state.clone()),
+            InvitationLookup::Id(invite.id),
+            "accepted",
+            Some("id-invitee@example.com".to_string()),
+            None,
+        )
+        .await
+        .expect_err("second id accept fails");
+
+        assert!(matches!(
+            second,
+            AppError::NotFound(ref message)
+                if message.contains("Invitation not found or already processed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn already_member_invitation_acceptance_consumes_without_duplicate_or_role_rewrite() {
+        let fixture = setup_fixture().await;
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&fixture.state.db),
+            "member@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create existing member")
+        .0;
+        MembershipStore::create(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &member.id,
+            "member",
+        )
+        .await
+        .expect("create existing membership");
+        let invite = create_invitation(
+            &fixture.state.db,
+            &fixture.org_id,
+            &fixture.owner_id,
+            &member.email,
+            "admin",
+            "already-member-token",
+        )
+        .await;
+
+        let _ = accept_by_token(&fixture, "already-member-token", Some(&member.email))
+            .await
+            .expect("already-member accept succeeds");
+
+        let membership = MembershipStore::find_by_org_and_user(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &member.id,
+        )
+        .await
+        .expect("query membership")
+        .expect("membership exists");
+        assert_eq!(membership.role, "member");
+        let member_count =
+            MembershipStore::count_by_org(DB::Conn(&fixture.state.db), &fixture.org_id, None)
+                .await
+                .expect("count members");
+        assert_eq!(member_count, 2);
+
+        let stored = OrganizationInvitations::find_by_id(invite.id)
+            .one(&fixture.state.db)
+            .await
+            .expect("query invitation")
+            .expect("invitation exists");
+        assert_eq!(stored.status, "accepted");
+    }
 }

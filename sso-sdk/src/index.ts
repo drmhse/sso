@@ -16,6 +16,7 @@ export { MemoryStorage, BrowserStorage, CookieStorage } from './storage';
 
 // Session (exported for framework adapters)
 export type { AuthSnapshot } from './session';
+export { SessionManager } from './session';
 
 // Error handling
 export { SsoApiError, AuthErrorCodes } from './errors';

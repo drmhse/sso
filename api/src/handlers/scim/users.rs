@@ -331,6 +331,10 @@ pub async fn update_user(
     Path(user_id): Path<String>,
     ScimJson(req): ScimJson<ScimUserRequest>,
 ) -> Result<Response> {
+    if let Some(error) = scim_id_mismatch_error(&user_id, req.id.as_deref(), "User") {
+        return Ok((StatusCode::BAD_REQUEST, Json(error)).into_response());
+    }
+
     let user = UserStore::find_by_id(DB::Conn(&state.db), &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
@@ -381,6 +385,10 @@ pub async fn patch_user(
     Path(user_id): Path<String>,
     Json(req): Json<ScimPatchRequest>,
 ) -> Result<Response> {
+    if let Some(error) = scim_patch_schema_error(&req.schemas) {
+        return Ok((StatusCode::BAD_REQUEST, Json(error)).into_response());
+    }
+
     let user = UserStore::find_by_id(DB::Conn(&state.db), &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;

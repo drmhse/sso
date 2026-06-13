@@ -7,6 +7,14 @@ export interface PasskeySignInProps {
   onSuccess?: () => void;
   /** Callback when sign-in fails */
   onError?: (error: Error) => void;
+  /** Organization slug for B2B service-scoped passkey sign-in. Defaults to provider config org. */
+  orgSlug?: string;
+  /** Service slug for B2B service-scoped passkey sign-in. Defaults to provider config service. */
+  serviceSlug?: string;
+  /** Redirect URI to validate for service-scoped passkey sign-in. Defaults to provider config redirectUri. */
+  redirectUri?: string;
+  /** Caller state to preserve through service-scoped passkey sign-in. */
+  state?: string;
   /** Custom class name */
   className?: string;
   /** Show sign in with password link */
@@ -36,10 +44,14 @@ export interface PasskeySignInProps {
 export function PasskeySignIn({
   onSuccess,
   onError,
+  orgSlug,
+  serviceSlug,
+  redirectUri,
+  state: authState,
   className,
   showPasswordSignIn = true,
 }: PasskeySignInProps) {
-  const { client, setUser } = useAuthOSContext();
+  const { client, config, setUser } = useAuthOSContext();
   
   const [email, setEmail] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -58,8 +70,19 @@ export function PasskeySignIn({
       setIsLoading(true);
 
       try {
+        const org = orgSlug ?? config.org;
+        const service = serviceSlug ?? config.service;
+        const passkeyContext = org && service
+          ? {
+              org_slug: org,
+              service_slug: service,
+              redirect_uri: redirectUri ?? config.redirectUri,
+              state: authState,
+            }
+          : undefined;
+
         // Use the SDK's convenient login method which handles the full WebAuthn flow
-        await client.passkeys.login(email);
+        await client.passkeys.login(email, passkeyContext);
 
         // Refresh user profile
         const profile = await client.user.getProfile();
@@ -77,7 +100,7 @@ export function PasskeySignIn({
         setIsLoading(false);
       }
     },
-    [client, email, setUser, onSuccess, onError]
+    [client, email, orgSlug, serviceSlug, redirectUri, authState, config.org, config.service, config.redirectUri, setUser, onSuccess, onError]
   );
 
   if (!isSupported) {

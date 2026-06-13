@@ -37,6 +37,7 @@ impl OAuthStateStore {
         requested_scopes: Option<&[String]>,
         client_state: Option<&str>,
         provider_token_request_state: Option<&str>,
+        resource: Option<&str>,
         expires_at: &chrono::NaiveDateTime,
     ) -> Result<oauth_states::Model> {
         let now = chrono::Utc::now().naive_utc();
@@ -60,6 +61,7 @@ impl OAuthStateStore {
             requested_scopes: Set(requested_scopes_json),
             client_state: Set(client_state.map(|s| s.to_string())),
             provider_token_request_state: Set(provider_token_request_state.map(|s| s.to_string())),
+            resource: Set(resource.map(|s| s.to_string())),
             created_at: Set(now),
             expires_at: Set(*expires_at),
             ..Default::default()

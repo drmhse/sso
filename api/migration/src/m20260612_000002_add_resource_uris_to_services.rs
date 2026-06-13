@@ -6,30 +6,30 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if manager.has_column("oauth_states", "client_state").await? {
+        if manager.has_column("services", "resource_uris").await? {
             return Ok(());
         }
 
         manager
             .alter_table(
                 Table::alter()
-                    .table(OauthStates::Table)
-                    .add_column(ColumnDef::new(OauthStates::ClientState).text().null())
+                    .table(Services::Table)
+                    .add_column(ColumnDef::new(Services::ResourceUris).text().null())
                     .to_owned(),
             )
             .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if !manager.has_column("oauth_states", "client_state").await? {
+        if !manager.has_column("services", "resource_uris").await? {
             return Ok(());
         }
 
         manager
             .alter_table(
                 Table::alter()
-                    .table(OauthStates::Table)
-                    .drop_column(OauthStates::ClientState)
+                    .table(Services::Table)
+                    .drop_column(Services::ResourceUris)
                     .to_owned(),
             )
             .await
@@ -37,7 +37,7 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-enum OauthStates {
+enum Services {
     Table,
-    ClientState,
+    ResourceUris,
 }

@@ -129,12 +129,15 @@ pub async fn verify_mfa_login(
     }
 
     // Generate full session JWT
-    let token = state.jwt_service.create_token(
+    let resource = crate::utils::resource_indicators::resource_from_audience(claims.aud.as_deref());
+    let resource_owned = resource.map(str::to_string);
+    let token = state.jwt_service.create_token_with_resource(
         &user.id,
         &user.email,
         user.is_platform_owner,
         claims.org.as_deref(),
         claims.service.as_deref(),
+        resource,
     )?;
 
     // Create session with refresh token
@@ -177,6 +180,7 @@ pub async fn verify_mfa_login(
             let refresh_expires_at = refresh_expires_at.naive_utc();
             let org_slug = org_slug.map(|s| s.to_string());
             let service_id = service_id.clone();
+            let resource = resource_owned.clone();
 
             Box::pin(async move {
                 SessionStore::create(
@@ -188,6 +192,7 @@ pub async fn verify_mfa_login(
                     Some(refresh_expires_at),
                     org_slug.as_deref(),
                     service_id.as_deref(),
+                    resource.as_deref(),
                     None,
                     None,
                 )

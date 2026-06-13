@@ -201,6 +201,7 @@ pub struct Service {
     pub google_scopes: Option<String>,
     pub redirect_uris: Option<String>,
     pub device_activation_uri: Option<String>,
+    pub resource_uris: Option<String>,
     // SAML configuration
     pub saml_enabled: bool,
     pub saml_entity_id: Option<String>,
@@ -228,6 +229,7 @@ impl From<crate::entities::services::Model> for Service {
             google_scopes: model.google_scopes,
             redirect_uris: model.redirect_uris,
             device_activation_uri: model.device_activation_uri,
+            resource_uris: model.resource_uris,
             saml_enabled: model.saml_enabled,
             saml_entity_id: model.saml_entity_id,
             saml_acs_url: model.saml_acs_url,
@@ -255,6 +257,7 @@ pub struct ServiceResponse {
     pub google_scopes: Option<Vec<String>>,
     pub redirect_uris: Option<Vec<String>>,
     pub device_activation_uri: Option<String>,
+    pub resource_uris: Option<Vec<String>>,
     // SAML configuration
     pub saml_enabled: bool,
     pub saml_entity_id: Option<String>,
@@ -290,6 +293,9 @@ impl From<Service> for ServiceResponse {
                 .redirect_uris
                 .and_then(|s| serde_json::from_str(&s).ok()),
             device_activation_uri: service.device_activation_uri,
+            resource_uris: service
+                .resource_uris
+                .and_then(|s| serde_json::from_str(&s).ok()),
             saml_enabled: service.saml_enabled,
             saml_entity_id: service.saml_entity_id,
             saml_acs_url: service.saml_acs_url,
@@ -340,6 +346,9 @@ impl From<crate::entities::services::Model> for ServiceResponse {
                 .redirect_uris
                 .and_then(|s| serde_json::from_str(&s).ok()),
             device_activation_uri: service.device_activation_uri,
+            resource_uris: service
+                .resource_uris
+                .and_then(|s| serde_json::from_str(&s).ok()),
             saml_enabled: service.saml_enabled,
             saml_entity_id: service.saml_entity_id,
             saml_acs_url: service.saml_acs_url,
@@ -418,6 +427,7 @@ pub struct Session {
     pub refresh_token_expires_at: Option<DateTime<Utc>>,
     pub org_slug: Option<String>,
     pub service_id: Option<String>,
+    pub resource: Option<String>,
     pub user_agent: Option<String>,
     pub ip_address: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -434,6 +444,7 @@ impl From<crate::entities::sessions::Model> for Session {
             refresh_token_expires_at: model.refresh_token_expires_at.map(naive_to_utc),
             org_slug: model.org_slug,
             service_id: model.service_id,
+            resource: model.resource,
             user_agent: model.user_agent,
             ip_address: model.ip_address,
             created_at: naive_to_utc(model.created_at),
@@ -477,6 +488,7 @@ pub struct OAuthState {
     pub requested_scopes: Option<String>,
     pub client_state: Option<String>,
     pub provider_token_request_state: Option<String>,
+    pub resource: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -498,6 +510,7 @@ impl From<crate::entities::oauth_states::Model> for OAuthState {
             requested_scopes: model.requested_scopes,
             client_state: model.client_state,
             provider_token_request_state: model.provider_token_request_state,
+            resource: model.resource,
             created_at: naive_to_utc(model.created_at),
             expires_at: naive_to_utc(model.expires_at),
         }

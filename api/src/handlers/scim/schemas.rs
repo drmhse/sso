@@ -162,6 +162,30 @@ impl ScimError {
     }
 }
 
+pub fn scim_id_mismatch_error(
+    path_id: &str,
+    body_id: Option<&str>,
+    resource_type: &str,
+) -> Option<ScimError> {
+    body_id.filter(|id| *id != path_id).map(|id| {
+        ScimError::invalid_value(format!(
+            "{} id '{}' does not match request path id '{}'",
+            resource_type, id, path_id
+        ))
+    })
+}
+
+pub fn scim_patch_schema_error(schemas: &[String]) -> Option<ScimError> {
+    if schemas.iter().any(|schema| schema == SCIM_PATCH_SCHEMA) {
+        return None;
+    }
+
+    Some(ScimError::invalid_value(format!(
+        "PATCH request schemas must include {}",
+        SCIM_PATCH_SCHEMA
+    )))
+}
+
 /// Custom SCIM JSON extractor that returns SCIM-formatted errors
 /// This wraps Axum's Json extractor and converts rejection errors to SCIM errors
 pub struct ScimJson<T>(pub T);
@@ -194,6 +218,8 @@ pub struct ScimUserRequest {
     #[serde(default)]
     pub schemas: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
     pub user_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,6 +239,8 @@ pub struct ScimGroupRequest {
     #[serde(default)]
     pub schemas: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -231,9 +259,10 @@ pub struct ScimPatchOp {
 
 /// SCIM Patch Request
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct ScimPatchRequest {
+    #[serde(default)]
     pub schemas: Vec<String>,
+    #[serde(rename = "Operations")]
     pub operations: Vec<ScimPatchOp>,
 }
 
@@ -243,3 +272,83 @@ pub const SCIM_GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group
 pub const SCIM_LIST_RESPONSE_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
 pub const SCIM_ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
 pub const SCIM_PATCH_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scim_user_request_accepts_optional_id_for_put_validation() {
+        let request: ScimUserRequest = serde_json::from_value(serde_json::json!({
+            "schemas": [SCIM_USER_SCHEMA],
+            "id": "user-123",
+            "userName": "person@example.com"
+        }))
+        .expect("deserialize scim user request with id");
+
+        assert_eq!(request.id.as_deref(), Some("user-123"));
+        assert_eq!(request.user_name, "person@example.com");
+    }
+
+    #[test]
+    fn scim_group_request_accepts_optional_id_for_put_validation() {
+        let request: ScimGroupRequest = serde_json::from_value(serde_json::json!({
+            "schemas": [SCIM_GROUP_SCHEMA],
+            "id": "group-123",
+            "displayName": "Acme"
+        }))
+        .expect("deserialize scim group request with id");
+
+        assert_eq!(request.id.as_deref(), Some("group-123"));
+        assert_eq!(request.display_name, "Acme");
+    }
+
+    #[test]
+    fn scim_id_mismatch_error_rejects_conflicting_body_id() {
+        let error = scim_id_mismatch_error("path-id", Some("body-id"), "User")
+            .expect("mismatched ids should return scim error");
+
+        assert_eq!(error.status, 400);
+        assert_eq!(error.scim_type.as_deref(), Some("invalidValue"));
+        assert!(error.detail.contains("body-id"));
+        assert!(error.detail.contains("path-id"));
+    }
+
+    #[test]
+    fn scim_id_mismatch_error_allows_missing_or_matching_body_id() {
+        assert!(scim_id_mismatch_error("path-id", None, "User").is_none());
+        assert!(scim_id_mismatch_error("path-id", Some("path-id"), "User").is_none());
+    }
+
+    #[test]
+    fn scim_patch_schema_error_requires_patchop_schema() {
+        let error = scim_patch_schema_error(&[SCIM_USER_SCHEMA.to_string()])
+            .expect("missing PatchOp schema should return scim error");
+
+        assert_eq!(error.status, 400);
+        assert_eq!(error.scim_type.as_deref(), Some("invalidValue"));
+        assert!(error.detail.contains(SCIM_PATCH_SCHEMA));
+    }
+
+    #[test]
+    fn scim_patch_schema_error_allows_patchop_schema() {
+        assert!(scim_patch_schema_error(&[SCIM_PATCH_SCHEMA.to_string()]).is_none());
+    }
+
+    #[test]
+    fn scim_patch_request_accepts_standard_field_casing() {
+        let request: ScimPatchRequest = serde_json::from_value(serde_json::json!({
+            "schemas": [SCIM_PATCH_SCHEMA],
+            "Operations": [{
+                "op": "replace",
+                "path": "userName",
+                "value": "person@example.com"
+            }]
+        }))
+        .expect("deserialize standard scim patch request");
+
+        assert_eq!(request.schemas, vec![SCIM_PATCH_SCHEMA.to_string()]);
+        assert_eq!(request.operations.len(), 1);
+        assert_eq!(request.operations[0].op, "replace");
+    }
+}

@@ -12,6 +12,7 @@ use crate::store::{
     memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
     plans::PlanStore, services::ServiceStore, subscriptions::SubscriptionStore, DB,
 };
+use crate::utils::resource_indicators::validate_resource_uri;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -44,6 +45,20 @@ fn validate_redirect_uris_input(redirect_uris: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn validate_resource_uris_input(resource_uris: &[String]) -> Result<()> {
+    if resource_uris.is_empty() {
+        return Err(crate::error::AppError::BadRequest(
+            "At least one resource URI is required".to_string(),
+        ));
+    }
+
+    for resource_uri in resource_uris {
+        validate_resource_uri(resource_uri)?;
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateServiceRequest {
     pub slug: String,
@@ -54,6 +69,7 @@ pub struct CreateServiceRequest {
     pub google_scopes: Option<Vec<String>>,
     pub redirect_uris: Option<Vec<String>>,
     pub device_activation_uri: Option<String>,
+    pub resource_uris: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +81,7 @@ pub struct UpdateServiceRequest {
     pub google_scopes: Option<Vec<String>>,
     pub redirect_uris: Option<Vec<String>>,
     pub device_activation_uri: Option<String>,
+    pub resource_uris: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -267,6 +284,9 @@ pub async fn create_service(
     if let Some(redirect_uris) = &req.redirect_uris {
         validate_redirect_uris_input(redirect_uris)?;
     }
+    if let Some(resource_uris) = &req.resource_uris {
+        validate_resource_uris_input(resource_uris)?;
+    }
 
     // Validate service type
     if !VALID_SERVICE_TYPES.contains(&req.service_type.as_str()) {
@@ -329,6 +349,10 @@ pub async fn create_service(
         .redirect_uris
         .as_ref()
         .map(|s| serde_json::to_string(s).unwrap());
+    let resource_uris_json = req
+        .resource_uris
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap());
 
     // Log service creation
     tracing::info!(
@@ -364,6 +388,7 @@ pub async fn create_service(
             let microsoft_scopes_json = microsoft_scopes_json.clone();
             let google_scopes_json = google_scopes_json.clone();
             let redirect_uris_json = redirect_uris_json.clone();
+            let resource_uris_json = resource_uris_json.clone();
             let device_activation_uri = device_activation_uri.clone();
             let plan_id = plan_id.clone();
             Box::pin(async move {
@@ -382,6 +407,7 @@ pub async fn create_service(
                     google_scopes_json.as_deref(),
                     redirect_uris_json.as_deref(),
                     device_activation_uri.as_deref(),
+                    resource_uris_json.as_deref(),
                 )
                 .await?;
 
@@ -618,6 +644,9 @@ pub async fn update_service(
     if let Some(redirect_uris) = &req.redirect_uris {
         validate_redirect_uris_input(redirect_uris)?;
     }
+    if let Some(resource_uris) = &req.resource_uris {
+        validate_resource_uris_input(resource_uris)?;
+    }
 
     // Get organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
@@ -642,6 +671,7 @@ pub async fn update_service(
         && req.google_scopes.is_none()
         && req.redirect_uris.is_none()
         && req.device_activation_uri.is_none()
+        && req.resource_uris.is_none()
     {
         return Err(crate::error::AppError::BadRequest(
             "No fields to update".to_string(),
@@ -675,6 +705,10 @@ pub async fn update_service(
         .redirect_uris
         .as_ref()
         .map(|s| serde_json::to_string(s).unwrap());
+    let resource_uris_json = req
+        .resource_uris
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap());
 
     // Update service using ServiceStore
     let updated_service = ServiceStore::update_dynamic(
@@ -688,6 +722,7 @@ pub async fn update_service(
         google_scopes_json.as_deref(),
         redirect_uris_json.as_deref(),
         req.device_activation_uri.as_deref(),
+        resource_uris_json.as_deref(),
     )
     .await?;
 

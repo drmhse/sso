@@ -4,6 +4,10 @@
     "useDefineForClassFields": true,
     "module": "ESNext",
     "moduleResolution": "Node",
+    "baseUrl": ".",
+    "paths": {
+      "@drmhse/sso-sdk": ["../../sso-sdk/src/index.ts"]
+    },
     "strict": true,
     "jsx": "preserve",
     "sourceMap": true,

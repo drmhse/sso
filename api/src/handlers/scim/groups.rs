@@ -9,7 +9,7 @@ use crate::store::{
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -195,7 +195,11 @@ pub async fn update_group(
     Extension(scim_auth): Extension<ScimAuth>,
     Path(group_id): Path<String>,
     Json(req): Json<ScimGroupRequest>,
-) -> Result<Json<ScimGroup>> {
+) -> Result<Response> {
+    if let Some(error) = scim_id_mismatch_error(&group_id, req.id.as_deref(), "Group") {
+        return Ok((StatusCode::BAD_REQUEST, Json(error)).into_response());
+    }
+
     let org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     // Note: Organization name updates would need to be implemented in OrganizationStore
@@ -263,7 +267,7 @@ pub async fn update_group(
     let base_url = &state.base_url;
     let scim_group = org_to_scim_group(&state.db, updated_org, &base_url).await?;
 
-    Ok(Json(scim_group))
+    Ok(Json(scim_group).into_response())
 }
 
 /// Patch Group (PATCH) - PATCH /scim/v2/Groups/:id
@@ -272,7 +276,11 @@ pub async fn patch_group(
     Extension(scim_auth): Extension<ScimAuth>,
     Path(group_id): Path<String>,
     Json(req): Json<ScimPatchRequest>,
-) -> Result<Json<ScimGroup>> {
+) -> Result<Response> {
+    if let Some(error) = scim_patch_schema_error(&req.schemas) {
+        return Ok((StatusCode::BAD_REQUEST, Json(error)).into_response());
+    }
+
     let org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     // Process each operation
@@ -369,7 +377,7 @@ pub async fn patch_group(
     let base_url = &state.base_url;
     let scim_group = org_to_scim_group(&state.db, updated_org, &base_url).await?;
 
-    Ok(Json(scim_group))
+    Ok(Json(scim_group).into_response())
 }
 
 /// Delete Group - DELETE /scim/v2/Groups/:id

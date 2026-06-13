@@ -1,5 +1,6 @@
 use crate::error::{AppError, Result};
 use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
+use crate::handlers::auth::password::reject_upstream_only_local_auth;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
@@ -213,6 +214,13 @@ pub async fn request_magic_link(
         req.redirect_uri.as_deref(),
     )
     .await?;
+    reject_upstream_only_local_auth(
+        &state,
+        &req.email,
+        issuing_org_id.as_deref(),
+        "Magic-link sign-in",
+    )
+    .await?;
 
     // Service-scoped magic links must resolve the tenant user, not a same-email
     // platform or sibling-organization user.
@@ -333,6 +341,14 @@ pub async fn verify_magic_link(
             "User not found. Please register first.".to_string(),
         ));
     };
+
+    reject_upstream_only_local_auth(
+        &state,
+        &user.email,
+        user.org_id.as_deref(),
+        "Magic-link sign-in",
+    )
+    .await?;
 
     // Delete the magic link token (one-time use)
     if !MagicLinksStore::delete(DB::Conn(&state.db), &query.token).await? {
@@ -500,6 +516,7 @@ pub async fn verify_magic_link(
                 Some(refresh_expires_at.naive_utc()),
                 org_slug,
                 service_id.as_deref(),
+                None,
                 None,
                 None,
             )

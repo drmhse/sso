@@ -6,33 +6,23 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if !manager
-            .has_column("oauth_states", "requested_scopes")
-            .await?
-        {
+        if !manager.has_column("oauth_states", "resource").await? {
             manager
                 .alter_table(
                     Table::alter()
                         .table(OauthStates::Table)
-                        .add_column(ColumnDef::new(OauthStates::RequestedScopes).text().null())
+                        .add_column(ColumnDef::new(OauthStates::Resource).text().null())
                         .to_owned(),
                 )
                 .await?;
         }
 
-        if !manager
-            .has_column("oauth_states", "provider_token_request_state")
-            .await?
-        {
+        if !manager.has_column("sessions", "resource").await? {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(OauthStates::Table)
-                        .add_column(
-                            ColumnDef::new(OauthStates::ProviderTokenRequestState)
-                                .string_len(36)
-                                .null(),
-                        )
+                        .table(Sessions::Table)
+                        .add_column(ColumnDef::new(Sessions::Resource).text().null())
                         .to_owned(),
                 )
                 .await?;
@@ -42,29 +32,23 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if manager
-            .has_column("oauth_states", "provider_token_request_state")
-            .await?
-        {
+        if manager.has_column("sessions", "resource").await? {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(OauthStates::Table)
-                        .drop_column(OauthStates::ProviderTokenRequestState)
+                        .table(Sessions::Table)
+                        .drop_column(Sessions::Resource)
                         .to_owned(),
                 )
                 .await?;
         }
 
-        if manager
-            .has_column("oauth_states", "requested_scopes")
-            .await?
-        {
+        if manager.has_column("oauth_states", "resource").await? {
             manager
                 .alter_table(
                     Table::alter()
                         .table(OauthStates::Table)
-                        .drop_column(OauthStates::RequestedScopes)
+                        .drop_column(OauthStates::Resource)
                         .to_owned(),
                 )
                 .await?;
@@ -77,6 +61,11 @@ impl MigrationTrait for Migration {
 #[derive(DeriveIden)]
 enum OauthStates {
     Table,
-    RequestedScopes,
-    ProviderTokenRequestState,
+    Resource,
+}
+
+#[derive(DeriveIden)]
+enum Sessions {
+    Table,
+    Resource,
 }
