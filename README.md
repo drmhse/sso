@@ -52,10 +52,11 @@ npm install @drmhse/authos-cli
 
 ## Docs
 
-- [Enterprise-managed authorization](./docs/enterprise-managed-authorization.md)
-- [SCIM provisioning setup](./docs/scim-provisioning.md)
-- [Organization roles and permissions](./docs/organization-roles.md)
-- [Package publishing](./docs/package-publishing.md)
+- [Getting started](https://authos.dev/docs/api/getting-started/)
+- [Authentication API](https://authos.dev/docs/api/reference/authentication/)
+- [SDK packages](https://authos.dev/docs/packages/)
+- [Enterprise-managed authorization](https://authos.dev/docs/api/reference/authentication/enterprise-managed-authorization/)
+- [SCIM provisioning](https://authos.dev/docs/sdk/guides/scim-provisioning/)
 
 AuthOS also maintains source-verified Agent Skills for integration and
 operations workflows:
