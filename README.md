@@ -44,6 +44,7 @@ AuthOS maintains source-verified Agent Skills for integration and operations wor
 
 - [SCIM provisioning setup](./docs/scim-provisioning.md)
 - [Organization roles and permissions](./docs/organization-roles.md)
+- [Enterprise-managed authorization](./docs/enterprise-managed-authorization.md)
 
 ## Standalone Linux Bundles
 

@@ -1,7 +1,9 @@
 use crate::error::{AppError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -39,8 +41,26 @@ pub struct Claims {
     pub aud: Option<String>, // Audience - used for impersonation sessions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iss: Option<String>, // Issuer - AuthOS API base URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>, // OAuth scope string for resource-scoped access tokens
     pub exp: i64, // expiration timestamp
     pub iat: i64, // issued at timestamp
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct IdJagClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: String,
+    pub resource: String,
+    pub client_id: String,
+    pub jti: String,
+    pub exp: i64,
+    pub iat: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 pub struct JwtService {
@@ -121,6 +141,28 @@ impl JwtService {
         service_slug: Option<&str>,
         resource: Option<&str>,
     ) -> Result<String> {
+        self.create_token_with_resource_and_scope(
+            user_id,
+            email,
+            is_platform_owner,
+            org_slug,
+            service_slug,
+            resource,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_token_with_resource_and_scope(
+        &self,
+        user_id: &str,
+        email: &str,
+        is_platform_owner: bool,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+        resource: Option<&str>,
+        scope: Option<&str>,
+    ) -> Result<String> {
         use uuid::Uuid;
 
         let now = Utc::now();
@@ -143,6 +185,7 @@ impl JwtService {
             act: None,
             aud,
             iss: Some(self.issuer.clone()),
+            scope: scope.map(|s| s.to_string()),
             exp: exp.timestamp(),
             iat: now.timestamp(),
         };
@@ -206,6 +249,7 @@ impl JwtService {
             act: None,
             aud,
             iss: Some(self.issuer.clone()),
+            scope: None,
             exp: exp.timestamp(),
             iat: now.timestamp(),
         };
@@ -269,6 +313,7 @@ impl JwtService {
             }),
             aud: Some("impersonation-session".to_string()),
             iss: Some(self.issuer.clone()),
+            scope: None,
             exp: exp.timestamp(),
             iat: now.timestamp(),
         };
@@ -303,6 +348,70 @@ impl JwtService {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
         hex::encode(hasher.finalize())
+    }
+
+    pub fn create_id_jag(
+        &self,
+        subject: &str,
+        email: Option<&str>,
+        audience: &str,
+        resource: &str,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> Result<String> {
+        use uuid::Uuid;
+
+        let now = Utc::now();
+        let exp = now + Duration::minutes(5);
+        let claims = IdJagClaims {
+            iss: self.issuer.clone(),
+            sub: subject.to_string(),
+            aud: audience.trim_end_matches('/').to_string(),
+            resource: resource.to_string(),
+            client_id: client_id.to_string(),
+            jti: Uuid::new_v4().to_string(),
+            exp: exp.timestamp(),
+            iat: now.timestamp(),
+            scope: scope.map(|s| s.to_string()),
+            email: email.map(|s| s.to_string()),
+        };
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.key_id.clone());
+        header.typ = Some("oauth-id-jag+jwt".to_string());
+
+        encode(&header, &claims, &self.encoding_key).map_err(AppError::Jwt)
+    }
+
+    pub fn validate_id_jag(&self, token: &str, expected_audience: &str) -> Result<IdJagClaims> {
+        let header = decode_header(token).map_err(AppError::Jwt)?;
+        if header.typ.as_deref() != Some("oauth-id-jag+jwt") {
+            return Err(AppError::Unauthorized(
+                "Invalid JWT authorization grant type".to_string(),
+            ));
+        }
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = true;
+        validation.validate_aud = false;
+
+        let token_data =
+            decode::<IdJagClaims>(token, &self.decoding_key, &validation).map_err(AppError::Jwt)?;
+
+        let claims = token_data.claims;
+        if claims.iss != self.issuer {
+            return Err(AppError::Unauthorized(
+                "Invalid JWT authorization grant issuer".to_string(),
+            ));
+        }
+
+        if claims.aud != expected_audience.trim_end_matches('/') {
+            return Err(AppError::Unauthorized(
+                "Invalid JWT authorization grant audience".to_string(),
+            ));
+        }
+
+        Ok(claims)
     }
 }
 

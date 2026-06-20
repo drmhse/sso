@@ -17,6 +17,7 @@ mod m20260529_000001_oauth_state_client_state;
 mod m20260612_000001_add_login_policy_to_verified_domains;
 mod m20260612_000002_add_resource_uris_to_services;
 mod m20260612_000003_add_resource_to_oauth_states_and_sessions;
+mod m20260620_000001_create_oauth_authorization_grants;
 
 pub struct Migrator;
 
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260612_000001_add_login_policy_to_verified_domains::Migration),
             Box::new(m20260612_000002_add_resource_uris_to_services::Migration),
             Box::new(m20260612_000003_add_resource_to_oauth_states_and_sessions::Migration),
+            Box::new(m20260620_000001_create_oauth_authorization_grants::Migration),
         ]
     }
 }

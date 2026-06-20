@@ -12,28 +12,19 @@ use crate::store::{
     memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
     plans::PlanStore, services::ServiceStore, subscriptions::SubscriptionStore, DB,
 };
+use crate::utils::client_secret::hash_client_secret;
 use crate::utils::resource_indicators::validate_resource_uri;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
-use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use uuid::Uuid;
-
-/// Hash a client secret using SHA-256
-fn hash_client_secret(client_secret: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(client_secret.as_bytes());
-    let hash = hasher.finalize();
-    general_purpose::STANDARD.encode(hash)
-}
 
 fn validate_redirect_uris_input(redirect_uris: &[String]) -> Result<()> {
     if redirect_uris.is_empty() {

@@ -630,6 +630,8 @@ pub fn auth_routes(config: &Config) -> Router<AppState> {
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/refresh", post(refresh_token))
         .route("/auth/revoke", post(revoke_token))
+        .route("/oauth/token", post(enterprise_token))
+        .route("/oauth2/token", post(enterprise_token))
         // Admin authentication routes
         .route("/auth/admin/:provider", get(auth_admin_provider))
         .route("/auth/admin/:provider/callback", get(auth_admin_callback))

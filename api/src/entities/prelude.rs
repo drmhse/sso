@@ -10,6 +10,7 @@ pub use super::login_events::Entity as LoginEvents;
 pub use super::magic_link_tokens::Entity as MagicLinkTokens;
 pub use super::memberships::Entity as Memberships;
 pub use super::mfa_audit_log::Entity as MfaAuditLog;
+pub use super::oauth_authorization_grants::Entity as OauthAuthorizationGrants;
 pub use super::organization_audit_log::Entity as OrganizationAuditLog;
 pub use super::organization_billing_credentials::Entity as OrganizationBillingCredentials;
 pub use super::organization_invitations::Entity as OrganizationInvitations;

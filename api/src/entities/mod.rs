@@ -16,6 +16,7 @@ pub mod mfa_audit_log;
 pub mod mfa_daily_metrics;
 pub mod mfa_failure_patterns;
 pub mod mfa_feature_usage;
+pub mod oauth_authorization_grants;
 pub mod oauth_states;
 pub mod organization_audit_log;
 pub mod organization_billing_credentials;

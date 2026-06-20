@@ -118,7 +118,12 @@ export class HttpClient {
       const response = await fetch(url, {
         method: options.method,
         headers,
-        body: options.body ? JSON.stringify(options.body) : undefined,
+        body:
+          options.body instanceof URLSearchParams || typeof options.body === 'string'
+            ? options.body
+            : options.body
+              ? JSON.stringify(options.body)
+              : undefined,
         signal: controller.signal,
       });
 
@@ -235,6 +240,30 @@ export class HttpClient {
       method: 'POST',
       body: data,
       headers: config?.headers,
+    });
+  }
+
+  /**
+   * POST form-urlencoded request.
+   */
+  public async postForm<T = any>(
+    path: string,
+    data: Record<string, string | undefined>,
+    config?: { headers?: Record<string, string> }
+  ): Promise<HttpResponse<T>> {
+    const form = new URLSearchParams();
+    Object.entries(data).forEach(([key, value]) => {
+      if (value !== undefined) {
+        form.append(key, value);
+      }
+    });
+    return this.request<T>(path, {
+      method: 'POST',
+      body: form,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...config?.headers,
+      },
     });
   }
 

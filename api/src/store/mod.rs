@@ -20,6 +20,7 @@ pub mod invitations;
 pub mod login_events;
 pub mod magic_links;
 pub mod memberships;
+pub mod oauth_authorization_grants;
 pub mod oauth_states;
 pub mod organization_billing_credentials;
 pub mod organization_oauth_credentials;

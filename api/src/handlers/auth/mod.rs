@@ -11,6 +11,7 @@
 
 pub mod device;
 pub(crate) mod email_delivery;
+pub mod enterprise;
 pub mod hrd;
 pub mod magic;
 pub mod mfa;
@@ -32,6 +33,9 @@ pub(crate) use oauth::{is_supported_upstream_oauth_type, resolve_upstream_oidc_c
 
 // Device flow handlers
 pub use device::{device_code, device_verify, token_exchange};
+
+// Enterprise-managed authorization token endpoint
+pub use enterprise::enterprise_token;
 
 // Session handlers
 pub use session::{logout, refresh_token, revoke_token};

@@ -973,6 +973,7 @@ mod tests {
                 act: None,
                 aud: Some("platform".to_string()),
                 iss: Some("http://localhost:3001".to_string()),
+                scope: None,
                 exp: (now + chrono::Duration::hours(1)).timestamp(),
                 iat: now.timestamp(),
             },

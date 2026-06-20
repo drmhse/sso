@@ -500,6 +500,7 @@ mod tests {
                 act: None,
                 aud: Some(format!("org:{}", org.slug)),
                 iss: Some(state.base_url.clone()),
+                scope: None,
                 exp: chrono::Utc::now().timestamp() + 3600,
                 iat: chrono::Utc::now().timestamp(),
             },

@@ -48,6 +48,37 @@ export interface TokenResponse {
   expires_in: number;
 }
 
+export interface IdJagTokenExchangeRequest {
+  client_id: string;
+  audience: string;
+  resource: string;
+  subject_token: string;
+  subject_token_type?: 'urn:ietf:params:oauth:token-type:access_token';
+  scope?: string;
+  client_secret?: string;
+}
+
+export interface IdJagTokenExchangeResponse {
+  issued_token_type: 'urn:ietf:params:oauth:token-type:id-jag';
+  access_token: string;
+  token_type: 'N_A';
+  expires_in: number;
+  scope?: string;
+}
+
+export interface IdJagBearerExchangeRequest {
+  client_id: string;
+  client_secret: string;
+  assertion: string;
+}
+
+export interface IdJagBearerExchangeResponse {
+  access_token: string;
+  token_type: 'Bearer';
+  expires_in: number;
+  scope?: string;
+}
+
 /**
  * Parameters for constructing login URL
  */

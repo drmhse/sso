@@ -7,6 +7,10 @@ import {
   DeviceVerifyResponse,
   TokenRequest,
   TokenResponse,
+  IdJagBearerExchangeRequest,
+  IdJagBearerExchangeResponse,
+  IdJagTokenExchangeRequest,
+  IdJagTokenExchangeResponse,
   LoginUrlParams,
   AdminLoginUrlParams,
   ProviderToken,
@@ -255,6 +259,47 @@ export class AuthModule {
      */
     exchangeToken: async (payload: TokenRequest): Promise<TokenResponse> => {
       const response = await this.http.post<TokenResponse>('/auth/token', payload);
+      return response.data;
+    },
+  };
+
+  /**
+   * Enterprise-managed authorization helpers for MCP/Cross-App Access.
+   */
+  public enterprise = {
+    /**
+     * Exchange an AuthOS service-scoped JWT for a short-lived ID-JAG.
+     */
+    requestIdJag: async (
+      payload: IdJagTokenExchangeRequest
+    ): Promise<IdJagTokenExchangeResponse> => {
+      const response = await this.http.postForm<IdJagTokenExchangeResponse>('/oauth/token', {
+        grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        requested_token_type: 'urn:ietf:params:oauth:token-type:id-jag',
+        audience: payload.audience,
+        resource: payload.resource,
+        scope: payload.scope,
+        subject_token: payload.subject_token,
+        subject_token_type:
+          payload.subject_token_type || 'urn:ietf:params:oauth:token-type:access_token',
+        client_id: payload.client_id,
+        client_secret: payload.client_secret,
+      });
+      return response.data;
+    },
+
+    /**
+     * Exchange an ID-JAG for a resource-scoped AuthOS bearer token.
+     */
+    exchangeIdJag: async (
+      payload: IdJagBearerExchangeRequest
+    ): Promise<IdJagBearerExchangeResponse> => {
+      const response = await this.http.postForm<IdJagBearerExchangeResponse>('/oauth/token', {
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion: payload.assertion,
+        client_id: payload.client_id,
+        client_secret: payload.client_secret,
+      });
       return response.data;
     },
   };

@@ -28,6 +28,26 @@ export interface JwtClaims {
   service?: string;
 
   /**
+   * JWT ID
+   */
+  jti?: string;
+
+  /**
+   * Token audience. Resource-scoped tokens use the registered resource URI.
+   */
+  aud?: string;
+
+  /**
+   * Token issuer.
+   */
+  iss?: string;
+
+  /**
+   * OAuth scope string for resource-scoped access tokens.
+   */
+  scope?: string;
+
+  /**
    * Subscription plan name
    */
   plan?: string;

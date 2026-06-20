@@ -91,6 +91,26 @@ const result = await sso.serviceApi.requestProviderToken({
 });
 ```
 
+### Enterprise-managed authorization
+
+For MCP and Cross-App Access style flows, exchange a service-scoped AuthOS JWT
+for an ID-JAG, then redeem it for a resource-scoped bearer token:
+
+```ts
+const idJag = await sso.auth.enterprise.requestIdJag({
+  client_id: 'service-client-id',
+  audience: 'https://auth.example.com',
+  resource: 'https://api.example.com/mcp',
+  subject_token: serviceAccessToken,
+});
+
+const resourceToken = await sso.auth.enterprise.exchangeIdJag({
+  client_id: 'service-client-id',
+  client_secret: process.env.AUTHOS_SERVICE_CLIENT_SECRET!,
+  assertion: idJag.access_token,
+});
+```
+
 ## Feature highlights
 
 - Password, OAuth, magic-link, passkey, MFA, and device-flow authentication
@@ -98,6 +118,7 @@ const result = await sso.serviceApi.requestProviderToken({
 - Linked accounts and provider-token request completion flows
 - Organization, service, analytics, audit-log, and platform-owner APIs
 - Service API helpers including backend-only provider token retrieval
+- Enterprise-managed authorization helpers for ID-JAG resource access
 
 ## Canonical references
 
