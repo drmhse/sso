@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-vue",
-  "version": "0.2.8",
+  "version": "0.8.0",
   "description": "Vue and Nuxt adapter for AuthOS authentication",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -69,6 +69,6 @@
     "access": "public"
   },
   "dependencies": {
-    "@drmhse/sso-sdk": "*"
+    "@drmhse/sso-sdk": "0.8.0"
   }
 }

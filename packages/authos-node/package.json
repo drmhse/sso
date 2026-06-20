@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-node",
-  "version": "0.1.10",
+  "version": "0.8.0",
   "description": "Node.js server adapter for AuthOS authentication - Express middleware and token verification",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -59,7 +59,7 @@
     }
   },
   "dependencies": {
-    "@drmhse/sso-sdk": "*"
+    "@drmhse/sso-sdk": "0.8.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",

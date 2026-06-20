@@ -1,6 +1,6 @@
 {
   "name": "@drmhse/authos-react",
-  "version": "0.2.7",
+  "version": "0.8.0",
   "description": "React and Next.js adapter for AuthOS authentication",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -69,7 +69,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@drmhse/sso-sdk": "*"
+    "@drmhse/sso-sdk": "0.8.0"
   },
   "overrides": {
     "postcss": "^8.5.10"
