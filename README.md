@@ -28,15 +28,6 @@ chmod +x install.sh
 sudo AUTHOS_RELEASE_TAG="${AUTHOS_VERSION}" ./install.sh
 ```
 
-## Docker
-
-Tagged releases publish multi-arch images for all database backends:
-
-- SQLite default: `editoredit/sso:latest`, `editoredit/sso:vX.Y.Z`, `editoredit/sso:X.Y.Z`
-- Explicit SQLite: `editoredit/sso:sqlite-latest`, `editoredit/sso:sqlite-vX.Y.Z`, `editoredit/sso:sqlite-X.Y.Z`
-- PostgreSQL: `editoredit/sso:psql-latest`, `editoredit/sso:psql-vX.Y.Z`, `editoredit/sso:psql-X.Y.Z`
-- MySQL: `editoredit/sso:mysql-latest`, `editoredit/sso:mysql-vX.Y.Z`, `editoredit/sso:mysql-X.Y.Z`
-
 ## Packages
 
 Install only the package your app needs:
@@ -48,10 +39,6 @@ npm install @drmhse/authos-vue
 npm install @drmhse/authos-node
 npm install @drmhse/authos-cli
 ```
-
-Public packages are released from the same `vX.Y.Z` tag as the standalone
-bundles and Docker images. Pushing `v1.0.0` publishes each public package as
-`1.0.0`.
 
 ## Repository
 
@@ -99,18 +86,6 @@ cd api
 cp .env.example .env
 cargo run --release
 ```
-
-## Release
-
-AuthOS releases are tag-driven. A pushed `vX.Y.Z` tag builds standalone assets,
-publishes Docker images, generates GitHub release notes, and publishes public
-npm packages with version `X.Y.Z`.
-
-Release workflow details live in:
-
-- [.github/workflows/release.yml](./.github/workflows/release.yml)
-- [.github/workflows/publish-npm-packages.yml](./.github/workflows/publish-npm-packages.yml)
-- [docs/package-publishing.md](./docs/package-publishing.md)
 
 ## License
 
