@@ -1,0 +1,88 @@
+name: Publish npm packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run npm publish with --dry-run
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish public npm workspaces
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck SDK
+        run: npm run typecheck:sdk
+
+      - name: Build SDK
+        run: npm run build:sdk
+
+      - name: Typecheck packages
+        run: npm run typecheck:packages
+
+      - name: Build packages
+        run: npm run build:packages
+
+      - name: Publish changed package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          publish_package() {
+            local workspace_dir="$1"
+            local name version publish_args
+
+            name="$(node -p "require('./${workspace_dir}/package.json').name")"
+            version="$(node -p "require('./${workspace_dir}/package.json').version")"
+
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "Skipping ${name}@${version}; already published."
+              return
+            fi
+
+            publish_args=(publish --workspace "${workspace_dir}" --access public)
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              publish_args+=(--dry-run)
+            else
+              publish_args+=(--provenance)
+            fi
+
+            echo "Publishing ${name}@${version} from ${workspace_dir}"
+            npm "${publish_args[@]}"
+          }
+
+          publish_package sso-sdk
+          publish_package packages/authos-node
+          publish_package packages/authos-react
+          publish_package packages/authos-vue
+          publish_package packages/authos-cli
