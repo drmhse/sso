@@ -2,9 +2,13 @@
 
 AuthOS publishes public npm packages from `.github/workflows/publish-npm-packages.yml`.
 
-The workflow runs on tags matching `v*`. It installs dependencies, typechecks
-the SDK and framework packages, builds them, then publishes only package
-versions that do not already exist on npm.
+The workflow runs on tags matching `v*`. The pushed tag is the source of truth
+for every public package version: pushing `v1.0.0` publishes each package as
+`1.0.0`.
+
+The workflow installs dependencies, stamps package versions from the tag,
+typechecks the SDK and framework packages, builds them, then publishes only
+package versions that do not already exist on npm.
 
 Published workspaces, in dependency order:
 
@@ -44,17 +48,20 @@ In npm:
 
 ## Release Flow
 
-1. Update package versions in the relevant `package.json` files.
-2. Commit the version changes.
-3. Push a tag matching `v*`, for example:
+1. Commit the code/docs changes you want to release.
+2. Push a tag matching `vX.Y.Z`, for example:
 
    ```bash
-   git tag v0.5.5
-   git push origin v0.5.5
+   git tag v1.0.0
+   git push origin v1.0.0
    ```
+
+The tag version is applied to all public package manifests in the workflow
+runner before build and publish. Internal package dependencies on
+`@drmhse/sso-sdk` are also stamped to the same exact version.
 
 The workflow skips any `name@version` already published to npm, so retrying a
 tag is safe for packages that were already published successfully.
 
-For a validation run without publishing, use the manual workflow dispatch and
-leave `dry_run` enabled.
+For a validation run without publishing, use the manual workflow dispatch, set
+the version to test, and leave `dry_run` enabled.

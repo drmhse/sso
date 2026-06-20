@@ -3,6 +3,11 @@ name: Publish npm packages
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: Package version to stamp during dry-run/manual publish
+        required: true
+        default: 0.0.0-dry-run.0
+        type: string
       dry_run:
         description: Run npm publish with --dry-run
         required: true
@@ -27,6 +32,7 @@ jobs:
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      MANUAL_VERSION: ${{ inputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,6 +46,51 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Stamp package versions from release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            package_version="${GITHUB_REF_NAME#v}"
+          else
+            package_version="${MANUAL_VERSION}"
+          fi
+
+          if ! [[ "${package_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid semver package version: ${package_version}" >&2
+            exit 1
+          fi
+
+          echo "PACKAGE_VERSION=${package_version}" >> "${GITHUB_ENV}"
+          export PACKAGE_VERSION="${package_version}"
+
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const version = process.env.PACKAGE_VERSION;
+          const packages = [
+            'sso-sdk',
+            'packages/authos-node',
+            'packages/authos-react',
+            'packages/authos-vue',
+            'packages/authos-cli',
+          ];
+
+          for (const directory of packages) {
+            const path = `${directory}/package.json`;
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.version = version;
+
+            if (pkg.dependencies?.['@drmhse/sso-sdk']) {
+              pkg.dependencies['@drmhse/sso-sdk'] = version;
+            }
+
+            fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
+            console.log(`${pkg.name}@${pkg.version}`);
+          }
+          NODE
 
       - name: Typecheck SDK
         run: npm run typecheck:sdk
