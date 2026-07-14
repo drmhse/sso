@@ -72,16 +72,20 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
 
-            manager
-                .create_index(
-                    Index::create()
-                        .if_not_exists()
-                        .name("idx_login_events_org")
-                        .table(LoginEvents::Table)
-                        .col(LoginEvents::OrgId)
-                        .to_owned(),
-                )
-                .await?;
+            if !manager
+                .has_index("login_events", "idx_login_events_org")
+                .await?
+            {
+                manager
+                    .create_index(
+                        Index::create()
+                            .name("idx_login_events_org")
+                            .table(LoginEvents::Table)
+                            .col(LoginEvents::OrgId)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
 
             manager
                 .create_foreign_key(
@@ -195,15 +199,19 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
 
-            manager
-                .drop_index(
-                    Index::drop()
-                        .if_exists()
-                        .name("idx_login_events_org")
-                        .table(LoginEvents::Table)
-                        .to_owned(),
-                )
-                .await?;
+            if manager
+                .has_index("login_events", "idx_login_events_org")
+                .await?
+            {
+                manager
+                    .drop_index(
+                        Index::drop()
+                            .name("idx_login_events_org")
+                            .table(LoginEvents::Table)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
 
             manager
                 .alter_table(

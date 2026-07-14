@@ -174,25 +174,9 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        // Step 4: Drop billing_customers table and its indexes
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_billing_customers_external_id")
-                    .table(BillingCustomers::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_billing_customers_org_provider")
-                    .table(BillingCustomers::Table)
-                    .to_owned(),
-            )
-            .await?;
-
+        // Step 4: Dropping the table also removes its indexes. Do not drop
+        // them individually: MySQL may use the composite org/provider index
+        // to support the table's organization foreign key.
         manager
             .drop_table(Table::drop().table(BillingCustomers::Table).to_owned())
             .await?;

@@ -21,17 +21,21 @@ impl MigrationTrait for Migration {
                 .await?;
         }
 
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_sessions_refresh_token_hash")
-                    .table(Sessions::Table)
-                    .col(Sessions::RefreshTokenHash)
-                    .unique()
-                    .to_owned(),
-            )
-            .await?;
+        if !manager
+            .has_index("sessions", "idx_sessions_refresh_token_hash")
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("idx_sessions_refresh_token_hash")
+                        .table(Sessions::Table)
+                        .col(Sessions::RefreshTokenHash)
+                        .unique()
+                        .to_owned(),
+                )
+                .await?;
+        }
 
         manager
             .create_table(
@@ -71,16 +75,23 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("idx_session_refresh_history_session")
-                    .table(SessionRefreshTokenHistory::Table)
-                    .col(SessionRefreshTokenHistory::SessionId)
-                    .to_owned(),
+        if !manager
+            .has_index(
+                "session_refresh_token_history",
+                "idx_session_refresh_history_session",
             )
-            .await?;
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("idx_session_refresh_history_session")
+                        .table(SessionRefreshTokenHistory::Table)
+                        .col(SessionRefreshTokenHistory::SessionId)
+                        .to_owned(),
+                )
+                .await?;
+        }
 
         // Existing plaintext refresh tokens cannot be portably hashed inside a
         // three-database schema migration without exposing them to application
@@ -95,15 +106,20 @@ impl MigrationTrait for Migration {
             .execute(manager.get_database_backend().build(&clear_plaintext))
             .await?;
 
-        manager
-            .drop_index(
-                Index::drop()
-                    .if_exists()
-                    .name("idx_sessions_refresh_token")
-                    .table(Sessions::Table)
-                    .to_owned(),
-            )
-            .await
+        if manager
+            .has_index("sessions", "idx_sessions_refresh_token")
+            .await?
+        {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name("idx_sessions_refresh_token")
+                        .table(Sessions::Table)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -115,15 +131,19 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        manager
-            .drop_index(
-                Index::drop()
-                    .if_exists()
-                    .name("idx_sessions_refresh_token_hash")
-                    .table(Sessions::Table)
-                    .to_owned(),
-            )
-            .await?;
+        if manager
+            .has_index("sessions", "idx_sessions_refresh_token_hash")
+            .await?
+        {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name("idx_sessions_refresh_token_hash")
+                        .table(Sessions::Table)
+                        .to_owned(),
+                )
+                .await?;
+        }
         if manager.has_column("sessions", "refresh_token_hash").await? {
             manager
                 .alter_table(

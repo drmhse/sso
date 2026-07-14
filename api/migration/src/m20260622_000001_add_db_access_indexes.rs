@@ -417,13 +417,6 @@ impl MigrationTrait for Migration {
 
         create_index(
             manager,
-            "idx_users_deleted_at",
-            Users::Table,
-            &[Users::DeletedAt],
-        )
-        .await?;
-        create_index(
-            manager,
             "idx_users_created_at",
             Users::Table,
             &[Users::CreatedAt],
@@ -561,6 +554,82 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // MySQL may replace implicit single-column FK indexes with the broader
+        // access indexes below. Restore dedicated FK support before removing
+        // the indexes introduced by this migration.
+        if manager.get_database_backend() == sea_orm_migration::sea_orm::DbBackend::MySql {
+            for (table, column, name) in [
+                (
+                    TotpBackupCodes::Table.into_iden(),
+                    TotpBackupCodes::UserId.into_iden(),
+                    "fk_backup_codes_user",
+                ),
+                (
+                    ScimTokens::Table.into_iden(),
+                    ScimTokens::OrgId.into_iden(),
+                    "fk_scim_tokens_org",
+                ),
+                (
+                    ApiKeys::Table.into_iden(),
+                    ApiKeys::ServiceId.into_iden(),
+                    "fk_api_keys_service",
+                ),
+                (
+                    Subscriptions::Table.into_iden(),
+                    Subscriptions::UserId.into_iden(),
+                    "fk_subscriptions_user",
+                ),
+                (
+                    Subscriptions::Table.into_iden(),
+                    Subscriptions::ServiceId.into_iden(),
+                    "fk_subscriptions_service",
+                ),
+                (
+                    Subscriptions::Table.into_iden(),
+                    Subscriptions::PlanId.into_iden(),
+                    "fk_subscriptions_plan",
+                ),
+                (
+                    LoginEvents::Table.into_iden(),
+                    LoginEvents::UserId.into_iden(),
+                    "fk_login_events_user",
+                ),
+                (
+                    LoginEvents::Table.into_iden(),
+                    LoginEvents::ServiceId.into_iden(),
+                    "fk_login_events_service",
+                ),
+                (
+                    WebhookDeliveries::Table.into_iden(),
+                    WebhookDeliveries::WebhookId.into_iden(),
+                    "fk_webhook_deliveries_webhook",
+                ),
+                (
+                    Sessions::Table.into_iden(),
+                    Sessions::UserId.into_iden(),
+                    "fk_sessions_user",
+                ),
+                (
+                    OrganizationAuditLog::Table.into_iden(),
+                    OrganizationAuditLog::OrgId.into_iden(),
+                    "fk_org_audit_org",
+                ),
+            ] {
+                let table_name = table.to_string();
+                if !manager.has_index(&table_name, name).await? {
+                    manager
+                        .create_index(
+                            Index::create()
+                                .name(name)
+                                .table(table)
+                                .col(column)
+                                .to_owned(),
+                        )
+                        .await?;
+                }
+            }
+        }
+
         for (table, name) in [
             (
                 MfaFailurePatterns::Table.into_iden(),
@@ -613,7 +682,6 @@ impl MigrationTrait for Migration {
                 "idx_password_reset_token_used",
             ),
             (Users::Table.into_iden(), "idx_users_created_at"),
-            (Users::Table.into_iden(), "idx_users_deleted_at"),
             (
                 SystemJobs::Table.into_iden(),
                 "idx_system_jobs_completed_at",
@@ -748,9 +816,12 @@ impl MigrationTrait for Migration {
             (Sessions::Table.into_iden(), "idx_sessions_user_expires"),
             (Sessions::Table.into_iden(), "idx_sessions_refresh_token"),
         ] {
-            manager
-                .drop_index(Index::drop().if_exists().name(name).table(table).to_owned())
-                .await?;
+            let table_name = table.to_string();
+            if manager.has_index(&table_name, name).await? {
+                manager
+                    .drop_index(Index::drop().name(name).table(table).to_owned())
+                    .await?;
+            }
         }
 
         Ok(())
@@ -767,8 +838,13 @@ where
     T: Iden + Copy + 'static,
     C: Iden + Copy + 'static,
 {
+    let table_name = table.to_string();
+    if manager.has_index(&table_name, name).await? {
+        return Ok(());
+    }
+
     let mut index = Index::create();
-    index.if_not_exists().name(name).table(table);
+    index.name(name).table(table);
     for column in columns {
         index.col(*column);
     }
@@ -954,7 +1030,6 @@ enum SystemJobs {
 #[derive(DeriveIden, Copy, Clone)]
 enum Users {
     Table,
-    DeletedAt,
     CreatedAt,
 }
 

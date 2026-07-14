@@ -115,24 +115,9 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_org_billing_creds_org")
-                    .table(OrganizationBillingCredentials::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_org_billing_creds_unique")
-                    .table(OrganizationBillingCredentials::Table)
-                    .to_owned(),
-            )
-            .await?;
-
+        // The table drop removes both indexes and its foreign key atomically.
+        // MySQL may otherwise reject an explicit index drop when it selected
+        // that index to support the organization foreign key.
         manager
             .drop_table(
                 Table::drop()

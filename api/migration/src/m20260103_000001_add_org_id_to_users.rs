@@ -4,9 +4,9 @@
 //!
 //! MIGRATION STRATEGY:
 //! - Adds nullable org_id column to users table
-//! - Creates partial/functional unique indexes to enforce uniqueness:
+//! - Creates backend-specific unique indexes to enforce uniqueness:
 //!   - PostgreSQL/SQLite: Partial indexes with WHERE clause
-//!   - MySQL 8.0+: Functional index on (email, COALESCE(org_id, ''))
+//!   - MySQL 8.0+: Indexed generated scope column plus email
 //! - Existing users remain with NULL org_id (platform-level users)
 //! - New service-created users will have org_id set
 
@@ -330,18 +330,18 @@ impl Migration {
             .await?;
 
         manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_users_org_id")
+            .drop_foreign_key(
+                ForeignKey::drop()
+                    .name("fk_users_org")
                     .table(Users::Table)
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_foreign_key(
-                ForeignKey::drop()
-                    .name("fk_users_org")
+            .drop_index(
+                Index::drop()
+                    .name("idx_users_org_id")
                     .table(Users::Table)
                     .to_owned(),
             )
@@ -370,50 +370,67 @@ impl Migration {
         db: &SchemaManagerConnection<'a>,
     ) -> Result<(), DbErr> {
         // 1. Add nullable org_id column
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Users::Table)
-                    .add_column(ColumnDef::new(Users::OrgId).string_len(36).null())
-                    .to_owned(),
-            )
-            .await?;
+        if !manager.has_column("users", "org_id").await? {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Users::Table)
+                        .add_column(ColumnDef::new(Users::OrgId).string_len(36).null())
+                        .to_owned(),
+                )
+                .await?;
+        }
 
         // 1b. Drop legacy unique index on email
         let _ = db.execute_unprepared("DROP INDEX email ON users").await;
         let _ = db.execute_unprepared("DROP INDEX email_2 ON users").await; // Sometimes created as duplicate
 
         // 2. Add foreign key
-        manager
-            .create_foreign_key(
-                ForeignKey::create()
-                    .name("fk_users_org")
-                    .from(Users::Table, Users::OrgId)
-                    .to(Organizations::Table, Organizations::Id)
-                    .on_delete(ForeignKeyAction::SetNull)
-                    .to_owned(),
+        if !self.mysql_foreign_key_exists(db, "fk_users_org").await? {
+            manager
+                .create_foreign_key(
+                    ForeignKey::create()
+                        .name("fk_users_org")
+                        .from(Users::Table, Users::OrgId)
+                        .to(Organizations::Table, Organizations::Id)
+                        .on_delete(ForeignKeyAction::SetNull)
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        // 3. MySQL does not support partial indexes. Materialize the nullable
+        // organization scope in a generated column, then index it with email.
+        // This avoids the functional-key syntax and remains compatible with
+        // MySQL 8.0/8.4 while preserving one platform user per email. It must
+        // remain VIRTUAL because org_id has an ON DELETE SET NULL foreign key;
+        // MySQL rejects that referential action for STORED generated bases.
+        if !manager.has_column("users", "org_id_email_scope").await? {
+            db.execute_unprepared(
+                "ALTER TABLE users ADD COLUMN org_id_email_scope VARCHAR(36) \
+                 GENERATED ALWAYS AS (COALESCE(org_id, '')) VIRTUAL",
             )
             .await?;
-
-        // 3. MySQL 8.0+ functional index approach
-        // Since MySQL doesn't support partial indexes, we use a functional unique index
-        // COALESCE(org_id, '') creates empty string for NULL, making (email, '') unique for platform users
-        // and (email, actual_org_id) unique for tenant users
-        db.execute_unprepared(
-            "CREATE UNIQUE INDEX idx_users_email_org ON users ((COALESCE(org_id, '')), email)",
-        )
-        .await?;
+        }
+        if !manager.has_index("users", "idx_users_email_org").await? {
+            db.execute_unprepared(
+                "CREATE UNIQUE INDEX idx_users_email_org ON users (org_id_email_scope, email)",
+            )
+            .await?;
+        }
 
         // 4. Create index on org_id for performance
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_users_org_id")
-                    .table(Users::Table)
-                    .col(Users::OrgId)
-                    .to_owned(),
-            )
-            .await?;
+        if !manager.has_index("users", "idx_users_org_id").await? {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("idx_users_org_id")
+                        .table(Users::Table)
+                        .col(Users::OrgId)
+                        .to_owned(),
+                )
+                .await?;
+        }
 
         Ok(())
     }
@@ -426,19 +443,25 @@ impl Migration {
         db.execute_unprepared("DROP INDEX idx_users_email_org ON users")
             .await?;
 
+        // Older installations may have applied the previous functional index
+        // form and therefore have no generated scope column.
+        let _ = db
+            .execute_unprepared("ALTER TABLE users DROP COLUMN org_id_email_scope")
+            .await;
+
         manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_users_org_id")
+            .drop_foreign_key(
+                ForeignKey::drop()
+                    .name("fk_users_org")
                     .table(Users::Table)
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_foreign_key(
-                ForeignKey::drop()
-                    .name("fk_users_org")
+            .drop_index(
+                Index::drop()
+                    .name("idx_users_org_id")
                     .table(Users::Table)
                     .to_owned(),
             )
@@ -459,6 +482,29 @@ impl Migration {
             .await;
 
         Ok(())
+    }
+
+    async fn mysql_foreign_key_exists<'a>(
+        &self,
+        db: &SchemaManagerConnection<'a>,
+        constraint_name: &str,
+    ) -> Result<bool, DbErr> {
+        let row = db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::MySql,
+                "SELECT COUNT(*) AS constraint_count \
+                 FROM information_schema.TABLE_CONSTRAINTS \
+                 WHERE CONSTRAINT_SCHEMA = DATABASE() \
+                   AND TABLE_NAME = 'users' \
+                   AND CONSTRAINT_NAME = ? \
+                   AND CONSTRAINT_TYPE = 'FOREIGN KEY'",
+                [constraint_name.into()],
+            ))
+            .await?;
+        let count = row
+            .ok_or_else(|| DbErr::Custom("failed to inspect MySQL foreign keys".to_owned()))?
+            .try_get::<i64>("", "constraint_count")?;
+        Ok(count > 0)
     }
 }
 

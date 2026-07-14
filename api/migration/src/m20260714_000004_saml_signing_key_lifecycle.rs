@@ -43,31 +43,59 @@ impl MigrationTrait for Migration {
                 .await?;
         }
 
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name(LIFECYCLE_INDEX)
-                    .table(SamlSigningKeys::Table)
-                    .col(SamlSigningKeys::ServiceId)
-                    .col(SamlSigningKeys::IsActive)
-                    .col(SamlSigningKeys::RetiredAt)
-                    .col(SamlSigningKeys::PublishUntil)
-                    .to_owned(),
-            )
-            .await
+        if !manager
+            .has_index("saml_signing_keys", LIFECYCLE_INDEX)
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .name(LIFECYCLE_INDEX)
+                        .table(SamlSigningKeys::Table)
+                        .col(SamlSigningKeys::ServiceId)
+                        .col(SamlSigningKeys::IsActive)
+                        .col(SamlSigningKeys::RetiredAt)
+                        .col(SamlSigningKeys::PublishUntil)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_index(
-                Index::drop()
-                    .if_exists()
-                    .name(LIFECYCLE_INDEX)
-                    .table(SamlSigningKeys::Table)
-                    .to_owned(),
-            )
-            .await?;
+        // MySQL may discard the original implicit service_id index after the
+        // broader lifecycle index can satisfy the foreign key. Recreate a
+        // dedicated supporting index before removing the lifecycle index.
+        if manager.get_database_backend() == sea_orm_migration::sea_orm::DbBackend::MySql
+            && !manager
+                .has_index("saml_signing_keys", "fk_saml_keys_service")
+                .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("fk_saml_keys_service")
+                        .table(SamlSigningKeys::Table)
+                        .col(SamlSigningKeys::ServiceId)
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        if manager
+            .has_index("saml_signing_keys", LIFECYCLE_INDEX)
+            .await?
+        {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name(LIFECYCLE_INDEX)
+                        .table(SamlSigningKeys::Table)
+                        .to_owned(),
+                )
+                .await?;
+        }
 
         for (name, column) in [
             ("retired_at", SamlSigningKeys::RetiredAt),
