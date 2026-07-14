@@ -45,7 +45,7 @@ time = { version = "0.3", features = ["serde", "formatting"] }
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8.6"
-hmac = "0.12"
+hmac = "0.13"
 futures = "0.3"
 async-trait = "0.1"
 num_cpus = "1.16"
