@@ -9,6 +9,7 @@ pub struct UserPasskeysStore;
 
 impl UserPasskeysStore {
     /// Create a new passkey
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         user_id: &str,

@@ -73,12 +73,6 @@ impl JobProcessor {
     /// 1. Continuously claim jobs up to max_concurrent_jobs limit
     /// 2. Each claimed job is processed in its own async task
     /// 3. When a slot frees up, immediately try to claim another job
-    /// Start the job processor worker with concurrent job processing
-    ///
-    /// Uses a concurrent claim-and-process pattern:
-    /// 1. Continuously claim jobs up to max_concurrent_jobs limit
-    /// 2. Each claimed job is processed in its own async task
-    /// 3. When a slot frees up, immediately try to claim another job
     pub async fn start(self) {
         tracing::info!(
             worker_id = %self.worker_id,

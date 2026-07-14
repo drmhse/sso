@@ -208,6 +208,7 @@ impl ServiceStore {
     }
 
     /// Update SAML configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_saml_config(
         db: DB<'_>,
         service_id: &str,

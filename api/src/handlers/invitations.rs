@@ -175,7 +175,6 @@ pub async fn create_invitation(
         token: Set(token_hash),
         expires_at: Set(expires_at.naive_utc()),
         created_at: Set(Utc::now().naive_utc()),
-        ..Default::default()
     };
 
     let invitation = new_invitation.insert(&state.db).await?;

@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible AuthOS defect without sensitive data
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities or include secrets here. Follow SECURITY.md for security-sensitive findings.
+  - type: input
+    id: version
+    attributes:
+      label: AuthOS version or commit
+      placeholder: v0.8.2 or a full commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database backend
+      options:
+        - SQLite
+        - PostgreSQL
+        - MySQL
+        - Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include installation method, operating system, architecture, proxy, and relevant SDK versions.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest sanitized reproduction you can.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or evidence
+      description: Remove credentials, tokens, private keys, personal data, and private infrastructure details.
+

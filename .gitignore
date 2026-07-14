@@ -4,7 +4,7 @@
 .LSOverride
 
 # Rust
-/target/
+**/target/
 **/*.rs.bk
 
 # Node

@@ -173,6 +173,7 @@ fn validate_service_redirect_uri(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_auth_link(
     web_client_url: &str,
     path: &str,
@@ -270,7 +271,7 @@ pub async fn register(
             .is_rate_limited_email(&req.email)
             .await
     {
-        tracing::warn!("Registration request rate limited for email: {}", req.email);
+        tracing::warn!("Registration request rate limited");
         return Err(AppError::TooManyRequests(
             "Too many registration attempts. Please try again later.".to_string(),
         ));
@@ -904,7 +905,7 @@ pub async fn login(
     let helper_org_slug = req.org_slug.clone();
     let helper_service_id = login_event_service_id.clone();
     let helper_ip = request_info.ip_address.clone();
-    let helper_risk_action = risk_assessment.action.clone();
+    let helper_risk_action = risk_assessment.action;
 
     // Generate device token outside transaction to avoid recreating it on retry if possible
     let device_token = state.risk_engine.generate_device_token(&user.id);
@@ -923,7 +924,7 @@ pub async fn login(
             let org_slug = helper_org_slug.clone();
             let service_id = helper_service_id.clone();
             let ip_address = helper_ip.clone();
-            let risk_action = helper_risk_action.clone();
+            let risk_action = helper_risk_action;
             let device_token = helper_device_token.clone();
 
             // Capture time/expirations for inside transaction consistency

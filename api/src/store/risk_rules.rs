@@ -21,7 +21,7 @@ impl RiskRulesStore {
             impossible_travel_score: Set(50),
             velocity_threshold: Set(10),
             velocity_score: Set(30),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 
@@ -50,6 +50,7 @@ impl RiskRulesStore {
     }
 
     /// Update risk rules
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         db: DB<'_>,
         org_id: &str,

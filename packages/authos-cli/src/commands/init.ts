@@ -94,7 +94,7 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
 
       execSync(installCmd, { cwd, stdio: 'inherit' });
       log.success(`Installed ${adapterPackage}`);
-    } catch (error) {
+    } catch {
       log.error(`Failed to install ${adapterPackage}`);
       log.info(`You can install it manually: npm install ${adapterPackage}`);
     }

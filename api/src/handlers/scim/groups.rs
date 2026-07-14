@@ -151,7 +151,7 @@ pub async fn list_groups(
     let base_url = &state.base_url;
     let include_resource = matches_filter && start_index <= 1 && count > 0;
     let scim_groups = if include_resource {
-        vec![org_to_scim_group(&state.db, org, &base_url).await?]
+        vec![org_to_scim_group(&state.db, org, base_url).await?]
     } else {
         vec![]
     };
@@ -173,7 +173,7 @@ pub async fn get_group(
     let org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     let base_url = &state.base_url;
-    let scim_group = org_to_scim_group(&state.db, org, &base_url).await?;
+    let scim_group = org_to_scim_group(&state.db, org, base_url).await?;
 
     Ok(Json(scim_group))
 }
@@ -265,7 +265,7 @@ pub async fn update_group(
         .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
     let base_url = &state.base_url;
-    let scim_group = org_to_scim_group(&state.db, updated_org, &base_url).await?;
+    let scim_group = org_to_scim_group(&state.db, updated_org, base_url).await?;
 
     Ok(Json(scim_group).into_response())
 }
@@ -375,7 +375,7 @@ pub async fn patch_group(
         .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
     let base_url = &state.base_url;
-    let scim_group = org_to_scim_group(&state.db, updated_org, &base_url).await?;
+    let scim_group = org_to_scim_group(&state.db, updated_org, base_url).await?;
 
     Ok(Json(scim_group).into_response())
 }

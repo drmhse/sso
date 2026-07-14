@@ -1,0 +1,71 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:15'
+      timezone: Africa/Nairobi
+    open-pull-requests-limit: 6
+    commit-message:
+      prefix: deps(npm)
+    groups:
+      npm-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /api
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:30'
+      timezone: Africa/Nairobi
+    open-pull-requests-limit: 6
+    commit-message:
+      prefix: deps(rust)
+    groups:
+      rust-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /api/migration
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:45'
+      timezone: Africa/Nairobi
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: deps(migration)
+    groups:
+      migration-minor-and-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:00'
+      timezone: Africa/Nairobi
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: deps(actions)
+    groups:
+      github-actions:
+        patterns:
+          - '*'

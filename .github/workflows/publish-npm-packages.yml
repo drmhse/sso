@@ -4,41 +4,143 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Package version to stamp during dry-run/manual publish
+        description: Package version to stamp during the dry run
         required: true
         default: 0.0.0-dry-run.0
         type: string
-      dry_run:
-        description: Run npm publish with --dry-run
-        required: true
-        default: true
-        type: boolean
   push:
     tags:
       - 'v*'
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: npm-publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  qualify:
+    name: Qualify npm release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "Release tag must be valid v-prefixed SemVer: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if [ "$(git cat-file -t "${RELEASE_TAG}")" != "tag" ]; then
+            echo "Release tags must be annotated: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if [ "$(git rev-list -n 1 "${RELEASE_TAG}")" != "${GITHUB_SHA}" ]; then
+            echo "The checked-out commit does not match ${RELEASE_TAG}." >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Release commit must be reachable from origin/main." >&2
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Validate trust and installer metadata
+        run: |
+          npm run check:trust
+          bash -n install.sh
+
+      - name: Build SDK dependency
+        run: npm run build:sdk
+
+      - name: Lint workspaces
+        run: npm run lint
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Test workspaces
+        run: npm run test --workspaces --if-present
+
+      - name: Build workspaces
+        run: npm run build
+
+      # A release tag represents the whole AuthOS source tree. Prevent npm
+      # packages from publishing when the API or a shipped database variant is
+      # broken, even if the JavaScript workspaces themselves are green.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --file api/Cargo.lock
+          cargo audit --file api/migration/Cargo.lock
+
+      - name: Qualify Rust API and database variants
+        working-directory: api
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path migration/Cargo.toml --all -- --check
+          cargo clippy --locked --package sso --all-targets --no-deps -- -D warnings
+          cargo clippy --manifest-path migration/Cargo.toml --locked --all-targets --no-deps -- -D warnings
+          cargo test --locked --package sso --all-targets
+          cargo test --manifest-path migration/Cargo.toml --locked --all-targets
+          cargo check --locked --package sso --no-default-features --features db_sqlite --all-targets
+          cargo check --locked --package sso --no-default-features --features db_psql --all-targets
+          cargo check --locked --package sso --no-default-features --features db_mysql --all-targets
+
   publish:
     name: Publish public npm workspaces
+    needs: qualify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      # Manual dispatch is deliberately incapable of publishing. Only an exact,
+      # qualified annotated tag can reach a real npm publish with provenance.
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
       MANUAL_VERSION: ${{ inputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: npm

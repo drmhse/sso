@@ -35,6 +35,7 @@ impl PlanStore {
     }
 
     /// Create a new plan
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         plan_id: &str,
@@ -69,6 +70,7 @@ impl PlanStore {
     }
 
     /// Update a plan
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         db: DB<'_>,
         plan_id: &str,

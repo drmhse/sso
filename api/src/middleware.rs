@@ -203,7 +203,7 @@ pub async fn extract_user_from_jwt(
         })?;
 
     // Validate token
-    let claims = jwt_service.validate_token(token)?;
+    let claims = jwt_service.validate_authos_token(token)?;
     let user_id = claims.sub.clone();
 
     // Extract IP and User-Agent before modifying request
@@ -250,7 +250,7 @@ pub async fn extract_user_from_jwt(
         // Normal authentication flow
         // Check if session is still valid (not revoked)
         let token_hash = JwtService::hash_token(token);
-        let session = SessionStore::find_valid_by_token_hash(DB::Conn(&db), &token_hash).await?;
+        let session = SessionStore::find_valid_by_token_hash(DB::Conn(db), &token_hash).await?;
 
         if session.is_none() {
             return Err(AppError::Unauthorized(
@@ -350,7 +350,7 @@ fn extract_user_agent(req: &Request) -> String {
     req.headers()
         .get("User-Agent")
         .and_then(|header| header.to_str().ok())
-        .unwrap_or_else(|| "unknown")
+        .unwrap_or("unknown")
         .to_string()
 }
 

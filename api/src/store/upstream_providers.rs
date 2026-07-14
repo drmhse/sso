@@ -124,7 +124,7 @@ impl UpstreamProviderStore {
             issuer: Set(issuer.map(|s| s.to_string())),
             metadata: Set(metadata.map(|s| s.to_string())),
             enabled: Set(true),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 

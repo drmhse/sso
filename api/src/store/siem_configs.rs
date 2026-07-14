@@ -16,6 +16,7 @@ pub struct SiemConfigStore;
 
 impl SiemConfigStore {
     /// Create a new SIEM configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         org_id: &str,
@@ -42,7 +43,7 @@ impl SiemConfigStore {
             last_successful_batch_at: Set(None),
             last_processed_log_id: Set(None),
             failure_count: Set(0),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 
@@ -105,6 +106,7 @@ impl SiemConfigStore {
     }
 
     /// Update SIEM configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         db: DB<'_>,
         id: &str,
@@ -222,7 +224,7 @@ impl SiemConfigStore {
             .into();
 
         let now = Utc::now().naive_utc();
-        active_model.last_successful_batch_at = Set(Some(now.clone()));
+        active_model.last_successful_batch_at = Set(Some(now));
         active_model.last_processed_log_id = Set(last_log_id);
         active_model.failure_count = Set(0);
         active_model.updated_at = Set(now);

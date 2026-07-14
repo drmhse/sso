@@ -218,6 +218,7 @@ impl JwtService {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_mfa_preauth_token_with_resource(
         &self,
         user_id: &str,
@@ -261,9 +262,58 @@ impl JwtService {
     }
 
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
+        self.validate_token_with_audience(token, None)
+    }
+
+    /// Validate a token presented to AuthOS's own authenticated API.
+    ///
+    /// Resource-scoped access tokens are deliberately rejected here: a token
+    /// minted for an external resource server must not be usable as a
+    /// management-session token at AuthOS itself.
+    pub fn validate_authos_token(&self, token: &str) -> Result<Claims> {
+        let claims = self.validate_token(token)?;
+        let expected_audience = if claims.act.is_some() {
+            "impersonation-session".to_string()
+        } else {
+            Self::audience_for(claims.org.as_deref(), claims.service.as_deref())
+                .expect("access-token audience profiles are exhaustive")
+        };
+
+        if claims.aud.as_deref() != Some(expected_audience.as_str()) {
+            return Err(AppError::Unauthorized(
+                "Token audience is not valid for the AuthOS API".to_string(),
+            ));
+        }
+
+        Ok(claims)
+    }
+
+    /// Validate an access token for one specific resource audience.
+    pub fn validate_token_for_audience(
+        &self,
+        token: &str,
+        expected_audience: &str,
+    ) -> Result<Claims> {
+        self.validate_token_with_audience(token, Some(expected_audience))
+    }
+
+    fn validate_token_with_audience(
+        &self,
+        token: &str,
+        expected_audience: Option<&str>,
+    ) -> Result<Claims> {
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-        validation.validate_aud = false;
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[self.issuer.as_str()]);
+        if let Some(audience) = expected_audience {
+            validation.set_audience(&[audience]);
+        } else {
+            // The generic validator is shared by multiple explicit token
+            // profiles. Consumers that know their resource audience must use
+            // `validate_token_for_audience`; AuthOS routes use
+            // `validate_authos_token`.
+            validation.validate_aud = false;
+        }
 
         let token_data =
             decode::<Claims>(token, &self.decoding_key, &validation).map_err(AppError::Jwt)?;
@@ -279,6 +329,7 @@ impl JwtService {
 
     /// Create an impersonation token (RFC 8693)
     /// This allows an admin to impersonate another user
+    #[allow(clippy::too_many_arguments)]
     pub fn create_impersonation_token(
         &self,
         target_user_id: &str,       // user being impersonated
@@ -392,25 +443,14 @@ impl JwtService {
         }
 
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-        validation.validate_aud = false;
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.set_audience(&[expected_audience.trim_end_matches('/')]);
 
         let token_data =
             decode::<IdJagClaims>(token, &self.decoding_key, &validation).map_err(AppError::Jwt)?;
 
         let claims = token_data.claims;
-        if claims.iss != self.issuer {
-            return Err(AppError::Unauthorized(
-                "Invalid JWT authorization grant issuer".to_string(),
-            ));
-        }
-
-        if claims.aud != expected_audience.trim_end_matches('/') {
-            return Err(AppError::Unauthorized(
-                "Invalid JWT authorization grant audience".to_string(),
-            ));
-        }
-
         Ok(claims)
     }
 }
@@ -451,6 +491,57 @@ mod tests {
         assert_eq!(claims.service, Some("analytics".to_string()));
         assert_eq!(claims.iss, Some("https://auth.example.com".to_string()));
         assert_eq!(claims.aud, Some("service:acme-corp/analytics".to_string()));
+
+        let other_issuer = JwtService::new(
+            private_key,
+            public_key,
+            24,
+            "test-key-id",
+            "https://other-issuer.example.com",
+        )
+        .unwrap();
+        let wrong_issuer_token = other_issuer
+            .create_token("user_123", "user@example.com", false, None, None)
+            .unwrap();
+        assert!(matches!(
+            jwt_service.validate_token(&wrong_issuer_token),
+            Err(AppError::Jwt(error))
+                if matches!(error.kind(), jsonwebtoken::errors::ErrorKind::InvalidIssuer)
+        ));
+
+        let mut missing_audience_claims = claims.clone();
+        missing_audience_claims.aud = None;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-id".to_string());
+        let missing_audience_token =
+            encode(&header, &missing_audience_claims, &jwt_service.encoding_key).unwrap();
+        assert!(matches!(
+            jwt_service.validate_token(&missing_audience_token),
+            Err(AppError::Jwt(error))
+                if matches!(
+                    error.kind(),
+                    jsonwebtoken::errors::ErrorKind::MissingRequiredClaim(claim)
+                        if claim == "aud"
+                )
+        ));
+
+        assert!(jwt_service.validate_authos_token(&token).is_ok());
+
+        let impersonation_token = jwt_service
+            .create_impersonation_token(
+                "target-user",
+                "target@example.com",
+                "admin-user",
+                "admin@example.com",
+                Some("support request"),
+                Some("acme-corp"),
+                Some("analytics"),
+                false,
+            )
+            .unwrap();
+        assert!(jwt_service
+            .validate_authos_token(&impersonation_token)
+            .is_ok());
     }
 
     #[test]
@@ -482,6 +573,16 @@ mod tests {
         assert_eq!(claims.org, Some("acme-corp".to_string()));
         assert_eq!(claims.service, Some("analytics".to_string()));
         assert_eq!(claims.aud, Some("https://api.example.com/mcp".to_string()));
+
+        assert!(jwt_service.validate_authos_token(&token).is_err());
+        assert!(jwt_service
+            .validate_token_for_audience(&token, "https://api.example.com/mcp")
+            .is_ok());
+        assert!(matches!(
+            jwt_service.validate_token_for_audience(&token, "https://api.example.com/other"),
+            Err(AppError::Jwt(error))
+                if matches!(error.kind(), jsonwebtoken::errors::ErrorKind::InvalidAudience)
+        ));
     }
 
     #[test]

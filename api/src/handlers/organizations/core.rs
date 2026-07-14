@@ -1057,7 +1057,7 @@ pub async fn update_risk_settings(
 
     // Validate thresholds if provided
     if let Some(low) = req.low_threshold {
-        if low < 0 || low > 100 {
+        if !(0..=100).contains(&low) {
             return Err(AppError::BadRequest(
                 "Low threshold must be between 0 and 100".to_string(),
             ));
@@ -1065,7 +1065,7 @@ pub async fn update_risk_settings(
     }
 
     if let Some(medium) = req.medium_threshold {
-        if medium < 0 || medium > 100 {
+        if !(0..=100).contains(&medium) {
             return Err(AppError::BadRequest(
                 "Medium threshold must be between 0 and 100".to_string(),
             ));
@@ -1082,7 +1082,7 @@ pub async fn update_risk_settings(
 
     // Validate scores if provided
     if let Some(score) = req.new_device_score {
-        if score < 0 || score > 100 {
+        if !(0..=100).contains(&score) {
             return Err(AppError::BadRequest(
                 "New device score must be between 0 and 100".to_string(),
             ));
@@ -1090,7 +1090,7 @@ pub async fn update_risk_settings(
     }
 
     if let Some(score) = req.impossible_travel_score {
-        if score < 0 || score > 100 {
+        if !(0..=100).contains(&score) {
             return Err(AppError::BadRequest(
                 "Impossible travel score must be between 0 and 100".to_string(),
             ));
@@ -1098,7 +1098,7 @@ pub async fn update_risk_settings(
     }
 
     if let Some(score) = req.velocity_score {
-        if score < 0 || score > 100 {
+        if !(0..=100).contains(&score) {
             return Err(AppError::BadRequest(
                 "Velocity score must be between 0 and 100".to_string(),
             ));

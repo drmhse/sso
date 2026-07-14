@@ -1,4 +1,4 @@
-import { defineComponent, type PropType } from 'vue';
+import { defineComponent } from 'vue';
 import { useAuthOS } from '../composables/useAuthOS';
 
 /**

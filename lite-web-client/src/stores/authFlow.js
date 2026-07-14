@@ -36,7 +36,7 @@ function readState() {
       sessionStorage.removeItem(STORAGE_KEY);
     }
     return { mfaChallenge };
-  } catch (error) {
+  } catch {
     sessionStorage.removeItem(STORAGE_KEY);
     return { mfaChallenge: null };
   }

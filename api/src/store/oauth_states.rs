@@ -64,7 +64,6 @@ impl OAuthStateStore {
             resource: Set(resource.map(|s| s.to_string())),
             created_at: Set(now),
             expires_at: Set(*expires_at),
-            ..Default::default()
         };
 
         let oauth_state = new_state.insert(&db).await?;

@@ -35,7 +35,7 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts,.tsx",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" tsdown.config.mjs --max-warnings 0",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

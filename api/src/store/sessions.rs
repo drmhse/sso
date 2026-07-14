@@ -59,6 +59,7 @@ impl SessionStore {
     }
 
     /// Create a new session
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         user_id: &str,

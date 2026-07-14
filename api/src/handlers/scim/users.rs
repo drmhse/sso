@@ -184,7 +184,7 @@ pub async fn list_users(
     let base_url = &state.base_url;
     let scim_users: Vec<ScimUser> = users
         .into_iter()
-        .map(|u| user_to_scim(u, &base_url))
+        .map(|u| user_to_scim(u, base_url))
         .collect();
 
     Ok(Json(ScimListResponse::new(
@@ -224,7 +224,7 @@ pub async fn get_user(
     }
 
     let base_url = &state.base_url;
-    Ok(Json(user_to_scim(user, &base_url)).into_response())
+    Ok(Json(user_to_scim(user, base_url)).into_response())
 }
 
 /// Create User - POST /scim/v2/Users
@@ -319,7 +319,7 @@ pub async fn create_user(
     );
 
     let base_url = &state.base_url;
-    let scim_user = user_to_scim(created_user, &base_url);
+    let scim_user = user_to_scim(created_user, base_url);
 
     Ok((StatusCode::CREATED, Json(scim_user)).into_response())
 }
@@ -375,7 +375,7 @@ pub async fn update_user(
     // These are provided in SCIM requests but not persisted to the database
     // The user_to_scim function will return None for these fields
     let base_url = &state.base_url;
-    Ok(Json(user_to_scim(updated_user, &base_url)).into_response())
+    Ok(Json(user_to_scim(updated_user, base_url)).into_response())
 }
 
 /// Patch User (PATCH) - PATCH /scim/v2/Users/:id
@@ -488,7 +488,7 @@ pub async fn patch_user(
     let updated_user = active_user.update(&state.db).await?;
 
     let base_url = &state.base_url;
-    Ok(Json(user_to_scim(updated_user, &base_url)).into_response())
+    Ok(Json(user_to_scim(updated_user, base_url)).into_response())
 }
 
 /// Delete User - DELETE /scim/v2/Users/:id

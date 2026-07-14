@@ -38,7 +38,7 @@
 import { computed } from 'vue';
 import BaseButton from '@/components/BaseButton.vue';
 
-const props = defineProps({
+defineProps({
   open: { type: Boolean, default: false },
   title: { type: String, default: '' },
   description: { type: String, default: '' },

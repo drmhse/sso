@@ -228,7 +228,7 @@ pub async fn revoke_token(
                 SessionStore::find_by_token_hash(DB::Conn(&state.db), &token_hash).await
             {
                 let _ = SessionStore::delete_by_token_hash(DB::Conn(&state.db), &token_hash).await;
-                tracing::info!(token_hash = %token_hash, "Access token revoked via RFC 7009");
+                tracing::info!("Access token revoked via RFC 7009");
             }
         }
     }
