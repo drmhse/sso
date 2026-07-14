@@ -41,6 +41,7 @@ impl ApiKeyStore {
     }
 
     /// Create a new API key
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         service_id: &str,

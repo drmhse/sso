@@ -194,6 +194,7 @@ async fn process_billing_event(
 }
 
 /// Handle subscription created/updated events
+#[allow(clippy::too_many_arguments)]
 async fn handle_subscription_event(
     pool: &DatabaseConnection,
     #[cfg(feature = "db_sqlite")] db_writer: &DatabaseConnection,

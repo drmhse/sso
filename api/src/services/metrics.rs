@@ -76,6 +76,7 @@ impl MfaMetricsService {
 
     /// Record a MFA feature usage event
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_feature_usage(
         &self,
         org_id: &str,

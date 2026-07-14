@@ -65,7 +65,6 @@ export const SignUp = defineComponent({
 
     // OAuth config check
     const hasOAuthConfig = !!(options.org && options.service);
-    // @ts-ignore - PropType casting issues with mixed types
     const oauthProviders = Array.isArray(props.providers) ? props.providers : [];
 
     async function submit() {

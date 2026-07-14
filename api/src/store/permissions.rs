@@ -107,6 +107,7 @@ impl PermissionsStore {
     }
 
     /// Internal check function with depth limiting to prevent infinite recursion
+    #[allow(clippy::too_many_arguments)]
     fn check_with_depth<'a>(
         db: DB<'a>,
         namespace: &'a str,

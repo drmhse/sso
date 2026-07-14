@@ -8,6 +8,7 @@ mod encryption;
 mod entities;
 mod error;
 mod handlers;
+mod http_security;
 mod jobs;
 mod lite_web;
 mod middleware;
@@ -33,7 +34,8 @@ use crate::jobs::saml_state_cleanup::SamlStateCleanupJob;
 use crate::jobs::token_refresh::TokenRefreshJob;
 use crate::state::AppState;
 use axum::extract::State;
-use axum::http::{header, HeaderValue};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum::{
     routing::{get, post},
@@ -124,9 +126,28 @@ struct OidcDiscoveryResponse {
 
 /// Prometheus metrics endpoint
 async fn metrics_handler(
+    headers: HeaderMap,
     prometheus_handle: axum::extract::Extension<Arc<metrics_exporter_prometheus::PrometheusHandle>>,
-) -> String {
-    prometheus_handle.render()
+    metrics_access: axum::extract::Extension<crate::http_security::MetricsAccess>,
+) -> Response {
+    match metrics_access.authorize(headers.get(header::AUTHORIZATION)) {
+        crate::http_security::MetricsAuthorization::Authorized => (
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            prometheus_handle.render(),
+        )
+            .into_response(),
+        crate::http_security::MetricsAuthorization::Unauthorized => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response(),
+        crate::http_security::MetricsAuthorization::Disabled => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 async fn oidc_discovery_handler(
@@ -245,11 +266,30 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = Config::from_env().expect("Failed to load configuration");
+    let http_security_config = crate::http_security::HttpSecurityConfig::from_env()
+        .expect("Failed to load HTTP security configuration");
+
+    // Validate secret encryption before touching the database. Normal server
+    // operation fails closed when the key is missing or malformed.
+    let encryption = EncryptionService::for_server_startup()?;
+    if encryption.is_some() {
+        tracing::info!("Encryption service initialized");
+    } else {
+        tracing::warn!(
+            "UNENCRYPTED DEVELOPMENT MODE ENABLED via {} - selected secrets may be stored in plaintext; do not use this mode with persistent or production data",
+            crate::encryption::ALLOW_UNENCRYPTED_DEVELOPMENT_ENV
+        );
+    }
 
     // Initialize database using SeaORM
+    let database_backend = config
+        .database_url
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .unwrap_or("unknown");
     tracing::info!(
-        "Connecting to database: {} (pool: {}-{} connections)",
-        config.database_url,
+        "Connecting to {} database (pool: {}-{} connections)",
+        database_backend,
         config.db_min_connections,
         config.db_max_connections
     );
@@ -275,14 +315,6 @@ async fn main() -> anyhow::Result<()> {
         UserStore::bootstrap_platform_owner(DbEnum::Conn(&db), email, password).await?;
     } else if let Some(email) = config.platform_owner_email.as_ref() {
         ensure_platform_owner(&db, email).await?;
-    }
-
-    // Initialize encryption service (optional)
-    let encryption = EncryptionService::new().ok();
-    if encryption.is_some() {
-        tracing::info!("Encryption service initialized");
-    } else {
-        tracing::warn!("Encryption service not available - tokens will be stored in plaintext");
     }
 
     // Initialize email service (optional)
@@ -620,6 +652,7 @@ async fn main() -> anyhow::Result<()> {
         // Prometheus metrics endpoint
         .route("/metrics", get(metrics_handler))
         .layer(axum::Extension(Arc::new(prometheus_handle)))
+        .layer(axum::Extension(http_security_config.metrics_access.clone()))
         // Request info extraction (IP and User-Agent) - must be before auth
         .layer(axum::middleware::from_fn(
             crate::middleware::extract_request_info_middleware,
@@ -653,6 +686,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
             30,
         )))
+        // Bound streamed and buffered bodies before handlers allocate unbounded input.
+        .layer(http_security_config.request_body_limit_layer())
         // HTTP request duration metrics - outermost layer to capture full request lifecycle
         // This measures time including CORS handling, auth, and all other middleware
         .layer(axum::middleware::from_fn(

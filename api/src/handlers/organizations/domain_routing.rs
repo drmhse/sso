@@ -112,12 +112,10 @@ async fn ensure_provider_belongs_to_org(
             .await?
             .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
 
-        if provider.org_id != org_id {
-            if !UpstreamProviderStore::allows_domain_bindings(&provider) {
-                return Err(AppError::NotFound(
-                    "Upstream provider not found".to_string(),
-                ));
-            }
+        if provider.org_id != org_id && !UpstreamProviderStore::allows_domain_bindings(&provider) {
+            return Err(AppError::NotFound(
+                "Upstream provider not found".to_string(),
+            ));
         }
     }
 

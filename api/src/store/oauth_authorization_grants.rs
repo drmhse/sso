@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub struct OAuthAuthorizationGrantStore;
 
 impl OAuthAuthorizationGrantStore {
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         token_hash: &str,

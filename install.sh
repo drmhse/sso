@@ -43,12 +43,15 @@ main() {
   require_command curl
   require_command tar
   require_command mktemp
+  require_command sha256sum
 
-  local authos_arch bundle_name archive_name archive_url temp_dir
+  local authos_arch bundle_name archive_name archive_url checksum_name checksum_url temp_dir
   authos_arch="$(detect_arch)"
   bundle_name="authos-sqlite-linux-${authos_arch}"
   archive_name="${bundle_name}.tar.gz"
   archive_url="$(build_release_url "$archive_name")"
+  checksum_name="SHA256SUMS.txt"
+  checksum_url="$(build_release_url "$checksum_name")"
   temp_dir="$(mktemp -d)"
 
   cleanup() {
@@ -58,6 +61,13 @@ main() {
 
   echo "Downloading ${archive_name}..."
   curl -fsSL -o "${temp_dir}/${archive_name}" "$archive_url"
+  curl -fsSL -o "${temp_dir}/${checksum_name}" "$checksum_url"
+
+  echo "Verifying ${archive_name}..."
+  (
+    cd "$temp_dir"
+    sha256sum --ignore-missing --check "$checksum_name"
+  )
 
   echo "Extracting ${archive_name}..."
   tar -xzf "${temp_dir}/${archive_name}" -C "$temp_dir"

@@ -33,7 +33,7 @@ pub fn validate_requested_resource(
     validate_resource_uri(resource)?;
 
     let registered_resources = registered_resources_json
-        .map(|raw| serde_json::from_str::<Vec<String>>(raw))
+        .map(serde_json::from_str::<Vec<String>>)
         .transpose()
         .map_err(|_| AppError::InternalServerError("Invalid service resource URIs".to_string()))?
         .unwrap_or_default();

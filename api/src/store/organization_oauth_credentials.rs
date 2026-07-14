@@ -53,7 +53,7 @@ impl OrganizationOAuthCredentialsStore {
                 client_id: Set(client_id.to_string()),
                 client_secret_encrypted: Set(client_secret_encrypted),
                 encryption_key_id: Set(encryption_key_id.to_string()),
-                created_at: Set(now.clone()),
+                created_at: Set(now),
                 updated_at: Set(now),
             };
 

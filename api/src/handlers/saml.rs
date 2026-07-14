@@ -25,7 +25,14 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
 use uuid::Uuid;
+
+/// Maximum decoded XML accepted from a SAML request. This bound is applied
+/// after HTTP-Redirect DEFLATE expansion so a small compressed query cannot
+/// cause unbounded allocation.
+const MAX_SAML_REQUEST_XML_BYTES: usize = 1_048_576;
+const MAX_SAML_REQUEST_ENCODED_BYTES: usize = 262_144;
 
 // Security Audit Item 7: XXE (XML External Entity) Prevention
 // This function validates XML input to prevent XXE attacks which could lead to:
@@ -73,6 +80,250 @@ fn validate_xml_no_xxe(xml: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedAuthnRequest {
+    request_id: Option<String>,
+    issuer: Option<String>,
+    acs_url: Option<String>,
+    destination: Option<String>,
+}
+
+fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Result<String> {
+    let name = reference.decode().map_err(|error| {
+        AppError::BadRequest(format!("Invalid SAMLRequest entity encoding: {}", error))
+    })?;
+    let encoded = format!("&{};", name);
+
+    quick_xml::escape::unescape(&encoded)
+        .map(|value| value.into_owned())
+        .map_err(|error| {
+            AppError::BadRequest(format!(
+                "Invalid or unknown SAMLRequest entity reference: {}",
+                error
+            ))
+        })
+}
+
+fn is_authn_request_element(name: &[u8]) -> bool {
+    matches!(name, b"samlp:AuthnRequest" | b"AuthnRequest")
+}
+
+fn read_saml_xml_bounded(reader: impl Read, operation: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_SAML_REQUEST_XML_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| AppError::BadRequest(format!("Failed to {operation}: {error}")))?;
+
+    if bytes.len() > MAX_SAML_REQUEST_XML_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "Decoded SAMLRequest exceeds the {MAX_SAML_REQUEST_XML_BYTES}-byte limit"
+        )));
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|error| AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {error}")))
+}
+
+/// Decode a SAML request for either HTTP-Redirect (raw RFC 1951 DEFLATE) or
+/// HTTP-POST (plain XML) binding while bounding the decoded representation.
+fn decode_saml_request_xml(encoded: &str, redirect_binding: bool) -> Result<String> {
+    if encoded.len() > MAX_SAML_REQUEST_ENCODED_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "Encoded SAMLRequest exceeds the {MAX_SAML_REQUEST_ENCODED_BYTES}-byte limit"
+        )));
+    }
+
+    let payload = BASE64
+        .decode(encoded)
+        .map_err(|error| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {error}")))?;
+
+    if redirect_binding {
+        let decoder = flate2::read::DeflateDecoder::new(payload.as_slice());
+        read_saml_xml_bounded(decoder, "inflate SAMLRequest")
+    } else {
+        read_saml_xml_bounded(payload.as_slice(), "read SAMLRequest")
+    }
+}
+
+/// Parse the fields AuthOS consumes from an SP-initiated AuthnRequest.
+///
+/// This stays intentionally separate from XML signature validation. It rejects
+/// DTD/entity declarations, malformed XML, malformed attributes, and unknown
+/// entity references before returning any request data.
+fn parse_authn_request(xml: &str) -> Result<ParsedAuthnRequest> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    validate_xml_no_xxe(xml)?;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut parsed = ParsedAuthnRequest::default();
+    let mut in_issuer = false;
+    let mut open_elements = 0_usize;
+    let mut seen_authn_request = false;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(element)) => {
+                if open_elements == 0 {
+                    if seen_authn_request || !is_authn_request_element(element.name().as_ref()) {
+                        return Err(AppError::BadRequest(
+                            "SAMLRequest root element must be AuthnRequest".into(),
+                        ));
+                    }
+                    seen_authn_request = true;
+                } else if is_authn_request_element(element.name().as_ref()) {
+                    return Err(AppError::BadRequest(
+                        "SAMLRequest must contain exactly one AuthnRequest element".into(),
+                    ));
+                }
+                open_elements += 1;
+                match element.name().as_ref() {
+                    b"samlp:AuthnRequest" | b"AuthnRequest" => {
+                        for attribute in element.attributes() {
+                            let attribute = attribute.map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid SAMLRequest attribute: {}",
+                                    error
+                                ))
+                            })?;
+                            let value = attribute
+                                .decoded_and_normalized_value(
+                                    quick_xml::XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| {
+                                    AppError::BadRequest(format!(
+                                        "Invalid SAMLRequest attribute value: {}",
+                                        error
+                                    ))
+                                })?
+                                .into_owned();
+
+                            match attribute.key.as_ref() {
+                                b"ID" => parsed.request_id = Some(value),
+                                b"AssertionConsumerServiceURL" => parsed.acs_url = Some(value),
+                                b"Destination" => parsed.destination = Some(value),
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"saml:Issuer" | b"Issuer" => {
+                        in_issuer = true;
+                        parsed.issuer = Some(String::new());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                if open_elements == 0 {
+                    if seen_authn_request || !is_authn_request_element(element.name().as_ref()) {
+                        return Err(AppError::BadRequest(
+                            "SAMLRequest root element must be AuthnRequest".into(),
+                        ));
+                    }
+                    seen_authn_request = true;
+                } else if is_authn_request_element(element.name().as_ref()) {
+                    return Err(AppError::BadRequest(
+                        "SAMLRequest must contain exactly one AuthnRequest element".into(),
+                    ));
+                }
+
+                if is_authn_request_element(element.name().as_ref()) {
+                    for attribute in element.attributes() {
+                        let attribute = attribute.map_err(|error| {
+                            AppError::BadRequest(format!(
+                                "Invalid SAMLRequest attribute: {}",
+                                error
+                            ))
+                        })?;
+                        let value = attribute
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid SAMLRequest attribute value: {}",
+                                    error
+                                ))
+                            })?
+                            .into_owned();
+
+                        match attribute.key.as_ref() {
+                            b"ID" => parsed.request_id = Some(value),
+                            b"AssertionConsumerServiceURL" => parsed.acs_url = Some(value),
+                            b"Destination" => parsed.destination = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(element)) => {
+                if matches!(element.name().as_ref(), b"saml:Issuer" | b"Issuer") {
+                    in_issuer = false;
+                }
+                open_elements = open_elements.checked_sub(1).ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Error parsing SAMLRequest XML: unexpected closing element".into(),
+                    )
+                })?;
+            }
+            Ok(Event::Text(text)) if in_issuer => {
+                let decoded = text.decode().map_err(|error| {
+                    AppError::BadRequest(format!("Invalid SAMLRequest text encoding: {}", error))
+                })?;
+                parsed.issuer.get_or_insert_default().push_str(
+                    &quick_xml::escape::unescape(&decoded).map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "Invalid SAMLRequest text escaping: {}",
+                            error
+                        ))
+                    })?,
+                );
+            }
+            Ok(Event::GeneralRef(reference)) if in_issuer => {
+                parsed
+                    .issuer
+                    .get_or_insert_default()
+                    .push_str(&decode_xml_reference(&reference)?);
+            }
+            Ok(Event::DocType(_)) | Ok(Event::GeneralRef(_)) => {
+                return Err(AppError::BadRequest(
+                    "XML entity declarations and references are forbidden in SAML requests".into(),
+                ));
+            }
+            Ok(Event::Eof) => {
+                if open_elements != 0 {
+                    return Err(AppError::BadRequest(
+                        "Error parsing SAMLRequest XML: unclosed element".into(),
+                    ));
+                }
+                if !seen_authn_request {
+                    return Err(AppError::BadRequest(
+                        "SAMLRequest root element must be AuthnRequest".into(),
+                    ));
+                }
+                break;
+            }
+            Err(error) => {
+                return Err(AppError::BadRequest(format!(
+                    "Error parsing SAMLRequest XML: {}",
+                    error
+                )));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(parsed)
+}
+
 fn escape_html_attr(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -93,7 +344,7 @@ struct SamlResponseBuilder {
     name_id_format: String,
     email: String,
     sp_entity_id: String,
-    attribute_statement: String,
+    attributes: Vec<(String, String)>,
     in_response_to: Option<String>,
 }
 
@@ -104,7 +355,7 @@ impl SamlResponseBuilder {
         acs_url: &str,
         sp_entity_id: &str,
         name_id_format: &str,
-        attribute_statement: String,
+        attributes: Vec<(String, String)>,
         in_response_to: Option<String>,
     ) -> Self {
         let now = Utc::now();
@@ -120,17 +371,20 @@ impl SamlResponseBuilder {
             name_id_format: name_id_format.to_string(),
             email: user_email.to_string(),
             sp_entity_id: sp_entity_id.to_string(),
-            attribute_statement,
+            attributes,
             in_response_to,
         }
     }
 
-    fn build_assertion(&self) -> String {
+    fn build_assertion(&self) -> Result<String> {
         use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use quick_xml::Writer;
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let write_error = |error| {
+            AppError::InternalServerError(format!("Failed to build SAML assertion XML: {error}"))
+        };
 
         // Start saml:Assertion
         let mut assertion = BytesStart::new("saml:Assertion");
@@ -138,27 +392,45 @@ impl SamlResponseBuilder {
         assertion.push_attribute(("ID", self.assertion_id.as_str()));
         assertion.push_attribute(("Version", "2.0"));
         assertion.push_attribute(("IssueInstant", self.issue_instant.to_rfc3339().as_str()));
-        let _ = writer.write_event(Event::Start(assertion));
+        writer
+            .write_event(Event::Start(assertion))
+            .map_err(write_error)?;
 
         // Issuer - properly escaped
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Issuer")));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.entity_id)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Issuer")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Issuer")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.entity_id)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Issuer")))
+            .map_err(write_error)?;
 
         // Subject
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Subject")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Subject")))
+            .map_err(write_error)?;
 
         // NameID - user email is properly escaped to prevent injection
         let mut name_id = BytesStart::new("saml:NameID");
         name_id.push_attribute(("Format", self.name_id_format.as_str()));
-        let _ = writer.write_event(Event::Start(name_id));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.email)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:NameID")));
+        writer
+            .write_event(Event::Start(name_id))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.email)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:NameID")))
+            .map_err(write_error)?;
 
         // SubjectConfirmation
         let mut subj_conf = BytesStart::new("saml:SubjectConfirmation");
         subj_conf.push_attribute(("Method", "urn:oasis:names:tc:SAML:2.0:cm:bearer"));
-        let _ = writer.write_event(Event::Start(subj_conf));
+        writer
+            .write_event(Event::Start(subj_conf))
+            .map_err(write_error)?;
 
         // SubjectConfirmationData
         let mut subj_conf_data = BytesStart::new("saml:SubjectConfirmationData");
@@ -167,59 +439,117 @@ impl SamlResponseBuilder {
         }
         subj_conf_data.push_attribute(("NotOnOrAfter", self.not_on_or_after.to_rfc3339().as_str()));
         subj_conf_data.push_attribute(("Recipient", self.acs_url.as_str()));
-        let _ = writer.write_event(Event::Empty(subj_conf_data));
+        writer
+            .write_event(Event::Empty(subj_conf_data))
+            .map_err(write_error)?;
 
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:SubjectConfirmation")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Subject")));
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:SubjectConfirmation")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Subject")))
+            .map_err(write_error)?;
 
         // Conditions
         let mut conditions = BytesStart::new("saml:Conditions");
         conditions.push_attribute(("NotBefore", self.issue_instant.to_rfc3339().as_str()));
         conditions.push_attribute(("NotOnOrAfter", self.not_on_or_after.to_rfc3339().as_str()));
-        let _ = writer.write_event(Event::Start(conditions));
+        writer
+            .write_event(Event::Start(conditions))
+            .map_err(write_error)?;
 
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AudienceRestriction")));
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Audience")));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.sp_entity_id)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Audience")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AudienceRestriction")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Conditions")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AudienceRestriction")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Audience")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.sp_entity_id)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Audience")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AudienceRestriction")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Conditions")))
+            .map_err(write_error)?;
 
         // AuthnStatement
         let mut authn_stmt = BytesStart::new("saml:AuthnStatement");
         authn_stmt.push_attribute(("AuthnInstant", self.issue_instant.to_rfc3339().as_str()));
-        let _ = writer.write_event(Event::Start(authn_stmt));
+        writer
+            .write_event(Event::Start(authn_stmt))
+            .map_err(write_error)?;
 
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AuthnContext")));
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AuthnContextClassRef")));
-        let _ = writer.write_event(Event::Text(BytesText::new(
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified",
-        )));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AuthnContextClassRef")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AuthnContext")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AuthnStatement")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AuthnContext")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AuthnContextClassRef")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(
+                "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified",
+            )))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AuthnContextClassRef")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AuthnContext")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AuthnStatement")))
+            .map_err(write_error)?;
 
-        // AttributeStatement - already formatted, write as raw XML
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AttributeStatement")));
-        // Note: attribute_statement is pre-built; in a full refactor, this should also use Writer
-        let _ = writer
-            .get_mut()
-            .get_mut()
-            .extend_from_slice(self.attribute_statement.as_bytes());
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AttributeStatement")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AttributeStatement")))
+            .map_err(write_error)?;
+        for (name, value) in &self.attributes {
+            let mut attribute = BytesStart::new("saml:Attribute");
+            attribute.push_attribute(("Name", name.as_str()));
+            writer
+                .write_event(Event::Start(attribute))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::Start(BytesStart::new("saml:AttributeValue")))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::Text(BytesText::new(value)))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::End(BytesEnd::new("saml:AttributeValue")))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::End(BytesEnd::new("saml:Attribute")))
+                .map_err(write_error)?;
+        }
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AttributeStatement")))
+            .map_err(write_error)?;
 
         // End Assertion
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Assertion")));
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Assertion")))
+            .map_err(write_error)?;
 
-        String::from_utf8(writer.into_inner().into_inner()).unwrap_or_default()
+        String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+            AppError::InternalServerError(format!("SAML assertion was not valid UTF-8: {error}"))
+        })
     }
 
-    fn build_response(&self, assertion_with_signature: &str) -> String {
+    fn build_response(&self, assertion_with_signature: &str) -> Result<String> {
         use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use quick_xml::Writer;
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let write_error = |error| {
+            AppError::InternalServerError(format!("Failed to build SAML response XML: {error}"))
+        };
 
         // Start samlp:Response
         let mut response = BytesStart::new("samlp:Response");
@@ -234,30 +564,50 @@ impl SamlResponseBuilder {
 
         response.push_attribute(("IssueInstant", self.issue_instant.to_rfc3339().as_str()));
         response.push_attribute(("Destination", self.acs_url.as_str()));
-        let _ = writer.write_event(Event::Start(response));
+        writer
+            .write_event(Event::Start(response))
+            .map_err(write_error)?;
 
         // Issuer
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Issuer")));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.entity_id)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Issuer")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Issuer")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.entity_id)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Issuer")))
+            .map_err(write_error)?;
 
         // Status
-        let _ = writer.write_event(Event::Start(BytesStart::new("samlp:Status")));
+        writer
+            .write_event(Event::Start(BytesStart::new("samlp:Status")))
+            .map_err(write_error)?;
         let mut status_code = BytesStart::new("samlp:StatusCode");
         status_code.push_attribute(("Value", "urn:oasis:names:tc:SAML:2.0:status:Success"));
-        let _ = writer.write_event(Event::Empty(status_code));
-        let _ = writer.write_event(Event::End(BytesEnd::new("samlp:Status")));
+        writer
+            .write_event(Event::Empty(status_code))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("samlp:Status")))
+            .map_err(write_error)?;
 
         // Write the signed assertion raw (since it's already built and signed)
         // Use from_escaped to treat the input as raw XML (not escaping it)
-        let _ = writer.write_event(Event::Text(BytesText::from_escaped(
-            assertion_with_signature,
-        )));
+        writer
+            .write_event(Event::Text(BytesText::from_escaped(
+                assertion_with_signature,
+            )))
+            .map_err(write_error)?;
 
         // End samlp:Response
-        let _ = writer.write_event(Event::End(BytesEnd::new("samlp:Response")));
+        writer
+            .write_event(Event::End(BytesEnd::new("samlp:Response")))
+            .map_err(write_error)?;
 
-        String::from_utf8(writer.into_inner().into_inner()).unwrap_or_default()
+        String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+            AppError::InternalServerError(format!("SAML response was not valid UTF-8: {error}"))
+        })
     }
 
     fn get_assertion_id(&self) -> &str {
@@ -267,6 +617,209 @@ impl SamlResponseBuilder {
     fn get_response_id(&self) -> &str {
         &self.response_id
     }
+}
+
+fn insert_signature_after_issuer(xml: &str, signature: &str) -> Result<String> {
+    const ISSUER_END: &str = "</saml:Issuer>";
+    let insertion_point = xml.find(ISSUER_END).ok_or_else(|| {
+        AppError::InternalServerError(
+            "Generated SAML XML did not contain the expected Issuer element".into(),
+        )
+    })? + ISSUER_END.len();
+
+    let mut signed = String::with_capacity(xml.len() + signature.len());
+    signed.push_str(&xml[..insertion_point]);
+    signed.push_str(signature);
+    signed.push_str(&xml[insertion_point..]);
+    Ok(signed)
+}
+
+fn build_logout_response_xml(
+    response_id: &str,
+    issue_instant: &chrono::DateTime<Utc>,
+    destination: &str,
+    in_response_to: &str,
+    entity_id: &str,
+) -> Result<String> {
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+    use quick_xml::Writer;
+    use std::io::Cursor;
+
+    let mut writer = Writer::new(Cursor::new(Vec::new()));
+    let write_error = |error| {
+        AppError::InternalServerError(format!("Failed to build SAML logout response: {error}"))
+    };
+
+    let mut response = BytesStart::new("samlp:LogoutResponse");
+    response.push_attribute(("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol"));
+    response.push_attribute(("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion"));
+    response.push_attribute(("ID", response_id));
+    response.push_attribute(("Version", "2.0"));
+    response.push_attribute(("IssueInstant", issue_instant.to_rfc3339().as_str()));
+    response.push_attribute(("Destination", destination));
+    response.push_attribute(("InResponseTo", in_response_to));
+    writer
+        .write_event(Event::Start(response))
+        .map_err(write_error)?;
+
+    writer
+        .write_event(Event::Start(BytesStart::new("saml:Issuer")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::Text(BytesText::new(entity_id)))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("saml:Issuer")))
+        .map_err(write_error)?;
+
+    writer
+        .write_event(Event::Start(BytesStart::new("samlp:Status")))
+        .map_err(write_error)?;
+    let mut status = BytesStart::new("samlp:StatusCode");
+    status.push_attribute(("Value", "urn:oasis:names:tc:SAML:2.0:status:Success"));
+    writer
+        .write_event(Event::Empty(status))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("samlp:Status")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("samlp:LogoutResponse")))
+        .map_err(write_error)?;
+
+    String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+        AppError::InternalServerError(format!("SAML logout response was not valid UTF-8: {error}"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_saml_metadata_xml(
+    entity_id: &str,
+    certificate: &str,
+    name_id_format: &str,
+    sso_url: &str,
+    slo_url: &str,
+    organization_name: &str,
+    organization_url: &str,
+) -> Result<String> {
+    use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+    use quick_xml::Writer;
+    use std::io::Cursor;
+
+    let mut writer = Writer::new(Cursor::new(Vec::new()));
+    let write_error = |error| {
+        AppError::InternalServerError(format!("Failed to build SAML metadata XML: {error}"))
+    };
+    writer
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .map_err(write_error)?;
+
+    let mut entity = BytesStart::new("EntityDescriptor");
+    entity.push_attribute(("xmlns", "urn:oasis:names:tc:SAML:2.0:metadata"));
+    entity.push_attribute(("entityID", entity_id));
+    writer
+        .write_event(Event::Start(entity))
+        .map_err(write_error)?;
+
+    let mut idp = BytesStart::new("IDPSSODescriptor");
+    idp.push_attribute(("WantAuthnRequestsSigned", "false"));
+    idp.push_attribute((
+        "protocolSupportEnumeration",
+        "urn:oasis:names:tc:SAML:2.0:protocol",
+    ));
+    writer.write_event(Event::Start(idp)).map_err(write_error)?;
+
+    let mut key_descriptor = BytesStart::new("KeyDescriptor");
+    key_descriptor.push_attribute(("use", "signing"));
+    writer
+        .write_event(Event::Start(key_descriptor))
+        .map_err(write_error)?;
+    let mut key_info = BytesStart::new("KeyInfo");
+    key_info.push_attribute(("xmlns", "http://www.w3.org/2000/09/xmldsig#"));
+    writer
+        .write_event(Event::Start(key_info))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::Start(BytesStart::new("X509Data")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::Start(BytesStart::new("X509Certificate")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::Text(BytesText::new(certificate)))
+        .map_err(write_error)?;
+    for name in ["X509Certificate", "X509Data", "KeyInfo", "KeyDescriptor"] {
+        writer
+            .write_event(Event::End(BytesEnd::new(name)))
+            .map_err(write_error)?;
+    }
+
+    writer
+        .write_event(Event::Start(BytesStart::new("NameIDFormat")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::Text(BytesText::new(name_id_format)))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("NameIDFormat")))
+        .map_err(write_error)?;
+
+    for binding in [
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+    ] {
+        let mut service = BytesStart::new("SingleSignOnService");
+        service.push_attribute(("Binding", binding));
+        service.push_attribute(("Location", sso_url));
+        writer
+            .write_event(Event::Empty(service))
+            .map_err(write_error)?;
+    }
+    for binding in [
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+    ] {
+        let mut service = BytesStart::new("SingleLogoutService");
+        service.push_attribute(("Binding", binding));
+        service.push_attribute(("Location", slo_url));
+        writer
+            .write_event(Event::Empty(service))
+            .map_err(write_error)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new("IDPSSODescriptor")))
+        .map_err(write_error)?;
+
+    writer
+        .write_event(Event::Start(BytesStart::new("Organization")))
+        .map_err(write_error)?;
+    for (element_name, value) in [
+        ("OrganizationName", organization_name),
+        ("OrganizationDisplayName", organization_name),
+        ("OrganizationURL", organization_url),
+    ] {
+        let mut element = BytesStart::new(element_name);
+        element.push_attribute(("xml:lang", "en"));
+        writer
+            .write_event(Event::Start(element))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(value)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new(element_name)))
+            .map_err(write_error)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new("Organization")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("EntityDescriptor")))
+        .map_err(write_error)?;
+
+    String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+        AppError::InternalServerError(format!("SAML metadata was not valid UTF-8: {error}"))
+    })
 }
 
 // XML Signing Helper Functions
@@ -287,7 +840,7 @@ fn sign_xml_element(
     })?;
 
     // Canonicalize the XML element (basic C14N - remove extra whitespace, normalize)
-    let canonical_xml = canonicalize_xml(xml_element);
+    let canonical_xml = canonicalize_xml(xml_element)?;
 
     // Compute SHA-256 digest
     let mut hasher = Sha256::new();
@@ -332,7 +885,7 @@ fn sign_xml_element(
     );
 
     // Canonicalize SignedInfo (use version with namespace)
-    let canonical_signed_info = canonicalize_xml(&signed_info_for_signing);
+    let canonical_signed_info = canonicalize_xml(&signed_info_for_signing)?;
 
     let mut signer = Signer::new(MessageDigest::sha256(), &private_key)
         .map_err(|e| AppError::InternalServerError(format!("Failed to create signer: {}", e)))?;
@@ -373,15 +926,15 @@ fn sign_xml_element(
 
 /// Exclusive XML Canonicalization (exc-c14n) implementation
 /// Implements http://www.w3.org/2001/10/xml-exc-c14n# algorithm
-fn canonicalize_xml(xml: &str) -> String {
+fn canonicalize_xml(xml: &str) -> Result<String> {
     use quick_xml::events::{BytesEnd, BytesText, Event};
     use quick_xml::{Reader, Writer};
     use std::borrow::Cow;
     use std::io::Cursor;
 
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(false); // Don't auto-trim - we handle whitespace
-    reader.expand_empty_elements(true); // Convert empty elements to start/end pairs
+    reader.config_mut().trim_text(false); // Don't auto-trim - we handle whitespace
+    reader.config_mut().expand_empty_elements = true; // Convert empty elements to start/end pairs
 
     let mut output = Vec::new();
     let mut writer = Writer::new(Cursor::new(&mut output));
@@ -390,6 +943,8 @@ fn canonicalize_xml(xml: &str) -> String {
     let mut ns_stack: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
 
     let mut buf = Vec::new();
+    let mut open_elements = 0_usize;
+    let mut root_elements = 0_usize;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -397,35 +952,78 @@ fn canonicalize_xml(xml: &str) -> String {
                 // XML declaration is omitted in canonical form
             }
             Ok(Event::Start(e)) => {
-                let sorted_element = canonicalize_start_element(&e, &mut ns_stack);
-                writer.write_event(Event::Start(sorted_element)).ok();
+                if open_elements == 0 {
+                    root_elements += 1;
+                }
+                open_elements += 1;
+                let sorted_element = canonicalize_start_element(&e, &mut ns_stack)?;
+                writer
+                    .write_event(Event::Start(sorted_element))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML start element: {error}"
+                        ))
+                    })?;
             }
             Ok(Event::End(e)) => {
+                open_elements = open_elements.checked_sub(1).ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "Cannot canonicalize XML with an unexpected closing element".into(),
+                    )
+                })?;
                 // Pop namespace scope
                 if ns_stack.len() > 1 {
                     ns_stack.pop();
                 }
-                writer.write_event(Event::End(e.to_owned())).ok();
+                writer
+                    .write_event(Event::End(e.to_owned()))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML end element: {error}"
+                        ))
+                    })?;
             }
             Ok(Event::Empty(e)) => {
                 // Empty elements are expanded to start/end pairs by reader config
                 // But handle if we still get one
-                let sorted_element = canonicalize_start_element(&e, &mut ns_stack);
+                if open_elements == 0 {
+                    root_elements += 1;
+                }
+                let sorted_element = canonicalize_start_element(&e, &mut ns_stack)?;
                 let end_name: Cow<'static, str> =
                     Cow::Owned(String::from_utf8_lossy(e.name().as_ref()).into_owned());
-                writer.write_event(Event::Start(sorted_element)).ok();
-                writer.write_event(Event::End(BytesEnd::new(end_name))).ok();
+                writer
+                    .write_event(Event::Start(sorted_element))
+                    .and_then(|_| writer.write_event(Event::End(BytesEnd::new(end_name))))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize empty XML element: {error}"
+                        ))
+                    })?;
                 if ns_stack.len() > 1 {
                     ns_stack.pop();
                 }
             }
             Ok(Event::Text(e)) => {
                 // Normalize text content - preserve significant whitespace
-                let text = e.unescape().unwrap_or_default();
+                let decoded = e.decode().map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "Cannot canonicalize invalid XML text encoding: {error}"
+                    ))
+                })?;
+                let text = quick_xml::escape::unescape(&decoded).map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "Cannot canonicalize invalid XML text escaping: {error}"
+                    ))
+                })?;
                 let normalized = normalize_text(&text);
                 writer
                     .write_event(Event::Text(BytesText::new(&normalized)))
-                    .ok();
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML text: {error}"
+                        ))
+                    })?;
             }
             Ok(Event::Comment(_)) => {
                 // Comments are omitted in canonical form (without comments variant)
@@ -435,27 +1033,59 @@ fn canonicalize_xml(xml: &str) -> String {
             }
             Ok(Event::CData(e)) => {
                 // CDATA sections are replaced with their character content
-                let text = String::from_utf8_lossy(&e);
+                let text = e.decode().map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "Cannot canonicalize invalid XML CDATA encoding: {error}"
+                    ))
+                })?;
                 let normalized = normalize_text(&text);
                 writer
                     .write_event(Event::Text(BytesText::new(&normalized)))
-                    .ok();
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML CDATA: {error}"
+                        ))
+                    })?;
             }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Ok(Event::GeneralRef(reference)) => {
+                let decoded = decode_xml_reference(&reference)?;
+                writer
+                    .write_event(Event::Text(BytesText::new(&decoded)))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML entity reference: {error}"
+                        ))
+                    })?;
+            }
+            Ok(Event::Eof) => {
+                if open_elements != 0 || root_elements != 1 {
+                    return Err(AppError::InternalServerError(
+                        "Cannot canonicalize malformed XML: expected exactly one closed root element"
+                            .into(),
+                    ));
+                }
+                break;
+            }
+            Err(error) => {
+                return Err(AppError::InternalServerError(format!(
+                    "Cannot canonicalize malformed XML: {error}"
+                )))
+            }
             _ => {}
         }
         buf.clear();
     }
 
-    String::from_utf8_lossy(&output).into_owned()
+    String::from_utf8(output).map_err(|error| {
+        AppError::InternalServerError(format!("Canonical XML was not valid UTF-8: {error}"))
+    })
 }
 
 /// Canonicalize a start element by sorting namespaces and attributes
 fn canonicalize_start_element(
     element: &quick_xml::events::BytesStart,
     ns_stack: &mut Vec<BTreeMap<String, String>>,
-) -> quick_xml::events::BytesStart<'static> {
+) -> Result<quick_xml::events::BytesStart<'static>> {
     use quick_xml::events::BytesStart;
 
     // Collect namespaces and attributes from the element
@@ -467,33 +1097,43 @@ fn canonicalize_start_element(
     let mut current_ns = parent_ns.clone();
 
     // Parse all attributes
-    for attr_result in element.attributes() {
-        if let Ok(attr) = attr_result {
-            let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-            let value = attr.unescape_value().unwrap_or_default().into_owned();
+    for attr in element.attributes() {
+        let attr = attr.map_err(|error| {
+            AppError::InternalServerError(format!(
+                "Cannot canonicalize malformed XML attribute: {error}"
+            ))
+        })?;
+        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        let value = attr
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|error| {
+                AppError::InternalServerError(format!(
+                    "Cannot canonicalize invalid XML attribute value: {error}"
+                ))
+            })?
+            .into_owned();
 
-            if key == "xmlns" {
-                // Default namespace declaration
-                namespaces.insert(String::new(), value.clone());
-                current_ns.insert(String::new(), value);
-            } else if let Some(prefix) = key.strip_prefix("xmlns:") {
-                // Prefixed namespace declaration
-                namespaces.insert(prefix.to_string(), value.clone());
-                current_ns.insert(prefix.to_string(), value);
+        if key == "xmlns" {
+            // Default namespace declaration
+            namespaces.insert(String::new(), value.clone());
+            current_ns.insert(String::new(), value);
+        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+            // Prefixed namespace declaration
+            namespaces.insert(prefix.to_string(), value.clone());
+            current_ns.insert(prefix.to_string(), value);
+        } else {
+            // Regular attribute - store with empty namespace for now
+            let (ns_uri, local_name) = if key.contains(':') {
+                let parts: Vec<&str> = key.splitn(2, ':').collect();
+                let prefix = parts[0];
+                let local = parts[1];
+                // Look up namespace URI from current scope
+                let uri = current_ns.get(prefix).cloned().unwrap_or_default();
+                (uri, local.to_string())
             } else {
-                // Regular attribute - store with empty namespace for now
-                let (ns_uri, local_name) = if key.contains(':') {
-                    let parts: Vec<&str> = key.splitn(2, ':').collect();
-                    let prefix = parts[0];
-                    let local = parts[1];
-                    // Look up namespace URI from current scope
-                    let uri = current_ns.get(prefix).cloned().unwrap_or_default();
-                    (uri, local.to_string())
-                } else {
-                    (String::new(), key)
-                };
-                attributes.insert((ns_uri, local_name), value);
-            }
+                (String::new(), key)
+            };
+            attributes.insert((ns_uri, local_name), value);
         }
     }
 
@@ -576,7 +1216,7 @@ fn canonicalize_start_element(
         }
     }
 
-    new_element
+    Ok(new_element)
 }
 
 /// Normalize attribute values according to XML C14N spec
@@ -1007,9 +1647,6 @@ pub async fn generate_saml_certificate(
             let private_key_encrypted = helper_private_key.clone();
             let public_cert_pem = helper_public_cert.clone();
             let encryption_key_id = helper_key_id.clone();
-            let valid_from = valid_from;
-            let valid_until = valid_until;
-
             Box::pin(async move {
                 use sea_orm::{EntityTrait, QuerySelect};
                 // 1. LOCKING: Select the Service row "FOR UPDATE" to serialize concurrent requests
@@ -1252,44 +1889,18 @@ pub async fn saml_metadata(
         .collect::<Vec<_>>()
         .join("");
 
-    // Build metadata XML manually (samael crate has limited builder support)
-    let metadata = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{}">
-  <IDPSSODescriptor WantAuthnRequestsSigned="false" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
-    <KeyDescriptor use="signing">
-      <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
-        <X509Data>
-          <X509Certificate>{}</X509Certificate>
-        </X509Data>
-      </KeyInfo>
-    </KeyDescriptor>
-    <NameIDFormat>{}</NameIDFormat>
-    <SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="{}"/>
-    <SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="{}"/>
-    <SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="{}"/>
-    <SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="{}"/>
-  </IDPSSODescriptor>
-  <Organization>
-    <OrganizationName xml:lang="en">{}</OrganizationName>
-    <OrganizationDisplayName xml:lang="en">{}</OrganizationDisplayName>
-    <OrganizationURL xml:lang="en">{}</OrganizationURL>
-  </Organization>
-</EntityDescriptor>"#,
-        entity_id,
-        cert_content,
+    let metadata = build_saml_metadata_xml(
+        &entity_id,
+        &cert_content,
         service
             .saml_name_id_format
             .as_deref()
             .unwrap_or("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"),
-        sso_url,
-        sso_url,
-        slo_url,
-        slo_url,
-        org.name,
-        org.name,
-        state.base_url
-    );
+        &sso_url,
+        &slo_url,
+        &org.name,
+        &state.base_url,
+    )?;
 
     Ok((
         [(
@@ -1334,92 +1945,13 @@ pub async fn saml_sso(
         .saml_request
         .ok_or_else(|| AppError::BadRequest("SAMLRequest parameter is required".into()))?;
 
-    // Decode base64
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-    let saml_request_bytes = BASE64
-        .decode(&saml_request_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {}", e)))?;
+    let saml_request_xml = decode_saml_request_xml(&saml_request_b64, true)?;
 
-    // Try to inflate (SAMLRequest is typically deflated for HTTP-Redirect binding)
-    // SAML HTTP-Redirect uses raw DEFLATE (RFC 1951) without zlib/gzip wrappers
-    use flate2::read::DeflateDecoder;
-    use std::io::Read;
-
-    // Try to inflate as raw deflate first (standard for SAML HTTP-Redirect)
-    let mut decoder = DeflateDecoder::new(&saml_request_bytes[..]);
-    let mut inflated = String::new();
-    let saml_request_xml =
-        if decoder.read_to_string(&mut inflated).is_ok() && inflated.starts_with("<?xml") {
-            // Successfully inflated and looks like XML
-            inflated
-        } else {
-            // Not deflated or inflation failed, treat as raw XML
-            String::from_utf8(saml_request_bytes)
-                .map_err(|e| AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {}", e)))?
-        };
-
-    // Parse XML to extract important fields
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-
-    // Security Audit Item 7: Validate XML for XXE attacks before parsing
-    validate_xml_no_xxe(&saml_request_xml)?;
-
-    let mut reader = Reader::from_str(&saml_request_xml);
-    reader.trim_text(true);
-
-    let mut request_id: Option<String> = None;
-    let mut issuer: Option<String> = None;
-    let mut acs_url_from_request: Option<String> = None;
-    let mut destination: Option<String> = None;
-    let mut in_issuer = false;
-
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                match e.name().as_ref() {
-                    b"samlp:AuthnRequest" | b"AuthnRequest" => {
-                        // Extract attributes from AuthnRequest element
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"ID" => {
-                                    request_id =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
-                                }
-                                b"AssertionConsumerServiceURL" => {
-                                    acs_url_from_request =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
-                                }
-                                b"Destination" => {
-                                    destination =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    b"saml:Issuer" | b"Issuer" => {
-                        in_issuer = true;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(e)) if in_issuer => {
-                issuer = Some(e.unescape().unwrap_or_default().to_string());
-                in_issuer = false;
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(AppError::BadRequest(format!(
-                    "Error parsing SAMLRequest XML: {}",
-                    e
-                )));
-            }
-            _ => {}
-        }
-        buf.clear();
-    }
+    let parsed_request = parse_authn_request(&saml_request_xml)?;
+    let request_id = parsed_request.request_id;
+    let issuer = parsed_request.issuer;
+    let acs_url_from_request = parsed_request.acs_url;
+    let destination = parsed_request.destination;
 
     let configured_acs_url = service
         .saml_acs_url
@@ -1638,36 +2170,22 @@ pub async fn saml_idp_login(
         }
     }
 
-    // Build AttributeStatement XML
-    let attribute_statement = attributes
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                r#"      <saml:Attribute Name="{}">
-        <saml:AttributeValue>{}</saml:AttributeValue>
-      </saml:Attribute>"#,
-                name, value
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
     // Create SAML Response Builder (IdP-initiated, no InResponseTo)
     let saml_builder = SamlResponseBuilder::new(
         &user.user.email,
         &entity_id,
-        &acs_url,
+        acs_url,
         service
             .saml_entity_id
             .as_deref()
             .unwrap_or(&service.client_id),
         name_id_format,
-        attribute_statement,
+        attributes,
         None, // No InResponseTo for IdP-initiated flow
     );
 
     // Build the Assertion element using the builder
-    let assertion_xml = saml_builder.build_assertion();
+    let assertion_xml = saml_builder.build_assertion()?;
 
     // Check if we should sign the assertion
     let sign_assertions = service.saml_sign_assertions;
@@ -1680,18 +2198,13 @@ pub async fn saml_idp_login(
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element (use replacen to only match first occurrence)
-        assertion_xml.replacen(
-            &format!("<saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!("<saml:Issuer>{}</saml:Issuer>{}", entity_id, signature),
-            1,
-        )
+        insert_signature_after_issuer(&assertion_xml, &signature)?
     } else {
         assertion_xml
     };
 
     // Build the complete SAML Response using the builder
-    let response_xml = saml_builder.build_response(&assertion_with_signature);
+    let response_xml = saml_builder.build_response(&assertion_with_signature)?;
 
     // Check if we should sign the response
     let sign_response = service.saml_sign_response;
@@ -1704,12 +2217,7 @@ pub async fn saml_idp_login(
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element (use replacen to only match first occurrence)
-        response_xml.replacen(
-            &format!("<saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!("<saml:Issuer>{}</saml:Issuer>{}", entity_id, signature),
-            1,
-        )
+        insert_signature_after_issuer(&response_xml, &signature)?
     } else {
         response_xml
     };
@@ -1808,12 +2316,6 @@ pub async fn complete_saml_authentication(
             AppError::InternalServerError(format!("Failed to decrypt private key: {}", e))
         })?;
 
-    // Generate SAML Response
-    let response_id = format!("_{}", Uuid::new_v4());
-    let assertion_id = format!("_{}", Uuid::new_v4());
-    let issue_instant = Utc::now();
-    let not_on_or_after = issue_instant + Duration::minutes(5);
-
     let entity_id = format!("{}/saml/{}/{}", state.base_url, org.slug, service.slug);
 
     // Build SAML response XML
@@ -1821,13 +2323,6 @@ pub async fn complete_saml_authentication(
         .saml_name_id_format
         .as_deref()
         .unwrap_or("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress");
-
-    // Build InResponseTo attribute if we have a request ID
-    let in_response_to_attr = if let Some(ref req_id) = saml_state.request_id {
-        format!(r#" InResponseTo="{}"#, req_id)
-    } else {
-        String::new()
-    };
 
     // Parse attribute mapping if available
     let mut attributes: Vec<(String, String)> = Vec::new();
@@ -1858,59 +2353,21 @@ pub async fn complete_saml_authentication(
         }
     }
 
-    // Build AttributeStatement XML
-    let attribute_statement = attributes
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                r#"      <saml:Attribute Name="{}">
-        <saml:AttributeValue>{}</saml:AttributeValue>
-      </saml:Attribute>"#,
-                name, value
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Build the Assertion element
-    let assertion_xml = format!(
-        r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{assertion_id}" Version="2.0" IssueInstant="{issue_instant}">
-    <saml:Issuer>{entity_id}</saml:Issuer>
-    <saml:Subject>
-      <saml:NameID Format="{name_id_format}">{email}</saml:NameID>
-      <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
-        <saml:SubjectConfirmationData{in_response_to} NotOnOrAfter="{not_on_or_after}" Recipient="{acs_url}"/>
-      </saml:SubjectConfirmation>
-    </saml:Subject>
-    <saml:Conditions NotBefore="{issue_instant}" NotOnOrAfter="{not_on_or_after}">
-      <saml:AudienceRestriction>
-        <saml:Audience>{sp_entity_id}</saml:Audience>
-      </saml:AudienceRestriction>
-    </saml:Conditions>
-    <saml:AuthnStatement AuthnInstant="{issue_instant}">
-      <saml:AuthnContext>
-        <saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified</saml:AuthnContextClassRef>
-      </saml:AuthnContext>
-    </saml:AuthnStatement>
-    <saml:AttributeStatement>
-{attribute_statement}
-    </saml:AttributeStatement>
-  </saml:Assertion>"#,
-        assertion_id = assertion_id,
-        in_response_to = in_response_to_attr,
-        issue_instant = issue_instant.naive_utc(),
-        not_on_or_after = not_on_or_after.naive_utc(),
-        entity_id = entity_id,
-        acs_url = saml_state.acs_url,
-        name_id_format = name_id_format,
-        email = user.email,
-        sp_entity_id = saml_state
+    let saml_builder = SamlResponseBuilder::new(
+        &user.email,
+        &entity_id,
+        &saml_state.acs_url,
+        saml_state
             .issuer
             .as_deref()
             .or(service.saml_entity_id.as_deref())
             .unwrap_or(&service.client_id),
-        attribute_statement = attribute_statement,
+        name_id_format,
+        attributes,
+        saml_state.request_id.clone(),
     );
+
+    let assertion_xml = saml_builder.build_assertion()?;
 
     // Check if we should sign the assertion
     let sign_assertions = service.saml_sign_assertions;
@@ -1918,39 +2375,17 @@ pub async fn complete_saml_authentication(
         // Sign the assertion
         let signature = sign_xml_element(
             &assertion_xml,
-            &assertion_id,
+            saml_builder.get_assertion_id(),
             &private_key_pem,
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element
-        assertion_xml.replace(
-            &format!("    <saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!(
-                "    <saml:Issuer>{}</saml:Issuer>\n    {}",
-                entity_id, signature
-            ),
-        )
+        insert_signature_after_issuer(&assertion_xml, &signature)?
     } else {
         assertion_xml
     };
 
-    // Build the complete SAML Response
-    let response_xml = format!(
-        r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{response_id}" Version="2.0"{in_response_to} IssueInstant="{issue_instant}" Destination="{acs_url}">
-  <saml:Issuer>{entity_id}</saml:Issuer>
-  <samlp:Status>
-    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
-  </samlp:Status>
-  {assertion}
-</samlp:Response>"#,
-        response_id = response_id,
-        in_response_to = in_response_to_attr,
-        issue_instant = issue_instant.naive_utc(),
-        acs_url = saml_state.acs_url,
-        entity_id = entity_id,
-        assertion = assertion_with_signature,
-    );
+    let response_xml = saml_builder.build_response(&assertion_with_signature)?;
 
     // Check if we should sign the response
     let sign_response = service.saml_sign_response;
@@ -1958,19 +2393,12 @@ pub async fn complete_saml_authentication(
         // Sign the response
         let signature = sign_xml_element(
             &response_xml,
-            &response_id,
+            saml_builder.get_response_id(),
             &private_key_pem,
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element
-        response_xml.replace(
-            &format!("  <saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!(
-                "  <saml:Issuer>{}</saml:Issuer>\n  {}",
-                entity_id, signature
-            ),
-        )
+        insert_signature_after_issuer(&response_xml, &signature)?
     } else {
         response_xml
     };
@@ -2105,50 +2533,7 @@ async fn process_saml_logout_request(
         ));
     }
 
-    // Decode base64
-    let saml_request_bytes = BASE64
-        .decode(saml_request_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {}", e)))?;
-
-    // Try to inflate if deflated (HTTP-Redirect binding)
-    let saml_request_xml = if is_deflated {
-        use flate2::read::DeflateDecoder;
-        use std::io::Read;
-
-        // Check for various compression formats
-        if saml_request_bytes.len() > 2
-            && saml_request_bytes[0] == 0x78
-            && (saml_request_bytes[1] == 0x9C
-                || saml_request_bytes[1] == 0xDA
-                || saml_request_bytes[1] == 0x01)
-        {
-            // Looks like deflated data (zlib header)
-            let mut decoder = DeflateDecoder::new(&saml_request_bytes[..]);
-            let mut inflated = String::new();
-            decoder.read_to_string(&mut inflated).map_err(|e| {
-                AppError::BadRequest(format!("Failed to inflate SAMLRequest: {}", e))
-            })?;
-            inflated
-        } else {
-            // Try raw deflate without zlib header
-            let mut decoder =
-                flate2::read::DeflateDecoder::new(std::io::Cursor::new(&saml_request_bytes));
-            let mut inflated = String::new();
-            match decoder.read_to_string(&mut inflated) {
-                Ok(_) => inflated,
-                Err(_) => {
-                    // Not compressed, treat as raw XML
-                    String::from_utf8(saml_request_bytes.clone()).map_err(|e| {
-                        AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {}", e))
-                    })?
-                }
-            }
-        }
-    } else {
-        // Not compressed (HTTP-POST binding)
-        String::from_utf8(saml_request_bytes)
-            .map_err(|e| AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {}", e)))?
-    };
+    let saml_request_xml = decode_saml_request_xml(saml_request_b64, is_deflated)?;
 
     // Parse XML to extract important fields
     use quick_xml::events::Event;
@@ -2158,7 +2543,7 @@ async fn process_saml_logout_request(
     validate_xml_no_xxe(&saml_request_xml)?;
 
     let mut reader = Reader::from_str(&saml_request_xml);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
 
     let mut request_id: Option<String> = None;
     let mut issuer: Option<String> = None;
@@ -2207,10 +2592,40 @@ async fn process_saml_logout_request(
             }
             Ok(Event::Text(e)) => {
                 if in_issuer {
-                    issuer = Some(e.unescape().unwrap_or_default().to_string());
+                    let decoded = e.decode().map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "Invalid LogoutRequest issuer encoding: {}",
+                            error
+                        ))
+                    })?;
+                    issuer = Some(
+                        quick_xml::escape::unescape(&decoded)
+                            .map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid LogoutRequest issuer escaping: {}",
+                                    error
+                                ))
+                            })?
+                            .into_owned(),
+                    );
                     in_issuer = false;
                 } else if in_name_id {
-                    name_id = Some(e.unescape().unwrap_or_default().to_string());
+                    let decoded = e.decode().map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "Invalid LogoutRequest NameID encoding: {}",
+                            error
+                        ))
+                    })?;
+                    name_id = Some(
+                        quick_xml::escape::unescape(&decoded)
+                            .map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid LogoutRequest NameID escaping: {}",
+                                    error
+                                ))
+                            })?
+                            .into_owned(),
+                    );
                     in_name_id = false;
                 }
             }
@@ -2297,20 +2712,13 @@ async fn process_saml_logout_request(
         .as_ref()
         .ok_or_else(|| AppError::BadRequest("No SLO URL configured for this service".into()))?;
 
-    // Build the SAML LogoutResponse
-    let logout_response_xml = format!(
-        r#"<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{response_id}" Version="2.0" IssueInstant="{issue_instant}" Destination="{slo_url}" InResponseTo="{in_response_to}">
-  <saml:Issuer>{entity_id}</saml:Issuer>
-  <samlp:Status>
-    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
-  </samlp:Status>
-</samlp:LogoutResponse>"#,
-        response_id = response_id,
-        issue_instant = issue_instant.naive_utc(),
-        slo_url = slo_response_url,
-        in_response_to = request_id,
-        entity_id = entity_id,
-    );
+    let logout_response_xml = build_logout_response_xml(
+        &response_id,
+        &issue_instant,
+        slo_response_url,
+        &request_id,
+        &entity_id,
+    )?;
 
     // Sign the LogoutResponse if configured
     let sign_response = service.saml_sign_response;
@@ -2322,14 +2730,7 @@ async fn process_saml_logout_request(
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element
-        logout_response_xml.replace(
-            &format!("  <saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!(
-                "  <saml:Issuer>{}</saml:Issuer>\n  {}",
-                entity_id, signature
-            ),
-        )
+        insert_signature_after_issuer(&logout_response_xml, &signature)?
     } else {
         logout_response_xml
     };
@@ -2383,4 +2784,212 @@ async fn process_saml_logout_request(
     );
 
     Ok(Html(html).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::DeflateEncoder, Compression};
+    use std::io::Write;
+
+    fn redirect_encode(xml: &str) -> String {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(xml.as_bytes()).expect("compress XML");
+        BASE64.encode(encoder.finish().expect("finish compression"))
+    }
+
+    #[test]
+    fn redirect_binding_accepts_deflated_xml_without_declaration() {
+        let xml = r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="request-1"><Issuer>sp.example</Issuer></samlp:AuthnRequest>"#;
+        let encoded = redirect_encode(xml);
+
+        assert_eq!(
+            decode_saml_request_xml(&encoded, true).expect("decode Redirect request"),
+            xml
+        );
+    }
+
+    #[test]
+    fn saml_request_decode_enforces_encoded_and_expanded_limits() {
+        let oversized_encoded = "A".repeat(MAX_SAML_REQUEST_ENCODED_BYTES + 1);
+        assert!(matches!(
+            decode_saml_request_xml(&oversized_encoded, false),
+            Err(AppError::BadRequest(message)) if message.contains("Encoded SAMLRequest exceeds")
+        ));
+
+        let expanded = "A".repeat(MAX_SAML_REQUEST_XML_BYTES + 1);
+        let compressed = redirect_encode(&expanded);
+        assert!(compressed.len() < MAX_SAML_REQUEST_ENCODED_BYTES);
+        assert!(matches!(
+            decode_saml_request_xml(&compressed, true),
+            Err(AppError::BadRequest(message)) if message.contains("Decoded SAMLRequest exceeds")
+        ));
+    }
+
+    #[test]
+    fn post_binding_accepts_bounded_plain_xml() {
+        let xml = r#"<LogoutRequest ID="logout-1"/>"#;
+        assert_eq!(
+            decode_saml_request_xml(&BASE64.encode(xml), false).expect("decode POST request"),
+            xml
+        );
+    }
+
+    #[test]
+    fn authn_request_parser_decodes_escaped_text_and_attributes() {
+        let parsed = parse_authn_request(
+            r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                    xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                    ID="request&amp;42"
+                    AssertionConsumerServiceURL="https://sp.example.test/acs?one=1&amp;two=2"
+                    Destination="https://idp.example.test/sso?realm=R&amp;mode=login">
+                <saml:Issuer>sp&amp;partner&lt;production&gt;</saml:Issuer>
+            </samlp:AuthnRequest>"#,
+        )
+        .expect("valid AuthnRequest should parse");
+
+        assert_eq!(parsed.request_id.as_deref(), Some("request&42"));
+        assert_eq!(
+            parsed.acs_url.as_deref(),
+            Some("https://sp.example.test/acs?one=1&two=2")
+        );
+        assert_eq!(
+            parsed.destination.as_deref(),
+            Some("https://idp.example.test/sso?realm=R&mode=login")
+        );
+        assert_eq!(parsed.issuer.as_deref(), Some("sp&partner<production>"));
+    }
+
+    #[test]
+    fn authn_request_parser_rejects_mismatched_and_unclosed_xml() {
+        let mismatched = r#"<AuthnRequest><Issuer>sp.example</AuthnRequest>"#;
+        let unclosed = r#"<AuthnRequest><Issuer>sp.example</Issuer>"#;
+
+        assert!(parse_authn_request(mismatched).is_err());
+        assert!(parse_authn_request(unclosed).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_requires_one_authn_request_root() {
+        let wrong_root = r#"<Issuer>sp.example</Issuer>"#;
+        let duplicate_root = r#"<AuthnRequest/><AuthnRequest/>"#;
+        let nested_request = r#"<AuthnRequest><AuthnRequest/></AuthnRequest>"#;
+
+        assert!(parse_authn_request(wrong_root).is_err());
+        assert!(parse_authn_request(duplicate_root).is_err());
+        assert!(parse_authn_request(nested_request).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_rejects_malformed_attributes() {
+        let duplicate_attribute = r#"<AuthnRequest ID="one" ID="two"/>"#;
+        let unterminated_attribute = r#"<AuthnRequest ID="one/>"#;
+
+        assert!(parse_authn_request(duplicate_attribute).is_err());
+        assert!(parse_authn_request(unterminated_attribute).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_rejects_xxe_doctype() {
+        let xxe = r#"<!DOCTYPE AuthnRequest [
+            <!ENTITY secret SYSTEM "file:///etc/passwd">
+        ]>
+        <AuthnRequest ID="request-1">
+            <Issuer>&secret;</Issuer>
+        </AuthnRequest>"#;
+
+        assert!(parse_authn_request(xxe).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_does_not_expand_unknown_entity_references() {
+        let entity_reference =
+            r#"<AuthnRequest ID="request-1"><Issuer>&external;</Issuer></AuthnRequest>"#;
+
+        assert!(parse_authn_request(entity_reference).is_err());
+    }
+
+    #[test]
+    fn canonicalization_decodes_then_safely_reescapes_xml_values() {
+        let canonical = canonicalize_xml(
+            r#"<root z="one&amp;two" a="&quot;quoted&quot;">Tom &amp; Jerry</root>"#,
+        )
+        .expect("canonicalize valid XML");
+
+        assert_eq!(
+            canonical,
+            r#"<root a="&quot;quoted&quot;" z="one&amp;two">Tom &amp; Jerry</root>"#
+        );
+        assert!(!canonical.contains("<Jerry"));
+    }
+
+    #[test]
+    fn canonicalization_rejects_malformed_xml_instead_of_signing_partial_output() {
+        assert!(canonicalize_xml("<root><child></root>").is_err());
+        assert!(canonicalize_xml("<one/><two/>").is_err());
+        assert!(canonicalize_xml("not XML").is_err());
+    }
+
+    #[test]
+    fn response_builder_escapes_configurable_and_user_values() {
+        let builder = SamlResponseBuilder::new(
+            "user<&@example.test",
+            "https://idp.example.test/a?x=1&y=2",
+            "https://sp.example.test/acs?x=1&y=2",
+            "sp<&audience",
+            "format\"<&",
+            vec![(
+                "role\"><evil injected=\"true".to_string(),
+                "admin</saml:AttributeValue><evil>".to_string(),
+            )],
+            Some("request\"<&".to_string()),
+        );
+
+        let assertion = builder.build_assertion().expect("build safe assertion");
+        let response = builder
+            .build_response(&assertion)
+            .expect("build safe response");
+
+        assert!(assertion.contains("Name=\"role&quot;&gt;&lt;evil injected=&quot;true\""));
+        assert!(assertion.contains("admin&lt;/saml:AttributeValue&gt;&lt;evil&gt;"));
+        assert!(!assertion.contains("<evil"));
+        assert!(response.contains("Destination=\"https://sp.example.test/acs?x=1&amp;y=2\""));
+        assert!(canonicalize_xml(&response).is_ok());
+    }
+
+    #[test]
+    fn metadata_and_logout_response_escape_configurable_and_request_values() {
+        let metadata = build_saml_metadata_xml(
+            "entity\"><evil>",
+            "certificate<&data",
+            "format<&value",
+            "https://idp.example.test/sso?x=1&y=2",
+            "https://idp.example.test/slo?x=1&y=2",
+            "Org </OrganizationName><evil>",
+            "https://idp.example.test/?x=1&y=2",
+        )
+        .expect("build metadata");
+        assert!(metadata.contains("entityID=\"entity&quot;&gt;&lt;evil&gt;\""));
+        assert!(metadata.contains("Org &lt;/OrganizationName&gt;&lt;evil&gt;"));
+        assert!(!metadata.contains("<evil>"));
+        assert!(canonicalize_xml(&metadata).is_ok());
+
+        let logout = build_logout_response_xml(
+            "response\"><evil>",
+            &Utc::now(),
+            "https://sp.example.test/slo?x=1&y=2",
+            "request\"><evil>",
+            "entity<&value",
+        )
+        .expect("build logout response");
+        assert!(logout.contains("InResponseTo=\"request&quot;&gt;&lt;evil&gt;\""));
+        assert!(logout.contains("Destination=\"https://sp.example.test/slo?x=1&amp;y=2\""));
+        assert!(!logout.contains("<evil>"));
+        assert!(canonicalize_xml(&logout).is_ok());
+    }
+
+    #[test]
+    fn html_attribute_escaping_covers_markup_and_quotes() {
+        assert_eq!(escape_html_attr(r#"&<>"'"#), "&amp;&lt;&gt;&quot;&#x27;");
+    }
 }

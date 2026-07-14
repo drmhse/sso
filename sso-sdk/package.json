@@ -26,7 +26,7 @@
     "dev": "tsdown --watch",
     "test": "npm run build && node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts",
+    "lint": "eslint \"src/**/*.ts\" tsdown.config.mjs --max-warnings 0",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -47,9 +47,6 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.5",
-    "@typescript-eslint/eslint-plugin": "^8.59.4",
-    "@typescript-eslint/parser": "^8.59.4",
-    "eslint": "^8.56.0",
     "tsdown": "^0.22.2",
     "typescript": "^5.3.3"
   },

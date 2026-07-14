@@ -1811,8 +1811,7 @@ async fn auth_callback_impl(
                         );
 
                         // Return error page instead of redirect
-                        let html = format!(
-                            r#"
+                        let html = r#"
                             <!DOCTYPE html>
                             <html>
                             <head><title>Login Blocked</title></head>
@@ -1822,8 +1821,7 @@ async fn auth_callback_impl(
                                 <p>Please contact support if this continues to occur.</p>
                             </body>
                             </html>
-                            "#
-                        );
+                            "#.to_string();
                         return Ok((axum::http::StatusCode::FORBIDDEN, Html(html)).into_response());
                     }
                     RiskAction::Allow | RiskAction::LogOnly => {
@@ -1915,7 +1913,7 @@ async fn auth_callback_impl(
             .await;
 
             // Check if JSON response is requested (to avoid header overflow in API flows)
-            if callback.format.as_ref().map_or(false, |f| f == "json") {
+            if callback.format.as_ref().is_some_and(|f| f == "json") {
                 // Return JSON response instead of redirect for API flows
                 use serde_json::json;
                 let response_body = json!({
@@ -2454,7 +2452,7 @@ async fn auth_admin_callback_impl(
     .await;
 
     // Check if JSON response is requested (to avoid header overflow in API flows)
-    if callback.format.as_ref().map_or(false, |f| f == "json") {
+    if callback.format.as_ref().is_some_and(|f| f == "json") {
         // Return JSON response instead of redirect for API flows
         use serde_json::json;
         let response_body = json!({
@@ -2845,7 +2843,7 @@ async fn handle_service_flow_via_admin_callback(
     .await;
 
     // Check if JSON response is requested
-    if callback.format.as_ref().map_or(false, |f| f == "json") {
+    if callback.format.as_ref().is_some_and(|f| f == "json") {
         use serde_json::json;
         let response_body = json!({
             "access_token": jwt,
@@ -2934,33 +2932,33 @@ fn create_admin_oauth_client(
         Provider::Github => {
             let client_id = config.platform_github_client_id.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.")
+                    "GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             let client_secret = config.platform_github_client_secret.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.")
+                    "GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             (client_id.clone(), client_secret.clone())
         }
         Provider::Google => {
             let client_id = config.platform_google_client_id.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")
+                    "Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             let client_secret = config.platform_google_client_secret.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")
+                    "Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             (client_id.clone(), client_secret.clone())
         }
         Provider::Microsoft => {
             let client_id = config.platform_microsoft_client_id.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")
+                    "Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             let client_secret = config.platform_microsoft_client_secret.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")
+                    "Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             (client_id.clone(), client_secret.clone())
         }
@@ -3341,7 +3339,7 @@ async fn get_provider_user_info(
             let client = reqwest::Client::new();
 
             let user: GithubUser = client
-                .get(&config.get_github_user_api_url())
+                .get(config.get_github_user_api_url())
                 .header("Authorization", format!("Bearer {}", access_token))
                 .header("User-Agent", "SSO-Service")
                 .send()
@@ -3355,7 +3353,7 @@ async fn get_provider_user_info(
                 email
             } else {
                 let emails: Vec<GithubEmail> = client
-                    .get(&config.get_github_user_emails_api_url())
+                    .get(config.get_github_user_emails_api_url())
                     .header("Authorization", format!("Bearer {}", access_token))
                     .header("User-Agent", "SSO-Service")
                     .send()
@@ -3390,7 +3388,7 @@ async fn get_provider_user_info(
 
             let client = reqwest::Client::new();
             let user: GoogleUser = client
-                .get(&config.get_google_user_api_url())
+                .get(config.get_google_user_api_url())
                 .header("Authorization", format!("Bearer {}", access_token))
                 .send()
                 .await
@@ -3420,7 +3418,7 @@ async fn get_provider_user_info(
 
             let client = reqwest::Client::new();
             let user: MicrosoftUser = client
-                .get(&config.get_microsoft_user_api_url())
+                .get(config.get_microsoft_user_api_url())
                 .header("Authorization", format!("Bearer {}", access_token))
                 .send()
                 .await
@@ -3439,16 +3437,12 @@ async fn get_provider_user_info(
                 name: user.name,
             })
         }
-        Provider::Oidc => {
-            return Err(AppError::BadRequest(
-                "OIDC not supported in generic get_provider_user_info".to_string(),
-            ));
-        }
-        Provider::Password => {
-            return Err(AppError::BadRequest(
-                "Password provider not supported in generic get_provider_user_info".to_string(),
-            ));
-        }
+        Provider::Oidc => Err(AppError::BadRequest(
+            "OIDC not supported in generic get_provider_user_info".to_string(),
+        )),
+        Provider::Password => Err(AppError::BadRequest(
+            "Password provider not supported in generic get_provider_user_info".to_string(),
+        )),
     }
 }
 

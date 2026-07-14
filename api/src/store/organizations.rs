@@ -141,7 +141,7 @@ impl OrganizationStore {
         let mut org_active: organizations::ActiveModel = org.into();
         org_active.status = Set("active".to_string());
         org_active.approved_by = Set(Some(approved_by.to_string()));
-        org_active.approved_at = Set(Some(now.clone()));
+        org_active.approved_at = Set(Some(now));
         org_active.updated_at = Set(now);
 
         let updated_org = org_active.update(&db).await?;
@@ -163,7 +163,7 @@ impl OrganizationStore {
         let mut org_active: organizations::ActiveModel = org.into();
         org_active.status = Set("rejected".to_string());
         org_active.rejected_by = Set(Some(rejected_by.to_string()));
-        org_active.rejected_at = Set(Some(now.clone()));
+        org_active.rejected_at = Set(Some(now));
         org_active.rejection_reason = Set(reason.map(|s| s.to_string()));
         org_active.updated_at = Set(now);
 
@@ -397,6 +397,7 @@ impl OrganizationStore {
     }
 
     /// Update organization SMTP configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_smtp_config(
         db: DB<'_>,
         org_id: &str,
@@ -685,7 +686,7 @@ impl OrganizationStore {
 
                 let count = LoginEvents::find()
                     .filter(login_events::Column::ServiceId.is_in(service_ids.clone()))
-                    .filter(login_events::Column::CreatedAt.gte(thirty_days_ago.clone()))
+                    .filter(login_events::Column::CreatedAt.gte(thirty_days_ago))
                     .count(&db)
                     .await?;
 

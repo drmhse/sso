@@ -67,6 +67,7 @@ impl LoginEventStore {
     }
 
     /// Create a new login event with risk assessment data and optional geo data
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_with_risk(
         db: DB<'_>,
         user_id: &str,

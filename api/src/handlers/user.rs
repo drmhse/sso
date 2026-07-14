@@ -959,8 +959,8 @@ pub async fn update_user(
     }
 
     // Update user with new email if provided
-    let updated_user = if req.email.is_some() {
-        UserStore::update_email(DB::Conn(&state.db), &user.id, req.email.as_ref().unwrap()).await?
+    let updated_user = if let Some(email) = &req.email {
+        UserStore::update_email(DB::Conn(&state.db), &user.id, email).await?
     } else {
         user
     };

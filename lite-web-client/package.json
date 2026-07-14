@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "lint": "eslint \"src/**/*.{js,vue}\" vite.config.js --max-warnings 0",
     "typecheck": "vue-tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

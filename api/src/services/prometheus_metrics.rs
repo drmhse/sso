@@ -366,7 +366,7 @@ impl PrometheusMetricsService {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let handle = builder
             .install_recorder()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(handle)
     }

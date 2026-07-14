@@ -10,6 +10,9 @@ AuthOS uses different licenses for first-party parts of this repository:
 | `packages/authos-node/` | MIT |
 | `packages/authos-react/` | MIT |
 | `packages/authos-vue/` | MIT |
+| `lite-web-client/` | No first-party license assigned yet |
+| `scripts/` and `install.sh` | No first-party license assigned yet |
+| Root documentation and configuration not listed above | No first-party license assigned yet |
 
 Vendored third-party code keeps its upstream license notices in place. For example,
 [`api/vendor/sqlx-mysql/`](./api/vendor/sqlx-mysql) includes the original SQLx
@@ -22,3 +25,6 @@ The canonical license texts are available in [`LICENSES/`](./LICENSES):
 - [`LICENSES/MIT.txt`](./LICENSES/MIT.txt)
 
 Package-specific license files are also kept with each publishable package so npm consumers receive the applicable license text.
+
+No license should be inferred for an unassigned path. Assigning those paths to
+AGPL-3.0-only, MIT, or another license requires an explicit maintainer decision.

@@ -98,6 +98,7 @@ impl MfaAuditService {
     /// * `user_agent` - Optional client user agent
     /// * `success` - Whether the operation succeeded
     /// * `details` - Optional details (e.g., failure reason, method used)
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_mfa_event(
         &self,
         org_id: Option<&str>,
@@ -572,6 +573,7 @@ impl OrgAuditService {
     }
 
     /// Log an organization audit event
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_org_event(
         &self,
         org_id: &str,
@@ -601,9 +603,7 @@ impl OrgAuditService {
             target_type: Set(target_type
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "unknown".to_string())),
-            target_id: Set(target_id
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "".to_string())),
+            target_id: Set(target_id.map(|s| s.to_string()).unwrap_or_default()),
             ip_address: Set(ip_str.clone()),
             user_agent: Set(user_agent_str.clone()),
             success: Set(success),
@@ -650,6 +650,7 @@ impl OrgAuditService {
     }
 
     /// Alias for log_org_event for backward compatibility
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_organization_event(
         &self,
         org_id: &str,

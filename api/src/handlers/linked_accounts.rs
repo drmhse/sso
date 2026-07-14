@@ -885,7 +885,7 @@ async fn create_provider_token_request_oauth_state(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
     let requested_scopes = parse_scopes_required(&request.requested_scopes);
-    let allowed_scopes = service_allowed_scopes(&state, &service, &request.provider).await?;
+    let allowed_scopes = service_allowed_scopes(state, &service, &request.provider).await?;
     if !has_all_scopes(&allowed_scopes, &requested_scopes) {
         return Err(AppError::Forbidden(
             "Requested scopes are not allowed for this service".to_string(),
@@ -942,7 +942,7 @@ async fn create_provider_token_request_oauth_state(
             )
             .await?
             .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
-            let client = build_upstream_oauth_client(&state, &upstream).await?;
+            let client = build_upstream_oauth_client(state, &upstream).await?;
             let (authorization_url, csrf_token, pkce_verifier) =
                 get_authorization_url_for_client(&client, Provider::Oidc, requested_scopes.clone());
             (

@@ -79,7 +79,7 @@ impl VerifiedDomainStore {
             verification_token: Set(verification_token.to_string()),
             verified: Set(false),
             verified_at: Set(None),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 
@@ -102,7 +102,7 @@ impl VerifiedDomainStore {
 
         let mut domain: verified_domains::ActiveModel = domain.into();
         domain.verified = Set(true);
-        domain.verified_at = Set(Some(now.clone()));
+        domain.verified_at = Set(Some(now));
         domain.updated_at = Set(now);
 
         let result = domain.update(&db).await.map_err(|e| {

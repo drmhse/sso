@@ -35,7 +35,7 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "typecheck": "vue-tsc --noEmit",
-    "lint": "eslint src --ext .ts,.vue",
+    "lint": "eslint \"src/**/*.ts\" tsdown.config.mjs --max-warnings 0",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

@@ -202,7 +202,11 @@ export class PermissionsModule {
       const decoded = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
       return JSON.parse(decoded) as JwtClaims;
     } catch (error) {
-      throw new Error(`Failed to decode JWT: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      const wrappedError = new Error(
+        `Failed to decode JWT: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      ) as Error & { cause?: unknown };
+      wrappedError.cause = error;
+      throw wrappedError;
     }
   }
 
