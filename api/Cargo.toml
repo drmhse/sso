@@ -42,7 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 time = { version = "0.3", features = ["serde", "formatting"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 rand = "0.8.6"
 hmac = "0.12"
