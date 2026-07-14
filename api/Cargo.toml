@@ -19,7 +19,7 @@ mime_guess = "2.0"
 openssl = { version = "0.10.80", features = ["vendored"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "chrono", "migrate", "sqlite", "postgres", "mysql"] }
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
-migration = { path = "migration" }
+migration = { path = "migration", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -124,9 +124,9 @@ required-features = ["db_mysql"]
 
 [features]
 default = ["db_sqlite"]
-db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite"]
-db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres"]
-db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql"]
+db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite", "migration/db_sqlite"]
+db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres", "migration/db_psql"]
+db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql", "migration/db_mysql"]
 
 [patch.crates-io]
 sqlx-mysql = { path = "vendor/sqlx-mysql" }
