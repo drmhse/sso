@@ -9,11 +9,25 @@ pub fn validate_resource_uri(resource: &str) -> Result<()> {
     if resource.len() > MAX_RESOURCE_URI_LEN {
         return Err(invalid_target("resource URI is too long"));
     }
+    if resource.eq_ignore_ascii_case("platform") {
+        return Err(invalid_target(
+            "resource URI uses an AuthOS-reserved audience prefix",
+        ));
+    }
 
     let parsed = oauth2::url::Url::parse(resource)
         .map_err(|_| invalid_target("resource must be an absolute URI"))?;
     if parsed.scheme().is_empty() {
         return Err(invalid_target("resource must be an absolute URI"));
+    }
+    // URI schemes are case-insensitive. Check the parsed scheme so variants
+    // such as `ORG:acme` cannot bypass the management-audience reservation.
+    if parsed.scheme().eq_ignore_ascii_case("org")
+        || parsed.scheme().eq_ignore_ascii_case("service")
+    {
+        return Err(invalid_target(
+            "resource URI uses an AuthOS-reserved audience prefix",
+        ));
     }
     if parsed.fragment().is_some() {
         return Err(invalid_target("resource URI must not contain a fragment"));
@@ -33,7 +47,7 @@ pub fn validate_requested_resource(
     validate_resource_uri(resource)?;
 
     let registered_resources = registered_resources_json
-        .map(|raw| serde_json::from_str::<Vec<String>>(raw))
+        .map(serde_json::from_str::<Vec<String>>)
         .transpose()
         .map_err(|_| AppError::InternalServerError("Invalid service resource URIs".to_string()))?
         .unwrap_or_default();
@@ -52,6 +66,13 @@ pub fn validate_requested_resource(
 
 pub fn resource_from_audience(audience: Option<&str>) -> Option<&str> {
     let audience = audience?;
+    // These values are AuthOS's internal management-session audience grammar,
+    // even though `org:` and `service:` also happen to parse as URI schemes.
+    // Treating them as RFC 8707 resources changes the JWT token profile during
+    // MFA completion and can turn a management login into an external token.
+    if audience == "platform" || audience.starts_with("org:") || audience.starts_with("service:") {
+        return None;
+    }
     validate_resource_uri(audience).ok()?;
     Some(audience)
 }
@@ -87,5 +108,25 @@ mod tests {
             Some(&registered)
         )
         .is_err());
+    }
+
+    #[test]
+    fn internal_management_audiences_are_not_resource_indicators() {
+        assert_eq!(resource_from_audience(Some("platform")), None);
+        assert_eq!(resource_from_audience(Some("org:acme")), None);
+        assert_eq!(resource_from_audience(Some("service:acme/portal")), None);
+        assert_eq!(resource_from_audience(Some("impersonation-session")), None);
+        assert_eq!(
+            resource_from_audience(Some("https://api.example.com/mcp")),
+            Some("https://api.example.com/mcp")
+        );
+        assert_eq!(
+            resource_from_audience(Some("urn:example:custom-resource")),
+            Some("urn:example:custom-resource")
+        );
+        assert!(validate_resource_uri("org:acme").is_err());
+        assert!(validate_resource_uri("ORG:acme").is_err());
+        assert!(validate_resource_uri("service:acme/portal").is_err());
+        assert!(validate_resource_uri("SERVICE:acme/portal").is_err());
     }
 }

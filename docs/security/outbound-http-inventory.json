@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "path": "api/src/services/safe_http.rs",
+      "classification": "central_policy",
+      "destination": "Caller-provided external HTTP(S) URLs",
+      "credentials": "Caller-specific",
+      "response_bound": "Caller-specific; OAuth refresh uses 64 KiB",
+      "remediation": "Keep this as the only general-purpose configurable-destination client and add proxy/DNS-rebinding integration tests."
+    },
+    {
+      "path": "api/src/services/domain_verification.rs",
+      "classification": "reviewed_custom",
+      "destination": "Operator-requested domain on port 80",
+      "credentials": "One-time public verification token only",
+      "response_bound": "4 KiB",
+      "remediation": "Retain explicit IP iteration, reserved-address rejection, no redirects, Host header control, and the response bound."
+    },
+    {
+      "path": "api/src/billing/providers/polar.rs",
+      "classification": "central_policy",
+      "destination": "Configured Polar API base URL",
+      "credentials": "Polar bearer API key",
+      "response_bound": "64 KiB",
+      "remediation": "Retain DNS validation, pinned resolution, disabled redirects, bounded JSON parsing, and generic errors that do not echo response bodies, configured URLs, or bearer keys."
+    },
+    {
+      "path": "api/src/billing/providers/stripe.rs",
+      "classification": "central_policy",
+      "destination": "Configured Stripe API base URL",
+      "credentials": "Stripe bearer API key",
+      "response_bound": "64 KiB",
+      "remediation": "Retain DNS validation, pinned resolution, disabled redirects, bounded JSON parsing, and generic errors that do not echo response bodies, configured URLs, or bearer keys."
+    }
+  ]
+}

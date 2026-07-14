@@ -29,9 +29,10 @@ async fn service_linked_user(
     principal: &ServicePrincipal,
     user_id: &str,
 ) -> Result<crate::entities::users::Model> {
-    let has_authenticated = IdentityStore::user_has_authenticated_with_service(
+    let has_authenticated = IdentityStore::user_has_authenticated_with_org_service(
         DB::Conn(&state.db),
         user_id,
+        &principal.service.org_id,
         &principal.service_id,
     )
     .await?;
@@ -86,24 +87,25 @@ pub async fn list_service_users(
 ) -> Result<Json<ListUsersResponse>> {
     check_permission(&principal, "read:users")?;
 
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = query.offset.unwrap_or(0);
+    let (limit, offset) =
+        crate::utils::pagination::signed_limit_offset(query.limit, query.offset, 50, 100);
 
     // Get total count of users who have authenticated with this service
-    let total = IdentityStore::count_users_by_service(DB::Conn(&state.db), &principal.service_id)
-        .await? as i64;
-
-    // Get list of user IDs who have authenticated with this service
-    let user_ids = IdentityStore::list_users_by_service(
+    let total = IdentityStore::count_users_by_org_service(
         DB::Conn(&state.db),
+        &principal.service.org_id,
+        &principal.service_id,
+    )
+    .await? as i64;
+
+    let users = IdentityStore::list_user_details_by_org_service(
+        DB::Conn(&state.db),
+        &principal.service.org_id,
         &principal.service_id,
         limit,
         offset,
     )
     .await?;
-
-    // Fetch user details for these IDs
-    let users = UserStore::find_by_ids(DB::Conn(&state.db), &user_ids).await?;
 
     let service_users: Vec<ServiceApiUser> = users
         .into_iter()
@@ -129,24 +131,7 @@ pub async fn get_service_user(
 ) -> Result<Json<ServiceApiUser>> {
     check_permission(&principal, "read:users")?;
 
-    // Verify the user has authenticated with this service
-    let has_authenticated = IdentityStore::user_has_authenticated_with_service(
-        DB::Conn(&state.db),
-        &user_id,
-        &principal.service_id,
-    )
-    .await?;
-
-    if !has_authenticated {
-        return Err(AppError::NotFound(
-            "User not found or has not authenticated with this service".to_string(),
-        ));
-    }
-
-    // Get the user
-    let user = UserStore::find_by_id(DB::Conn(&state.db), &user_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let user = service_linked_user(&state, &principal, &user_id).await?;
 
     Ok(Json(ServiceApiUser {
         id: user.id,
@@ -190,8 +175,8 @@ pub async fn list_service_subscriptions(
 ) -> Result<Json<ListSubscriptionsResponse>> {
     check_permission(&principal, "read:subscriptions")?;
 
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = query.offset.unwrap_or(0);
+    let (limit, offset) =
+        crate::utils::pagination::signed_limit_offset(query.limit, query.offset, 50, 100);
 
     // Get total count with optional status filter
     let total = SubscriptionStore::count_by_service_with_status(
@@ -288,9 +273,12 @@ pub async fn get_service_analytics(
     check_permission(&principal, "read:analytics")?;
 
     // Get total users who have authenticated
-    let total_users =
-        IdentityStore::count_users_by_service(DB::Conn(&state.db), &principal.service_id).await?
-            as i64;
+    let total_users = IdentityStore::count_users_by_org_service(
+        DB::Conn(&state.db),
+        &principal.service.org_id,
+        &principal.service_id,
+    )
+    .await? as i64;
 
     // Get total subscriptions
     let total_subscriptions =
@@ -395,9 +383,10 @@ pub async fn create_user(
 
     if let Some(user) = existing_user {
         // User exists in this Org - check if already linked to this specific Service
-        let has_identity = IdentityStore::user_has_authenticated_with_service(
+        let has_identity = IdentityStore::user_has_authenticated_with_org_service(
             DB::Conn(&state.db),
             &user.id,
+            &principal.service.org_id,
             &principal.service_id,
         )
         .await?;

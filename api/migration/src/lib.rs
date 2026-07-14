@@ -18,6 +18,15 @@ mod m20260612_000001_add_login_policy_to_verified_domains;
 mod m20260612_000002_add_resource_uris_to_services;
 mod m20260612_000003_add_resource_to_oauth_states_and_sessions;
 mod m20260620_000001_create_oauth_authorization_grants;
+mod m20260622_000001_add_db_access_indexes;
+mod m20260714_000001_hash_refresh_tokens;
+mod m20260714_000002_create_audit_outbox;
+mod m20260714_000003_encrypt_webhook_secrets;
+mod m20260714_000004_saml_signing_key_lifecycle;
+mod m20260714_000005_fix_sqlite_user_email_scope;
+
+#[cfg(test)]
+mod upgrade_fixtures;
 
 pub struct Migrator;
 
@@ -43,6 +52,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20260612_000002_add_resource_uris_to_services::Migration),
             Box::new(m20260612_000003_add_resource_to_oauth_states_and_sessions::Migration),
             Box::new(m20260620_000001_create_oauth_authorization_grants::Migration),
+            Box::new(m20260622_000001_add_db_access_indexes::Migration),
+            Box::new(m20260714_000001_hash_refresh_tokens::Migration),
+            Box::new(m20260714_000002_create_audit_outbox::Migration),
+            Box::new(m20260714_000003_encrypt_webhook_secrets::Migration),
+            Box::new(m20260714_000004_saml_signing_key_lifecycle::Migration),
+            Box::new(m20260714_000005_fix_sqlite_user_email_scope::Migration),
         ]
     }
 }

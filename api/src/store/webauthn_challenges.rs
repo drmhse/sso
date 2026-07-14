@@ -67,3 +67,67 @@ impl WebAuthnChallengeStore {
         Ok(result.rows_affected)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::users::UserStore;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn concurrent_challenge_consumption_has_exactly_one_winner() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let user = UserStore::create(DB::Conn(&db), "challenge@example.com", None, false)
+            .await
+            .expect("create user");
+        let challenge = WebAuthnChallengeStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "authentication",
+            "serialized-state",
+            300,
+        )
+        .await
+        .expect("create challenge");
+
+        let first = WebAuthnChallengeStore::delete(DB::Conn(&db), &challenge.id);
+        let second = WebAuthnChallengeStore::delete(DB::Conn(&db), &challenge.id);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(
+            usize::from(first.expect("first consume"))
+                + usize::from(second.expect("second consume")),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_challenge_is_not_returned() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let user = UserStore::create(DB::Conn(&db), "expired-challenge@example.com", None, false)
+            .await
+            .expect("create user");
+        let challenge = WebAuthnChallengeStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "authentication",
+            "serialized-state",
+            -1,
+        )
+        .await
+        .expect("create expired challenge");
+
+        assert!(
+            WebAuthnChallengeStore::find_by_id(DB::Conn(&db), &challenge.id)
+                .await
+                .expect("find challenge")
+                .is_none()
+        );
+    }
+}

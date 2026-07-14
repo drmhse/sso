@@ -1,17 +1,18 @@
 use crate::constants::DEFAULT_MAX_USERS;
+use crate::entities::organization_invitations;
 use crate::entities::permissions::RelationTuple;
-use crate::entities::prelude::{OrganizationInvitations, Organizations};
-use crate::entities::{organization_invitations, organizations};
+use crate::entities::prelude::OrganizationInvitations;
 use crate::error::Result;
 use crate::store::{
     memberships::MembershipStore, organization_tiers::OrganizationTierStore,
-    permissions::PermissionsStore, DB,
+    organizations::OrganizationStore, permissions::PermissionsStore, DB,
 };
 use chrono::NaiveDateTime;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
     QuerySelect, Set,
 };
+use std::collections::{HashMap, HashSet};
 /// Invitation with organization details
 #[derive(Debug, FromQueryResult)]
 pub struct InvitationWithOrg {
@@ -127,6 +128,7 @@ impl InvitationStore {
         use crate::entities::prelude::OrganizationInvitations;
         use sea_orm::{JoinType, QueryOrder, QuerySelect, RelationTrait};
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
         let invitations = OrganizationInvitations::find()
             .join(
                 JoinType::InnerJoin,
@@ -148,8 +150,8 @@ impl InvitationStore {
             )
             .filter(organization_invitations::Column::OrgId.eq(org_id))
             .order_by_desc(organization_invitations::Column::CreatedAt)
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .limit(limit)
+            .offset(offset)
             .into_model::<InvitationWithInviter>()
             .all(&db)
             .await?;
@@ -170,43 +172,63 @@ impl InvitationStore {
             .all(&db)
             .await?;
 
+        if pending_invitations.is_empty() {
+            return Ok(());
+        }
+
+        let org_ids = pending_invitations
+            .iter()
+            .map(|invitation| invitation.org_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let existing_membership_org_ids =
+            MembershipStore::list_by_user_and_org_ids(db.clone(), user_id, &org_ids)
+                .await?
+                .into_iter()
+                .map(|membership| membership.org_id)
+                .collect::<HashSet<_>>();
+        let member_counts = MembershipStore::count_by_orgs(db.clone(), &org_ids).await?;
+        let organizations = OrganizationStore::find_by_ids(db.clone(), &org_ids)
+            .await?
+            .into_iter()
+            .map(|org| (org.id.clone(), org))
+            .collect::<HashMap<_, _>>();
+        let tier_ids = organizations
+            .values()
+            .filter(|org| org.max_users.is_none())
+            .filter_map(|org| org.tier_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tiers = OrganizationTierStore::find_by_ids(db.clone(), &tier_ids)
+            .await?
+            .into_iter()
+            .map(|tier| (tier.id.clone(), tier))
+            .collect::<HashMap<_, _>>();
+
         for invitation in pending_invitations {
             let org_id_clone = invitation.org_id.clone();
 
-            let membership_exists =
-                MembershipStore::find_by_org_and_user(db.clone(), &invitation.org_id, user_id)
-                    .await?
-                    .is_some();
-
-            if !membership_exists {
-                let member_count =
-                    MembershipStore::count_by_org(db.clone(), &invitation.org_id, None).await?;
-
-                let org = Organizations::find()
-                    .filter(organizations::Column::Id.eq(&invitation.org_id))
-                    .one(&db)
-                    .await?
-                    .ok_or_else(|| {
-                        crate::error::AppError::NotFound("Organization not found".to_string())
-                    })?;
-
-                let tier_limit = if let (Some(max_users), Some(_tier_id)) =
-                    (org.max_users, org.tier_id.as_ref())
-                {
-                    max_users as i64
-                } else if let Some(tier_id) = org.tier_id.as_ref() {
-                    let tier = OrganizationTierStore::find_by_id(db.clone(), tier_id)
-                        .await?
-                        .ok_or_else(|| {
-                            crate::error::AppError::NotFound("Tier not found".to_string())
-                        })?;
-
-                    tier.default_max_users as i64
-                } else {
-                    DEFAULT_MAX_USERS
+            if !existing_membership_org_ids.contains(&invitation.org_id) {
+                let member_count = member_counts.get(&invitation.org_id).copied().unwrap_or(0);
+                let org = organizations.get(&invitation.org_id).ok_or_else(|| {
+                    crate::error::AppError::NotFound("Organization not found".to_string())
+                })?;
+                let tier_limit = match (org.max_users, org.tier_id.as_ref()) {
+                    (Some(max_users), Some(_)) => max_users as i64,
+                    (_, Some(tier_id)) => {
+                        tiers
+                            .get(tier_id)
+                            .ok_or_else(|| {
+                                crate::error::AppError::NotFound("Tier not found".to_string())
+                            })?
+                            .default_max_users as i64
+                    }
+                    _ => DEFAULT_MAX_USERS,
                 };
 
-                if member_count >= tier_limit as u64 {
+                if member_count >= tier_limit {
                     return Err(crate::error::AppError::BadRequest(
                         "Team limit reached".to_string(),
                     ));

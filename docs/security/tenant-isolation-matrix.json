@@ -1,0 +1,272 @@
+{
+  "version": 1,
+  "status": "partial-local-evidence",
+  "reviewed": "2026-07-14",
+  "sources": {
+    "inventory": "docs/security/tenant-resource-inventory.md",
+    "router": "api/src/router.rs",
+    "main": "api/src/main.rs",
+    "entities": "api/src/entities"
+  },
+  "resources": [
+    {
+      "name": "organization-core",
+      "scope": "organization",
+      "criticality": "critical",
+      "tenant_selector": "resolved organization slug/id plus current membership and capability; child IDs must be rebound to that organization",
+      "inventory_refs": ["`organizations`", "`memberships`", "`organization_roles`", "`organization_invitations`"],
+      "entities": ["organizations", "memberships", "organization_roles", "permissions", "organization_invitations"],
+      "route_patterns": [
+        "^/api/organizations(?:$|/:org_slug(?:$|/(?:select$|members(?:/|$)|transfer-ownership$|invitations(?:/|$)|roles(?:/|$)|users(?:/|$))))",
+        "^/api/invitations(?:/|$)",
+        "^/invitations/"
+      ],
+      "sqlite_evidence": [
+        "handlers::organizations::core::tests::select_organization_switches_multi_org_member_and_persists_session_scope",
+        "handlers::organizations::core::tests::select_organization_rejects_inactive_target_org",
+        "handlers::organizations::core::tests::select_organization_rejects_non_member_target_org",
+        "handlers::organizations::core::tests::tenant_capability_does_not_trust_stale_platform_owner_snapshot",
+        "handlers::organizations::members::tests::ownership_transfer_binds_same_email_to_selected_org_member",
+        "handlers::organizations::members::tests::concurrent_ownership_transfers_have_one_winner_and_one_owner_membership",
+        "handlers::invitations::tests::invitation_acceptance_ignores_platform_and_sibling_same_email_users",
+        "handlers::invitations::tests::concurrent_invited_user_resolution_has_one_tenant_identity",
+        "handlers::invitations::tests::suspended_parent_rejects_invitation_acceptance_without_state_changes"
+      ],
+      "open_gaps": [
+        "critical: complete route tests for owner/admin/custom-role/member/non-member with cross-org child IDs and unchanged denied state",
+        "high: pending/deleted-parent and distributed cache-revocation timing, plus suspended-parent cases beyond organization selection",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "service-resources-and-credentials",
+      "scope": "service-derived",
+      "criticality": "critical",
+      "tenant_selector": "organization slug resolves parent; service slug/id and every plan/key/SAML/subscription/provider child are matched to the same service",
+      "inventory_refs": ["`services`", "`plans`", "`api_keys`", "Service API user operations"],
+      "entities": ["services", "plans", "api_keys", "saml_signing_keys", "saml_states", "oauth_authorization_grants", "subscriptions", "provider_token_requests", "service_provider_grants"],
+      "route_patterns": [
+        "^/api/organizations/:org_slug/services(?:/|$)",
+        "^/api/service(?:/|$)",
+        "^/saml/"
+      ],
+      "sqlite_evidence": [
+        "store::api_keys::tests::delete_for_service_denies_cross_tenant_key_and_preserves_target",
+        "store::plans::tests::plan_mutations_require_parent_service_and_preserve_other_tenant",
+        "middleware::service_principal_tenant_status_tests::service_principal_authority_follows_current_organization_status",
+        "store::identities::tests::service_principal_queries_reject_inconsistent_cross_tenant_identity_context"
+      ],
+      "open_gaps": [
+        "critical: complete actor/permission handler matrix for services and plans, plus SAML material, subscriptions and service-principal operations",
+        "high: API-key permission combinations and parent/child races",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "organization-billing",
+      "scope": "organization",
+      "criticality": "critical",
+      "tenant_selector": "organization membership/capability plus org_id/provider compound predicates for customers and encrypted credentials",
+      "inventory_refs": ["`organization_billing_credentials`", "`billing_customers`"],
+      "entities": ["organization_billing_credentials", "billing_customers"],
+      "route_patterns": [
+        "^/api/organizations/:org_slug/billing(?:/|-)",
+        "^/webhooks/(?:stripe|billing)$"
+      ],
+      "sqlite_evidence": [
+        "store::organization_billing_credentials::tests::billing_credential_mutations_are_org_scoped_and_preserve_other_tenant",
+        "handlers::webhook::tests::subscription_webhook_rejects_cross_tenant_metadata_and_preserves_state",
+        "handlers::organizations::billing_credentials::tests::billing_credentials_authority_honors_scoped_capability_and_revocation"
+      ],
+      "open_gaps": [
+        "critical: handler owner/custom-role/non-member tests and external-customer substitution beyond subscription metadata",
+        "high: provider callback/webhook concurrency and customer-creation races",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "tenant-audit-and-analytics",
+      "scope": "organization",
+      "criticality": "critical",
+      "tenant_selector": "organization ID is applied before filters, pagination, target lookup, and aggregation; platform aggregation uses separate authority",
+      "inventory_refs": ["`organization_audit_log`", "`login_events`", "`mfa_feature_usage`"],
+      "entities": ["organization_audit_log", "login_events", "mfa_audit_log", "mfa_failure_patterns", "mfa_feature_usage", "audit_outbox"],
+      "route_patterns": ["^/api/organizations/:org_slug/(?:audit-log|analytics)(?:/|$)"],
+      "sqlite_evidence": [
+        "handlers::organization_audit::tests::audit_route_authority_is_bound_to_selected_organization",
+        "handlers::organization_audit::tests::audit_metadata_recursively_redacts_credentials_but_preserves_identifiers",
+        "handlers::analytics::tests::tenant_analytics_requires_live_scoped_capability_and_excludes_other_scopes"
+      ],
+      "open_gaps": [
+        "critical: remaining audit actor/filter/export combinations and analytics date-filter response tests",
+        "high: remaining PII/free-form metadata policy, null-org MFA rows, and unchanged-state/export assertions",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "organization-integrations",
+      "scope": "organization",
+      "criticality": "critical",
+      "tenant_selector": "organization slug/id plus same-org provider/domain/webhook/SIEM credential ID",
+      "inventory_refs": ["`organization_oauth_credentials`", "`upstream_providers`", "`webhooks`", "`siem_configs`"],
+      "entities": ["organization_oauth_credentials", "upstream_providers", "verified_domains", "webhooks", "webhook_deliveries", "siem_configs"],
+      "route_patterns": [
+        "^/api/organizations/:org_slug/(?:oauth-credentials|smtp|webhooks|siem-configs|upstream-providers|domain-routes|branding)(?:/|$)",
+        "^/api/organizations/:org_slug/domain(?:/|$)"
+      ],
+      "sqlite_evidence": [
+        "store::webhooks::tests::webhook_mutations_deny_other_organization_and_missing_ids",
+        "store::webhook_deliveries::tests::pending_delivery_polling_reauthorizes_active_parent_and_honors_limit",
+        "store::siem_configs::tests::siem_config_mutations_are_org_scoped_and_preserve_results",
+        "handlers::siem_configs::secret_tests::siem_runtime_rejects_plaintext_and_wrong_context_without_fallback",
+        "handlers::siem_configs::secret_tests::siem_test_credentials_are_provider_specific_and_fail_closed",
+        "handlers::siem_configs::secret_tests::siem_api_response_never_serializes_credential_columns",
+        "handlers::organizations::domain_routing::tests::domain_route_mutations_reject_cross_org_id_and_preserve_target",
+        "handlers::organizations::domain_routing::tests::domain_route_mutations_reject_suspended_parent_and_preserve_state"
+      ],
+      "open_gaps": [
+        "critical: handler tests for OAuth credential and upstream-provider IDs plus SIEM actor/test-action and webhook delivery-history/test-action cases; complete domain actor cases",
+        "high: remaining secret rotation and background delivery concurrency/multi-replica cases",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "scim",
+      "scope": "organization-token",
+      "criticality": "critical",
+      "tenant_selector": "organization comes only from the verified stored SCIM token; optional organization header must match",
+      "inventory_refs": ["`scim_tokens`", "SCIM middleware derives org only from token"],
+      "entities": ["scim_tokens"],
+      "route_patterns": [
+        "^/api/organizations/:org_slug/scim-tokens(?:/|$)",
+        "^/scim/"
+      ],
+      "sqlite_evidence": [
+        "handlers::scim::tests::user_routes_do_not_disclose_members_of_another_tenant",
+        "handlers::scim::tests::group_patch_rejects_cross_tenant_member_without_changing_state",
+        "handlers::scim::tests::shared_user_put_and_patch_cannot_mutate_global_identity",
+        "handlers::scim::users::deprovision_tests::shared_user_deprovision_removes_only_selected_organization_authority",
+        "handlers::scim::users::deprovision_tests::deprovision_audit_failure_rolls_back_all_authority_changes",
+        "handlers::scim::tests::suspended_parent_rejects_every_scim_route_before_handler_state_changes",
+        "handlers::scim::tests::optional_organization_header_must_be_absent_or_exactly_match_token_scope",
+        "store::scim_tokens::tests::scim_token_lifecycle_is_org_scoped_and_preserves_other_tenant"
+      ],
+      "open_gaps": [
+        "critical: complete token lifecycle actor/status route matrix and remaining resource-ID cases",
+        "high: PostgreSQL and MySQL route-suite parity"
+      ]
+    },
+    {
+      "name": "organization-risk-policy",
+      "scope": "organization",
+      "criticality": "high",
+      "tenant_selector": "resolved organization ID scopes every risk rule and risk-event read or mutation",
+      "inventory_refs": ["`risk_rules`"],
+      "entities": ["risk_rules"],
+      "route_patterns": ["^/api/organizations/:org_slug/risk(?:-|/)"] ,
+      "sqlite_evidence": [
+        "store::risk_rules::tests::risk_rule_update_and_delete_preserve_other_organization"
+      ],
+      "open_gaps": [
+        "high: risk-event selectors plus handler reset/custom-role/suspended-parent and unchanged-state tests",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "user-owned-resources",
+      "scope": "user/context",
+      "criticality": "critical",
+      "tenant_selector": "authenticated subject plus explicit organization/service context where a user can span tenants",
+      "inventory_refs": ["`users`", "`identities`", "`connected_accounts`", "`user_devices`", "`user_passkeys`"],
+      "entities": ["users", "identities", "connected_accounts", "user_devices", "user_passkeys", "user_totp_secrets", "totp_backup_codes"],
+      "route_patterns": [
+        "^/api/user(?:/|$)",
+        "^/api/privacy(?:/|$)",
+        "^/api/provider-token(?:/|$)",
+        "^/api/subscription$"
+      ],
+      "sqlite_evidence": [
+        "store::users::tests::same_email_lookups_and_default_creation_preserve_tenant_context",
+        "store::connected_accounts::tests::linked_account_ownership_and_provider_subject_collision_are_enforced",
+        "store::service_provider_grants::tests::provider_grants_require_owned_matching_account_and_preserve_denied_state",
+        "store::user_devices::tests::user_scoped_device_mutations_deny_other_user_and_preserve_state",
+        "store::user_passkeys::tests::passkey_management_denies_other_user_and_preserves_target"
+      ],
+      "open_gaps": [
+        "critical: privacy user_id and identity cross-user handler matrix",
+        "high: shared-user multi-organization context tests",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "authentication-state-and-sessions",
+      "scope": "user/service/context",
+      "criticality": "critical",
+      "tenant_selector": "stored session/token/challenge context binds user, organization, service, resource, flow and expiry; bearer state is consumed atomically",
+      "inventory_refs": ["`sessions`", "`password_reset_tokens`", "`magic_link_tokens`", "`oauth_states`", "`device_codes`"],
+      "entities": ["sessions", "session_refresh_token_history", "device_codes", "email_verification_tokens", "magic_link_tokens", "oauth_states", "password_reset_tokens", "webauthn_challenges"],
+      "route_patterns": [
+        "^/api/auth(?:/|$)",
+        "^/auth(?:/|$)",
+        "^/oauth2?/token$",
+        "^/connect/provider-token(?:/|$)"
+      ],
+      "sqlite_evidence": [
+        "store::sessions::tests::org_scoped_session_revocation_preserves_other_tenant_and_other_user",
+        "store::sessions::tests::list_user_org_scoped_sessions_filters_in_sql_shape",
+        "store::users::tests::same_email_lookups_and_default_creation_preserve_tenant_context",
+        "store::provider_token_requests::tests::provider_token_request_completion_is_user_bound_and_one_time",
+        "store::provider_token_requests::tests::transactional_completion_rolls_back_failures_and_has_one_concurrent_winner",
+        "auth::jwt::tests::device_mfa_preauth_token_binds_exact_device_context",
+        "handlers::auth::mfa::tests::device_context_requires_exact_signed_match",
+        "handlers::auth::magic::tests::malformed_callback_and_suspension_after_issuance_preserve_magic_link",
+        "handlers::auth::magic::tests::same_email_and_cross_service_context_cannot_select_or_consume_wrong_identity"
+      ],
+      "open_gaps": [
+        "critical: handler-level cross-service context matrix across reset, magic-link, OAuth, device, and session flows",
+        "high: distributed session/cache revocation and multi-replica one-time consumption",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "platform-and-internal",
+      "scope": "platform/internal",
+      "criticality": "critical",
+      "tenant_selector": "current database platform-owner role or internal-only execution; tenant roles and cached privilege snapshots are insufficient",
+      "inventory_refs": ["Platform-owner user flag and platform routes", "`platform_audit_log`", "`system_jobs`", "`distributed_locks`"],
+      "entities": ["organization_tiers", "platform_audit_log", "mfa_daily_metrics", "system_jobs", "distributed_locks", "token_refresh_locks"],
+      "route_patterns": ["^/api/platform(?:/|$)"],
+      "sqlite_evidence": [
+        "middleware::platform_authority_tests::platform_authority_uses_current_database_role_not_cached_snapshot",
+        "middleware::impersonation_authority_tests::platform_actor_demotion_immediately_removes_global_impersonation_authority",
+        "router::platform_route_boundary_tests::every_platform_route_is_inside_the_platform_owner_boundary",
+        "handlers::platform::audit_redaction_tests::platform_audit_metadata_uses_recursive_credential_redaction"
+      ],
+      "open_gaps": [
+        "high: remaining platform audit attribution and internal job payload authorization",
+        "high: PostgreSQL and MySQL parity"
+      ]
+    },
+    {
+      "name": "public-operational",
+      "scope": "public/operational",
+      "criticality": "high",
+      "tenant_selector": "no tenant-private data; operational details are bounded and proxy-restricted where required",
+      "inventory_refs": ["health/readiness"],
+      "entities": [],
+      "route_patterns": [
+        "^/health(?:/|$)",
+        "^/\\.well-known/jwks\\.json$",
+        "^/metrics$"
+      ],
+      "sqlite_evidence": [
+        "handlers::health::tests::public_health_responses_have_a_bounded_non_tenant_shape",
+        "jwks_tests::jwks_publishes_active_and_previous_verification_keys",
+        "http_security::tests::metrics_requires_the_exact_bearer_token"
+      ],
+      "open_gaps": [
+        "high: deployment-proxy disclosure and network-boundary checks"
+      ]
+    }
+  ]
+}

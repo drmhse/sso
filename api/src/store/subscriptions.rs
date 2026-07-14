@@ -2,6 +2,7 @@ use crate::error::Result;
 use crate::store::DB;
 use chrono::NaiveDateTime;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, Set};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct SubscriptionWithPlan {
@@ -71,6 +72,18 @@ pub struct SubscriptionWithPlanDetails {
     pub status: String,
     pub current_period_end: String,
     pub plan_name: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct CountByService {
+    service_id: String,
+    count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct CountByPlan {
+    plan_id: String,
+    count: i64,
 }
 
 pub struct SubscriptionStore;
@@ -234,53 +247,51 @@ impl SubscriptionStore {
         offset: i64,
     ) -> Result<Vec<EndUser>> {
         use crate::entities::{identities, services, subscriptions, users};
-        use sea_orm::{JoinType, Order, QueryOrder, QuerySelect, RelationTrait};
-        use std::collections::HashSet;
+        use sea_orm::sea_query::{Expr, Query};
+        use sea_orm::{Condition, Order, QueryFilter, QueryOrder, QuerySelect};
 
-        // Get user IDs from identities for this org (optionally filtered by service)
-        let mut identity_query = identities::Entity::find()
-            .filter(identities::Column::IssuingOrgId.eq(org_id))
-            .select_only()
-            .column(identities::Column::UserId);
+        let mut identity_exists = Query::select();
+        identity_exists
+            .expr(Expr::val(1))
+            .from(identities::Entity)
+            .and_where(
+                Expr::col((identities::Entity, identities::Column::UserId))
+                    .equals((users::Entity, users::Column::Id)),
+            )
+            .and_where(Expr::col(identities::Column::IssuingOrgId).eq(org_id));
+
+        let mut subscription_exists = Query::select();
+        subscription_exists
+            .expr(Expr::val(1))
+            .from(subscriptions::Entity)
+            .and_where(
+                Expr::col((subscriptions::Entity, subscriptions::Column::UserId))
+                    .equals((users::Entity, users::Column::Id)),
+            );
 
         if let Some(svc_id) = service_id {
-            identity_query = identity_query.filter(identities::Column::IssuingServiceId.eq(svc_id));
-        }
-
-        let identity_user_ids: Vec<String> = identity_query.into_tuple().all(&db).await?;
-
-        // Get user IDs from subscriptions for this org (optionally filtered by service)
-        let mut sub_query = subscriptions::Entity::find()
-            .join(JoinType::InnerJoin, subscriptions::Relation::Services.def())
-            .select_only()
-            .column(subscriptions::Column::UserId);
-
-        if let Some(svc_id) = service_id {
-            sub_query = sub_query.filter(subscriptions::Column::ServiceId.eq(svc_id));
+            identity_exists.and_where(Expr::col(identities::Column::IssuingServiceId).eq(svc_id));
+            subscription_exists.and_where(Expr::col(subscriptions::Column::ServiceId).eq(svc_id));
         } else {
-            sub_query = sub_query.filter(services::Column::OrgId.eq(org_id));
+            subscription_exists
+                .inner_join(
+                    services::Entity,
+                    Expr::col((subscriptions::Entity, subscriptions::Column::ServiceId))
+                        .equals((services::Entity, services::Column::Id)),
+                )
+                .and_where(Expr::col(services::Column::OrgId).eq(org_id));
         }
 
-        let sub_user_ids: Vec<String> = sub_query.into_tuple().all(&db).await?;
-
-        // Combine and deduplicate user IDs
-        let all_user_ids: Vec<String> = identity_user_ids
-            .into_iter()
-            .chain(sub_user_ids)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        if all_user_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Fetch user details with pagination
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
         let results = users::Entity::find()
-            .filter(users::Column::Id.is_in(all_user_ids))
+            .filter(
+                Condition::any()
+                    .add(Expr::exists(identity_exists.to_owned()))
+                    .add(Expr::exists(subscription_exists.to_owned())),
+            )
             .order_by(users::Column::CreatedAt, Order::Desc)
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .limit(limit)
+            .offset(offset)
             .select_only()
             .column_as(users::Column::Id, "id")
             .column_as(users::Column::Email, "email")
@@ -299,41 +310,52 @@ impl SubscriptionStore {
         org_id: &str,
         service_id: Option<&str>,
     ) -> Result<i64> {
-        use crate::entities::{identities, services, subscriptions};
-        use sea_orm::{JoinType, QuerySelect, RelationTrait};
-        use std::collections::HashSet;
+        use crate::entities::{identities, services, subscriptions, users};
+        use sea_orm::sea_query::{Expr, Query};
+        use sea_orm::{Condition, PaginatorTrait, QueryFilter};
 
-        // Get user IDs from identities for this org (optionally filtered by service)
-        let mut identity_query = identities::Entity::find()
-            .filter(identities::Column::IssuingOrgId.eq(org_id))
-            .select_only()
-            .column(identities::Column::UserId);
+        let mut identity_exists = Query::select();
+        identity_exists
+            .expr(Expr::val(1))
+            .from(identities::Entity)
+            .and_where(
+                Expr::col((identities::Entity, identities::Column::UserId))
+                    .equals((users::Entity, users::Column::Id)),
+            )
+            .and_where(Expr::col(identities::Column::IssuingOrgId).eq(org_id));
+
+        let mut subscription_exists = Query::select();
+        subscription_exists
+            .expr(Expr::val(1))
+            .from(subscriptions::Entity)
+            .and_where(
+                Expr::col((subscriptions::Entity, subscriptions::Column::UserId))
+                    .equals((users::Entity, users::Column::Id)),
+            );
 
         if let Some(svc_id) = service_id {
-            identity_query = identity_query.filter(identities::Column::IssuingServiceId.eq(svc_id));
-        }
-
-        let identity_user_ids: Vec<String> = identity_query.into_tuple().all(&db).await?;
-
-        // Get user IDs from subscriptions for this org (optionally filtered by service)
-        let mut sub_query = subscriptions::Entity::find()
-            .join(JoinType::InnerJoin, subscriptions::Relation::Services.def())
-            .select_only()
-            .column(subscriptions::Column::UserId);
-
-        if let Some(svc_id) = service_id {
-            sub_query = sub_query.filter(subscriptions::Column::ServiceId.eq(svc_id));
+            identity_exists.and_where(Expr::col(identities::Column::IssuingServiceId).eq(svc_id));
+            subscription_exists.and_where(Expr::col(subscriptions::Column::ServiceId).eq(svc_id));
         } else {
-            sub_query = sub_query.filter(services::Column::OrgId.eq(org_id));
+            subscription_exists
+                .inner_join(
+                    services::Entity,
+                    Expr::col((subscriptions::Entity, subscriptions::Column::ServiceId))
+                        .equals((services::Entity, services::Column::Id)),
+                )
+                .and_where(Expr::col(services::Column::OrgId).eq(org_id));
         }
 
-        let sub_user_ids: Vec<String> = sub_query.into_tuple().all(&db).await?;
+        let count = users::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(Expr::exists(identity_exists.to_owned()))
+                    .add(Expr::exists(subscription_exists.to_owned())),
+            )
+            .count(&db)
+            .await?;
 
-        // Combine and deduplicate user IDs, return count
-        let unique_user_ids: HashSet<String> =
-            identity_user_ids.into_iter().chain(sub_user_ids).collect();
-
-        Ok(unique_user_ids.len() as i64)
+        Ok(count as i64)
     }
 
     /// Check if a specific user is an end-user of an organization
@@ -432,6 +454,36 @@ impl SubscriptionStore {
         Ok(count)
     }
 
+    /// Count active subscriptions grouped by service ID.
+    pub async fn count_active_by_services(
+        db: DB<'_>,
+        service_ids: &[String],
+    ) -> Result<HashMap<String, i64>> {
+        use crate::entities::prelude::Subscriptions;
+        use crate::entities::subscriptions;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+
+        if service_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = Subscriptions::find()
+            .filter(subscriptions::Column::ServiceId.is_in(service_ids.iter().cloned()))
+            .filter(subscriptions::Column::Status.eq("active"))
+            .select_only()
+            .column(subscriptions::Column::ServiceId)
+            .column_as(subscriptions::Column::Id.count(), "count")
+            .group_by(subscriptions::Column::ServiceId)
+            .into_model::<CountByService>()
+            .all(&db)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.service_id, row.count))
+            .collect())
+    }
+
     /// Count active subscriptions for a plan
     pub async fn count_active_by_plan(db: DB<'_>, plan_id: &str) -> Result<i64> {
         use crate::entities::prelude::Subscriptions;
@@ -445,6 +497,36 @@ impl SubscriptionStore {
             .await? as i64;
 
         Ok(count)
+    }
+
+    /// Count active subscriptions grouped by plan ID.
+    pub async fn count_active_by_plans(
+        db: DB<'_>,
+        plan_ids: &[String],
+    ) -> Result<HashMap<String, i64>> {
+        use crate::entities::prelude::Subscriptions;
+        use crate::entities::subscriptions;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+
+        if plan_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = Subscriptions::find()
+            .filter(subscriptions::Column::PlanId.is_in(plan_ids.iter().cloned()))
+            .filter(subscriptions::Column::Status.eq("active"))
+            .select_only()
+            .column(subscriptions::Column::PlanId)
+            .column_as(subscriptions::Column::Id.count(), "count")
+            .group_by(subscriptions::Column::PlanId)
+            .into_model::<CountByPlan>()
+            .all(&db)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.plan_id, row.count))
+            .collect())
     }
 
     /// Count active subscriptions for a service by organization and slug lookup
@@ -516,9 +598,10 @@ impl SubscriptionStore {
             query = query.filter(subscriptions::Column::Status.eq(s));
         }
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
         let results = query
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .limit(limit)
+            .offset(offset)
             .into_model::<SubscriptionWithPlanDetails>()
             .all(&db)
             .await?;
@@ -643,5 +726,297 @@ impl SubscriptionStore {
         let subscription_active: subscriptions::ActiveModel = subscription.into();
         subscription_active.delete(&db).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::identities::IdentityStore;
+    use crate::store::organizations::OrganizationStore;
+    use crate::store::plans::PlanStore;
+    use crate::store::services::ServiceStore;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn end_user_listing_uses_identity_and_subscription_matches() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let org = OrganizationStore::create(DB::Conn(&db), "acme", "Acme", &owner.id, None)
+            .await
+            .expect("create org");
+        let service_a = ServiceStore::create_with_options(
+            DB::Conn(&db),
+            "svc-a",
+            &org.id,
+            "app-a",
+            "App A",
+            "web",
+            "client-a",
+            "secret-a",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create service a");
+        let service_b = ServiceStore::create_with_options(
+            DB::Conn(&db),
+            "svc-b",
+            &org.id,
+            "app-b",
+            "App B",
+            "web",
+            "client-b",
+            "secret-b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create service b");
+        let now = chrono::Utc::now().naive_utc();
+        PlanStore::create(
+            DB::Conn(&db),
+            "plan-a",
+            &service_a.id,
+            "Plan A",
+            None,
+            0,
+            "USD",
+            "[]",
+            None,
+            true,
+            now,
+        )
+        .await
+        .expect("create plan a");
+        PlanStore::create(
+            DB::Conn(&db),
+            "plan-b",
+            &service_b.id,
+            "Plan B",
+            None,
+            0,
+            "USD",
+            "[]",
+            None,
+            true,
+            now,
+        )
+        .await
+        .expect("create plan b");
+
+        let identity_only = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "identity-only@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create identity-only user")
+        .0;
+        let subscription_only = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "subscription-only@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create subscription-only user")
+        .0;
+        let both = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "both@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create both user")
+        .0;
+        let outsider = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "outsider@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create outsider")
+        .0;
+
+        IdentityStore::create(
+            DB::Conn(&db),
+            &identity_only.id,
+            "github",
+            "identity-only",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&service_a.id),
+        )
+        .await
+        .expect("create identity-only identity");
+        IdentityStore::create(
+            DB::Conn(&db),
+            &both.id,
+            "github",
+            "both",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&service_a.id),
+        )
+        .await
+        .expect("create both identity");
+        IdentityStore::create(
+            DB::Conn(&db),
+            &both.id,
+            "google",
+            "both-google",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&service_a.id),
+        )
+        .await
+        .expect("create duplicate service identity for same user");
+
+        SubscriptionStore::create(
+            DB::Conn(&db),
+            &subscription_only.id,
+            &service_a.id,
+            "plan-a",
+            "active",
+            now,
+        )
+        .await
+        .expect("create service a subscription");
+        SubscriptionStore::create(
+            DB::Conn(&db),
+            &both.id,
+            &service_b.id,
+            "plan-b",
+            "active",
+            now,
+        )
+        .await
+        .expect("create service b subscription");
+        let plan_counts = SubscriptionStore::count_active_by_plans(
+            DB::Conn(&db),
+            &[
+                "plan-a".to_string(),
+                "plan-b".to_string(),
+                "missing".to_string(),
+            ],
+        )
+        .await
+        .expect("count active subscriptions by plan");
+        assert_eq!(plan_counts.get("plan-a"), Some(&1));
+        assert_eq!(plan_counts.get("plan-b"), Some(&1));
+        assert_eq!(plan_counts.get("missing"), None);
+
+        assert_eq!(
+            IdentityStore::count_users_by_service(DB::Conn(&db), &service_a.id)
+                .await
+                .expect("count distinct service users"),
+            2
+        );
+        let service_a_identity_users =
+            IdentityStore::list_user_details_by_service(DB::Conn(&db), &service_a.id, 10, 0)
+                .await
+                .expect("list distinct service user details");
+        let service_a_identity_user_ids: HashSet<_> = service_a_identity_users
+            .iter()
+            .map(|user| user.id.as_str())
+            .collect();
+        assert_eq!(service_a_identity_user_ids.len(), 2);
+        assert!(service_a_identity_user_ids.contains(identity_only.id.as_str()));
+        assert!(service_a_identity_user_ids.contains(both.id.as_str()));
+
+        let all = SubscriptionStore::list_end_users_by_org(DB::Conn(&db), &org.id, None, 10, 0)
+            .await
+            .expect("list all end users");
+        let all_ids: HashSet<_> = all.iter().map(|user| user.id.as_str()).collect();
+        assert_eq!(all_ids.len(), 3);
+        assert!(all_ids.contains(identity_only.id.as_str()));
+        assert!(all_ids.contains(subscription_only.id.as_str()));
+        assert!(all_ids.contains(both.id.as_str()));
+        assert!(!all_ids.contains(outsider.id.as_str()));
+        assert_eq!(
+            SubscriptionStore::count_end_users_by_org(DB::Conn(&db), &org.id, None)
+                .await
+                .expect("count all end users"),
+            3
+        );
+
+        let service_a_users = SubscriptionStore::list_end_users_by_org(
+            DB::Conn(&db),
+            &org.id,
+            Some(&service_a.id),
+            10,
+            0,
+        )
+        .await
+        .expect("list service a end users");
+        let service_a_ids: HashSet<_> = service_a_users
+            .iter()
+            .map(|user| user.id.as_str())
+            .collect();
+        assert_eq!(service_a_ids.len(), 3);
+        assert!(service_a_ids.contains(identity_only.id.as_str()));
+        assert!(service_a_ids.contains(subscription_only.id.as_str()));
+        assert!(service_a_ids.contains(both.id.as_str()));
+
+        let service_b_users = SubscriptionStore::list_end_users_by_org(
+            DB::Conn(&db),
+            &org.id,
+            Some(&service_b.id),
+            10,
+            0,
+        )
+        .await
+        .expect("list service b end users");
+        assert_eq!(service_b_users.len(), 1);
+        assert_eq!(service_b_users[0].id, both.id);
+        assert_eq!(
+            SubscriptionStore::count_end_users_by_org(DB::Conn(&db), &org.id, Some(&service_b.id))
+                .await
+                .expect("count service b end users"),
+            1
+        );
     }
 }

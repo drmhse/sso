@@ -10,6 +10,23 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
+    "check:docs": "bash scripts/docs-check.sh",
+    "check:bootstrap": "node --test scripts/authos-bootstrap/compose.test.js && python3 scripts/test-authos-standalone-atomic.py && python3 scripts/test-install-sh.py",
+    "check:backup": "python3 scripts/test-authos-sqlite-backup.py",
+    "check:monitoring": "python3 scripts/test-monitoring-assets.py && python3 scripts/check-monitoring-assets.py",
+    "check:capacity": "python3 scripts/test-authos-capacity.py && python3 scripts/authos-capacity.py --scenarios deploy/qualification/capacity-scenarios.json --validate-only",
+    "check:failures": "python3 scripts/test-authos-local-failures.py && python3 scripts/authos-local-failures.py --manifest deploy/qualification/local-failure-cases.json",
+    "check:licenses": "node scripts/check-first-party-licenses.mjs",
+    "check:audit-policy": "node scripts/check-audit-transaction-policy.mjs",
+    "check:pagination-policy": "node scripts/check-pagination-policy.mjs",
+    "qualify:backup:sqlite": "bash scripts/qualify-sqlite-backup-restore.sh",
+    "check:release-assets": "python3 scripts/test-generate-release-manifest.py && python3 scripts/test-verify-release-assets.py && python3 scripts/test-npm-release-evidence.py && python3 scripts/test-container-release-evidence.py",
+    "check:release-policy": "node scripts/check-release-policy.mjs",
+    "check:outbound-http": "node scripts/check-outbound-http.mjs",
+    "check:tenant-isolation": "node scripts/check-tenant-isolation-matrix.mjs",
+    "check:redaction": "node --test scripts/test-sensitive-logging.mjs && node scripts/check-sensitive-logging.mjs && python3 scripts/test-qualification-secret-transport.py",
+    "check:trust": "node --test scripts/test-trust-metadata.mjs && node scripts/check-trust-metadata.mjs",
+    "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lite-web:build": "npm run build -w lite-web-client",
     "build:sdk": "npm run build -w @drmhse/sso-sdk",
@@ -33,7 +50,7 @@
   "author": "DRM HSE <info@drmhse.com>",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
-    "node": ">=18.0.0"
+    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
   },
   "overrides": {
     "postcss": "^8.5.10",
@@ -46,7 +63,14 @@
     }
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@typescript-eslint/eslint-plugin": "^8.64.0",
+    "@typescript-eslint/parser": "^8.64.0",
     "esbuild": "0.28.1",
-    "vite": "8.0.16"
+    "eslint": "^10.7.0",
+    "eslint-plugin-vue": "^10.9.2",
+    "globals": "^17.7.0",
+    "vite": "8.0.16",
+    "vue-eslint-parser": "^10.4.1"
   }
 }

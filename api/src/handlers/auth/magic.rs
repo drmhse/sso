@@ -1,4 +1,4 @@
-use crate::error::{AppError, Result};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::handlers::auth::password::reject_upstream_only_local_auth;
 use crate::middleware::RequestInfo;
@@ -15,7 +15,6 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // Import session response type
 pub use super::session::RefreshTokenResponse;
@@ -100,6 +99,43 @@ fn parse_magic_context(
     (Some(context.to_string()), None, None, None)
 }
 
+type BoundMagicContext = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn validate_magic_callback(
+    context: &str,
+    query: &VerifyMagicLinkQuery,
+) -> Result<BoundMagicContext> {
+    let (org_slug, service_slug, context_redirect_uri, context_state) =
+        parse_magic_context(context);
+    let redirect_uri = match (
+        context_redirect_uri.as_deref(),
+        query.redirect_uri.as_deref(),
+    ) {
+        (Some(bound), Some(requested)) if requested != bound => {
+            return Err(AppError::BadRequest(
+                "redirect_uri does not match the issued magic link".to_string(),
+            ));
+        }
+        (Some(bound), _) => Some(bound.to_string()),
+        (None, requested) => requested.map(str::to_string),
+    };
+    let callback_state = match (context_state.as_deref(), query.state.as_deref()) {
+        (Some(bound), Some(requested)) if requested != bound => {
+            return Err(AppError::BadRequest(
+                "state does not match the issued magic link".to_string(),
+            ));
+        }
+        (Some(bound), _) => Some(bound.to_string()),
+        (None, requested) => requested.map(str::to_string),
+    };
+    Ok((org_slug, service_slug, redirect_uri, callback_state))
+}
+
 fn validate_service_redirect_uri(
     service: &crate::entities::services::Model,
     redirect_uri: &str,
@@ -128,11 +164,14 @@ fn validate_service_redirect_uri(
 }
 
 async fn resolve_magic_service_context(
-    state: &AppState,
+    db: &sea_orm::DatabaseConnection,
     org_slug: Option<&str>,
     service_slug: Option<&str>,
     redirect_uri: Option<&str>,
-) -> Result<(Option<String>, Option<String>)> {
+) -> Result<(
+    Option<crate::entities::organizations::Model>,
+    Option<crate::entities::services::Model>,
+)> {
     if service_slug.is_some() && org_slug.is_none() {
         return Err(AppError::BadRequest(
             "service_slug requires org_slug".to_string(),
@@ -149,24 +188,155 @@ async fn resolve_magic_service_context(
         return Ok((None, None));
     };
 
-    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
+    let org = OrganizationStore::find_by_slug(DB::Conn(db), org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let org = crate::handlers::organizations::ensure_organization_active(db, &org.id).await?;
 
     if let Some(service_slug) = service_slug {
-        let service =
-            ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+        let service = ServiceStore::find_by_org_and_slug(DB::Conn(db), &org.id, service_slug)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
         if let Some(redirect_uri) = redirect_uri {
             validate_service_redirect_uri(&service, redirect_uri)?;
         }
 
-        return Ok((Some(org.id), Some(service.id)));
+        return Ok((Some(org), Some(service)));
     }
 
-    Ok((Some(org.id), None))
+    Ok((Some(org), None))
+}
+
+async fn validate_magic_scope_at_consume(
+    db: DB<'_>,
+    user: &crate::entities::users::Model,
+    org_id: Option<&str>,
+    service_id: Option<&str>,
+) -> Result<()> {
+    let user = UserStore::find_by_id(db.clone(), &user.id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::BadRequest("Invalid or expired magic link".to_string()))?;
+    let Some(org_id) = org_id else {
+        if service_id.is_some() {
+            return Err(AppError::BadRequest(
+                "Magic link service context is missing its organization".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    let org = OrganizationStore::find_by_id(db.clone(), org_id)
+        .await?
+        .filter(|org| org.status == "active")
+        .ok_or_else(|| AppError::Forbidden("Organization is not active".to_string()))?;
+    if let Some(service_id) = service_id {
+        let service = ServiceStore::find_by_id(db.clone(), service_id)
+            .await?
+            .filter(|service| service.org_id == org.id)
+            .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+        if !user.is_platform_owner {
+            use crate::entities::{identities, prelude::Identities};
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+            if Identities::find()
+                .filter(identities::Column::UserId.eq(&user.id))
+                .filter(identities::Column::IssuingOrgId.eq(&org.id))
+                .filter(identities::Column::IssuingServiceId.eq(&service.id))
+                .one(&db)
+                .await?
+                .is_none()
+            {
+                return Err(AppError::Forbidden(
+                    "You do not have access to this service".to_string(),
+                ));
+            }
+        }
+    } else if !user.is_platform_owner {
+        MembershipStore::find_by_org_and_user(db.clone(), &org.id, &user.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Forbidden("You are not a member of this organization".to_string())
+            })?;
+    }
+    Ok(())
+}
+
+async fn consume_magic_link(
+    state: &AppState,
+    token: &str,
+    user: &crate::entities::users::Model,
+    org_id: Option<&str>,
+    service_id: Option<&str>,
+) -> Result<()> {
+    let token = token.to_string();
+    let user = user.clone();
+    let org_id = org_id.map(str::to_string);
+    let service_id = service_id.map(str::to_string);
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "consume_magic_link",
+        |db| {
+            let token = token.clone();
+            let user = user.clone();
+            let org_id = org_id.clone();
+            let service_id = service_id.clone();
+            Box::pin(async move {
+                validate_magic_scope_at_consume(
+                    db.clone(),
+                    &user,
+                    org_id.as_deref(),
+                    service_id.as_deref(),
+                )
+                .await?;
+                if !MagicLinksStore::delete(db, &token).await? {
+                    return Err(AppError::BadRequest(
+                        "Invalid or expired magic link".to_string(),
+                    ));
+                }
+                Ok(())
+            })
+        },
+    )
+    .await
+}
+
+async fn ensure_magic_context_access(
+    db: &sea_orm::DatabaseConnection,
+    user: &crate::entities::users::Model,
+    org: Option<&crate::entities::organizations::Model>,
+    service: Option<&crate::entities::services::Model>,
+) -> Result<()> {
+    let Some(org) = org else {
+        return Ok(());
+    };
+    if user.is_platform_owner {
+        return Ok(());
+    }
+    if let Some(service) = service {
+        use crate::entities::{identities, prelude::Identities};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        if Identities::find()
+            .filter(identities::Column::UserId.eq(&user.id))
+            .filter(identities::Column::IssuingOrgId.eq(&org.id))
+            .filter(identities::Column::IssuingServiceId.eq(&service.id))
+            .one(db)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::Forbidden(
+                "You do not have access to this service".to_string(),
+            ));
+        }
+    } else {
+        MembershipStore::find_by_org_and_user(DB::Conn(db), &org.id, &user.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Forbidden("You are not a member of this organization".to_string())
+            })?;
+    }
+    Ok(())
 }
 
 /// POST /api/auth/magic-link/request - Request a magic link
@@ -207,32 +377,24 @@ pub async fn request_magic_link(
         req.redirect_uri.as_deref(),
         req.state.as_deref(),
     );
-    let (issuing_org_id, issuing_service_id) = resolve_magic_service_context(
-        &state,
+    let (issuing_org, _issuing_service) = resolve_magic_service_context(
+        &state.db,
         req.org_slug.as_deref(),
         req.service_slug.as_deref(),
         req.redirect_uri.as_deref(),
     )
     .await?;
-    reject_upstream_only_local_auth(
-        &state,
-        &req.email,
-        issuing_org_id.as_deref(),
-        "Magic-link sign-in",
-    )
-    .await?;
+    let issuing_org_id = issuing_org.as_ref().map(|org| org.id.as_str());
+    reject_upstream_only_local_auth(&state, &req.email, issuing_org_id, "Magic-link sign-in")
+        .await?;
 
     // Service-scoped magic links must resolve the tenant user, not a same-email
     // platform or sibling-organization user.
-    let user = if issuing_service_id.is_some() {
-        UserStore::find_by_email_with_context(
-            DB::Conn(&state.db),
-            &req.email,
-            issuing_org_id.as_deref(),
-        )
-        .await?
+    let user = if issuing_org_id.is_some() {
+        UserStore::find_by_email_with_context(DB::Conn(&state.db), &req.email, issuing_org_id)
+            .await?
     } else {
-        UserStore::find_by_email(DB::Conn(&state.db), &req.email).await?
+        UserStore::find_by_email_with_context(DB::Conn(&state.db), &req.email, None).await?
     };
 
     // Generate magic link token
@@ -286,13 +448,12 @@ pub async fn request_magic_link(
     .await
     {
         tracing::warn!(
-            email = %req.email,
+            user_id = ?user.as_ref().map(|u| u.id.as_str()),
             error = %e,
             "Failed to enqueue magic link email"
         );
     } else {
         tracing::info!(
-            email = %req.email,
             user_id = ?user.as_ref().map(|u| u.id.as_str()),
             "Magic link email enqueued successfully"
         );
@@ -333,6 +494,7 @@ pub async fn verify_magic_link(
     let user = if let Some(user_id) = &magic_link.user_id {
         UserStore::find_by_id(DB::Conn(&state.db), user_id)
             .await?
+            .filter(|user| user.deleted_at.is_none())
             .ok_or_else(|| AppError::NotFound("User not found".to_string()))?
     } else {
         // Auto-create user if email verification is not required
@@ -342,150 +504,57 @@ pub async fn verify_magic_link(
         ));
     };
 
+    let (org_slug_owned, service_slug_owned, redirect_uri_owned, callback_state_owned) =
+        validate_magic_callback(&magic_link.context, &query)?;
+    let org_slug = org_slug_owned.as_deref();
+    let service_slug = service_slug_owned.as_deref();
+    let redirect_uri = redirect_uri_owned.as_deref();
+    let callback_state = callback_state_owned.as_deref();
+
+    let (resolved_org, resolved_service) =
+        resolve_magic_service_context(&state.db, org_slug, service_slug, redirect_uri).await?;
+    let resolved_org_id = resolved_org.as_ref().map(|org| org.id.as_str());
+
     reject_upstream_only_local_auth(
         &state,
         &user.email,
-        user.org_id.as_deref(),
+        resolved_org_id.or(user.org_id.as_deref()),
         "Magic-link sign-in",
     )
     .await?;
 
-    // Delete the magic link token (one-time use)
-    if !MagicLinksStore::delete(DB::Conn(&state.db), &query.token).await? {
-        return Err(AppError::BadRequest(
-            "Invalid or expired magic link".to_string(),
-        ));
-    }
+    ensure_magic_context_access(
+        &state.db,
+        &user,
+        resolved_org.as_ref(),
+        resolved_service.as_ref(),
+    )
+    .await?;
 
-    // Run risk engine evaluation
+    // All callback, tenant, service, local-auth, and access checks are complete
+    // before risk evaluation and the one-time consume boundary.
     use crate::services::risk_engine::RiskContext;
-
     let risk_ctx = RiskContext {
         user_id: &user.id,
-        org_id: None, // Magic links don't have org context yet
+        org_id: resolved_org_id,
         ip_address: &request_info.ip_address,
         user_agent: &request_info.user_agent,
-        device_cookie: None, // No device cookie on magic link auth
+        device_cookie: None,
     };
-
     let risk_assessment = state
         .risk_engine
         .evaluate(DB::Conn(&state.db), risk_ctx)
         .await?;
 
-    // Log risk assessment
     tracing::info!(
         user_id = %user.id,
-        email = %user.email,
         risk_score = risk_assessment.score,
         risk_action = ?risk_assessment.action,
         risk_factors = ?risk_assessment.factors,
         "Magic link authentication risk assessment"
     );
 
-    // Log the successful authentication with risk data
-    tracing::info!(
-        user_id = %user.id,
-        email = %user.email,
-        risk_score = risk_assessment.score,
-        risk_factors = ?risk_assessment.factors,
-        ip_address = %request_info.ip_address,
-        "Magic link authentication successful"
-    );
-
-    let (org_slug_owned, service_slug_owned, context_redirect_uri, context_state) =
-        parse_magic_context(&magic_link.context);
-    let org_slug = org_slug_owned.as_deref();
-    let service_slug = service_slug_owned.as_deref();
-    let redirect_uri = match (
-        context_redirect_uri.as_deref(),
-        query.redirect_uri.as_deref(),
-    ) {
-        (Some(bound_redirect_uri), Some(requested_redirect_uri))
-            if requested_redirect_uri != bound_redirect_uri =>
-        {
-            return Err(AppError::BadRequest(
-                "redirect_uri does not match the issued magic link".to_string(),
-            ));
-        }
-        (Some(bound_redirect_uri), _) => Some(bound_redirect_uri),
-        (None, requested_redirect_uri) => requested_redirect_uri,
-    };
-    let callback_state = match (context_state.as_deref(), query.state.as_deref()) {
-        (Some(bound_state), Some(requested_state)) if requested_state != bound_state => {
-            return Err(AppError::BadRequest(
-                "state does not match the issued magic link".to_string(),
-            ));
-        }
-        (Some(bound_state), _) => Some(bound_state),
-        (None, requested_state) => requested_state,
-    };
-
-    if service_slug.is_some() && org_slug.is_none() {
-        return Err(AppError::BadRequest(
-            "service_slug requires org_slug".to_string(),
-        ));
-    }
-
-    if redirect_uri.is_some() && service_slug.is_none() {
-        return Err(AppError::BadRequest(
-            "redirect_uri requires org_slug and service_slug".to_string(),
-        ));
-    }
-
-    let service_id = if let (Some(org_slug), Some(service_slug)) = (org_slug, service_slug) {
-        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-        let service =
-            ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_slug)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
-
-        if let Some(redirect_uri) = redirect_uri {
-            validate_service_redirect_uri(&service, redirect_uri)?;
-        }
-
-        if !user.is_platform_owner {
-            use crate::entities::{identities, prelude::Identities};
-            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-
-            let has_service_identity = Identities::find()
-                .filter(identities::Column::UserId.eq(&user.id))
-                .filter(identities::Column::IssuingOrgId.eq(&org.id))
-                .filter(identities::Column::IssuingServiceId.eq(&service.id))
-                .one(&state.db)
-                .await?
-                .is_some();
-
-            if !has_service_identity {
-                return Err(AppError::Forbidden(
-                    "You do not have access to this service".to_string(),
-                ));
-            }
-        }
-
-        Some(service.id)
-    } else {
-        if let Some(org_slug) = org_slug {
-            let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_slug)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-
-            if !user.is_platform_owner {
-                let _membership =
-                    MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &org.id, &user.id)
-                        .await?
-                        .ok_or_else(|| {
-                            AppError::Forbidden(
-                                "You are not a member of this organization".to_string(),
-                            )
-                        })?;
-            }
-        }
-
-        None
-    };
+    let service_id = resolved_service.as_ref().map(|service| service.id.as_str());
 
     // Take action based on risk
     use crate::services::risk_engine::RiskAction;
@@ -502,25 +571,10 @@ pub async fn verify_magic_link(
 
             // Create session with refresh token
             let token_hash = hash_token(&token);
-            let refresh_token = Uuid::new_v4().to_string();
+            let refresh_token = crate::auth::refresh_tokens::generate();
             let now = Utc::now();
             let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
             let refresh_expires_at = now + chrono::Duration::days(30);
-
-            SessionStore::create(
-                DB::Conn(&state.db),
-                &user.id,
-                &token_hash,
-                expires_at.naive_utc(),
-                Some(&refresh_token),
-                Some(refresh_expires_at.naive_utc()),
-                org_slug,
-                service_id.as_deref(),
-                None,
-                None,
-                None,
-            )
-            .await?;
 
             // Generate device trust cookie
             let device_token = state.risk_engine.generate_device_token(&user.id);
@@ -536,19 +590,87 @@ pub async fn verify_magic_link(
 
             let mut hasher = Sha256::new();
             hasher.update(device_token.as_bytes());
-            let token_hash = hex::encode(hasher.finalize());
+            let device_token_hash = hex::encode(hasher.finalize());
+            let device_expires_at = (Utc::now() + chrono::Duration::days(90)).naive_utc();
 
-            let expires_at = (Utc::now() + chrono::Duration::days(90)).naive_utc();
-
-            UserDevicesStore::create(
-                DB::Conn(&state.db),
-                &user.id,
-                &token_hash,
-                "Magic Link Device", // Device name
-                Some(request_info.ip_address.clone()),
-                expires_at,
+            // Consume, session creation, and device trust creation commit as
+            // one unit. Any database failure rolls the token consumption back,
+            // while concurrent verification still has exactly one winner.
+            let magic_token = query.token.clone();
+            let user_id = user.id.clone();
+            let user_for_tx = user.clone();
+            let session_token_hash = token_hash.clone();
+            let refresh_token_for_tx = refresh_token.clone();
+            let org_slug_for_tx = org_slug_owned.clone();
+            let service_id_for_tx = service_id.map(str::to_string);
+            let org_id_for_tx = resolved_org_id.map(str::to_string);
+            let device_token_hash_for_tx = device_token_hash.clone();
+            let request_ip = request_info.ip_address.clone();
+            with_retrying_transaction(
+                &state.db,
+                #[cfg(feature = "db_sqlite")]
+                &state.db_writer,
+                "complete_magic_link",
+                |db| {
+                    let magic_token = magic_token.clone();
+                    let user_id = user_id.clone();
+                    let user = user_for_tx.clone();
+                    let session_token_hash = session_token_hash.clone();
+                    let refresh_token = refresh_token_for_tx.clone();
+                    let org_slug = org_slug_for_tx.clone();
+                    let service_id = service_id_for_tx.clone();
+                    let org_id = org_id_for_tx.clone();
+                    let device_token_hash = device_token_hash_for_tx.clone();
+                    let request_ip = request_ip.clone();
+                    Box::pin(async move {
+                        validate_magic_scope_at_consume(
+                            db.clone(),
+                            &user,
+                            org_id.as_deref(),
+                            service_id.as_deref(),
+                        )
+                        .await?;
+                        if !MagicLinksStore::delete(db.clone(), &magic_token).await? {
+                            return Err(AppError::BadRequest(
+                                "Invalid or expired magic link".to_string(),
+                            ));
+                        }
+                        SessionStore::create(
+                            db.clone(),
+                            &user_id,
+                            &session_token_hash,
+                            expires_at.naive_utc(),
+                            Some(&refresh_token),
+                            Some(refresh_expires_at.naive_utc()),
+                            org_slug.as_deref(),
+                            service_id.as_deref(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?;
+                        UserDevicesStore::create(
+                            db,
+                            &user_id,
+                            &device_token_hash,
+                            "Magic Link Device",
+                            Some(request_ip),
+                            device_expires_at,
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                },
             )
             .await?;
+
+            tracing::info!(
+                user_id = %user.id,
+                risk_score = risk_assessment.score,
+                risk_factors = ?risk_assessment.factors,
+                ip_address = %request_info.ip_address,
+                "Magic link authentication successful"
+            );
 
             // Return token as JSON (with Set-Cookie header for device trust)
             let response = Json(RefreshTokenResponse {
@@ -575,6 +697,7 @@ pub async fn verify_magic_link(
                 service_slug,
                 None,
             )?;
+            consume_magic_link(&state, &query.token, &user, resolved_org_id, service_id).await?;
 
             Ok((
                 StatusCode::OK,
@@ -589,9 +712,9 @@ pub async fn verify_magic_link(
         }
 
         RiskAction::Block => {
+            consume_magic_link(&state, &query.token, &user, resolved_org_id, service_id).await?;
             tracing::warn!(
                 user_id = %user.id,
-                email = %user.email,
                 risk_score = risk_assessment.score,
                 factors = ?risk_assessment.factors,
                 "Magic link authentication blocked by risk engine"
@@ -610,4 +733,161 @@ pub fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::identities;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, Set};
+    use uuid::Uuid;
+
+    async fn setup_magic_scope() -> (
+        sea_orm::DatabaseConnection,
+        crate::entities::organizations::Model,
+        crate::entities::users::Model,
+    ) {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "magic-owner@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "magic-org",
+            "Magic Org",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        let user =
+            UserStore::create_with_org_id(DB::Conn(&db), "magic-user@example.com", None, &org.id)
+                .await
+                .expect("create tenant user");
+        MembershipStore::create(DB::Conn(&db), &org.id, &user.id, "member")
+            .await
+            .expect("create membership");
+        (db, org, user)
+    }
+
+    #[tokio::test]
+    async fn malformed_callback_and_suspension_after_issuance_preserve_magic_link() {
+        let (db, org, user) = setup_magic_scope().await;
+        let context = build_magic_context(Some(&org.slug), None, None, Some("bound-state"));
+        let token = MagicLinksStore::create(DB::Conn(&db), &user.email, Some(&user.id), &context)
+            .await
+            .expect("issue magic link");
+        let wrong_callback = VerifyMagicLinkQuery {
+            token: token.clone(),
+            redirect_uri: None,
+            state: Some("wrong-state".to_string()),
+        };
+        assert!(matches!(
+            validate_magic_callback(&context, &wrong_callback),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &token)
+            .await
+            .expect("reload after malformed callback")
+            .is_some());
+
+        resolve_magic_service_context(&db, Some(&org.slug), None, None)
+            .await
+            .expect("active scope resolves");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "suspended")
+            .await
+            .expect("suspend after issuance");
+        assert!(matches!(
+            resolve_magic_service_context(&db, Some(&org.slug), None, None).await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &token)
+            .await
+            .expect("reload after suspended verification")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn same_email_and_cross_service_context_cannot_select_or_consume_wrong_identity() {
+        let (db, org, tenant_user) = setup_magic_scope().await;
+        let platform_user = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            &tenant_user.email,
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create same-email platform user")
+        .0;
+        let selected =
+            UserStore::find_by_email_with_context(DB::Conn(&db), &tenant_user.email, Some(&org.id))
+                .await
+                .expect("select tenant user")
+                .expect("tenant user exists");
+        assert_eq!(selected.id, tenant_user.id);
+        assert_ne!(selected.id, platform_user.id);
+
+        let service_a = ServiceStore::create(
+            DB::Conn(&db),
+            &org.id,
+            "service-a",
+            "Service A",
+            "web",
+            "magic-client-a",
+        )
+        .await
+        .expect("create service A");
+        let service_b = ServiceStore::create(
+            DB::Conn(&db),
+            &org.id,
+            "service-b",
+            "Service B",
+            "web",
+            "magic-client-b",
+        )
+        .await
+        .expect("create service B");
+        identities::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(tenant_user.id.clone()),
+            provider: Set("google".to_string()),
+            provider_user_id: Set("magic-provider-user".to_string()),
+            issuing_org_id: Set(Some(org.id.clone())),
+            issuing_service_id: Set(Some(service_b.id.clone())),
+            created_at: Set(Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("create service B identity");
+        let context = build_magic_context(Some(&org.slug), Some(&service_a.slug), None, None);
+        let token = MagicLinksStore::create(
+            DB::Conn(&db),
+            &tenant_user.email,
+            Some(&tenant_user.id),
+            &context,
+        )
+        .await
+        .expect("issue service A link");
+        assert!(matches!(
+            ensure_magic_context_access(&db, &tenant_user, Some(&org), Some(&service_a)).await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &token)
+            .await
+            .expect("reload cross-service denied token")
+            .is_some());
+    }
 }

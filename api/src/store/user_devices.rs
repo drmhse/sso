@@ -169,54 +169,136 @@ impl UserDevicesStore {
         Ok(devices)
     }
 
-    /// Delete a device by ID only
-    pub async fn delete_by_id(db: DB<'_>, device_id: &str) -> Result<()> {
-        let device = UserDevices::find()
-            .filter(user_devices::Column::Id.eq(device_id))
-            .one(&db)
-            .await?;
-
-        if let Some(device) = device {
-            let active: user_devices::ActiveModel = device.into();
-            active.delete(&db).await?;
+    /// Delete all devices for a user except the provided device IDs.
+    pub async fn delete_by_user_except_ids(
+        db: DB<'_>,
+        user_id: &str,
+        keep_device_ids: &[String],
+    ) -> Result<u64> {
+        let mut delete =
+            UserDevices::delete_many().filter(user_devices::Column::UserId.eq(user_id));
+        if !keep_device_ids.is_empty() {
+            delete =
+                delete.filter(user_devices::Column::Id.is_not_in(keep_device_ids.iter().cloned()));
         }
-
-        Ok(())
+        let result = delete.exec(&db).await?;
+        Ok(result.rows_affected)
     }
 
     /// Update device name
-    pub async fn update_name(db: DB<'_>, device_id: &str, name: &str) -> Result<()> {
-        let device = UserDevices::find()
+    pub async fn update_name(
+        db: DB<'_>,
+        device_id: &str,
+        user_id: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let result = UserDevices::update_many()
             .filter(user_devices::Column::Id.eq(device_id))
-            .one(&db)
+            .filter(user_devices::Column::UserId.eq(user_id))
+            .col_expr(
+                user_devices::Column::Name,
+                sea_orm::sea_query::Expr::value(name),
+            )
+            .exec(&db)
             .await?;
-
-        if let Some(device) = device {
-            let mut active: user_devices::ActiveModel = device.into();
-            active.name = Set(name.to_string());
-            active.update(&db).await?;
-        }
-
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 
     /// Update device expiration time
     pub async fn update_expires_at(
         db: DB<'_>,
         device_id: &str,
+        user_id: &str,
         expires_at: &chrono::NaiveDateTime,
-    ) -> Result<()> {
-        let device = UserDevices::find()
+    ) -> Result<bool> {
+        let result = UserDevices::update_many()
             .filter(user_devices::Column::Id.eq(device_id))
-            .one(&db)
+            .filter(user_devices::Column::UserId.eq(user_id))
+            .col_expr(
+                user_devices::Column::ExpiresAt,
+                sea_orm::sea_query::Expr::value(*expires_at),
+            )
+            .exec(&db)
             .await?;
+        Ok(result.rows_affected == 1)
+    }
+}
 
-        if let Some(device) = device {
-            let mut active: user_devices::ActiveModel = device.into();
-            active.expires_at = Set(*expires_at);
-            active.update(&db).await?;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::users::UserStore;
+    use chrono::Duration;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
 
-        Ok(())
+    #[tokio::test]
+    async fn user_scoped_device_mutations_deny_other_user_and_preserve_state() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::create(DB::Conn(&db), "device-owner@example.test", None, false)
+            .await
+            .expect("create owner");
+        let other = UserStore::create(DB::Conn(&db), "device-other@example.test", None, false)
+            .await
+            .expect("create other user");
+        let original_expiry = (Utc::now() + Duration::days(10)).naive_utc();
+        let device = UserDevicesStore::create(
+            DB::Conn(&db),
+            &owner.id,
+            "owner-token-hash",
+            "Owner device",
+            None,
+            original_expiry,
+        )
+        .await
+        .expect("create device");
+
+        assert!(!UserDevicesStore::update_name(
+            DB::Conn(&db),
+            &device.id,
+            &other.id,
+            "Stolen device"
+        )
+        .await
+        .expect("deny cross-user rename"));
+        let attacker_expiry = (Utc::now() + Duration::days(3650)).naive_utc();
+        assert!(!UserDevicesStore::update_expires_at(
+            DB::Conn(&db),
+            &device.id,
+            &other.id,
+            &attacker_expiry
+        )
+        .await
+        .expect("deny cross-user trust extension"));
+        assert!(
+            !UserDevicesStore::delete(DB::Conn(&db), &device.id, &other.id)
+                .await
+                .expect("deny cross-user delete")
+        );
+
+        let unchanged = UserDevicesStore::find_by_id(DB::Conn(&db), &device.id)
+            .await
+            .expect("load device")
+            .expect("device preserved");
+        assert_eq!(unchanged.name, "Owner device");
+        assert_eq!(unchanged.expires_at, original_expiry);
+        assert!(unchanged.is_trusted);
+
+        assert!(UserDevicesStore::update_name(
+            DB::Conn(&db),
+            &device.id,
+            &owner.id,
+            "Renamed by owner"
+        )
+        .await
+        .expect("owner rename"));
+        assert!(
+            UserDevicesStore::revoke(DB::Conn(&db), &device.id, &owner.id)
+                .await
+                .expect("owner revoke")
+        );
     }
 }

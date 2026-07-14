@@ -122,6 +122,9 @@ pub async fn create_checkout(
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let organization =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &organization.id)
+            .await?;
 
     // 3. Find the service
     let service =
@@ -130,16 +133,9 @@ pub async fn create_checkout(
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
     // 4. Find the plan and verify it has a Stripe price ID
-    let plan = PlanStore::find_by_id(DB::Conn(&state.db), &req.plan_id)
+    let plan = PlanStore::find_by_id_and_service(DB::Conn(&state.db), &req.plan_id, &service.id)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
-
-    // Verify plan belongs to the service
-    if plan.service_id != service.id {
-        return Err(AppError::BadRequest(
-            "Plan does not belong to this service".to_string(),
-        ));
-    }
 
     // Verify plan has a billing price ID (use stripe_price_id for backwards compatibility)
     let price_id = plan.stripe_price_id.as_ref().ok_or_else(|| {

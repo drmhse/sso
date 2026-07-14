@@ -13,6 +13,7 @@ x-common-env: &common-env
   JWT_PRIVATE_KEY_BASE64: ${JWT_PRIVATE_KEY_BASE64}
   JWT_PUBLIC_KEY_BASE64: ${JWT_PUBLIC_KEY_BASE64}
   JWT_KID: ${JWT_KID}
+  JWT_PREVIOUS_PUBLIC_KEYS_JSON: ${JWT_PREVIOUS_PUBLIC_KEYS_JSON:-}
   JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
   PLATFORM_GITHUB_CLIENT_ID: ${PLATFORM_GITHUB_CLIENT_ID}
   PLATFORM_GITHUB_CLIENT_SECRET: ${PLATFORM_GITHUB_CLIENT_SECRET}
@@ -70,7 +71,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: editoredit/sso:psql-v0.1.55
+    image: editoredit/sso:psql-v0.8.2
     container_name: sso-postgres
     environment:
       <<: *common-env
@@ -83,7 +84,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: sso-postgres-db
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sso}

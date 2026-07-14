@@ -3,7 +3,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 const DEFAULT_CONFIG = 'authos.config.json';
-const DEFAULT_EXAMPLE_CONFIG = 'authos.config.example.json';
+const DEFAULT_EXAMPLE_CONFIG = 'scripts/authos-standalone/authos.config.example.json';
 
 function parseArgs(argv) {
   const result = {
@@ -45,7 +45,7 @@ Usage:
 
 Options:
   -c, --config <path>     JSON config path (default: authos.config.json)
-      --init              Create a config from authos.config.example.json
+      --init              Create a config from the AGPL-licensed standalone example
       --force             Overwrite the config when used with --init
       --up                Start or update the generated Docker Compose stack
       --wait              Wait for /health/ready

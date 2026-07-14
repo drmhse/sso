@@ -65,24 +65,43 @@ impl UserCleanupJob {
         let mut error_count = 0;
 
         for batch in users_to_delete.chunks(BATCH_SIZE) {
-            for user in batch {
-                match UserStore::delete(DB::Conn(&self.db), &user.id).await {
-                    Ok(()) => {
-                        deleted_count += 1;
+            let batch_ids = batch.iter().map(|user| user.id.clone()).collect::<Vec<_>>();
+            match UserStore::delete_by_ids(DB::Conn(&self.db), &batch_ids).await {
+                Ok(rows_affected) => {
+                    deleted_count += rows_affected as usize;
+                    for user in batch {
                         tracing::debug!(
                             user_id = %user.id,
-                            original_email = %user.email,
                             soft_deleted_at = ?user.deleted_at,
                             "Permanently deleted user"
                         );
                     }
-                    Err(e) => {
-                        error_count += 1;
-                        tracing::error!(
-                            user_id = %user.id,
-                            error = %e,
-                            "Failed to permanently delete user"
-                        );
+                }
+                Err(batch_error) => {
+                    tracing::warn!(
+                        error = %batch_error,
+                        batch_size = batch.len(),
+                        "Bulk user cleanup batch failed, falling back to per-user deletes"
+                    );
+                    for user in batch {
+                        match UserStore::delete(DB::Conn(&self.db), &user.id).await {
+                            Ok(()) => {
+                                deleted_count += 1;
+                                tracing::debug!(
+                                    user_id = %user.id,
+                                    soft_deleted_at = ?user.deleted_at,
+                                    "Permanently deleted user"
+                                );
+                            }
+                            Err(e) => {
+                                error_count += 1;
+                                tracing::error!(
+                                    user_id = %user.id,
+                                    error = %e,
+                                    "Failed to permanently delete user"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -128,18 +147,33 @@ impl UserCleanupJob {
         let mut deleted_count = 0;
         let mut error_count = 0;
 
-        for user in users_to_delete {
-            match UserStore::delete(DB::Conn(&self.db), &user.id).await {
-                Ok(()) => {
-                    deleted_count += 1;
+        for batch in users_to_delete.chunks(100) {
+            let batch_ids = batch.iter().map(|user| user.id.clone()).collect::<Vec<_>>();
+            match UserStore::delete_by_ids(DB::Conn(&self.db), &batch_ids).await {
+                Ok(rows_affected) => {
+                    deleted_count += rows_affected as usize;
                 }
-                Err(e) => {
-                    error_count += 1;
-                    tracing::error!(
-                        user_id = %user.id,
-                        error = %e,
-                        "Failed to permanently delete user"
+                Err(batch_error) => {
+                    tracing::warn!(
+                        error = %batch_error,
+                        batch_size = batch.len(),
+                        "Bulk user cleanup batch failed, falling back to per-user deletes"
                     );
+                    for user in batch {
+                        match UserStore::delete(DB::Conn(&self.db), &user.id).await {
+                            Ok(()) => {
+                                deleted_count += 1;
+                            }
+                            Err(e) => {
+                                error_count += 1;
+                                tracing::error!(
+                                    user_id = %user.id,
+                                    error = %e,
+                                    "Failed to permanently delete user"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

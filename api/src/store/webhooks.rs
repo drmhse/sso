@@ -70,13 +70,15 @@ impl WebhookStore {
     }
 
     /// Create a new webhook
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         webhook_id: &str,
         org_id: &str,
         name: &str,
         url: &str,
-        secret: &str,
+        secret_encrypted: Vec<u8>,
+        encryption_key_id: &str,
         events: &str,
         is_active: bool,
         created_at: chrono::NaiveDateTime,
@@ -87,7 +89,9 @@ impl WebhookStore {
             org_id: Set(org_id.to_string()),
             name: Set(name.to_string()),
             url: Set(url.to_string()),
-            secret: Set(secret.to_string()),
+            secret: Set(String::new()),
+            secret_encrypted: Set(Some(secret_encrypted)),
+            encryption_key_id: Set(Some(encryption_key_id.to_string())),
             events: Set(events.to_string()),
             is_active: Set(is_active),
             created_at: Set(created_at),
@@ -230,5 +234,193 @@ impl WebhookStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{
+        organizations::OrganizationStore,
+        users::{UserCreationOptions, UserStore},
+        DB,
+    };
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    async fn setup_db() -> (sea_orm::DatabaseConnection, String, String) {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "webhook-isolation-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let org_a = OrganizationStore::create(
+            DB::Conn(&db),
+            "webhook-isolation-a",
+            "Webhook Isolation A",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create organization A");
+        let org_b = OrganizationStore::create(
+            DB::Conn(&db),
+            "webhook-isolation-b",
+            "Webhook Isolation B",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create organization B");
+
+        (db, org_a.id, org_b.id)
+    }
+
+    async fn create_webhook(
+        db: &sea_orm::DatabaseConnection,
+        webhook_id: &str,
+        org_id: &str,
+        event: &str,
+    ) {
+        let now = chrono::Utc::now().naive_utc();
+        WebhookStore::create(
+            DB::Conn(db),
+            webhook_id,
+            org_id,
+            webhook_id,
+            &format!("https://{webhook_id}.example.test/events"),
+            vec![1, 2, 3],
+            "test-key",
+            &serde_json::to_string(&[event]).expect("serialize events"),
+            true,
+            now,
+            now,
+        )
+        .await
+        .expect("create webhook");
+    }
+
+    #[tokio::test]
+    async fn webhook_lists_and_event_selection_are_organization_scoped() {
+        let (db, org_a, org_b) = setup_db().await;
+        create_webhook(&db, "webhook-a", &org_a, "user.signup.success").await;
+        create_webhook(&db, "webhook-b", &org_b, "user.signup.success").await;
+
+        let org_a_webhooks = WebhookStore::find_by_organization(DB::Conn(&db), &org_a)
+            .await
+            .expect("list organization A webhooks");
+        assert_eq!(org_a_webhooks.len(), 1);
+        assert_eq!(org_a_webhooks[0].id, "webhook-a");
+        assert_eq!(
+            WebhookStore::count_by_organization(DB::Conn(&db), &org_a)
+                .await
+                .expect("count organization A webhooks"),
+            1
+        );
+
+        let org_a_event_webhooks = WebhookStore::find_active_webhooks_for_event(
+            DB::Conn(&db),
+            &org_a,
+            "user.signup.success",
+        )
+        .await
+        .expect("select organization A event webhooks");
+        assert_eq!(org_a_event_webhooks.len(), 1);
+        assert_eq!(org_a_event_webhooks[0].id, "webhook-a");
+
+        assert!(
+            WebhookStore::find_by_organization(DB::Conn(&db), "missing-org")
+                .await
+                .expect("list missing organization")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_mutations_deny_other_organization_and_missing_ids() {
+        let (db, org_a, org_b) = setup_db().await;
+        create_webhook(&db, "webhook-a", &org_a, "user.signup.success").await;
+        let now = chrono::Utc::now().naive_utc();
+
+        WebhookStore::update_name(DB::Conn(&db), "webhook-a", &org_a, "allowed", now)
+            .await
+            .expect("same-organization update succeeds");
+
+        for result in [
+            WebhookStore::update_url(
+                DB::Conn(&db),
+                "webhook-a",
+                &org_b,
+                "https://attacker.example.test/events",
+                now,
+            )
+            .await,
+            WebhookStore::update_events(
+                DB::Conn(&db),
+                "webhook-a",
+                &org_b,
+                r#"["organization.updated"]"#,
+                now,
+            )
+            .await,
+            WebhookStore::update_is_active(DB::Conn(&db), "webhook-a", &org_b, false, now).await,
+        ] {
+            assert!(matches!(result, Err(crate::error::AppError::NotFound(_))));
+        }
+
+        let after_denied_updates = WebhookStore::find_by_id(DB::Conn(&db), "webhook-a")
+            .await
+            .expect("load webhook after denied updates")
+            .expect("webhook remains");
+        assert_eq!(after_denied_updates.name, "allowed");
+        assert_eq!(
+            after_denied_updates.url,
+            "https://webhook-a.example.test/events"
+        );
+        assert_eq!(after_denied_updates.events, r#"["user.signup.success"]"#);
+        assert!(after_denied_updates.is_active);
+
+        let missing_update =
+            WebhookStore::update_name(DB::Conn(&db), "missing-webhook", &org_a, "missing", now)
+                .await;
+        assert!(matches!(
+            missing_update,
+            Err(crate::error::AppError::NotFound(_))
+        ));
+
+        let wrong_org_delete = WebhookStore::delete(DB::Conn(&db), "webhook-a", &org_b).await;
+        assert!(matches!(
+            wrong_org_delete,
+            Err(crate::error::AppError::NotFound(_))
+        ));
+        assert!(WebhookStore::find_by_id(DB::Conn(&db), "webhook-a")
+            .await
+            .expect("load webhook after denied delete")
+            .is_some());
+
+        let missing_delete = WebhookStore::delete(DB::Conn(&db), "missing-webhook", &org_a).await;
+        assert!(matches!(
+            missing_delete,
+            Err(crate::error::AppError::NotFound(_))
+        ));
+
+        WebhookStore::delete(DB::Conn(&db), "webhook-a", &org_a)
+            .await
+            .expect("same-organization delete succeeds");
+        assert!(WebhookStore::find_by_id(DB::Conn(&db), "webhook-a")
+            .await
+            .expect("load deleted webhook")
+            .is_none());
     }
 }

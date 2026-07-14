@@ -124,7 +124,7 @@ impl UpstreamProviderStore {
             issuer: Set(issuer.map(|s| s.to_string())),
             metadata: Set(metadata.map(|s| s.to_string())),
             enabled: Set(true),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 
@@ -170,19 +170,17 @@ impl UpstreamProviderStore {
     }
 
     /// Delete an upstream provider
-    pub async fn delete(db: DB<'_>, provider_id: &str) -> Result<()> {
-        let provider = UpstreamProviders::find_by_id(provider_id)
-            .one(&db)
+    pub async fn delete_in_org(db: DB<'_>, org_id: &str, provider_id: &str) -> Result<bool> {
+        let result = UpstreamProviders::delete_many()
+            .filter(upstream_providers::Column::Id.eq(provider_id))
+            .filter(upstream_providers::Column::OrgId.eq(org_id))
+            .exec(&db)
             .await
-            .map_err(|e| AppError::InternalServerError(format!("Database error: {}", e)))?
-            .ok_or_else(|| AppError::NotFound("Provider not found".to_string()))?;
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to delete provider: {}", e))
+            })?;
 
-        let provider: upstream_providers::ActiveModel = provider.into();
-        provider.delete(&db).await.map_err(|e| {
-            AppError::InternalServerError(format!("Failed to delete provider: {}", e))
-        })?;
-
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 }
 
@@ -298,5 +296,17 @@ mod tests {
         .expect("shared provider should resolve");
 
         assert_eq!(resolved.id, provider.id);
+
+        assert!(
+            !UpstreamProviderStore::delete_in_org(DB::Conn(&db), &tenant_org.id, &provider.id,)
+                .await
+                .expect("cross-org delete is a noop")
+        );
+        assert!(
+            UpstreamProviderStore::find_by_id(DB::Conn(&db), &provider.id)
+                .await
+                .expect("load protected provider")
+                .is_some()
+        );
     }
 }

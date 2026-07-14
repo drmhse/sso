@@ -1,5 +1,5 @@
-use crate::entities::{memberships, users};
-use crate::error::{AppError, Result};
+use crate::entities::{memberships, platform_audit_log};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
 use crate::store::{
@@ -11,9 +11,9 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use sea_orm::Set;
 use serde::{Deserialize, Serialize};
-
-use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Deserialize)]
 pub struct ForgetUserRequest {
@@ -39,7 +39,20 @@ async fn verify_self_delete_authorization(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        if crate::handlers::user::verify_mfa_code(&state.db, &user.id, code).await? {
+        let backup_event =
+            crate::services::audit_builder::MfaAuditBuilder::new(&user.id, "backup_code_used")
+                .success(true)
+                .details(Some("context:self_anonymization"))
+                .build();
+        if crate::handlers::user::verify_mfa_code_with_backup_audit(
+            &state.db,
+            &user.id,
+            code,
+            (&state.audit_actor, backup_event),
+        )
+        .await?
+        .is_some()
+        {
             return Ok(());
         }
     }
@@ -56,32 +69,11 @@ async fn verify_self_delete_authorization(
             )
         })?;
 
-        let password_hash_clone = password_hash.clone();
-        let password_input = password.to_string();
-        let _permit = crate::services::concurrency::ARGON2_SEMAPHORE
-            .acquire()
-            .await
-            .map_err(|_| {
-                AppError::InternalServerError("Password verification unavailable".to_string())
-            })?;
-
-        let is_valid = tokio::task::spawn_blocking(move || {
-            let parsed_hash = match PasswordHash::new(&password_hash_clone) {
-                Ok(hash) => hash,
-                Err(e) => {
-                    tracing::error!("Corrupted password hash in database: {}", e);
-                    return false;
-                }
-            };
-
-            Argon2::default()
-                .verify_password(password_input.as_bytes(), &parsed_hash)
-                .is_ok()
-        })
-        .await
-        .map_err(|e| {
-            AppError::InternalServerError(format!("Password verification failed: {}", e))
-        })?;
+        let is_valid = crate::services::concurrency::verify_password_bounded(
+            password.to_string(),
+            password_hash.clone(),
+        )
+        .await?;
 
         if is_valid {
             return Ok(());
@@ -94,12 +86,16 @@ async fn verify_self_delete_authorization(
 }
 
 async fn require_platform_owner_or_owner_in_all_target_orgs(
-    state: &AppState,
-    requesting_user: &users::Model,
+    db: DB<'_>,
+    requesting_user_id: &str,
     target_user_id: &str,
     action: &str,
 ) -> Result<Vec<memberships::Model>> {
-    let memberships = MembershipStore::list_by_user(DB::Conn(&state.db), target_user_id).await?;
+    let requesting_user = UserStore::find_by_id(db.clone(), requesting_user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Forbidden("Current user is no longer active".to_string()))?;
+    let memberships = MembershipStore::list_by_user(db.clone(), target_user_id).await?;
 
     if requesting_user.is_platform_owner {
         return Ok(memberships);
@@ -112,17 +108,16 @@ async fn require_platform_owner_or_owner_in_all_target_orgs(
         )));
     }
 
-    for membership in &memberships {
-        let requesting_membership = MembershipStore::find_by_org_and_user(
-            DB::Conn(&state.db),
-            &membership.org_id,
-            &requesting_user.id,
-        )
-        .await?;
+    let owner_org_ids = MembershipStore::list_by_user(db.clone(), &requesting_user.id)
+        .await?
+        .into_iter()
+        .filter(|membership| membership.role == "owner")
+        .map(|membership| membership.org_id)
+        .collect::<HashSet<_>>();
 
-        if !matches!(requesting_membership, Some(req_membership) if req_membership.role == "owner")
-        {
-            let org = OrganizationStore::find_by_id(DB::Conn(&state.db), &membership.org_id)
+    for membership in &memberships {
+        if !owner_org_ids.contains(&membership.org_id) {
+            let org = OrganizationStore::find_by_id(db.clone(), &membership.org_id)
                 .await?
                 .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
@@ -230,23 +225,62 @@ pub async fn forget_user(
 
         let memberships = MembershipStore::list_by_user(DB::Conn(&state.db), &user_id).await?;
 
-        UserStore::anonymize(DB::Conn(&state.db), &user_id).await?;
-
         use crate::services::audit_builder::OrgAuditBuilder;
-        for membership in memberships {
-            let event = OrgAuditBuilder::new(
-                &membership.org_id,
-                Some(&requesting_user.id),
-                "user.anonymized",
-            )
-            .target("user", &user_id)
-            .success(true)
-            .details_json(Some(serde_json::json!({
-                "reason": "Self-service GDPR Right to be Forgotten"
-            })))
-            .build();
-            state.audit_actor.log_org(event).await;
-        }
+        let events = memberships
+            .into_iter()
+            .map(|membership| {
+                OrgAuditBuilder::new(
+                    &membership.org_id,
+                    Some(&requesting_user.id),
+                    "user.anonymized",
+                )
+                .target("user", &user_id)
+                .success(true)
+                .details_json(Some(serde_json::json!({
+                    "reason": "Self-service GDPR Right to be Forgotten"
+                })))
+                .build()
+            })
+            .collect::<Vec<_>>();
+        let platform_event = events.is_empty().then(|| platform_audit_log::ActiveModel {
+            id: Set(uuid::Uuid::new_v4().to_string()),
+            platform_owner_id: Set(requesting_user.id.clone()),
+            action: Set("user.anonymized".to_string()),
+            target_type: Set("user".to_string()),
+            target_id: Set(user_id.clone()),
+            metadata: Set(Some(
+                serde_json::json!({
+                    "reason": "Self-service GDPR Right to be Forgotten",
+                    "actor_kind": "self",
+                    "organization_count": 0,
+                })
+                .to_string(),
+            )),
+            ..Default::default()
+        });
+        with_retrying_transaction(
+            &state.db,
+            #[cfg(feature = "db_sqlite")]
+            &state.db_writer,
+            "self_anonymize_user_with_audit",
+            |db| {
+                let user_id = user_id.clone();
+                let events = events.clone();
+                let platform_event = platform_event.clone();
+                let audit_actor = state.audit_actor.clone();
+                Box::pin(async move {
+                    UserStore::anonymize(db.clone(), &user_id).await?;
+                    for event in events {
+                        audit_actor.log_org_with_db(db.clone(), event).await?;
+                    }
+                    if let Some(event) = platform_event {
+                        audit_actor.log_platform_with_db(db, event).await?;
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .await?;
 
         tracing::warn!(
             actor_id = %requesting_user.id,
@@ -263,33 +297,80 @@ pub async fn forget_user(
         }));
     }
 
-    let memberships = require_platform_owner_or_owner_in_all_target_orgs(
-        &state,
-        requesting_user,
+    require_platform_owner_or_owner_in_all_target_orgs(
+        DB::Conn(&state.db),
+        &requesting_user.id,
         &user_id,
         "anonymize",
     )
     .await?;
 
-    // Anonymize the user (includes transaction)
-    UserStore::anonymize(DB::Conn(&state.db), &user_id).await?;
-
-    // Non-blocking audit via actor for all organizations
-    use crate::services::audit_builder::OrgAuditBuilder;
-    for membership in memberships {
-        let event = OrgAuditBuilder::new(
-            &membership.org_id,
-            Some(&requesting_user.id),
-            "user.anonymized",
-        )
-        .target("user", &user_id)
-        .success(true)
-        .details_json(Some(
-            serde_json::json!({"reason": "GDPR Right to be Forgotten"}),
-        ))
-        .build();
-        state.audit_actor.log_org(event).await;
-    }
+    let requesting_user_id = requesting_user.id.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "admin_anonymize_user_with_audit",
+        |db| {
+            let user_id = user_id.clone();
+            let requesting_user_id = requesting_user_id.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                // Recheck live authority inside the mutation transaction so a
+                // cached platform-owner snapshot or concurrent demotion cannot
+                // authorize cross-user anonymization.
+                let memberships = require_platform_owner_or_owner_in_all_target_orgs(
+                    db.clone(),
+                    &requesting_user_id,
+                    &user_id,
+                    "anonymize",
+                )
+                .await?;
+                use crate::services::audit_builder::OrgAuditBuilder;
+                let events = memberships
+                    .into_iter()
+                    .map(|membership| {
+                        OrgAuditBuilder::new(
+                            &membership.org_id,
+                            Some(&requesting_user_id),
+                            "user.anonymized",
+                        )
+                        .target("user", &user_id)
+                        .success(true)
+                        .details_json(Some(
+                            serde_json::json!({"reason": "GDPR Right to be Forgotten"}),
+                        ))
+                        .build()
+                    })
+                    .collect::<Vec<_>>();
+                let platform_event = events.is_empty().then(|| platform_audit_log::ActiveModel {
+                    id: Set(uuid::Uuid::new_v4().to_string()),
+                    platform_owner_id: Set(requesting_user_id.clone()),
+                    action: Set("user.anonymized".to_string()),
+                    target_type: Set("user".to_string()),
+                    target_id: Set(user_id.clone()),
+                    metadata: Set(Some(
+                        serde_json::json!({
+                            "reason": "GDPR Right to be Forgotten",
+                            "actor_kind": "administrator",
+                            "organization_count": 0,
+                        })
+                        .to_string(),
+                    )),
+                    ..Default::default()
+                });
+                UserStore::anonymize(db.clone(), &user_id).await?;
+                for event in events {
+                    audit_actor.log_org_with_db(db.clone(), event).await?;
+                }
+                if let Some(event) = platform_event {
+                    audit_actor.log_platform_with_db(db, event).await?;
+                }
+                Ok(())
+            })
+        },
+    )
+    .await?;
 
     tracing::warn!(
         actor_id = %requesting_user.id,
@@ -318,8 +399,8 @@ pub async fn export_user_data(
 
     if requesting_user.id != user_id {
         require_platform_owner_or_owner_in_all_target_orgs(
-            &state,
-            requesting_user,
+            DB::Conn(&state.db),
+            &requesting_user.id,
             &user_id,
             "export",
         )
@@ -333,15 +414,22 @@ pub async fn export_user_data(
 
     // Get memberships with organization details
     let memberships = MembershipStore::list_by_user(DB::Conn(&state.db), &user_id).await?;
+    let org_ids = memberships
+        .iter()
+        .map(|membership| membership.org_id.clone())
+        .collect::<Vec<_>>();
+    let organizations = OrganizationStore::find_by_ids(DB::Conn(&state.db), &org_ids)
+        .await?
+        .into_iter()
+        .map(|org| (org.id.clone(), org))
+        .collect::<HashMap<_, _>>();
 
     let mut membership_exports = Vec::new();
     for membership in memberships {
-        if let Some(org) =
-            OrganizationStore::find_by_id(DB::Conn(&state.db), &membership.org_id).await?
-        {
+        if let Some(org) = organizations.get(&membership.org_id) {
             membership_exports.push(MembershipExport {
                 organization_id: membership.org_id,
-                organization_slug: org.slug,
+                organization_slug: org.slug.clone(),
                 role: membership.role,
                 joined_at: DateTime::<Utc>::from_naive_utc_and_offset(membership.created_at, Utc)
                     .to_rfc3339(),
@@ -449,4 +537,60 @@ pub async fn export_user_data(
         mfa_events: mfa_event_exports,
         passkeys: passkey_exports,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn demoted_cached_platform_owner_cannot_authorize_cross_user_privacy_action() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let actor = UserStore::create(DB::Conn(&db), "privacy-owner@example.com", None, true)
+            .await
+            .expect("create platform owner");
+        let stale_actor = actor.clone();
+        let target = UserStore::create(DB::Conn(&db), "privacy-target@example.com", None, false)
+            .await
+            .expect("create target");
+
+        require_platform_owner_or_owner_in_all_target_orgs(
+            DB::Conn(&db),
+            &actor.id,
+            &target.id,
+            "export",
+        )
+        .await
+        .expect("current platform owner may export");
+
+        UserStore::set_platform_owner(DB::Conn(&db), &actor.id, false)
+            .await
+            .expect("demote platform owner");
+        assert!(
+            stale_actor.is_platform_owner,
+            "cached snapshot remains stale"
+        );
+        assert!(matches!(
+            require_platform_owner_or_owner_in_all_target_orgs(
+                DB::Conn(&db),
+                &actor.id,
+                &target.id,
+                "export",
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        let unchanged = UserStore::find_by_id(DB::Conn(&db), &target.id)
+            .await
+            .expect("load target")
+            .expect("target remains");
+        assert_eq!(unchanged.email, target.email);
+        assert!(unchanged.deleted_at.is_none());
+    }
 }

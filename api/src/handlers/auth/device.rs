@@ -2,12 +2,12 @@ use crate::auth::jwt::JwtService;
 use crate::auth::sso::Provider;
 use crate::constants::DEVICE_CODE_EXPIRE_MINUTES;
 use crate::db::models::User;
-use crate::error::{AppError, Result};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::state::AppState;
 use crate::store::{
-    device_codes::DeviceCodeStore, identities::IdentityStore, organizations::OrganizationStore,
-    services::ServiceStore, sessions::SessionStore, subscriptions::SubscriptionStore,
-    totp::TotpStore, DB,
+    device_codes::DeviceCodeStore, identities::IdentityStore, memberships::MembershipStore,
+    organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
+    subscriptions::SubscriptionStore, DB,
 };
 use axum::{extract::State, Json};
 use chrono::Utc;
@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const PLATFORM_ADMIN_CLI_CLIENT_ID: &str = "platform-admin-cli";
+const DEVICE_USER_CODE_UNAVAILABLE: &str = "Invalid or unavailable user code";
+
+fn unavailable_user_code() -> AppError {
+    AppError::BadRequest(DEVICE_USER_CODE_UNAVAILABLE.to_string())
+}
 
 // Re-export common types for use in other modules
 pub use crate::auth::device_flow::DeviceFlowService;
@@ -179,47 +184,47 @@ pub async fn device_verify(
 ) -> Result<Json<DeviceVerifyResponse>> {
     // Validate user code length and format (should be "XXXX-XXXX")
     if req.user_code.len() != 9 || !req.user_code.contains('-') {
-        return Err(AppError::BadRequest("Invalid user code format".to_string()));
+        return Err(unavailable_user_code());
     }
 
     // User codes should contain only characters that are easy to distinguish (alphanumeric + dash)
     let valid_chars = |s: &str| -> bool { s.chars().all(|c| c.is_alphanumeric() || c == '-') };
 
     if !valid_chars(&req.user_code) {
-        return Err(AppError::BadRequest("Invalid user code format".to_string()));
+        return Err(unavailable_user_code());
     }
 
-    // Find device code with retry to handle batch processing timing
+    // Use a fixed number of lookups and delays for every valid-format code.
+    // This preserves the eventual-consistency retry window without making an
+    // absent short code take a visibly different branch from an existing one.
     let mut device_code = None;
     for attempt in 0..3 {
         match DeviceFlowService::find_by_user_code(&state.db, &req.user_code).await {
             Ok(Some(dc)) => {
-                device_code = Some(dc);
-                break;
-            }
-            Ok(None) => {
-                if attempt < 2 {
-                    // Wait a bit for batch writer to process
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                if device_code.is_none() {
+                    device_code = Some(dc);
                 }
             }
+            Ok(None) => {}
             Err(e) => return Err(e),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
-    let device_code =
-        device_code.ok_or_else(|| AppError::BadRequest("Invalid user code".to_string()))?;
+    let device_code = device_code.ok_or_else(unavailable_user_code)?;
 
     // Check if expired
     if DeviceFlowService::is_expired(&device_code) {
-        return Err(AppError::DeviceCodeExpired);
+        return Err(unavailable_user_code());
     }
 
-    // Check if already authorized
-    if DeviceFlowService::is_authorized(&device_code) {
-        return Err(AppError::BadRequest(
-            "Device already authorized".to_string(),
-        ));
+    // Only an unclaimed pending code is available for browser activation.
+    // Denied, consumed, authorized, and MFA-bound rows share the same public
+    // unavailable response as an absent code.
+    if device_code.status != "pending" || device_code.user_id.is_some() {
+        return Err(unavailable_user_code());
     }
 
     // Check if this is a platform-level admin device flow
@@ -312,19 +317,27 @@ pub async fn token_exchange(
     // Get user info
     let user = crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user_id)
         .await?
+        .filter(|user| user.deleted_at.is_none())
         .map(User::from)
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
-
-    // Check if user has MFA enabled - device flows cannot proceed without completing MFA
-    let mfa_enabled = is_mfa_enabled(&state.db, &user.id).await?;
-    if mfa_enabled {
-        return Err(AppError::BadRequest(
-            "MFA verification required. Please complete MFA verification in your browser before the device can be authorized.".to_string()
-        ));
-    }
+    let login_provider = IdentityStore::get_latest_provider(DB::Conn(&state.db), &user_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|provider| Provider::from_str(&provider).ok());
+    let login_provider_key = login_provider
+        .as_ref()
+        .map(Provider::as_str)
+        .unwrap_or("device")
+        .to_string();
 
     // Check if this is a platform-level device flow
     if device_code.org_slug == "platform" && device_code.service_slug == "admin-cli" {
+        if !user.is_platform_owner {
+            return Err(AppError::Forbidden(
+                "Platform device authorization requires a current platform owner".to_string(),
+            ));
+        }
         // Generate platform JWT for admin CLI
         let token = state.jwt_service.create_token(
             &user.id,
@@ -335,7 +348,7 @@ pub async fn token_exchange(
         )?;
 
         // Generate refresh token
-        let refresh_token = Uuid::new_v4().to_string();
+        let refresh_token = crate::auth::refresh_tokens::generate();
 
         // Store session with refresh token
         let token_hash = JwtService::hash_token(&token);
@@ -343,28 +356,21 @@ pub async fn token_exchange(
         let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
         let refresh_expires_at = now + chrono::Duration::days(30);
 
-        if !DeviceCodeStore::consume_authorized(
-            DB::Conn(&state.db),
+        consume_device_code_create_session_and_audit(
+            &state,
             &device_code.id,
             &req.client_id,
-        )
-        .await?
-        {
-            return Err(AppError::BadRequest("Invalid device code".to_string()));
-        }
-
-        SessionStore::create(
-            DB::Conn(&state.db),
             &user_id,
             &token_hash,
             expires_at.naive_utc(),
-            Some(&refresh_token),
-            Some(refresh_expires_at.naive_utc()),
+            &refresh_token,
+            refresh_expires_at.naive_utc(),
             None, // org_slug
             None, // service_id
             None, // resource
-            None, // user_agent
-            None, // ip_address
+            &device_code.org_slug,
+            &device_code.service_slug,
+            &login_provider_key,
         )
         .await?;
 
@@ -387,6 +393,18 @@ pub async fn token_exchange(
     let service = ServiceStore::find_by_id(DB::Conn(&state.db), &result.service_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &result.org_slug)
+        .await?
+        .filter(|org| org.status == "active" && org.id == service.org_id)
+        .ok_or_else(|| AppError::Forbidden("Organization is not active".to_string()))?;
+    validate_live_device_authority(
+        DB::Conn(&state.db),
+        &user.id,
+        &org.slug,
+        &service.slug,
+        Some(&service.id),
+    )
+    .await?;
     let requested_resource = crate::utils::resource_indicators::validate_requested_resource(
         req.resource.as_deref(),
         service.resource_uris.as_deref(),
@@ -403,7 +421,7 @@ pub async fn token_exchange(
     )?;
 
     // Generate refresh token
-    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_token = crate::auth::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&token);
@@ -411,40 +429,25 @@ pub async fn token_exchange(
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
 
-    if !DeviceCodeStore::consume_authorized(DB::Conn(&state.db), &device_code.id, &req.client_id)
-        .await?
-    {
-        return Err(AppError::BadRequest("Invalid device code".to_string()));
-    }
-
-    SessionStore::create(
-        DB::Conn(&state.db),
+    consume_device_code_create_session_and_audit(
+        &state,
+        &device_code.id,
+        &req.client_id,
         &user_id,
         &token_hash,
         expires_at.naive_utc(),
-        Some(&refresh_token),
-        Some(refresh_expires_at.naive_utc()),
+        &refresh_token,
+        refresh_expires_at.naive_utc(),
         Some(&result.org_slug),
         Some(&result.service_id),
         requested_resource.as_deref(),
-        None, // user_agent
-        None, // ip_address
+        &device_code.org_slug,
+        &device_code.service_slug,
+        &login_provider_key,
     )
     .await?;
 
-    // Record login event - get provider from most recent identity
-    let provider_opt = if let Ok(Some(provider_str)) =
-        IdentityStore::get_latest_provider(DB::Conn(&state.db), &user_id).await
-    {
-        if let Ok(provider) = Provider::from_str(&provider_str) {
-            record_login_event(&state.audit_actor, &user_id, &result.service_id, provider).await;
-            Some(provider.as_str())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let provider_opt = login_provider.as_ref().map(Provider::as_str);
 
     // Publish login success event for webhooks
     crate::handlers::auth::oauth::publish_login_event(
@@ -466,31 +469,145 @@ pub async fn token_exchange(
 
 // Helper functions
 
-/// Check if a user has MFA enabled
-async fn is_mfa_enabled(pool: &sea_orm::DatabaseConnection, user_id: &str) -> Result<bool> {
-    TotpStore::is_enabled(DB::Conn(pool), user_id).await
-}
-
-/// Record login event for analytics (via buffered audit actor)
-async fn record_login_event(
-    audit_actor: &crate::services::audit_actor::AuditHandle,
+#[allow(clippy::too_many_arguments)]
+async fn consume_device_code_create_session_and_audit(
+    state: &AppState,
+    device_code_id: &str,
+    client_id: &str,
     user_id: &str,
-    service_id: &str,
-    provider: Provider,
-) {
+    token_hash: &str,
+    expires_at: chrono::NaiveDateTime,
+    refresh_token: &str,
+    refresh_expires_at: chrono::NaiveDateTime,
+    org_slug: Option<&str>,
+    service_id: Option<&str>,
+    resource: Option<&str>,
+    device_org_slug: &str,
+    device_service_slug: &str,
+    provider: &str,
+) -> Result<()> {
     use crate::entities::login_events;
     use sea_orm::Set;
 
     let event_model = login_events::ActiveModel {
         id: Set(Uuid::new_v4().to_string()),
         user_id: Set(user_id.to_string()),
-        service_id: Set(Some(service_id.to_string())),
-        provider: Set(provider.as_str().to_string()),
+        service_id: Set(service_id.map(str::to_string)),
+        provider: Set(provider.to_string()),
         ..Default::default()
     };
+    let device_code_id = device_code_id.to_string();
+    let client_id = client_id.to_string();
+    let user_id = user_id.to_string();
+    let token_hash = token_hash.to_string();
+    let refresh_token = refresh_token.to_string();
+    let org_slug = org_slug.map(str::to_string);
+    let service_id = service_id.map(str::to_string);
+    let resource = resource.map(str::to_string);
+    let device_org_slug = device_org_slug.to_string();
+    let device_service_slug = device_service_slug.to_string();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "consume_device_code_create_session_and_audit",
+        |db| {
+            let device_code_id = device_code_id.clone();
+            let client_id = client_id.clone();
+            let user_id = user_id.clone();
+            let token_hash = token_hash.clone();
+            let refresh_token = refresh_token.clone();
+            let org_slug = org_slug.clone();
+            let service_id = service_id.clone();
+            let resource = resource.clone();
+            let device_org_slug = device_org_slug.clone();
+            let device_service_slug = device_service_slug.clone();
+            let event_model = event_model.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                validate_live_device_authority(
+                    db.clone(),
+                    &user_id,
+                    &device_org_slug,
+                    &device_service_slug,
+                    service_id.as_deref(),
+                )
+                .await?;
+                if !DeviceCodeStore::consume_authorized(
+                    db.clone(),
+                    &device_code_id,
+                    &client_id,
+                    &user_id,
+                    &device_org_slug,
+                    &device_service_slug,
+                )
+                .await?
+                {
+                    return Err(AppError::BadRequest("Invalid device code".to_string()));
+                }
+                SessionStore::create(
+                    db.clone(),
+                    &user_id,
+                    &token_hash,
+                    expires_at,
+                    Some(&refresh_token),
+                    Some(refresh_expires_at),
+                    org_slug.as_deref(),
+                    service_id.as_deref(),
+                    resource.as_deref(),
+                    None,
+                    None,
+                )
+                .await?;
+                audit_actor.log_login_with_db(db, event_model).await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+}
 
-    // Non-blocking: queues to actor, doesn't wait for DB
-    audit_actor.log_login(event_model).await;
+async fn validate_live_device_authority(
+    db: DB<'_>,
+    user_id: &str,
+    org_slug: &str,
+    service_slug: &str,
+    expected_service_id: Option<&str>,
+) -> Result<()> {
+    let user = crate::store::users::UserStore::find_by_id(db.clone(), user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Forbidden("Device user is no longer active".to_string()))?;
+    if org_slug == "platform" && service_slug == "admin-cli" {
+        if expected_service_id.is_none() && user.is_platform_owner {
+            return Ok(());
+        }
+        return Err(AppError::Forbidden(
+            "Platform device authorization requires a current platform owner".to_string(),
+        ));
+    }
+    let service_id = expected_service_id
+        .ok_or_else(|| AppError::Forbidden("Device service context is incomplete".to_string()))?;
+    let org = OrganizationStore::find_by_slug(db.clone(), org_slug)
+        .await?
+        .filter(|org| org.status == "active")
+        .ok_or_else(|| AppError::Forbidden("Organization is not active".to_string()))?;
+    let service = ServiceStore::find_by_org_and_slug(db.clone(), &org.id, service_slug)
+        .await?
+        .filter(|service| service.id == service_id)
+        .ok_or_else(|| AppError::Forbidden("Device service context changed".to_string()))?;
+    if user.is_platform_owner
+        || MembershipStore::find_by_org_and_user(db.clone(), &org.id, user_id)
+            .await?
+            .is_some()
+        || IdentityStore::exists_for_user_and_service_context(db, user_id, &org.id, &service.id)
+            .await?
+    {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(
+        "You do not currently have access to this service".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -513,7 +630,7 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use openssl::rsa::Rsa;
-    use sea_orm::Database;
+    use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait};
     use std::sync::Arc;
 
     fn test_config() -> Config {
@@ -618,7 +735,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_consume_and_session_roll_back_when_success_audit_fails() {
+        let state = setup_state().await;
+        let user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "device-audit-rollback@example.test",
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        let code = DeviceCodeStore::create(
+            DB::Conn(&state.db),
+            "device-audit-rollback",
+            "AUDT-CODE",
+            "audit-client",
+            "platform",
+            "admin-cli",
+            &(Utc::now() + chrono::Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .unwrap();
+        DeviceCodeStore::set_user_id(DB::Conn(&state.db), &code.id, &user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            DeviceCodeStore::authorize_for_user(DB::Conn(&state.db), &code.id, &user.id)
+                .await
+                .unwrap(),
+            1
+        );
+        state
+            .db
+            .execute_unprepared("DROP TABLE audit_outbox")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        assert!(consume_device_code_create_session_and_audit(
+            &state,
+            &code.id,
+            "audit-client",
+            &user.id,
+            "token-hash",
+            (now + chrono::Duration::hours(1)).naive_utc(),
+            "refresh-token",
+            (now + chrono::Duration::days(30)).naive_utc(),
+            None,
+            None,
+            None,
+            "platform",
+            "admin-cli",
+            "device",
+        )
+        .await
+        .is_err());
+
+        assert_eq!(
+            crate::entities::device_codes::Entity::find_by_id(&code.id)
+                .one(&state.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "authorized"
+        );
+        assert_eq!(
+            crate::entities::sessions::Entity::find()
+                .count(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_device_exchange_rechecks_current_owner_authority() {
+        let state = setup_state().await;
+        let user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "revoked-platform-device@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        let code = DeviceCodeStore::create(
+            DB::Conn(&state.db),
+            "revoked-platform-device-code",
+            "RVKD-CODE",
+            PLATFORM_ADMIN_CLI_CLIENT_ID,
+            "platform",
+            "admin-cli",
+            &(Utc::now() + chrono::Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .unwrap();
+        DeviceCodeStore::update_status(DB::Conn(&state.db), &code.id, "authorized", Some(&user.id))
+            .await
+            .unwrap();
+
+        let denied = token_exchange(
+            State(state.clone()),
+            Json(TokenRequest {
+                client_id: PLATFORM_ADMIN_CLI_CLIENT_ID.to_string(),
+                device_code: code.device_code,
+                grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+                resource: None,
+            }),
+        )
+        .await;
+        assert!(matches!(denied, Err(AppError::Forbidden(_))));
+        assert_eq!(
+            DeviceCodeStore::find_by_id(DB::Conn(&state.db), &code.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "authorized"
+        );
+        assert_eq!(
+            crate::entities::sessions::Entity::find()
+                .count(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn service_device_authority_accepts_membership_or_exact_identity_and_denies_revocation() {
+        let state = setup_state().await;
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "device-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&state.db),
+            "device-entitlement",
+            "Device entitlement",
+            &owner.id,
+            None,
+        )
+        .await
+        .unwrap();
+        OrganizationStore::update_status(DB::Conn(&state.db), &org.id, "active")
+            .await
+            .unwrap();
+        let service = ServiceStore::create(
+            DB::Conn(&state.db),
+            &org.id,
+            "portal",
+            "Portal",
+            "web",
+            "device-entitlement-client",
+        )
+        .await
+        .unwrap();
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "device-member@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        MembershipStore::create(DB::Conn(&state.db), &org.id, &member.id, "member")
+            .await
+            .unwrap();
+
+        assert!(validate_live_device_authority(
+            DB::Conn(&state.db),
+            &member.id,
+            &org.slug,
+            &service.slug,
+            Some(&service.id),
+        )
+        .await
+        .is_ok());
+        MembershipStore::delete_by_org_and_user(DB::Conn(&state.db), &org.id, &member.id)
+            .await
+            .unwrap();
+        assert!(validate_live_device_authority(
+            DB::Conn(&state.db),
+            &member.id,
+            &org.slug,
+            &service.slug,
+            Some(&service.id),
+        )
+        .await
+        .is_err());
+
+        IdentityStore::create(
+            DB::Conn(&state.db),
+            &member.id,
+            "github",
+            "device-member-provider-id",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&service.id),
+        )
+        .await
+        .unwrap();
+        assert!(validate_live_device_authority(
+            DB::Conn(&state.db),
+            &member.id,
+            &org.slug,
+            &service.slug,
+            Some(&service.id),
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn browser_device_verify_normalizes_absent_and_expired_codes() {
+        let state = setup_state().await;
+        DeviceCodeStore::create(
+            DB::Conn(&state.db),
+            "expired-device-code",
+            "ABCD-EFGH",
+            "client-portal",
+            "acme",
+            "portal",
+            &(Utc::now() - chrono::Duration::minutes(1)).naive_utc(),
+        )
+        .await
+        .expect("create expired device code");
+        let denied = DeviceCodeStore::create(
+            DB::Conn(&state.db),
+            "denied-device-code",
+            "DENY-0000",
+            "client-portal",
+            "acme",
+            "portal",
+            &(Utc::now() + chrono::Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .expect("create denied device code");
+        DeviceCodeStore::update_status(DB::Conn(&state.db), &denied.id, "denied", None)
+            .await
+            .expect("deny device code");
+
+        let mut errors = Vec::new();
+        for user_code in ["WXYZ-1234", "ABCD-EFGH", "DENY-0000"] {
+            let result = device_verify(
+                State(state.clone()),
+                Json400(DeviceVerifyRequest {
+                    user_code: user_code.to_string(),
+                }),
+            )
+            .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("device verification must reject an unavailable code"),
+            };
+
+            assert!(matches!(
+                error,
+                AppError::BadRequest(ref message) if message == DEVICE_USER_CODE_UNAVAILABLE
+            ));
+            let response = axum::response::IntoResponse::into_response(error);
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("read bounded error response");
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse error response");
+            assert!(body
+                .as_object_mut()
+                .expect("error response object")
+                .remove("timestamp")
+                .is_some());
+            errors.push((status, headers, body));
+        }
+        assert_eq!(errors[0], errors[1]);
+        assert_eq!(errors[0], errors[2]);
+    }
+
+    #[tokio::test]
     async fn token_exchange_accepts_only_registered_resource() {
+        use crate::entities::user_totp_secrets;
+        use sea_orm::{ActiveModelTrait, Set};
+
         let state = setup_state().await;
         let user = UserStore::find_or_create_with_options(
             DB::Conn(&state.db),
@@ -640,6 +1062,9 @@ mod tests {
         )
         .await
         .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&state.db), &org.id, "active")
+            .await
+            .expect("activate org");
         let service = ServiceStore::create(
             DB::Conn(&state.db),
             &org.id,
@@ -679,9 +1104,27 @@ mod tests {
         )
         .await
         .expect("create device code");
-        DeviceCodeStore::authorize(DB::Conn(&state.db), &device_code.id, &user.id)
+        user_totp_secrets::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user.id.clone()),
+            secret_encrypted: Set(vec![1, 2, 3]),
+            encryption_key_id: Set("test-key".to_string()),
+            enabled: Set(true),
+            created_at: Set(Utc::now().naive_utc()),
+            enabled_at: Set(Some(Utc::now().naive_utc())),
+        }
+        .insert(&state.db)
+        .await
+        .expect("enable MFA for device user");
+        DeviceCodeStore::set_user_id(DB::Conn(&state.db), &device_code.id, &user.id)
             .await
-            .expect("authorize device code");
+            .expect("bind device code for MFA");
+        assert_eq!(
+            DeviceCodeStore::authorize_for_user(DB::Conn(&state.db), &device_code.id, &user.id,)
+                .await
+                .expect("complete browser MFA authorization"),
+            1
+        );
 
         let invalid = token_exchange(
             State(state.clone()),
@@ -711,7 +1154,7 @@ mod tests {
         .expect("exchange token");
         let claims = state
             .jwt_service
-            .validate_token(&response.access_token)
+            .validate_token_for_audience(&response.access_token, resource)
             .expect("validate token");
         assert_eq!(claims.org.as_deref(), Some("acme"));
         assert_eq!(claims.service.as_deref(), Some("portal"));

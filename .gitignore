@@ -4,7 +4,7 @@
 .LSOverride
 
 # Rust
-/target/
+**/target/
 **/*.rs.bk
 
 # Node
@@ -55,5 +55,7 @@ temp/
 
 # Build artifacts
 *.tsbuildinfo
+__pycache__/
+*.py[cod]
 web-client
 auth-os

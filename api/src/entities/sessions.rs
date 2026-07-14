@@ -15,6 +15,8 @@ pub struct Model {
     pub expires_at: DateTime,
     #[sea_orm(column_type = "Text", nullable)]
     pub refresh_token: Option<String>,
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub refresh_token_hash: Option<String>,
     pub refresh_token_expires_at: Option<DateTime>,
     #[sea_orm(column_type = "Text", nullable)]
     pub org_slug: Option<String>,

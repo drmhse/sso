@@ -6,6 +6,7 @@ use crate::billing::models::{
 };
 use crate::billing::traits::BillingProvider;
 use crate::error::{AppError, Result};
+use crate::services::safe_http::{SafeHttpClient, MAX_BILLING_RESPONSE_BYTES};
 use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::http::HeaderMap;
@@ -20,7 +21,6 @@ type HmacSha256 = Hmac<Sha256>;
 const STRIPE_WEBHOOK_TOLERANCE_SECONDS: i64 = 300;
 
 pub struct StripeProvider {
-    client: reqwest::Client,
     api_key: String,
     webhook_secret: String,
     base_url: String,
@@ -44,7 +44,6 @@ impl StripeProvider {
 
     pub fn new_with_base_url(api_key: String, webhook_secret: String, base_url: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
             api_key,
             webhook_secret,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -59,38 +58,51 @@ impl StripeProvider {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let response = self
-            .client
-            .post(self.endpoint(path))
-            .bearer_auth(&self.api_key)
-            .form(&form)
-            .send()
+        let body = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.extend_pairs(
+                form.iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+            serializer.finish().into_bytes()
+        };
+        let headers = vec![
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", self.api_key).into_bytes(),
+            ),
+            (
+                "content-type".to_string(),
+                b"application/x-www-form-urlencoded".to_vec(),
+            ),
+        ];
+        let response = SafeHttpClient::new()
+            .map_err(|_| AppError::Billing("Stripe request could not be started".to_string()))?
+            .request_with_owned_headers(reqwest::Method::POST, &self.endpoint(path), body, headers)
             .await
-            .map_err(|e| AppError::Billing(format!("Stripe request failed: {}", e)))?;
+            .map_err(|_| AppError::Billing("Stripe API request failed".to_string()))?;
 
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AppError::Billing(format!("Stripe response read failed: {}", e)))?;
+        Self::decode_response(response).await
+    }
+
+    async fn decode_response<T>(response: reqwest::Response) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let (status, body) =
+            SafeHttpClient::read_body_limited(response, MAX_BILLING_RESPONSE_BYTES)
+                .await
+                .map_err(|_| AppError::Billing("Stripe API response was rejected".to_string()))?;
 
         if !status.is_success() {
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|json| {
-                    json.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or(body);
             return Err(AppError::Billing(format!(
-                "Stripe API error {}: {}",
-                status, message
+                "Stripe API request failed with status {}",
+                status.as_u16()
             )));
         }
 
-        serde_json::from_str(&body)
-            .map_err(|e| AppError::Billing(format!("Invalid Stripe response JSON: {}", e)))
+        serde_json::from_slice(&body)
+            .map_err(|_| AppError::Billing("Stripe API returned an invalid response".to_string()))
     }
 
     fn push_metadata(form: &mut Vec<(String, String)>, metadata: HashMap<String, String>) {
@@ -369,4 +381,60 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         .zip(right.iter())
         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
         == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn configured_private_base_url_fails_closed_with_redacted_error() {
+        let api_key = "sk_test_must_not_leak";
+        let base_url = "http://127.0.0.1:9/private-stripe-endpoint";
+        let provider = StripeProvider::new_with_base_url(
+            api_key.to_string(),
+            "webhook-secret".to_string(),
+            base_url,
+        );
+
+        let error = provider
+            .post_form::<StripeIdResponse>("/v1/customers", Vec::new())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Stripe API request failed"));
+        assert!(!message.contains(api_key));
+        assert!(!message.contains(base_url));
+        assert!(!message.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_rejected_without_exposing_body_details() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let declared_size = MAX_BILLING_RESPONSE_BYTES + 1;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {declared_size}\r\n\r\nsecret-response-body"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+
+        let error = StripeProvider::decode_response::<StripeIdResponse>(response)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Stripe API response was rejected"));
+        assert!(!message.contains("secret-response-body"));
+        server.await.unwrap();
+    }
 }

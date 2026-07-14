@@ -2,12 +2,9 @@ use crate::entities::prelude::{Memberships, Users};
 use crate::entities::{memberships, users};
 use crate::error::{AppError, Result};
 use crate::store::DB;
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
 use chrono::{NaiveDate, NaiveDateTime};
 use sea_orm::{
+    sea_query::{Expr, Query},
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, FromQueryResult, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
@@ -28,6 +25,21 @@ pub struct UserCreationOptions {
 
 pub struct UserStore;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserEmailFilterOp {
+    Equals,
+    Contains,
+    StartsWith,
+    EndsWith,
+    NotEquals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEmailFilter {
+    pub op: UserEmailFilterOp,
+    pub value: String,
+}
+
 impl UserStore {
     /// Find a user by their ID
     pub async fn find_by_id(db: DB<'_>, user_id: &str) -> Result<Option<users::Model>> {
@@ -47,6 +59,128 @@ impl UserStore {
         Ok(results)
     }
 
+    /// List SCIM-visible users for an organization through memberships.
+    pub async fn list_scim_org_members(
+        db: DB<'_>,
+        org_id: &str,
+        email_filters: &[UserEmailFilter],
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<users::Model>> {
+        use sea_orm::{JoinType, RelationTrait};
+
+        let mut query = Users::find()
+            .join(JoinType::InnerJoin, users::Relation::Memberships.def())
+            .filter(memberships::Column::OrgId.eq(org_id))
+            .order_by_asc(users::Column::CreatedAt)
+            .limit(limit)
+            .offset(offset);
+
+        for filter in email_filters {
+            query = match filter.op {
+                UserEmailFilterOp::Equals => query.filter(users::Column::Email.eq(&filter.value)),
+                UserEmailFilterOp::Contains => {
+                    query.filter(users::Column::Email.contains(&filter.value))
+                }
+                UserEmailFilterOp::StartsWith => {
+                    query.filter(users::Column::Email.starts_with(&filter.value))
+                }
+                UserEmailFilterOp::EndsWith => {
+                    query.filter(users::Column::Email.ends_with(&filter.value))
+                }
+                UserEmailFilterOp::NotEquals => {
+                    query.filter(users::Column::Email.ne(&filter.value))
+                }
+            };
+        }
+
+        let users = query.all(&db).await?;
+        Ok(users)
+    }
+
+    /// Count SCIM-visible users for an organization through memberships.
+    pub async fn count_scim_org_members(
+        db: DB<'_>,
+        org_id: &str,
+        email_filters: &[UserEmailFilter],
+    ) -> Result<u64> {
+        use sea_orm::{JoinType, RelationTrait};
+
+        let mut query = Users::find()
+            .join(JoinType::InnerJoin, users::Relation::Memberships.def())
+            .filter(memberships::Column::OrgId.eq(org_id));
+
+        for filter in email_filters {
+            query = match filter.op {
+                UserEmailFilterOp::Equals => query.filter(users::Column::Email.eq(&filter.value)),
+                UserEmailFilterOp::Contains => {
+                    query.filter(users::Column::Email.contains(&filter.value))
+                }
+                UserEmailFilterOp::StartsWith => {
+                    query.filter(users::Column::Email.starts_with(&filter.value))
+                }
+                UserEmailFilterOp::EndsWith => {
+                    query.filter(users::Column::Email.ends_with(&filter.value))
+                }
+                UserEmailFilterOp::NotEquals => {
+                    query.filter(users::Column::Email.ne(&filter.value))
+                }
+            };
+        }
+
+        let count = query.count(&db).await?;
+        Ok(count)
+    }
+
+    /// Update a SCIM-managed user only when both the user record and a live
+    /// membership belong to the token organization. The organization predicate
+    /// prevents a SCIM tenant from mutating a shared/platform user through a
+    /// membership, and the membership EXISTS predicate removes the handler's
+    /// preload-to-primary-key update race.
+    pub async fn update_scim_owned_member(
+        db: DB<'_>,
+        org_id: &str,
+        user_id: &str,
+        email: &str,
+        active: bool,
+    ) -> Result<Option<users::Model>> {
+        let mut membership_scope = Query::select();
+        membership_scope
+            .expr(Expr::val(1))
+            .from(memberships::Entity)
+            .and_where(memberships::Column::OrgId.eq(org_id))
+            .and_where(memberships::Column::UserId.eq(user_id));
+        if !active {
+            membership_scope.and_where(
+                memberships::Column::Role.is_not_in(["owner".to_string(), "admin".to_string()]),
+            );
+        }
+
+        let now = chrono::Utc::now().naive_utc();
+        let result = Users::update_many()
+            .filter(users::Column::Id.eq(user_id))
+            .filter(users::Column::OrgId.eq(org_id))
+            .filter(Expr::exists(membership_scope.to_owned()))
+            .set(users::ActiveModel {
+                email: Set(email.to_string()),
+                deleted_at: Set(if active { None } else { Some(now) }),
+                updated_at: Set(Some(now)),
+                ..Default::default()
+            })
+            .exec(&db)
+            .await?;
+
+        if result.rows_affected != 1 {
+            return Ok(None);
+        }
+
+        Ok(Users::find()
+            .filter(users::Column::Id.eq(user_id))
+            .filter(users::Column::OrgId.eq(org_id))
+            .one(&db)
+            .await?)
+    }
+
     /// Unified find or create user method with options
     /// If the user exists, return it. Otherwise, create a new user with the specified options.
     /// Returns (user, was_created) where was_created is true if the user was just created
@@ -56,7 +190,10 @@ impl UserStore {
         options: UserCreationOptions,
     ) -> Result<(users::Model, bool)> {
         // Check if user already exists
-        if let Some(user) = Self::find_by_email(db.clone(), email).await? {
+        // This convenience path creates platform-context users. Tenant users
+        // must use `create_with_org_id`; an unscoped lookup could otherwise
+        // select a same-email account belonging to an unrelated organization.
+        if let Some(user) = Self::find_by_email_with_context(db.clone(), email, None).await? {
             return Ok((user, false));
         }
 
@@ -350,12 +487,9 @@ impl UserStore {
             }
         }
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
         // Apply pagination
-        let users = query
-            .limit(limit as u64)
-            .offset(offset as u64)
-            .all(&db)
-            .await?;
+        let users = query.limit(limit).offset(offset).all(&db).await?;
 
         Ok(users)
     }
@@ -499,31 +633,50 @@ impl UserStore {
         Ok(())
     }
 
+    /// Delete users by ID in one statement.
+    /// This relies on database-level cascade rules for related data.
+    pub async fn delete_by_ids(db: DB<'_>, user_ids: &[String]) -> Result<u64> {
+        if user_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let result = Users::delete_many()
+            .filter(users::Column::Id.is_in(user_ids.iter().cloned()))
+            .exec(&db)
+            .await?;
+
+        Ok(result.rows_affected)
+    }
+
     /// Anonymize a user for GDPR compliance
     /// - Soft deletes the user (sets deleted_at)
     /// - Anonymizes PII (email, password_hash)
     /// - Deletes sensitive authentication data (identities, passkeys, TOTP secrets)
     /// - Preserves audit logs and login events for security integrity
     pub async fn anonymize(db: DB<'_>, user_id: &str) -> Result<()> {
-        use crate::entities::prelude::{Identities, Sessions, UserPasskeys, UserTotpSecrets};
         use sea_orm::TransactionTrait;
 
-        // Get the database connection to start a transaction
-        let db_conn = match db {
-            DB::Conn(conn) => conn,
-            DB::Tx(_) => {
-                return Err(AppError::InternalServerError(
-                    "Cannot nest transactions".to_string(),
-                ))
+        match db {
+            DB::Conn(conn) => {
+                let transaction = conn.begin().await?;
+                Self::anonymize_on_db(DB::Tx(&transaction), user_id).await?;
+                transaction.commit().await?;
             }
-        };
+            DB::Tx(transaction) => {
+                Self::anonymize_on_db(DB::Tx(transaction), user_id).await?;
+            }
+        }
 
-        let user = Self::find_by_id(DB::Conn(db_conn), user_id)
+        tracing::info!(user_id = %user_id, "User anonymized for GDPR compliance");
+        Ok(())
+    }
+
+    async fn anonymize_on_db(db: DB<'_>, user_id: &str) -> Result<()> {
+        use crate::entities::prelude::{Identities, Sessions, UserPasskeys, UserTotpSecrets};
+
+        let user = Self::find_by_id(db.clone(), user_id)
             .await?
             .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
-
-        // Start a transaction to ensure atomicity
-        let txn = db_conn.begin().await?;
 
         // Generate anonymized email using a new UUID to prevent collisions
         let anonymized_email = format!("deleted_{}@redacted.invalid", Uuid::new_v4());
@@ -535,45 +688,37 @@ impl UserStore {
         user_active.password_hash = Set(None);
         user_active.deleted_at = Set(Some(now));
         user_active.updated_at = Set(Some(now));
-        user_active.update(&txn).await?;
+        user_active.update(&db).await?;
 
         // Delete sensitive authentication data
         // 1. Delete all OAuth identities
         Identities::delete_many()
             .filter(crate::entities::identities::Column::UserId.eq(user_id))
-            .exec(&txn)
+            .exec(&db)
             .await?;
 
         // 2. Delete all passkeys (WebAuthn credentials)
         UserPasskeys::delete_many()
             .filter(crate::entities::user_passkeys::Column::UserId.eq(user_id))
-            .exec(&txn)
+            .exec(&db)
             .await?;
 
         // 3. Delete TOTP secrets
         UserTotpSecrets::delete_many()
             .filter(crate::entities::user_totp_secrets::Column::UserId.eq(user_id))
-            .exec(&txn)
+            .exec(&db)
             .await?;
 
         // 4. Revoke all active sessions (immediate logout on anonymization)
         let sessions_deleted = Sessions::delete_many()
             .filter(crate::entities::sessions::Column::UserId.eq(user_id))
-            .exec(&txn)
+            .exec(&db)
             .await?;
 
         tracing::info!(
             user_id = %user_id,
             sessions_revoked = sessions_deleted.rows_affected,
             "Revoked all sessions during user anonymization"
-        );
-
-        // Commit the transaction
-        txn.commit().await?;
-
-        tracing::info!(
-            user_id = %user_id,
-            "User anonymized for GDPR compliance"
         );
 
         Ok(())
@@ -584,21 +729,11 @@ impl UserStore {
     /// If the user already has a password hash, leaves it unchanged.
     /// If the user doesn't exist, creates them as a platform owner.
     pub async fn bootstrap_platform_owner(db: DB<'_>, email: &str, password: &str) -> Result<()> {
-        // Hash the provided password
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        let password_hash = argon2
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| {
-                AppError::InternalServerError(format!(
-                    "Failed to hash platform owner password: {}",
-                    e
-                ))
-            })?
-            .to_string();
+        let password_hash =
+            crate::services::concurrency::hash_password_bounded(password.to_string()).await?;
 
         // Try to find the user by email first
-        match Self::find_by_email(db.clone(), email).await? {
+        match Self::find_by_email_with_context(db.clone(), email, None).await? {
             Some(user) => {
                 // User exists, ensure they are a platform owner.
                 let now = chrono::Utc::now().naive_utc();
@@ -609,8 +744,8 @@ impl UserStore {
                     user_active.password_hash = Set(Some(password_hash));
                     user_active.email_verified_at = Set(Some(now));
                 }
-                user_active.update(&db).await?;
-                tracing::info!("Platform owner status ensured for existing user: {}", email);
+                let user = user_active.update(&db).await?;
+                tracing::info!(user_id = %user.id, "Platform owner status ensured for existing user");
             }
             None => {
                 // User doesn't exist, create them as platform owner using unified method
@@ -621,9 +756,9 @@ impl UserStore {
                     ..Default::default()
                 };
 
-                let (_user, _was_created) =
+                let (user, _was_created) =
                     Self::find_or_create_with_options(db, email, options).await?;
-                tracing::info!("Platform owner account created: {}", email);
+                tracing::info!(user_id = %user.id, "Platform owner account created");
             }
         }
 
@@ -645,4 +780,203 @@ pub struct UserSearchResult {
 pub struct UserGrowthTrendData {
     pub date: NaiveDate,
     pub count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::memberships::MembershipStore;
+    use crate::store::organizations::OrganizationStore;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn scim_org_member_listing_filters_and_counts_through_memberships() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "owner@owner.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let org = OrganizationStore::create(DB::Conn(&db), "scim-org", "SCIM Org", &owner.id, None)
+            .await
+            .expect("create org");
+
+        let alpha = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "alpha@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create alpha")
+        .0;
+        let beta = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "beta@test.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create beta")
+        .0;
+        let non_member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "nonmember@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create non-member")
+        .0;
+
+        MembershipStore::create(DB::Conn(&db), &org.id, &alpha.id, "member")
+            .await
+            .expect("add alpha");
+        MembershipStore::create(DB::Conn(&db), &org.id, &beta.id, "member")
+            .await
+            .expect("add beta");
+
+        let all_members = UserStore::list_scim_org_members(DB::Conn(&db), &org.id, &[], 10, 0)
+            .await
+            .expect("list members");
+        let member_ids = all_members
+            .iter()
+            .map(|user| user.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(all_members.len(), 2);
+        assert!(!member_ids.contains(owner.id.as_str()));
+        assert!(member_ids.contains(alpha.id.as_str()));
+        assert!(member_ids.contains(beta.id.as_str()));
+        assert!(!member_ids.contains(non_member.id.as_str()));
+
+        let filters = vec![UserEmailFilter {
+            op: UserEmailFilterOp::EndsWith,
+            value: "example.com".to_string(),
+        }];
+        let filtered = UserStore::list_scim_org_members(DB::Conn(&db), &org.id, &filters, 10, 0)
+            .await
+            .expect("list filtered members");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, alpha.id);
+
+        let count = UserStore::count_scim_org_members(DB::Conn(&db), &org.id, &filters)
+            .await
+            .expect("count filtered members");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn same_email_lookups_and_default_creation_preserve_tenant_context() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let org_a_owner = UserStore::create(DB::Conn(&db), "owner-a@example.test", None, false)
+            .await
+            .expect("create owner A");
+        let org_b_owner = UserStore::create(DB::Conn(&db), "owner-b@example.test", None, false)
+            .await
+            .expect("create owner B");
+        let org_a = OrganizationStore::create(
+            DB::Conn(&db),
+            "same-email-a",
+            "Same Email A",
+            &org_a_owner.id,
+            None,
+        )
+        .await
+        .expect("create org A");
+        let org_b = OrganizationStore::create(
+            DB::Conn(&db),
+            "same-email-b",
+            "Same Email B",
+            &org_b_owner.id,
+            None,
+        )
+        .await
+        .expect("create org B");
+        let tenant_a =
+            UserStore::create_with_org_id(DB::Conn(&db), "shared@example.test", None, &org_a.id)
+                .await
+                .expect("create tenant A user");
+        let tenant_b =
+            UserStore::create_with_org_id(DB::Conn(&db), "shared@example.test", None, &org_b.id)
+                .await
+                .expect("create tenant B user");
+
+        assert_eq!(
+            UserStore::find_by_email_with_context(
+                DB::Conn(&db),
+                "shared@example.test",
+                Some(&org_a.id),
+            )
+            .await
+            .expect("lookup tenant A")
+            .expect("tenant A exists")
+            .id,
+            tenant_a.id
+        );
+        assert_eq!(
+            UserStore::find_by_email_with_context(
+                DB::Conn(&db),
+                "shared@example.test",
+                Some(&org_b.id),
+            )
+            .await
+            .expect("lookup tenant B")
+            .expect("tenant B exists")
+            .id,
+            tenant_b.id
+        );
+        assert!(
+            UserStore::find_by_email_with_context(DB::Conn(&db), "shared@example.test", None,)
+                .await
+                .expect("lookup platform context")
+                .is_none()
+        );
+
+        let (platform, created) = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "shared@example.test",
+            UserCreationOptions {
+                is_platform_owner: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create platform-context user");
+        assert!(created);
+        assert!(platform.org_id.is_none());
+        assert!(platform.is_platform_owner);
+        assert_ne!(platform.id, tenant_a.id);
+        assert_ne!(platform.id, tenant_b.id);
+
+        let (admin_oauth, created) = UserStore::find_or_create_admin_oauth(
+            DB::Conn(&db),
+            "shared@example.test",
+            Some("shared@example.test"),
+        )
+        .await
+        .expect("resolve admin OAuth user");
+        assert!(!created);
+        assert_eq!(admin_oauth.id, platform.id);
+    }
 }

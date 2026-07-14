@@ -23,7 +23,6 @@ use chrono::Utc;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::task::JoinSet;
 use uuid::Uuid;
 
 fn validate_redirect_uris_input(redirect_uris: &[String]) -> Result<()> {
@@ -360,6 +359,17 @@ pub async fn create_service(
     let service_type = req.service_type.clone();
     let device_activation_uri = req.device_activation_uri.clone();
     let org_id = org.id.clone();
+    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.user.id), "service.created")
+        .target("service", &service_id)
+        .success(true)
+        .details_json(Some(json!({
+            "service_slug": &req.slug,
+            "service_name": &req.name,
+            "service_type": &req.service_type,
+            "client_id": &client_id
+        })))
+        .build();
+    let audit_actor = state.audit_actor.clone();
 
     // 8. Execute transaction with automatic retry on database contention
     let (service, default_plan) = with_retrying_transaction(
@@ -382,6 +392,8 @@ pub async fn create_service(
             let resource_uris_json = resource_uris_json.clone();
             let device_activation_uri = device_activation_uri.clone();
             let plan_id = plan_id.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
                 // Create service using ServiceStore
                 let service = ServiceStore::create_with_options(
@@ -448,24 +460,12 @@ pub async fn create_service(
                     ),
                 };
 
+                audit_actor.log_org_with_db(db, event).await?;
                 Ok((service, default_plan))
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.user.id), "service.created")
-        .target("service", &service_id)
-        .success(true)
-        .details_json(Some(json!({
-            "service_slug": req.slug,
-            "service_name": req.name,
-            "service_type": req.service_type,
-            "client_id": client_id
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     // 10. RETURN response matching architecture document
     let usage = ServiceUsageInfo {
@@ -492,6 +492,8 @@ pub async fn list_organization_services(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Check if user is member
     let _membership =
@@ -518,66 +520,54 @@ pub async fn list_organization_services(
     )
     .await?;
 
-    let mut services = Vec::new();
-    for service in all_services {
-        if can_view_all
-            || PermissionsStore::check(
-                DB::Conn(&state.db),
-                "service",
-                &service.id,
-                "manager",
-                &auth_user.user.id,
-            )
-            .await?
-            || PermissionsStore::check(
-                DB::Conn(&state.db),
-                "service",
-                &service.id,
-                "viewer",
-                &auth_user.user.id,
-            )
-            .await?
-        {
-            services.push(service);
-        }
-    }
+    let services = if can_view_all {
+        all_services
+    } else {
+        let service_ids = all_services
+            .iter()
+            .map(|service| service.id.clone())
+            .collect::<Vec<_>>();
+        let access_by_service = PermissionsStore::list_service_access_for_user(
+            DB::Conn(&state.db),
+            &service_ids,
+            &auth_user.user.id,
+        )
+        .await?;
+
+        all_services
+            .into_iter()
+            .filter(|service| access_by_service.contains_key(&service.id))
+            .collect::<Vec<_>>()
+    };
 
     let accessible_total = services.len() as i64;
-    let offset = query.offset.unwrap_or(0).max(0) as usize;
-    let limit = query
-        .limit
-        .map(|value| value.max(0) as usize)
-        .unwrap_or(services.len());
+    let (limit, offset) =
+        crate::utils::pagination::signed_slice_window(query.limit, query.offset, services.len());
     let services = services
         .into_iter()
         .skip(offset)
         .take(limit)
         .collect::<Vec<_>>();
 
-    // Get detailed information for each service
-    let mut join_set = JoinSet::new();
-    for service in services {
-        let db = state.db.clone();
-        let service_id = service.id.clone();
-        join_set.spawn(async move {
-            let plan_count = PlanStore::count_by_service(DB::Conn(&db), &service_id)
-                .await
-                .unwrap_or(0);
+    let service_ids = services
+        .iter()
+        .map(|service| service.id.clone())
+        .collect::<Vec<_>>();
+    let plan_counts = PlanStore::count_by_services(DB::Conn(&state.db), &service_ids).await?;
+    let subscription_counts =
+        SubscriptionStore::count_active_by_services(DB::Conn(&state.db), &service_ids).await?;
 
-            let subscription_count =
-                SubscriptionStore::count_active_by_service(DB::Conn(&db), &service_id)
-                    .await
-                    .unwrap_or(0);
-
+    let services_with_details = services
+        .into_iter()
+        .map(|service| {
+            let service_id = service.id.clone();
             ServiceWithDetails {
                 service: ServiceResponse::from(service),
-                plan_count,
-                subscription_count,
+                plan_count: plan_counts.get(&service_id).copied().unwrap_or(0),
+                subscription_count: subscription_counts.get(&service_id).copied().unwrap_or(0),
             }
-        });
-    }
-
-    let services_with_details: Vec<ServiceWithDetails> = join_set.join_all().await;
+        })
+        .collect::<Vec<_>>();
 
     // Get usage information
     let current_services = accessible_total;
@@ -603,6 +593,8 @@ pub async fn get_service(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Check if user is member
     let _membership =
@@ -643,6 +635,8 @@ pub async fn update_service(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Validate service type if provided
     if let Some(service_type) = &req.service_type {
@@ -729,6 +723,8 @@ pub async fn rotate_service_secret(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
         .await?
@@ -742,24 +738,45 @@ pub async fn rotate_service_secret(
 
     let client_secret = Uuid::new_v4().to_string();
     let client_secret_hash = hash_client_secret(&client_secret);
-    let service = ServiceStore::update_client_secret_hash(
-        DB::Conn(&state.db),
-        &org.id,
-        &service_slug,
-        &client_secret_hash,
+    let audit_actor = state.audit_actor.clone();
+    let helper_org_id = org.id.clone();
+    let helper_service_slug = service_slug.clone();
+    let helper_actor_id = auth_user.user.id.clone();
+    let service = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "rotate_service_secret",
+        |db| {
+            let org_id = helper_org_id.clone();
+            let service_slug = helper_service_slug.clone();
+            let actor_id = helper_actor_id.clone();
+            let client_secret_hash = client_secret_hash.clone();
+            let audit_actor = audit_actor.clone();
+            Box::pin(async move {
+                let service = ServiceStore::update_client_secret_hash(
+                    db.clone(),
+                    &org_id,
+                    &service_slug,
+                    &client_secret_hash,
+                )
+                .await?;
+                let event =
+                    OrgAuditBuilder::new(&org_id, Some(&actor_id), "service.secret_rotated")
+                        .target("service", &service.id)
+                        .success(true)
+                        .details_json(Some(json!({
+                            "service_slug": service_slug,
+                            "service_name": &service.name,
+                            "client_id": &service.client_id
+                        })))
+                        .build();
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(service)
+            })
+        },
     )
     .await?;
-
-    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.user.id), "service.secret_rotated")
-        .target("service", &service.id)
-        .success(true)
-        .details_json(Some(json!({
-            "service_slug": service_slug,
-            "service_name": service.name,
-            "client_id": service.client_id
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(Json(RotateServiceSecretResponse {
         service: ServiceResponse::from(service),
@@ -777,6 +794,8 @@ pub async fn delete_service(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Check if user is owner (only owners can delete services)
     let membership =
@@ -827,6 +846,8 @@ pub async fn create_plan(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Get service
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
@@ -904,6 +925,8 @@ pub async fn list_service_plans(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Check if user is member
     let _membership =
@@ -926,12 +949,17 @@ pub async fn list_service_plans(
 
     // Get all plans for this service using PlanStore
     let plan_entities = PlanStore::find_by_service(DB::Conn(&state.db), &service.id).await?;
+    let plan_ids: Vec<String> = plan_entities.iter().map(|plan| plan.id.clone()).collect();
+    let subscription_counts =
+        SubscriptionStore::count_active_by_plans(DB::Conn(&state.db), &plan_ids).await?;
 
     let mut responses = Vec::new();
 
     for plan_entity in plan_entities {
-        let subscription_count =
-            SubscriptionStore::count_active_by_plan(DB::Conn(&state.db), &plan_entity.id).await?;
+        let subscription_count = subscription_counts
+            .get(&plan_entity.id)
+            .copied()
+            .unwrap_or_default();
 
         // Convert to Plan model
         let plan = Plan {
@@ -967,6 +995,8 @@ pub async fn update_plan(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Get service to verify it belongs to the organization
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
@@ -980,15 +1010,10 @@ pub async fn update_plan(
     }
 
     // Verify the plan belongs to this service
-    let existing_plan = PlanStore::find_by_id(DB::Conn(&state.db), &plan_id)
-        .await?
-        .ok_or_else(|| crate::error::AppError::NotFound("Plan not found".to_string()))?;
-
-    if existing_plan.service_id != service.id {
-        return Err(crate::error::AppError::NotFound(
-            "Plan not found".to_string(),
-        ));
-    }
+    let _existing_plan =
+        PlanStore::find_by_id_and_service(DB::Conn(&state.db), &plan_id, &service.id)
+            .await?
+            .ok_or_else(|| crate::error::AppError::NotFound("Plan not found".to_string()))?;
 
     // Check if there are any fields to update
     if req.name.is_none()
@@ -1016,6 +1041,7 @@ pub async fn update_plan(
     // Update plan using PlanStore
     let updated_plan_entity = PlanStore::update(
         DB::Conn(&state.db),
+        &service.id,
         &plan_id,
         req.name.as_deref(),
         description_update,
@@ -1064,6 +1090,8 @@ pub async fn delete_plan(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     // Get service to verify it belongs to the organization
     let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
@@ -1077,15 +1105,10 @@ pub async fn delete_plan(
     }
 
     // Verify the plan exists and belongs to this service
-    let existing_plan = PlanStore::find_by_id(DB::Conn(&state.db), &plan_id)
-        .await?
-        .ok_or_else(|| crate::error::AppError::NotFound("Plan not found".to_string()))?;
-
-    if existing_plan.service_id != service.id {
-        return Err(crate::error::AppError::NotFound(
-            "Plan not found".to_string(),
-        ));
-    }
+    let _existing_plan =
+        PlanStore::find_by_id_and_service(DB::Conn(&state.db), &plan_id, &service.id)
+            .await?
+            .ok_or_else(|| crate::error::AppError::NotFound("Plan not found".to_string()))?;
 
     // Check if plan has active subscriptions
     let subscription_count =
@@ -1098,7 +1121,7 @@ pub async fn delete_plan(
     }
 
     // Delete plan using PlanStore
-    PlanStore::delete(DB::Conn(&state.db), &plan_id).await?;
+    PlanStore::delete(DB::Conn(&state.db), &service.id, &plan_id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

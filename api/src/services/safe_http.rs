@@ -13,6 +13,9 @@ use crate::error::{AppError, Result};
 use reqwest::Url;
 use std::net::{IpAddr, SocketAddr};
 
+pub const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
+pub const MAX_BILLING_RESPONSE_BYTES: usize = 64 * 1024;
+
 struct ValidatedUrl {
     url: Url,
     host: String,
@@ -244,6 +247,53 @@ impl SafeHttpClient {
             .await
             .map_err(|e| AppError::InternalServerError(format!("HTTP request failed: {}", e)))
     }
+
+    /// POST URL-encoded form data after DNS validation and address pinning.
+    pub async fn post_form(
+        &self,
+        url: &str,
+        fields: &[(String, String)],
+    ) -> Result<reqwest::Response> {
+        let validated_url = self.validate_url(url).await?;
+        let client =
+            Self::build_client_with_pinned_resolution(&validated_url.host, &validated_url.addrs)?;
+
+        client
+            .post(validated_url.url.as_str())
+            .form(fields)
+            .send()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("HTTP request failed: {}", e)))
+    }
+
+    /// Read a response body with an explicit upper bound.
+    pub async fn read_body_limited(
+        mut response: reqwest::Response,
+        maximum_bytes: usize,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum_bytes as u64)
+        {
+            return Err(AppError::InternalServerError(
+                "HTTP response exceeded the configured size limit".to_string(),
+            ));
+        }
+
+        let status = response.status();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            AppError::InternalServerError(format!("Failed to read HTTP response: {error}"))
+        })? {
+            if body.len().saturating_add(chunk.len()) > maximum_bytes {
+                return Err(AppError::InternalServerError(
+                    "HTTP response exceeded the configured size limit".to_string(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((status, body))
+    }
 }
 
 impl Default for SafeHttpClient {
@@ -298,6 +348,16 @@ pub(crate) fn is_private_or_reserved_ip(ip: &IpAddr) -> bool {
                 return true;
             }
 
+            // Additional non-global and special-purpose ranges.
+            if octets[0] == 0
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || octets[0] >= 240
+            {
+                return true;
+            }
+
             // Unspecified: 0.0.0.0
             if v4.is_unspecified() {
                 return true;
@@ -323,6 +383,10 @@ pub(crate) fn is_private_or_reserved_ip(ip: &IpAddr) -> bool {
 
             // Note: Many IPv6 private address checks are still unstable in std
             // We'll check common private ranges manually
+            if let Some(ipv4) = v6.to_ipv4_mapped() {
+                return is_private_or_reserved_ip(&IpAddr::V4(ipv4));
+            }
+
             let segments = v6.segments();
 
             // Link-local: fe80::/10
@@ -335,23 +399,6 @@ pub(crate) fn is_private_or_reserved_ip(ip: &IpAddr) -> bool {
                 return true;
             }
 
-            // IPv4-mapped IPv6 addresses (::ffff:0:0/96) - check the mapped IPv4
-            if segments[0] == 0
-                && segments[1] == 0
-                && segments[2] == 0
-                && segments[3] == 0
-                && segments[4] == 0
-                && segments[5] == 0xffff
-            {
-                let ipv4 = std::net::Ipv4Addr::new(
-                    (segments[6] >> 8) as u8,
-                    (segments[6] & 0xff) as u8,
-                    (segments[7] >> 8) as u8,
-                    (segments[7] & 0xff) as u8,
-                );
-                return is_private_or_reserved_ip(&IpAddr::V4(ipv4));
-            }
-
             false
         }
     }
@@ -361,6 +408,7 @@ pub(crate) fn is_private_or_reserved_ip(ip: &IpAddr) -> bool {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn test_private_ipv4_addresses() {
@@ -408,5 +456,49 @@ mod tests {
         assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
             0xfe80, 0, 0, 0, 0, 0, 0, 1
         ))));
+
+        assert!(is_private_or_reserved_ip(&IpAddr::V6(
+            "::ffff:127.0.0.1".parse().unwrap()
+        )));
+        assert!(is_private_or_reserved_ip(&IpAddr::V6(
+            "::ffff:169.254.169.254".parse().unwrap()
+        )));
+    }
+
+    #[tokio::test]
+    async fn url_validation_rejects_literal_internal_destinations() {
+        let client = SafeHttpClient::new().unwrap();
+        for url in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+        ] {
+            assert!(client.validate_external_url(url).await.is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_reader_rejects_declared_oversize_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345")
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let error = SafeHttpClient::read_body_limited(response, 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("size limit"));
+        server.await.unwrap();
     }
 }

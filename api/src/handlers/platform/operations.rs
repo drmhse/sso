@@ -1,7 +1,8 @@
-use crate::entities::{siem_configs, system_jobs, webhook_deliveries};
+use crate::entities::{siem_configs, webhook_deliveries};
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
+use crate::store::{system_jobs::SystemJobStore, DB};
 use axum::{extract::State, Extension, Json};
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::Serialize;
@@ -28,18 +29,11 @@ pub async fn get_operations_status(
         ));
     }
 
-    let jobs_pending = system_jobs::Entity::find()
-        .filter(system_jobs::Column::Status.eq("pending"))
-        .count(&state.db)
-        .await?;
-    let jobs_running = system_jobs::Entity::find()
-        .filter(system_jobs::Column::Status.eq("processing"))
-        .count(&state.db)
-        .await?;
-    let jobs_failed = system_jobs::Entity::find()
-        .filter(system_jobs::Column::Status.eq("failed"))
-        .count(&state.db)
-        .await?;
+    let job_counts = SystemJobStore::count_by_statuses(
+        DB::Conn(&state.db),
+        &["pending", "processing", "failed"],
+    )
+    .await?;
     let webhook_deliveries_failed = webhook_deliveries::Entity::find()
         .filter(webhook_deliveries::Column::Delivered.eq(false))
         .filter(webhook_deliveries::Column::DeliveryError.is_not_null())
@@ -55,9 +49,9 @@ pub async fn get_operations_status(
         .await?;
 
     Ok(Json(PlatformOperationsStatus {
-        jobs_pending,
-        jobs_running,
-        jobs_failed,
+        jobs_pending: *job_counts.get("pending").unwrap_or(&0) as u64,
+        jobs_running: *job_counts.get("processing").unwrap_or(&0) as u64,
+        jobs_failed: *job_counts.get("failed").unwrap_or(&0) as u64,
         webhook_deliveries_failed,
         siem_configs_enabled,
         siem_configs_with_failures,

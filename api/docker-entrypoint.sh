@@ -21,8 +21,8 @@ sqlite:*)
     if [ ! -f "$DB_PATH" ]; then
         echo "Creating database file at $DB_PATH"
         touch "$DB_PATH"
-        chmod 666 "$DB_PATH"
     fi
+    chmod 600 "$DB_PATH"
 
     echo "✓ SQLite database ready"
     ;;

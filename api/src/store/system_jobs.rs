@@ -5,11 +5,18 @@ use crate::store::DB;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    IntoActiveModel, QuerySelect, Set,
+    FromQueryResult, IntoActiveModel, QueryFilter, QuerySelect, Set,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub struct SystemJobStore;
+
+#[derive(Debug, FromQueryResult)]
+struct JobStatusCount {
+    status: String,
+    count: i64,
+}
 
 impl SystemJobStore {
     /// Create a new job in the queue
@@ -46,6 +53,28 @@ impl SystemJobStore {
         job.insert(&db).await?;
 
         Ok(job_id)
+    }
+
+    /// Count jobs grouped by status in one query.
+    pub async fn count_by_statuses(db: DB<'_>, statuses: &[&str]) -> Result<HashMap<String, i64>> {
+        if statuses.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = SystemJobs::find()
+            .filter(system_jobs::Column::Status.is_in(statuses.iter().copied()))
+            .select_only()
+            .column(system_jobs::Column::Status)
+            .column_as(system_jobs::Column::Id.count(), "count")
+            .group_by(system_jobs::Column::Status)
+            .into_model::<JobStatusCount>()
+            .all(&db)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.status, row.count))
+            .collect())
     }
 
     /// Atomically claim the next available job for a worker.
@@ -482,4 +511,100 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
     let base_delay_ms = 20 * (1 << attempt.min(8)); // 40ms... up to ~5120ms
     let jitter_ms = rand::random::<u64>() % (base_delay_ms / 2);
     base_delay_ms + jitter_ms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn count_by_statuses_groups_job_statuses_in_one_result() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let pending = SystemJobStore::create_job(DB::Conn(&db), "test", "{}", 0, 3, None)
+            .await
+            .expect("create pending job");
+        let processing = SystemJobStore::create_job(DB::Conn(&db), "test", "{}", 0, 3, None)
+            .await
+            .expect("create processing job");
+        let failed = SystemJobStore::create_job(DB::Conn(&db), "test", "{}", 0, 3, None)
+            .await
+            .expect("create failed job");
+        let completed = SystemJobStore::create_job(DB::Conn(&db), "test", "{}", 0, 3, None)
+            .await
+            .expect("create completed job");
+
+        #[allow(deprecated)]
+        SystemJobStore::mark_as_processing(DB::Conn(&db), &processing)
+            .await
+            .expect("mark processing");
+        SystemJobStore::mark_as_failed_permanently(DB::Conn(&db), &failed, "failed")
+            .await
+            .expect("mark failed");
+        SystemJobStore::mark_as_completed(DB::Conn(&db), &completed)
+            .await
+            .expect("mark completed");
+
+        let counts =
+            SystemJobStore::count_by_statuses(DB::Conn(&db), &["pending", "processing", "failed"])
+                .await
+                .expect("count statuses");
+
+        assert_eq!(*counts.get("pending").unwrap_or(&0), 1);
+        assert_eq!(*counts.get("processing").unwrap_or(&0), 1);
+        assert_eq!(*counts.get("failed").unwrap_or(&0), 1);
+        assert_eq!(*counts.get("completed").unwrap_or(&0), 0);
+        assert!(!pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_jobs_retry_then_stop_at_the_configured_bound() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let job_id = SystemJobStore::create_job(DB::Conn(&db), "test", "{}", 0, 2, None)
+            .await
+            .expect("create job");
+
+        #[allow(deprecated)]
+        SystemJobStore::mark_as_processing(DB::Conn(&db), &job_id)
+            .await
+            .expect("claim first attempt");
+        SystemJobStore::mark_as_failed(DB::Conn(&db), &job_id, "transient")
+            .await
+            .expect("schedule retry");
+        let retry = SystemJobs::find_by_id(&job_id)
+            .one(&db)
+            .await
+            .expect("load retry")
+            .expect("retry exists");
+        assert_eq!(retry.status, "pending");
+        assert_eq!(retry.attempt_count, 1);
+        assert_eq!(retry.worker_id, None);
+        assert!(retry.failed_at.is_none());
+
+        #[allow(deprecated)]
+        SystemJobStore::mark_as_processing(DB::Conn(&db), &job_id)
+            .await
+            .expect("claim final attempt");
+        SystemJobStore::mark_as_failed(DB::Conn(&db), &job_id, "still failing")
+            .await
+            .expect("stop retries");
+        let failed = SystemJobs::find_by_id(&job_id)
+            .one(&db)
+            .await
+            .expect("load failure")
+            .expect("failure exists");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.attempt_count, 2);
+        assert_eq!(failed.error_message.as_deref(), Some("still failing"));
+        assert!(failed.failed_at.is_some());
+    }
 }

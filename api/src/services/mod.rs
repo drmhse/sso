@@ -16,5 +16,6 @@ pub mod prometheus_metrics;
 pub mod risk_engine;
 pub mod safe_http;
 pub mod scim_filter;
+pub mod secret_rewrap;
 pub mod tier_enforcement;
 pub mod webauthn;

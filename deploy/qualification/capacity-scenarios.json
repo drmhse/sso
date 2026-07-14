@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "workloads": [
+    {
+      "name": "password-authentication",
+      "category": "authentication",
+      "method": "POST",
+      "path": "/api/auth/login",
+      "headers": {"Content-Type": "application/json"},
+      "body_env": "AUTHOS_CAPACITY_LOGIN_BODY",
+      "expected_statuses": [200],
+      "requests": 100,
+      "warmup_requests": 10,
+      "concurrency": 4,
+      "timeout_seconds": 10
+    },
+    {
+      "name": "token-refresh",
+      "category": "token",
+      "method": "POST",
+      "path": "/api/auth/refresh",
+      "headers": {"Content-Type": "application/json"},
+      "body_env": "AUTHOS_CAPACITY_REFRESH_BODY",
+      "expected_statuses": [200],
+      "requests": 100,
+      "warmup_requests": 10,
+      "concurrency": 4,
+      "timeout_seconds": 10
+    },
+    {
+      "name": "organization-members",
+      "category": "organization",
+      "method": "GET",
+      "path": "/api/organizations/capacity-org/members",
+      "header_env": {"Authorization": "AUTHOS_CAPACITY_MANAGEMENT_AUTHORIZATION"},
+      "expected_statuses": [200],
+      "requests": 100,
+      "warmup_requests": 10,
+      "concurrency": 4,
+      "timeout_seconds": 10
+    },
+    {
+      "name": "saml-metadata",
+      "category": "saml",
+      "method": "GET",
+      "path": "/saml/capacity-org/capacity-service/metadata",
+      "expected_statuses": [200],
+      "requests": 100,
+      "warmup_requests": 10,
+      "concurrency": 4,
+      "timeout_seconds": 10
+    },
+    {
+      "name": "scim-user-list",
+      "category": "scim",
+      "method": "GET",
+      "path": "/scim/v2/Users?startIndex=1&count=25",
+      "header_env": {"Authorization": "AUTHOS_CAPACITY_SCIM_AUTHORIZATION"},
+      "expected_statuses": [200],
+      "requests": 100,
+      "warmup_requests": 10,
+      "concurrency": 4,
+      "timeout_seconds": 10
+    }
+  ]
+}

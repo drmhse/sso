@@ -16,7 +16,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 async fn require_end_user_viewer(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
     if PermissionService::check_any(
@@ -141,9 +141,8 @@ pub async fn list_end_users(
 
     require_end_user_viewer(&state, &organization.id, &user.id).await?;
 
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).clamp(1, 100);
-    let offset = (page - 1) * limit;
+    let (page, limit, offset) =
+        crate::utils::pagination::signed_page(query.page, query.limit, 50, 100);
 
     // Build query to get users who have identities or subscriptions for this organization
     // This includes users who logged in (have identities) even if they don't have subscriptions yet
@@ -388,44 +387,41 @@ pub async fn get_end_user(
 
     // Get scoped sessions and recent login events to support admin troubleshooting.
     let org_services = ServiceStore::list_by_org(DB::Conn(&state.db), &organization.id).await?;
-    let service_ids: HashSet<String> = org_services
+    let service_ids = org_services
         .iter()
         .map(|service| service.id.clone())
-        .collect();
+        .collect::<Vec<_>>();
     let service_names: HashMap<String, String> = org_services
         .into_iter()
         .map(|service| (service.id, service.name))
         .collect();
 
     let now = Utc::now().naive_utc();
-    let sessions = SessionStore::list_by_user(DB::Conn(&state.db), &end_user_id)
-        .await?
-        .into_iter()
-        .filter(|session| {
-            session.org_slug.as_deref() == Some(&org_slug)
-                || session
-                    .service_id
-                    .as_ref()
-                    .map(|id| service_ids.contains(id))
-                    .unwrap_or(false)
-        })
-        .map(|session| EndUserSession {
-            id: session.id,
-            service_name: session
-                .service_id
-                .as_ref()
-                .and_then(|id| service_names.get(id).cloned()),
-            service_id: session.service_id,
-            org_slug: session.org_slug,
-            ip_address: session.ip_address,
-            user_agent: session.user_agent,
-            expires_at: chrono::DateTime::from_naive_utc_and_offset(session.expires_at, Utc),
-            refresh_token_expires_at: session
-                .refresh_token_expires_at
-                .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, Utc)),
-            created_at: chrono::DateTime::from_naive_utc_and_offset(session.created_at, Utc),
-        })
-        .collect::<Vec<_>>();
+    let sessions = SessionStore::list_user_org_scoped_sessions(
+        DB::Conn(&state.db),
+        &end_user_id,
+        &org_slug,
+        &service_ids,
+    )
+    .await?
+    .into_iter()
+    .map(|session| EndUserSession {
+        id: session.id,
+        service_name: session
+            .service_id
+            .as_ref()
+            .and_then(|id| service_names.get(id).cloned()),
+        service_id: session.service_id,
+        org_slug: session.org_slug,
+        ip_address: session.ip_address,
+        user_agent: session.user_agent,
+        expires_at: chrono::DateTime::from_naive_utc_and_offset(session.expires_at, Utc),
+        refresh_token_expires_at: session
+            .refresh_token_expires_at
+            .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, Utc)),
+        created_at: chrono::DateTime::from_naive_utc_and_offset(session.created_at, Utc),
+    })
+    .collect::<Vec<_>>();
 
     let session_count = sessions
         .iter()

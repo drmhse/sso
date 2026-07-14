@@ -10,7 +10,6 @@ use crate::services::job_queue::{EmailJobPayload, JobType, WebhookJobPayload};
 use crate::services::safe_http::SafeHttpClient;
 use crate::store::system_jobs::SystemJobStore;
 use crate::store::webhook_deliveries::WebhookDeliveryStore;
-use crate::store::webhooks::WebhookStore;
 use crate::store::DB;
 use sea_orm::DatabaseConnection;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,6 +28,7 @@ pub struct JobProcessor {
     db_writer: Arc<DatabaseConnection>,
     worker_id: String,
     email_service: Option<Arc<EmailService>>,
+    encryption: Option<crate::encryption::EncryptionService>,
     max_concurrent_jobs: usize,
 }
 
@@ -37,6 +37,7 @@ impl JobProcessor {
         db: DatabaseConnection,
         #[cfg(feature = "db_sqlite")] db_writer: DatabaseConnection,
         email_service: Option<Arc<EmailService>>,
+        encryption: Option<crate::encryption::EncryptionService>,
         batch_size: usize, // Now used as max_concurrent_jobs
     ) -> Self {
         // Generate unique worker ID: hostname-uuid
@@ -63,16 +64,11 @@ impl JobProcessor {
             db_writer: Arc::new(db_writer),
             worker_id,
             email_service,
+            encryption,
             max_concurrent_jobs,
         }
     }
 
-    /// Start the job processor worker with concurrent job processing
-    ///
-    /// Uses a concurrent claim-and-process pattern:
-    /// 1. Continuously claim jobs up to max_concurrent_jobs limit
-    /// 2. Each claimed job is processed in its own async task
-    /// 3. When a slot frees up, immediately try to claim another job
     /// Start the job processor worker with concurrent job processing
     ///
     /// Uses a concurrent claim-and-process pattern:
@@ -345,37 +341,69 @@ impl JobProcessor {
             crate::error::AppError::BadRequest(format!("Invalid webhook payload: {}", e))
         })?;
 
-        // Get the webhook configuration
-        let webhook = WebhookStore::find_by_id(DB::Conn(&self.db), &webhook_payload.webhook_id)
-            .await?
-            .ok_or_else(|| crate::error::AppError::NotFound("Webhook not found".to_string()))?;
-
-        if !webhook.is_active {
-            tracing::warn!(
-                worker_id = %self.worker_id,
-                webhook_id = %webhook_payload.webhook_id,
-                "Webhook is inactive, skipping"
-            );
-            // Mark delivery as permanently failed since webhook is inactive
-            WebhookDeliveryStore::mark_as_failed_permanently(
-                DB::Conn(&self.db),
-                &webhook_payload.delivery_id,
-                Some("Webhook is inactive".to_string()),
-            )
-            .await?;
-            return Ok(());
-        }
-
         let payload_body = serde_json::to_string(&webhook_payload.payload).map_err(|e| {
             crate::error::AppError::InternalServerError(format!(
                 "Failed to serialize webhook payload: {}",
                 e
             ))
         })?;
-        let signature = self.generate_signature(payload_body.as_bytes(), &webhook.secret);
-        let timestamp = chrono::Utc::now().timestamp().to_string();
         let safe_client = SafeHttpClient::new()?;
 
+        // Reauthorize the exact delivery immediately before outbound I/O. A
+        // queued job cannot outlive webhook disablement or parent suspension,
+        // and payload IDs cannot be mixed across deliveries.
+        let Some(authorized) = WebhookDeliveryStore::find_authorized_open_delivery(
+            DB::Conn(&self.db),
+            &webhook_payload.delivery_id,
+            &webhook_payload.webhook_id,
+        )
+        .await?
+        else {
+            tracing::warn!(
+                worker_id = %self.worker_id,
+                webhook_id = %webhook_payload.webhook_id,
+                delivery_id = %webhook_payload.delivery_id,
+                "Webhook delivery is no longer authorized, skipping outbound request"
+            );
+            WebhookDeliveryStore::mark_as_failed_permanently_for_webhook(
+                DB::Conn(&self.db),
+                &webhook_payload.delivery_id,
+                &webhook_payload.webhook_id,
+                Some("Webhook or parent organization is inactive".to_string()),
+                None,
+            )
+            .await?;
+            return Ok(());
+        };
+        let delivery = authorized.delivery;
+        let webhook = authorized.webhook;
+
+        let encrypted_secret = webhook.secret_encrypted.as_deref().ok_or_else(|| {
+            crate::error::AppError::InternalServerError(
+                "Webhook secret requires migration; run rewrap-secrets --apply".to_string(),
+            )
+        })?;
+        let encryption = self.encryption.as_ref().ok_or_else(|| {
+            crate::error::AppError::InternalServerError(
+                "Encryption service is required to deliver webhooks".to_string(),
+            )
+        })?;
+        let secret = encryption
+            .decrypt_with_context(
+                encrypted_secret,
+                crate::encryption::EncryptionContext::new(
+                    "webhooks",
+                    &webhook.id,
+                    "secret_encrypted",
+                ),
+            )
+            .map_err(|_| {
+                crate::error::AppError::InternalServerError(
+                    "Webhook secret could not be authenticated".to_string(),
+                )
+            })?;
+        let signature = self.generate_signature(payload_body.as_bytes(), &secret);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
         let response_result = safe_client
             .post_with_owned_headers(
                 &webhook.url,
@@ -407,9 +435,10 @@ impl JobProcessor {
 
                 if status.is_success() {
                     // Mark delivery as successful with response details
-                    WebhookDeliveryStore::mark_as_successful_with_response(
+                    WebhookDeliveryStore::mark_as_successful_with_response_for_webhook(
                         DB::Conn(&self.db),
                         &webhook_payload.delivery_id,
+                        &webhook_payload.webhook_id,
                         status_code,
                         Some(response_body.clone()),
                     )
@@ -425,59 +454,52 @@ impl JobProcessor {
                     );
                 } else {
                     // Mark delivery as failed and schedule retry if appropriate
-                    let delivery =
-                        WebhookDeliveryStore::get_pending_deliveries(DB::Conn(&self.db), 1).await?;
-                    if let Some(current_delivery) = delivery.first() {
-                        if current_delivery.id == webhook_payload.delivery_id
-                            && current_delivery.attempt_count < current_delivery.max_attempts - 1
-                        {
-                            // Schedule retry with exponential backoff
-                            let retry_delay = Duration::from_secs(
-                                60 * (2_u64.pow(current_delivery.attempt_count as u32)),
-                            );
-                            let next_retry_at = (chrono::Utc::now()
-                                + chrono::Duration::from_std(retry_delay).unwrap_or_default())
-                            .naive_utc();
+                    if delivery.attempt_count < delivery.max_attempts - 1 {
+                        // Schedule retry with exponential backoff
+                        let retry_delay =
+                            Duration::from_secs(60 * (2_u64.pow(delivery.attempt_count as u32)));
+                        let next_retry_at = (chrono::Utc::now()
+                            + chrono::Duration::from_std(retry_delay).unwrap_or_default())
+                        .naive_utc();
 
-                            WebhookDeliveryStore::schedule_retry_with_response(
-                                DB::Conn(&self.db),
-                                &webhook_payload.delivery_id,
-                                next_retry_at,
-                                Some(format!("HTTP {}: {}", status_code, response_body)),
-                                status_code,
-                                Some(response_body.clone()),
-                            )
-                            .await?;
+                        WebhookDeliveryStore::schedule_retry_for_webhook(
+                            DB::Conn(&self.db),
+                            &webhook_payload.delivery_id,
+                            &webhook_payload.webhook_id,
+                            next_retry_at,
+                            Some(format!("HTTP {}: {}", status_code, response_body)),
+                            Some((status_code, Some(response_body.clone()))),
+                        )
+                        .await?;
 
-                            tracing::warn!(
-                                worker_id = %self.worker_id,
-                                webhook_id = %webhook_payload.webhook_id,
-                                event_type = %webhook_payload.event_type,
-                                delivery_id = %webhook_payload.delivery_id,
-                                status = %status,
-                                attempt = current_delivery.attempt_count + 1,
-                                "Webhook delivery failed, retry scheduled"
-                            );
-                        } else {
-                            // Mark as permanently failed with response details
-                            WebhookDeliveryStore::mark_as_failed_permanently_with_response(
-                                DB::Conn(&self.db),
-                                &webhook_payload.delivery_id,
-                                Some(format!("HTTP {}: {}", status_code, response_body)),
-                                status_code,
-                                Some(response_body.clone()),
-                            )
-                            .await?;
+                        tracing::warn!(
+                            worker_id = %self.worker_id,
+                            webhook_id = %webhook_payload.webhook_id,
+                            event_type = %webhook_payload.event_type,
+                            delivery_id = %webhook_payload.delivery_id,
+                            status = %status,
+                            attempt = delivery.attempt_count + 1,
+                            "Webhook delivery failed, retry scheduled"
+                        );
+                    } else {
+                        // Mark as permanently failed with response details
+                        WebhookDeliveryStore::mark_as_failed_permanently_for_webhook(
+                            DB::Conn(&self.db),
+                            &webhook_payload.delivery_id,
+                            &webhook_payload.webhook_id,
+                            Some(format!("HTTP {}: {}", status_code, response_body)),
+                            Some((status_code, Some(response_body.clone()))),
+                        )
+                        .await?;
 
-                            tracing::error!(
-                                worker_id = %self.worker_id,
-                                webhook_id = %webhook_payload.webhook_id,
-                                event_type = %webhook_payload.event_type,
-                                delivery_id = %webhook_payload.delivery_id,
-                                status = %status,
-                                "Webhook delivery failed permanently"
-                            );
-                        }
+                        tracing::error!(
+                            worker_id = %self.worker_id,
+                            webhook_id = %webhook_payload.webhook_id,
+                            event_type = %webhook_payload.event_type,
+                            delivery_id = %webhook_payload.delivery_id,
+                            status = %status,
+                            "Webhook delivery failed permanently"
+                        );
                     }
 
                     // Return error to mark job as failed in system_jobs
@@ -489,34 +511,31 @@ impl JobProcessor {
             }
             Err(e) => {
                 // Network or other error - schedule retry if we have attempts left
-                let delivery =
-                    WebhookDeliveryStore::get_pending_deliveries(DB::Conn(&self.db), 1).await?;
-                if let Some(current_delivery) = delivery.first() {
-                    if current_delivery.id == webhook_payload.delivery_id
-                        && current_delivery.attempt_count < current_delivery.max_attempts - 1
-                    {
-                        let retry_delay = Duration::from_secs(
-                            60 * (2_u64.pow(current_delivery.attempt_count as u32)),
-                        );
-                        let next_retry_at = (chrono::Utc::now()
-                            + chrono::Duration::from_std(retry_delay).unwrap_or_default())
-                        .naive_utc();
+                if delivery.attempt_count < delivery.max_attempts - 1 {
+                    let retry_delay =
+                        Duration::from_secs(60 * (2_u64.pow(delivery.attempt_count as u32)));
+                    let next_retry_at = (chrono::Utc::now()
+                        + chrono::Duration::from_std(retry_delay).unwrap_or_default())
+                    .naive_utc();
 
-                        WebhookDeliveryStore::schedule_retry(
-                            DB::Conn(&self.db),
-                            &webhook_payload.delivery_id,
-                            next_retry_at,
-                            Some(format!("Network error: {}", e)),
-                        )
-                        .await?;
-                    } else {
-                        WebhookDeliveryStore::mark_as_failed_permanently(
-                            DB::Conn(&self.db),
-                            &webhook_payload.delivery_id,
-                            Some(format!("Network error: {}", e)),
-                        )
-                        .await?;
-                    }
+                    WebhookDeliveryStore::schedule_retry_for_webhook(
+                        DB::Conn(&self.db),
+                        &webhook_payload.delivery_id,
+                        &webhook_payload.webhook_id,
+                        next_retry_at,
+                        Some(format!("Network error: {}", e)),
+                        None,
+                    )
+                    .await?;
+                } else {
+                    WebhookDeliveryStore::mark_as_failed_permanently_for_webhook(
+                        DB::Conn(&self.db),
+                        &webhook_payload.delivery_id,
+                        &webhook_payload.webhook_id,
+                        Some(format!("Network error: {}", e)),
+                        None,
+                    )
+                    .await?;
                 }
 
                 return Err(crate::error::AppError::BadRequest(format!(

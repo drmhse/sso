@@ -1,7 +1,7 @@
 {
   "name": "@drmhse/authos-vue",
   "version": "0.8.0",
-  "description": "Vue and Nuxt adapter for AuthOS authentication",
+  "description": "Pre-1.0 Vue and Nuxt adapter for AuthOS authentication",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -35,7 +35,7 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "typecheck": "vue-tsc --noEmit",
-    "lint": "eslint src --ext .ts,.vue",
+    "lint": "eslint \"src/**/*.ts\" tsdown.config.mjs --max-warnings 0",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -58,7 +58,7 @@
     "tsdown": "^0.22.2",
     "typescript": "^5.7.2",
     "vue": "^3.5.13",
-    "vue-tsc": "^2.2.0"
+    "vue-tsc": "^3.3.2"
   },
   "repository": {
     "type": "git",

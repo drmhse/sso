@@ -41,6 +41,7 @@ impl ApiKeyStore {
     }
 
     /// Create a new API key
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
         service_id: &str,
@@ -93,14 +94,17 @@ impl ApiKeyStore {
         Ok(updated_key)
     }
 
-    /// Delete an API key
-    pub async fn delete(db: DB<'_>, api_key_id: &str) -> Result<()> {
-        let api_key = Self::find_by_id(db.clone(), api_key_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("API key not found".to_string()))?;
+    /// Delete an API key only when it belongs to the authorized service.
+    pub async fn delete_for_service(db: DB<'_>, api_key_id: &str, service_id: &str) -> Result<()> {
+        let result = ApiKeys::delete_many()
+            .filter(api_keys::Column::Id.eq(api_key_id))
+            .filter(api_keys::Column::ServiceId.eq(service_id))
+            .exec(&db)
+            .await?;
 
-        let key_active: api_keys::ActiveModel = api_key.into();
-        key_active.delete(&db).await?;
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound("API key not found".to_string()));
+        }
 
         Ok(())
     }
@@ -148,5 +152,117 @@ impl ApiKeyStore {
             .await?;
 
         Ok(result.rows_affected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::organizations::OrganizationStore;
+    use crate::store::services::ServiceStore;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{Database, EntityTrait};
+
+    #[tokio::test]
+    async fn delete_reports_missing_api_key_without_preload() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        assert!(matches!(
+            ApiKeyStore::delete_for_service(DB::Conn(&db), "missing", "missing-service").await,
+            Err(AppError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_for_service_denies_cross_tenant_key_and_preserves_target() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "api-key-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let org_a = OrganizationStore::create(
+            DB::Conn(&db),
+            "api-key-org-a",
+            "API Key Org A",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org A");
+        let org_b = OrganizationStore::create(
+            DB::Conn(&db),
+            "api-key-org-b",
+            "API Key Org B",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org B");
+        let service_a = ServiceStore::create(
+            DB::Conn(&db),
+            &org_a.id,
+            "service-a",
+            "Service A",
+            "web",
+            "client-a",
+        )
+        .await
+        .expect("create service A");
+        let service_b = ServiceStore::create(
+            DB::Conn(&db),
+            &org_b.id,
+            "service-b",
+            "Service B",
+            "web",
+            "client-b",
+        )
+        .await
+        .expect("create service B");
+        let target = ApiKeyStore::create(
+            DB::Conn(&db),
+            &service_b.id,
+            "target",
+            "authos_target",
+            "hash",
+            "[]",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create target key");
+
+        assert!(matches!(
+            ApiKeyStore::delete_for_service(DB::Conn(&db), &target.id, &service_a.id).await,
+            Err(AppError::NotFound(_))
+        ));
+        let unchanged = ApiKeys::find_by_id(&target.id)
+            .one(&db)
+            .await
+            .expect("reload target key")
+            .expect("cross-tenant delete must preserve target key");
+        assert_eq!(unchanged.service_id, service_b.id);
+
+        ApiKeyStore::delete_for_service(DB::Conn(&db), &target.id, &service_b.id)
+            .await
+            .expect("same-service delete succeeds");
+        assert!(ApiKeys::find_by_id(&target.id)
+            .one(&db)
+            .await
+            .expect("reload deleted key")
+            .is_none());
     }
 }

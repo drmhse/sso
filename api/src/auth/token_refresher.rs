@@ -1,6 +1,8 @@
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 
+use crate::services::safe_http::{SafeHttpClient, MAX_OAUTH_RESPONSE_BYTES};
+
 #[derive(Debug)]
 pub struct RefreshedToken {
     pub access_token: String,
@@ -27,45 +29,37 @@ pub async fn refresh_microsoft_token(
         expires_in: i64,
     }
 
-    let client = reqwest::Client::new();
+    let client = SafeHttpClient::new()?;
     let params = [
-        ("client_id", client_id.to_string()),
-        ("client_secret", client_secret.to_string()),
-        ("refresh_token", refresh_token.to_string()),
-        ("grant_type", "refresh_token".to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+        ("client_secret".to_string(), client_secret.to_string()),
+        ("refresh_token".to_string(), refresh_token.to_string()),
+        ("grant_type".to_string(), "refresh_token".to_string()),
     ];
 
     let http_response = client
-        .post("https://login.microsoftonline.com/common/oauth2/v2.0/token")
-        .form(&params)
-        .send()
+        .post_form(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            &params,
+        )
         .await?;
-
-    let status = http_response.status();
-    let body = http_response.text().await?;
+    let (status, body) =
+        SafeHttpClient::read_body_limited(http_response, MAX_OAUTH_RESPONSE_BYTES).await?;
 
     if !status.is_success() {
         // Try to parse as OAuth error response
-        if let Ok(error_resp) = serde_json::from_str::<OAuthErrorResponse>(&body) {
+        if let Ok(error_resp) = serde_json::from_slice::<OAuthErrorResponse>(&body) {
             let error_msg = match error_resp.error_description {
                 Some(desc) => format!("Microsoft OAuth error: {} - {}", error_resp.error, desc),
                 None => format!("Microsoft OAuth error: {}", error_resp.error),
             };
             return Err(error_msg.into());
         }
-        return Err(format!(
-            "Microsoft token refresh failed with status {}: {}",
-            status, body
-        )
-        .into());
+        return Err(format!("Microsoft token refresh failed with status {}", status).into());
     }
 
-    let response: MicrosoftTokenResponse = serde_json::from_str(&body).map_err(|e| {
-        format!(
-            "Failed to parse Microsoft token response: {} (body: {})",
-            e, body
-        )
-    })?;
+    let response: MicrosoftTokenResponse = serde_json::from_slice(&body)
+        .map_err(|e| format!("Failed to parse Microsoft token response: {e}"))?;
 
     let expires_at = Utc::now() + Duration::seconds(response.expires_in);
 
@@ -88,43 +82,34 @@ pub async fn refresh_google_token(
         expires_in: i64,
     }
 
-    let client = reqwest::Client::new();
+    let client = SafeHttpClient::new()?;
     let params = [
-        ("client_id", client_id.to_string()),
-        ("client_secret", client_secret.to_string()),
-        ("refresh_token", refresh_token.to_string()),
-        ("grant_type", "refresh_token".to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+        ("client_secret".to_string(), client_secret.to_string()),
+        ("refresh_token".to_string(), refresh_token.to_string()),
+        ("grant_type".to_string(), "refresh_token".to_string()),
     ];
 
     let google_token_url = token_url.unwrap_or("https://oauth2.googleapis.com/token");
 
-    let http_response = client.post(google_token_url).form(&params).send().await?;
-
-    let status = http_response.status();
-    let body = http_response.text().await?;
+    let http_response = client.post_form(google_token_url, &params).await?;
+    let (status, body) =
+        SafeHttpClient::read_body_limited(http_response, MAX_OAUTH_RESPONSE_BYTES).await?;
 
     if !status.is_success() {
         // Try to parse as OAuth error response
-        if let Ok(error_resp) = serde_json::from_str::<OAuthErrorResponse>(&body) {
+        if let Ok(error_resp) = serde_json::from_slice::<OAuthErrorResponse>(&body) {
             let error_msg = match error_resp.error_description {
                 Some(desc) => format!("Google OAuth error: {} - {}", error_resp.error, desc),
                 None => format!("Google OAuth error: {}", error_resp.error),
             };
             return Err(error_msg.into());
         }
-        return Err(format!(
-            "Google token refresh failed with status {}: {}",
-            status, body
-        )
-        .into());
+        return Err(format!("Google token refresh failed with status {}", status).into());
     }
 
-    let response: GoogleTokenResponse = serde_json::from_str(&body).map_err(|e| {
-        format!(
-            "Failed to parse Google token response: {} (body: {})",
-            e, body
-        )
-    })?;
+    let response: GoogleTokenResponse = serde_json::from_slice(&body)
+        .map_err(|e| format!("Failed to parse Google token response: {e}"))?;
 
     let expires_at = Utc::now() + Duration::seconds(response.expires_in);
 

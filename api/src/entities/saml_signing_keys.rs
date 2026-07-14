@@ -19,6 +19,8 @@ pub struct Model {
     pub valid_from: DateTime,
     pub valid_until: DateTime,
     pub is_active: bool,
+    pub publish_until: Option<DateTime>,
+    pub retired_at: Option<DateTime>,
     pub created_at: DateTime,
 }
 

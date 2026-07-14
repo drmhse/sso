@@ -152,8 +152,6 @@ async function waitForServiceRecovery(currentOrigin, targetUrl) {
   const normalizedTargetUrl = String(targetUrl || '').replace(/\/$/, '');
   const sameOrigin = currentUrl === normalizedTargetUrl;
   const deadline = Date.now() + 90000;
-  let currentReady = false;
-
   while (Date.now() < deadline) {
     if (await isReady(normalizedTargetUrl)) {
       return { currentReady: true, targetReady: true };
@@ -164,16 +162,11 @@ async function waitForServiceRecovery(currentOrigin, targetUrl) {
       continue;
     }
 
-    if (!currentReady && await isReady(currentUrl)) {
-      currentReady = true;
+    if (await isReady(currentUrl)) {
       return { currentReady: true, targetReady: false };
     }
 
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
-  }
-
-  if (currentReady) {
-    return { currentReady: true, targetReady: false };
   }
 
   throw new Error(`Timed out waiting for AuthOS to restart at ${normalizedTargetUrl}/health/ready.`);
@@ -185,7 +178,7 @@ async function isReady(baseUrl) {
   try {
     const response = await fetch(`${baseUrl}/health/ready`, { cache: 'no-store' });
     return response.ok;
-  } catch (error) {
+  } catch {
     return false;
   }
 }

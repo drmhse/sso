@@ -122,6 +122,10 @@ pub fn active_org_routes(state: &AppState) -> Router<AppState> {
             post(generate_saml_certificate).get(get_saml_certificate),
         )
         .route(
+            "/api/organizations/:org_slug/services/:service_slug/saml/certificate/overlap",
+            delete(retire_saml_certificate_overlap),
+        )
+        .route(
             "/api/organizations/:org_slug/services/:service_slug/saml/login",
             get(saml_idp_login),
         )
@@ -474,6 +478,7 @@ pub fn mfa_routes(state: &AppState, config: &Config) -> Router<AppState> {
 pub fn mfa_verification_routes(config: &Config) -> Router<AppState> {
     Router::new()
         .route("/api/auth/mfa/verify", post(verify_mfa_login))
+        .route("/saml/mfa/verify", post(verify_saml_mfa))
         .layer(GovernorLayer {
             config: Box::leak(Box::new(
                 GovernorConfigBuilder::default()
@@ -596,7 +601,10 @@ pub fn platform_routes(state: &AppState) -> Router<AppState> {
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
         ))
-        .route_layer(axum_middleware::from_fn(middleware::require_platform_owner))
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::require_platform_owner,
+        ))
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::extract_user_from_jwt,
@@ -795,7 +803,8 @@ pub fn saml_routes() -> Router<AppState> {
 }
 
 /// Build public routes (no authentication required)
-/// Note: OIDC discovery and JWKS endpoints should be added in main.rs
+/// Note: AuthOS capability metadata, explicit unsupported-discovery responses,
+/// and the JWKS endpoint are added in main.rs.
 pub fn public_routes(config: &Config) -> Router<AppState> {
     Router::new()
         // Health check endpoints
@@ -820,4 +829,84 @@ pub fn public_routes(config: &Config) -> Router<AppState> {
         .merge(auth_routes(config))
         .merge(device_routes(config))
         .merge(saml_routes())
+}
+
+#[cfg(test)]
+mod platform_route_boundary_tests {
+    /// Platform authorization is intentionally centralized as a route layer.
+    /// Keep an explicit inventory here so a newly added platform handler
+    /// cannot silently land outside that boundary.
+    #[test]
+    fn every_platform_route_is_inside_the_platform_owner_boundary() {
+        const ROUTES: &[&str] = &[
+            "/api/platform/tiers",
+            "/api/platform/organizations",
+            "/api/platform/organizations/:id/approve",
+            "/api/platform/organizations/:id/reject",
+            "/api/platform/organizations/:id/suspend",
+            "/api/platform/organizations/:id/activate",
+            "/api/platform/organizations/:id/tier",
+            "/api/platform/organizations/:id/features",
+            "/api/platform/organizations/:id",
+            "/api/platform/owners",
+            "/api/platform/owners/:user_id",
+            "/api/platform/bootstrap/config",
+            "/api/platform/bootstrap/config",
+            "/api/platform/bootstrap/apply",
+            "/api/platform/audit-log",
+            "/api/platform/analytics/overview",
+            "/api/platform/analytics/organization-status",
+            "/api/platform/analytics/growth-trends",
+            "/api/platform/analytics/login-activity",
+            "/api/platform/analytics/top-organizations",
+            "/api/platform/analytics/recent-organizations",
+            "/api/platform/users/:user_id/mfa/status",
+            "/api/platform/users/:user_id/mfa",
+            "/api/platform/users/search",
+            "/api/platform/users",
+            "/api/platform/users/:user_id",
+            "/api/platform/impersonate",
+            "/api/platform/operations/status",
+            "/api/platform/mfa/metrics",
+            "/api/platform/mfa/suspicious-activity",
+            "/api/platform/mfa/metrics/generate",
+        ];
+
+        let source = include_str!("router.rs");
+        let start = source
+            .find("pub fn platform_routes")
+            .expect("platform router");
+        let end = source[start..]
+            .find("/// Build authentication routes")
+            .map(|offset| start + offset)
+            .expect("end of platform router");
+        let platform_router = &source[start..end];
+        let owner_boundary = platform_router
+            .find("middleware::require_platform_owner")
+            .expect("platform-owner boundary");
+        let authentication_boundary = platform_router
+            .find("middleware::extract_user_from_jwt")
+            .expect("JWT authentication boundary");
+
+        for route in ROUTES {
+            let position = platform_router
+                .find(&format!("\"{route}\""))
+                .unwrap_or_else(|| panic!("missing platform route inventory entry: {route}"));
+            assert!(
+                position < owner_boundary,
+                "{route} is outside the owner boundary"
+            );
+            assert!(
+                position < authentication_boundary,
+                "{route} is outside JWT auth"
+            );
+        }
+
+        assert_eq!(
+            platform_router.matches("\"/api/platform/").count(),
+            ROUTES.len(),
+            "update the explicit platform route authorization inventory"
+        );
+        assert!(!platform_router[owner_boundary..].contains("\"/api/platform/"));
+    }
 }

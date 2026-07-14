@@ -1,0 +1,53 @@
+groups:
+  - name: authos-recording
+    interval: 30s
+    rules:
+      - record: authos:http_requests:rate5m
+        expr: sum(rate(sso_http_request_duration_seconds_count[5m]))
+      - record: authos:http_5xx:ratio5m
+        expr: sum(rate(sso_http_request_duration_seconds_count{status="5xx"}[5m])) / clamp_min(authos:http_requests:rate5m, 0.001)
+      - record: authos:db_pool:utilization
+        expr: (sso_db_pool_connections_total - sso_db_pool_connections_idle) / clamp_min(sso_db_pool_connections_max, 1)
+  - name: authos-alerts
+    interval: 30s
+    rules:
+      - alert: AuthOSUnavailable
+        expr: up{job=~"authos.*"} == 0 or absent(up{job=~"authos.*"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: AuthOS metrics target is unavailable
+          runbook_url: https://github.com/drmhse/AuthOS/blob/main/docs/operations/monitoring.md#alert-response
+      - alert: AuthOSHighServerErrorRatio
+        expr: authos:http_requests:rate5m >= 0.1 and authos:http_5xx:ratio5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: AuthOS HTTP 5xx ratio exceeds the starter threshold
+          runbook_url: https://github.com/drmhse/AuthOS/blob/main/docs/operations/monitoring.md#alert-response
+      - alert: AuthOSDatabasePoolPressure
+        expr: authos:db_pool:utilization > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: AuthOS database pool utilization exceeds the starter threshold
+          runbook_url: https://github.com/drmhse/AuthOS/blob/main/docs/operations/monitoring.md#alert-response
+      - alert: AuthOSPendingJobsNotDraining
+        expr: sso_pending_jobs_total{status="pending"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: AuthOS has pending jobs for at least 30 minutes
+          runbook_url: https://github.com/drmhse/AuthOS/blob/main/docs/operations/monitoring.md#alert-response
+      - alert: AuthOSPersistentProcessingOccupancy
+        expr: sso_pending_jobs_total{status="processing"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: AuthOS processing occupancy has stayed nonzero for 30 minutes
+          runbook_url: https://github.com/drmhse/AuthOS/blob/main/docs/operations/monitoring.md#alert-response

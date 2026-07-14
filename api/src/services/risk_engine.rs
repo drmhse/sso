@@ -129,27 +129,8 @@ pub struct RiskEngine {
 impl RiskEngine {
     pub fn new() -> Result<Self> {
         let geoip = GeoIpReader::new();
-
-        // Load signing key from environment or use a persistent default
-        let signing_key = std::env::var("DEVICE_TRUST_SECRET")
-            .ok()
-            .and_then(|s| {
-                let bytes = s.as_bytes();
-                if bytes.len() >= 32 {
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&bytes[0..32]);
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    "DEVICE_TRUST_SECRET not set or invalid, using fallback (NOT FOR PRODUCTION)"
-                );
-                // In production, this MUST be a persistent secret
-                [0u8; 32]
-            });
+        let configured_secret = std::env::var("DEVICE_TRUST_SECRET").ok();
+        let signing_key = parse_device_trust_secret(configured_secret.as_deref(), cfg!(test))?;
 
         Ok(Self { geoip, signing_key })
     }
@@ -407,8 +388,72 @@ impl RiskEngine {
     }
 }
 
+fn parse_device_trust_secret(
+    configured_secret: Option<&str>,
+    allow_missing_for_tests: bool,
+) -> Result<[u8; 32]> {
+    let Some(configured_secret) = configured_secret else {
+        if allow_missing_for_tests {
+            return Ok([0u8; 32]);
+        }
+        return Err(AppError::Generic(
+            "DEVICE_TRUST_SECRET must be set to exactly 64 hexadecimal characters".to_string(),
+        ));
+    };
+
+    let invalid_secret = || {
+        AppError::Generic(
+            "DEVICE_TRUST_SECRET must be set to exactly 64 hexadecimal characters".to_string(),
+        )
+    };
+    let decoded = hex::decode(configured_secret).map_err(|_| invalid_secret())?;
+    decoded.try_into().map_err(|_| invalid_secret())
+}
+
 impl Default for RiskEngine {
     fn default() -> Self {
         Self::new().expect("Failed to create RiskEngine")
+    }
+}
+
+#[cfg(test)]
+mod device_trust_secret_tests {
+    use super::parse_device_trust_secret;
+
+    #[test]
+    fn accepts_exactly_32_bytes_of_hexadecimal_key_material() {
+        let parsed = parse_device_trust_secret(
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            false,
+        )
+        .expect("valid device trust secret");
+
+        assert_eq!(parsed.len(), 32);
+        assert_eq!(parsed[0], 0x01);
+        assert_eq!(parsed[31], 0xef);
+    }
+
+    #[test]
+    fn missing_secret_fails_closed_outside_tests() {
+        let error = parse_device_trust_secret(None, false).expect_err("missing secret must fail");
+
+        assert!(error.to_string().contains("DEVICE_TRUST_SECRET"));
+    }
+
+    #[test]
+    fn rejects_incorrect_length_and_non_hexadecimal_values_without_echoing_them() {
+        for invalid in ["abcd", &"g".repeat(64), &"00".repeat(33)] {
+            let error = parse_device_trust_secret(Some(invalid), false)
+                .expect_err("invalid device trust secret must fail");
+            let message = error.to_string();
+
+            assert!(message.contains("DEVICE_TRUST_SECRET"));
+            assert!(!message.contains(invalid));
+        }
+    }
+
+    #[test]
+    fn test_only_missing_secret_uses_deterministic_fixture_key() {
+        assert_eq!(parse_device_trust_secret(None, true).unwrap(), [0u8; 32]);
     }
 }

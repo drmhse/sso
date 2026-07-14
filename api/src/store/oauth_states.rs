@@ -64,7 +64,6 @@ impl OAuthStateStore {
             resource: Set(resource.map(|s| s.to_string())),
             created_at: Set(now),
             expires_at: Set(*expires_at),
-            ..Default::default()
         };
 
         let oauth_state = new_state.insert(&db).await?;
@@ -73,12 +72,17 @@ impl OAuthStateStore {
 
     /// Delete an OAuth state
     pub async fn delete(db: DB<'_>, state: &str) -> Result<()> {
-        let oauth_state = Self::find_by_state(db.clone(), state)
-            .await?
-            .ok_or_else(|| AppError::NotFound("OAuth state not found".to_string()))?;
+        let now = chrono::Utc::now().naive_utc();
 
-        let state_active: oauth_states::ActiveModel = oauth_state.into();
-        state_active.delete(&db).await?;
+        let result = oauth_states::Entity::delete_many()
+            .filter(oauth_states::Column::State.eq(state))
+            .filter(oauth_states::Column::ExpiresAt.gt(now))
+            .exec(&db)
+            .await?;
+
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound("OAuth state not found".to_string()));
+        }
 
         Ok(())
     }
@@ -93,5 +97,155 @@ impl OAuthStateStore {
             .await?;
 
         Ok(result.rows_affected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn delete_removes_unexpired_state_without_preloading() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let expires_at = (Utc::now() + Duration::minutes(5)).naive_utc();
+
+        OAuthStateStore::create(
+            DB::Conn(&db),
+            "state-token",
+            Some("verifier"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &expires_at,
+        )
+        .await
+        .expect("create state");
+
+        OAuthStateStore::delete(DB::Conn(&db), "state-token")
+            .await
+            .expect("delete state");
+        assert!(OAuthStateStore::find_by_state(DB::Conn(&db), "state-token")
+            .await
+            .expect("load state")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_reports_missing_or_expired_state() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let expires_at = (Utc::now() - Duration::minutes(5)).naive_utc();
+
+        OAuthStateStore::create(
+            DB::Conn(&db),
+            "expired-state",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &expires_at,
+        )
+        .await
+        .expect("create expired state");
+
+        assert!(matches!(
+            OAuthStateStore::delete(DB::Conn(&db), "missing").await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            OAuthStateStore::delete(DB::Conn(&db), "expired-state").await,
+            Err(AppError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_callback_consumption_has_exactly_one_winner() {
+        let path =
+            std::env::temp_dir().join(format!("authos-oauth-state-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let expires_at = (Utc::now() + Duration::minutes(5)).naive_utc();
+        OAuthStateStore::create(
+            DB::Conn(&db),
+            "concurrent-state",
+            Some("pkce-verifier"),
+            None,
+            Some("https://client.example.test/callback"),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("client-state"),
+            None,
+            None,
+            &expires_at,
+        )
+        .await
+        .expect("create state");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                OAuthStateStore::delete(DB::Conn(&db), "concurrent-state")
+                    .await
+                    .is_ok()
+            }));
+        }
+        barrier.wait().await;
+
+        let mut wins = 0;
+        for task in tasks {
+            wins += usize::from(task.await.expect("join callback"));
+        }
+        assert_eq!(wins, 1);
+        assert!(
+            OAuthStateStore::find_by_state(DB::Conn(&db), "concurrent-state")
+                .await
+                .expect("reload state")
+                .is_none()
+        );
+
+        db.close().await.expect("close sqlite");
+        let _ = std::fs::remove_file(path);
     }
 }

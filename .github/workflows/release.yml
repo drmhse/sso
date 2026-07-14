@@ -9,16 +9,82 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # Mutable GitHub/Docker "latest" pointers must be advanced by only one
+  # release version at a time. A per-tag group permits cross-version races.
+  group: authos-public-release
+  cancel-in-progress: false
+
 jobs:
-  frontend:
-    name: Build frontend assets
+  qualify:
+    name: Qualify exact release source
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: authos_runtime
+          POSTGRES_USER: authos_runtime
+          POSTGRES_PASSWORD: authos_runtime_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U authos_runtime -d authos_runtime"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: authos_runtime
+          MYSQL_USER: authos_runtime
+          MYSQL_PASSWORD: authos_runtime_password
+          MYSQL_ROOT_PASSWORD: authos_runtime_root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pauthos_runtime_root_password --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must be a stable v-prefixed SemVer without prerelease/build metadata: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if [ "$(git cat-file -t "${RELEASE_TAG}")" != "tag" ]; then
+            echo "Release tags must be annotated: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if [ "$(git rev-list -n 1 "${RELEASE_TAG}")" != "${GITHUB_SHA}" ]; then
+            echo "The checked-out commit does not match ${RELEASE_TAG}." >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Release commit must be reachable from origin/main." >&2
+            exit 1
+          fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: npm
@@ -26,16 +92,133 @@ jobs:
       - name: Install workspace dependencies
         run: npm ci
 
-      - name: Build shared frontend assets
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Validate trust and installer metadata
         run: |
-          npm run build -w @drmhse/sso-sdk
-          npm --workspace lite-web-client run build
+          npm run check:trust
+          npm run check:licenses
+          npm run check:docs
+          npm run check:bootstrap
+          npm run check:backup
+          npm run check:monitoring
+          npm run check:capacity
+          npm run check:failures
+          npm run check:release-assets
+          npm run check:release-policy
+          npm run check:outbound-http
+          npm run check:redaction
+          npm run check:tenant-isolation
+          npm run check:audit-policy
+          npm run check:pagination-policy
+          bash -n install.sh
+
+      - name: Build SDK dependency
+        run: npm run build:sdk
+
+      - name: Lint workspaces
+        run: npm run lint
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Test workspaces
+        run: npm run test --workspaces --if-present
+
+      - name: Build workspaces
+        run: npm run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --file api/Cargo.lock
+          cargo audit --file api/migration/Cargo.lock
+
+      - name: Check Rust formatting
+        working-directory: api
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path migration/Cargo.toml --all -- --check
+
+      - name: Run Clippy
+        working-directory: api
+        run: |
+          cargo clippy --locked --package sso --all-targets --no-deps -- -D warnings
+          cargo clippy --manifest-path migration/Cargo.toml --locked --all-targets --no-deps -- -D warnings
+
+      - name: Run SQLite and migration tests
+        working-directory: api
+        run: |
+          cargo test --locked --package sso --all-targets
+          cargo test --manifest-path migration/Cargo.toml --locked --all-targets
+
+      - name: Check all database backends
+        working-directory: api
+        run: |
+          cargo check --locked --package sso --no-default-features --features db_sqlite --all-targets
+          cargo check --locked --package sso --no-default-features --features db_psql --all-targets
+          cargo check --locked --package sso --no-default-features --features db_mysql --all-targets
+
+      - name: Build PostgreSQL and MySQL runtime qualification candidates
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo build --locked --bin sso_psql --no-default-features --features db_psql
+          cargo build --locked --bin sso_mysql --no-default-features --features db_mysql
+
+      - name: Install logical backup clients
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client default-mysql-client
+
+      - name: Exercise PostgreSQL 16 runtime and logical restore
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          AUTHOS_BACKEND: postgres
+          AUTHOS_BINARY: api/target/debug/sso_psql
+          DATABASE_URL: postgres://authos_runtime:authos_runtime_password@127.0.0.1:5432/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: bash scripts/qualify-logical-backup-restore.sh
+
+      - name: Exercise MySQL 8.4 runtime and logical restore
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          AUTHOS_BACKEND: mysql
+          AUTHOS_BINARY: api/target/debug/sso_mysql
+          DATABASE_URL: mysql://authos_runtime:authos_runtime_password@127.0.0.1:3306/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: bash scripts/qualify-logical-backup-restore.sh
+
+      - name: Build SQLite runtime qualification candidate
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: release-qualification
+        run: cargo build --locked --bin sso_sqlite --no-default-features --features db_sqlite
+
+      - name: Exercise SQLite backup and restored runtime
+        env:
+          AUTHOS_BINARY: api/target/debug/sso_sqlite
+        run: bash scripts/qualify-sqlite-backup-restore.sh
 
       - name: Archive frontend dist
         run: tar -czf frontend-dist.tar.gz -C lite-web-client dist
 
       - name: Upload frontend dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: frontend-dist
           path: frontend-dist.tar.gz
@@ -44,7 +227,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.backend }} ${{ matrix.arch }}
-    needs: frontend
+    needs: qualify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -88,31 +271,36 @@ jobs:
             standalone: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.rust_target }}
 
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             api -> target
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
         with:
           version: 0.13.0
 
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@cargo-zigbuild
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-zigbuild
+          fallback: none
 
       - name: Install UPX and binutils
         if: matrix.standalone
@@ -129,7 +317,7 @@ jobs:
           fi
 
       - name: Download frontend dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: frontend-dist
           path: .artifacts/frontend
@@ -145,65 +333,182 @@ jobs:
         if: ${{ !matrix.standalone }}
         run: npm run authos:docker:dist -- --backend ${{ matrix.backend }} --platform ${{ matrix.platform }} --skip-frontend-build
 
-      - name: Generate standalone checksum
+      - name: Generate standalone SPDX SBOM
         if: matrix.standalone
-        run: |
-          cd .authos/releases
-          sha256sum authos-sqlite-linux-${{ matrix.arch }}.tar.gz > authos-sqlite-linux-${{ matrix.arch }}.sha256
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .authos/releases/authos-sqlite-linux-${{ matrix.arch }}
+          format: spdx-json
+          output-file: .authos/releases/authos-sqlite-linux-${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Upload standalone artifacts
         if: matrix.standalone
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: standalone-${{ matrix.arch }}
           path: |
             .authos/releases/authos-sqlite-linux-${{ matrix.arch }}.tar.gz
-            .authos/releases/authos-sqlite-linux-${{ matrix.arch }}.sha256
+            .authos/releases/authos-sqlite-linux-${{ matrix.arch }}.spdx.json
           retention-days: 3
           if-no-files-found: error
 
       - name: Upload Docker binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: docker-${{ matrix.backend }}-${{ matrix.arch }}
           path: api/target/dist/linux-${{ matrix.arch }}/${{ matrix.binary_name }}
           retention-days: 3
           if-no-files-found: error
 
-  publish_release:
-    name: Publish standalone release assets
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+  create_draft_release:
+    name: Create immutable draft release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: registry_preflight
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Create new draft for the exact tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "A GitHub release already exists for ${RELEASE_TAG}; refusing to mutate it." >&2
+            exit 1
+          fi
+          gh release create "${RELEASE_TAG}" \
+            --verify-tag \
+            --draft \
+            --generate-notes \
+            --title "${RELEASE_TAG}"
+
+  package_standalone:
+    name: Prepare standalone release assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Download standalone artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: standalone-*
           path: dist
           merge-multiple: true
 
-      - name: Consolidate checksums
-        run: cat dist/*.sha256 > dist/SHA256SUMS.txt
+      - name: Consolidate release checksums
+        run: |
+          set -euo pipefail
+          cp install.sh dist/install.sh
+          (
+            cd dist
+            sha256sum \
+              authos-sqlite-linux-amd64.tar.gz \
+              authos-sqlite-linux-amd64.spdx.json \
+              authos-sqlite-linux-arm64.tar.gz \
+              authos-sqlite-linux-arm64.spdx.json \
+              install.sh
+          ) > dist/SHA256SUMS.txt
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+      - name: Generate standalone release manifest
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_WORKFLOW_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-release-manifest.py dist \
+            --tag "${RELEASE_TAG}" \
+            --commit "${RELEASE_COMMIT}" \
+            --repository "${RELEASE_REPOSITORY}" \
+            --workflow-run "${RELEASE_WORKFLOW_RUN}"
+          (cd dist && sha256sum authos-standalone-release-manifest.json) >> dist/SHA256SUMS.txt
+
+      - name: Verify exact standalone release set
+        run: python3 scripts/verify-release-assets.py dist
+
+      - name: Upload prepared standalone release set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          generate_release_notes: true
-          files: |
-            install.sh
+          name: standalone-release-set
+          path: dist
+          retention-days: 90
+          if-no-files-found: error
+
+  publish_standalone:
+    name: Attest and attach standalone release assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [package_standalone, create_draft_release]
+    runs-on: ubuntu-latest
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download prepared standalone release set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: standalone-release-set
+          path: dist
+
+      - name: Verify downloaded standalone checksums
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS.txt
+
+      - name: Attest release build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: |
+            dist/install.sh
             dist/authos-sqlite-linux-amd64.tar.gz
+            dist/authos-sqlite-linux-amd64.spdx.json
             dist/authos-sqlite-linux-arm64.tar.gz
+            dist/authos-sqlite-linux-arm64.spdx.json
+            dist/authos-standalone-release-manifest.json
             dist/SHA256SUMS.txt
 
-  publish_docker:
-    name: Publish ${{ matrix.backend }} image
-    if: startsWith(github.ref, 'refs/tags/v')
+      - name: Attest amd64 SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: dist/authos-sqlite-linux-amd64.tar.gz
+          sbom-path: dist/authos-sqlite-linux-amd64.spdx.json
+
+      - name: Attest arm64 SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: dist/authos-sqlite-linux-arm64.tar.gz
+          sbom-path: dist/authos-sqlite-linux-arm64.spdx.json
+
+      - name: Attach assets to draft GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/install.sh
+            dist/authos-sqlite-linux-amd64.tar.gz
+            dist/authos-sqlite-linux-amd64.spdx.json
+            dist/authos-sqlite-linux-arm64.tar.gz
+            dist/authos-sqlite-linux-arm64.spdx.json
+            dist/authos-standalone-release-manifest.json
+            dist/SHA256SUMS.txt
+
+  package_docker:
+    name: Prepare ${{ matrix.backend }} OCI image
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     strategy:
@@ -221,77 +526,483 @@ jobs:
             tag_prefix: mysql
     env:
       DOCKER_IMAGE: editoredit/sso
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Download amd64 Docker binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: docker-${{ matrix.backend }}-amd64
           path: .artifacts/docker/${{ matrix.backend }}/amd64
 
       - name: Download arm64 Docker binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: docker-${{ matrix.backend }}-arm64
           path: .artifacts/docker/${{ matrix.backend }}/arm64
 
       - name: Restore Docker binary layout
         run: |
-          mkdir -p api/target/dist/linux-amd64 api/target/dist/linux-arm64
+          mkdir -p api/target/dist/linux-amd64 api/target/dist/linux-arm64 dist
           cp "$(find .artifacts/docker/${{ matrix.backend }}/amd64 -type f -name '${{ matrix.binary_name }}' | head -n 1)" "api/target/dist/linux-amd64/${{ matrix.binary_name }}"
           cp "$(find .artifacts/docker/${{ matrix.backend }}/arm64 -type f -name '${{ matrix.binary_name }}' | head -n 1)" "api/target/dist/linux-arm64/${{ matrix.binary_name }}"
           chmod +x "api/target/dist/linux-amd64/${{ matrix.binary_name }}" "api/target/dist/linux-arm64/${{ matrix.binary_name }}"
 
-      - name: Compute Docker tags
-        id: docker_tags
-        env:
-          VERSION_TAG: ${{ github.ref_name }}
-          BACKEND: ${{ matrix.backend }}
-          TAG_PREFIX: ${{ matrix.tag_prefix }}
-          DOCKER_IMAGE: ${{ env.DOCKER_IMAGE }}
-        run: |
-          set -euo pipefail
-          version_without_v="${VERSION_TAG#v}"
-          {
-            echo 'tags<<EOF'
-            if [ "${BACKEND}" = "sqlite" ]; then
-              echo "${DOCKER_IMAGE}:${VERSION_TAG}"
-              echo "${DOCKER_IMAGE}:${version_without_v}"
-              echo "${DOCKER_IMAGE}:latest"
-            fi
-            echo "${DOCKER_IMAGE}:${TAG_PREFIX}-${VERSION_TAG}"
-            echo "${DOCKER_IMAGE}:${TAG_PREFIX}-${version_without_v}"
-            echo "${DOCKER_IMAGE}:${TAG_PREFIX}-latest"
-            echo 'EOF'
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+      - name: Build immutable multi-architecture OCI archive
+        id: build_oci
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./api
           file: ./api/Dockerfile
-          push: true
-          provenance: false
+          push: false
+          provenance: mode=max
+          sbom: true
           platforms: linux/amd64,linux/arm64
+          outputs: type=oci,dest=dist/authos-docker-${{ matrix.backend }}.tar
           build-args: |
             BINARY_NAME=${{ matrix.binary_name }}
-          tags: ${{ steps.docker_tags.outputs.tags }}
+          tags: ${{ env.DOCKER_IMAGE }}:${{ matrix.tag_prefix }}-${{ github.ref_name }}
           labels: |
             org.opencontainers.image.title=AuthOS
             org.opencontainers.image.source=https://github.com/drmhse/AuthOS
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Generate and verify immutable container release record
+        env:
+          BACKEND: ${{ matrix.backend }}
+          IMAGE_DIGEST: ${{ steps.build_oci.outputs.digest }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_WORKFLOW_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          record="dist/authos-docker-${BACKEND}-manifest.json"
+          python3 scripts/container-release-evidence.py generate \
+            --backend "${BACKEND}" \
+            --digest "${IMAGE_DIGEST}" \
+            --tag "${RELEASE_TAG}" \
+            --commit "${RELEASE_COMMIT}" \
+            --workflow-run "${RELEASE_WORKFLOW_RUN}" \
+            --output "${record}"
+          python3 scripts/container-release-evidence.py verify "${record}"
+
+      - name: Checksum prepared container artifacts
+        run: |
+          cd dist
+          sha256sum \
+            authos-docker-${{ matrix.backend }}.tar \
+            authos-docker-${{ matrix.backend }}-manifest.json \
+            > authos-docker-${{ matrix.backend }}.sha256
+
+      - name: Upload prepared OCI archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: prepared-docker-${{ matrix.backend }}
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
+
+  prepare_npm:
+    name: Prepare coordinated npm artifacts
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    uses: ./.github/workflows/publish-npm-packages.yml
+    with:
+      mode: prepare
+    permissions:
+      contents: read
+
+  registry_preflight:
+    name: Gate every artifact and immutable registry version
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [package_standalone, package_docker, prepare_npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require every npm and Docker version to be absent
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DOCKER_IMAGE: editoredit/sso
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version_without_v="${RELEASE_TAG#v}"
+          docker_tags=(
+            "${RELEASE_TAG}"
+            "${version_without_v}"
+            "sqlite-${RELEASE_TAG}"
+            "sqlite-${version_without_v}"
+            "psql-${RELEASE_TAG}"
+            "psql-${version_without_v}"
+            "mysql-${RELEASE_TAG}"
+            "mysql-${version_without_v}"
+          )
+          for tag in "${docker_tags[@]}"; do
+            status="$(curl --silent --show-error --output /tmp/docker-tag.json --write-out '%{http_code}' \
+              "https://hub.docker.com/v2/repositories/${DOCKER_IMAGE}/tags/${tag}")"
+            case "${status}" in
+              404) echo "Docker tag is available: ${DOCKER_IMAGE}:${tag}" ;;
+              200)
+                echo "Docker tag already exists and is immutable: ${DOCKER_IMAGE}:${tag}" >&2
+                exit 1
+                ;;
+              *)
+                echo "Docker Hub preflight failed for ${DOCKER_IMAGE}:${tag} (HTTP ${status})." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          PACKAGE_VERSION="${version_without_v}" node <<'NODE'
+          const packages = [
+            '@drmhse/sso-sdk',
+            '@drmhse/authos-node',
+            '@drmhse/authos-react',
+            '@drmhse/authos-vue',
+            '@drmhse/authos-cli',
+          ];
+
+          function stableVersion(value, label) {
+            const match = /^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(value ?? '');
+            if (!match) throw new Error(`${label} is not a stable semantic version: ${value}`);
+            return match.slice(1).map(BigInt);
+          }
+
+          function compare(left, right) {
+            for (let index = 0; index < 3; index += 1) {
+              if (left[index] > right[index]) return 1;
+              if (left[index] < right[index]) return -1;
+            }
+            return 0;
+          }
+
+          function requireNewer(candidate, current, label) {
+            if (compare(stableVersion(candidate, 'candidate'), stableVersion(current, label)) <= 0) {
+              throw new Error(`Candidate ${candidate} must be newer than ${label} ${current}; refusing to move latest backward.`);
+            }
+          }
+
+          async function main() {
+            const candidate = process.env.PACKAGE_VERSION;
+            const latestRelease = await fetch(
+              `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/releases/latest`,
+              {
+                headers: {
+                  accept: 'application/vnd.github+json',
+                  authorization: `Bearer ${process.env.GH_TOKEN}`,
+                  'x-github-api-version': '2022-11-28',
+                },
+              },
+            );
+            if (latestRelease.ok) {
+              const release = await latestRelease.json();
+              requireNewer(candidate, release.tag_name, 'current GitHub latest');
+            } else if (latestRelease.status !== 404) {
+              throw new Error(`GitHub latest-release preflight failed (HTTP ${latestRelease.status})`);
+            }
+
+            let conflict = false;
+            for (const name of packages) {
+              const packagePath = encodeURIComponent(name);
+              const endpoint = `https://registry.npmjs.org/${packagePath}/${encodeURIComponent(candidate)}`;
+              const response = await fetch(endpoint, { headers: { accept: 'application/json' } });
+              if (response.status === 404) {
+                console.log(`Registry version is available: ${name}@${candidate}`);
+              } else if (response.ok) {
+                console.error(`Registry version already exists and is immutable: ${name}@${candidate}`);
+                conflict = true;
+              } else {
+                throw new Error(`npm registry preflight failed for ${name} (HTTP ${response.status})`);
+              }
+
+              const latestResponse = await fetch(
+                `https://registry.npmjs.org/${packagePath}/latest`,
+                { headers: { accept: 'application/json' } },
+              );
+              if (latestResponse.ok) {
+                const latest = await latestResponse.json();
+                requireNewer(candidate, latest.version, `${name} npm latest`);
+              } else if (latestResponse.status !== 404) {
+                throw new Error(`npm latest-tag preflight failed for ${name} (HTTP ${latestResponse.status})`);
+              }
+            }
+            if (conflict) process.exitCode = 1;
+          }
+
+          main().catch((error) => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+
+  publish_docker:
+    name: Publish prepared ${{ matrix.backend }} image
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [package_docker, publish_npm]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite
+            tag_prefix: sqlite
+          - backend: postgres
+            tag_prefix: psql
+          - backend: mysql
+            tag_prefix: mysql
+    env:
+      DOCKER_IMAGE: editoredit/sso
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Install registry copy client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Download prepared OCI archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: prepared-docker-${{ matrix.backend }}
+          path: dist
+
+      - name: Verify downloaded container checksums
+        working-directory: dist
+        run: sha256sum --check authos-docker-${{ matrix.backend }}.sha256
+
+      - name: Read expected image digest
+        id: image
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          digest="$(jq --exit-status --raw-output .digest "dist/authos-docker-${BACKEND}-manifest.json")"
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid prepared image digest: ${digest}" >&2
+            exit 1
+          fi
+          archive_digest="sha256:$(skopeo inspect --raw "oci-archive:dist/authos-docker-${BACKEND}.tar" | sha256sum | cut -d' ' -f1)"
+          if [ "${archive_digest}" != "${digest}" ]; then
+            echo "Prepared archive digest ${archive_digest} does not match release record ${digest}." >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Copy prepared OCI archive to coordinated Docker tags
+        env:
+          BACKEND: ${{ matrix.backend }}
+          TAG_PREFIX: ${{ matrix.tag_prefix }}
+          VERSION_TAG: ${{ github.ref_name }}
+          EXPECTED_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          version_without_v="${VERSION_TAG#v}"
+          primary_tag="${TAG_PREFIX}-${VERSION_TAG}"
+          archive="dist/authos-docker-${BACKEND}.tar"
+          skopeo copy --all "oci-archive:${archive}" "docker://${DOCKER_IMAGE}:${primary_tag}"
+
+          published_digest="sha256:$(skopeo inspect --raw "docker://${DOCKER_IMAGE}:${primary_tag}" | sha256sum | cut -d' ' -f1)"
+          if [ "${published_digest}" != "${EXPECTED_DIGEST}" ]; then
+            echo "Published digest ${published_digest} does not match prepared digest ${EXPECTED_DIGEST}." >&2
+            exit 1
+          fi
+
+          aliases=("${TAG_PREFIX}-${version_without_v}" "${TAG_PREFIX}-latest")
+          if [ "${BACKEND}" = "sqlite" ]; then
+            aliases+=("${VERSION_TAG}" "${version_without_v}" latest)
+          fi
+          for alias in "${aliases[@]}"; do
+            skopeo copy --all \
+              "docker://${DOCKER_IMAGE}:${primary_tag}" \
+              "docker://${DOCKER_IMAGE}:${alias}"
+          done
+
+      - name: Attest Docker image provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-name: docker.io/${{ env.DOCKER_IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+
+      - name: Attest container release record
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: dist/authos-docker-${{ matrix.backend }}-manifest.json
+
+      - name: Attach container release record to draft
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: dist/authos-docker-${{ matrix.backend }}-manifest.json
+
+  publish_npm:
+    name: Publish coordinated npm artifacts
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare_npm, publish_standalone]
+    uses: ./.github/workflows/publish-npm-packages.yml
+    with:
+      mode: publish
+    secrets: inherit
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+
+  finalize_release:
+    name: Publish completed GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [publish_standalone, publish_docker, publish_npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install registry inspection client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Verify every coordinated publication while release is draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          DOCKER_IMAGE: editoredit/sso
+        run: |
+          set -euo pipefail
+
+          if [ "$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "Release ${RELEASE_TAG} is not a draft before final verification." >&2
+            exit 1
+          fi
+
+          expected_assets=(
+            install.sh
+            authos-sqlite-linux-amd64.tar.gz
+            authos-sqlite-linux-amd64.spdx.json
+            authos-sqlite-linux-arm64.tar.gz
+            authos-sqlite-linux-arm64.spdx.json
+            authos-standalone-release-manifest.json
+            SHA256SUMS.txt
+            authos-docker-sqlite-manifest.json
+            authos-docker-postgres-manifest.json
+            authos-docker-mysql-manifest.json
+            sso-sdk.tgz
+            sso-sdk.spdx.json
+            authos-node.tgz
+            authos-node.spdx.json
+            authos-react.tgz
+            authos-react.spdx.json
+            authos-vue.tgz
+            authos-vue.spdx.json
+            authos-cli.tgz
+            authos-cli.spdx.json
+            authos-npm-release-manifest.json
+            npm-SHA256SUMS.txt
+          )
+          published_assets="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
+          for asset in "${expected_assets[@]}"; do
+            if ! grep --fixed-strings --line-regexp --quiet "${asset}" <<<"${published_assets}"; then
+              echo "Draft release is missing expected asset: ${asset}" >&2
+              exit 1
+            fi
+          done
+
+          mkdir -p /tmp/authos-container-records
+          gh release download "${RELEASE_TAG}" \
+            --pattern 'authos-docker-*-manifest.json' \
+            --dir /tmp/authos-container-records
+
+          version_without_v="${RELEASE_TAG#v}"
+          for backend in sqlite postgres mysql; do
+            case "${backend}" in
+              sqlite)
+                prefix=sqlite
+                aliases=(
+                  "${RELEASE_TAG}"
+                  "${version_without_v}"
+                  "latest"
+                  "sqlite-${RELEASE_TAG}"
+                  "sqlite-${version_without_v}"
+                  "sqlite-latest"
+                )
+                ;;
+              postgres)
+                prefix=psql
+                aliases=("psql-${RELEASE_TAG}" "psql-${version_without_v}" "psql-latest")
+                ;;
+              mysql)
+                prefix=mysql
+                aliases=("mysql-${RELEASE_TAG}" "mysql-${version_without_v}" "mysql-latest")
+                ;;
+            esac
+
+            record="/tmp/authos-container-records/authos-docker-${backend}-manifest.json"
+            expected_digest="$(jq --exit-status --raw-output .digest "${record}")"
+            if ! [[ "${expected_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Invalid ${backend} release-record digest: ${expected_digest}" >&2
+              exit 1
+            fi
+
+            for tag in "${aliases[@]}"; do
+              actual_digest="sha256:$(skopeo inspect --raw "docker://${DOCKER_IMAGE}:${tag}" | sha256sum | cut -d' ' -f1)"
+              if [ "${actual_digest}" != "${expected_digest}" ]; then
+                echo "Docker tag ${DOCKER_IMAGE}:${tag} resolves to ${actual_digest}, expected ${expected_digest}." >&2
+                exit 1
+              fi
+            done
+          done
+
+          PACKAGE_VERSION="${version_without_v}" node <<'NODE'
+          const packages = [
+            '@drmhse/sso-sdk',
+            '@drmhse/authos-node',
+            '@drmhse/authos-react',
+            '@drmhse/authos-vue',
+            '@drmhse/authos-cli',
+          ];
+
+          async function main() {
+            for (const name of packages) {
+              const endpoint = `https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(process.env.PACKAGE_VERSION)}`;
+              const response = await fetch(endpoint, { headers: { accept: 'application/json' } });
+              if (!response.ok) {
+                throw new Error(`Published npm version cannot be verified: ${name}@${process.env.PACKAGE_VERSION} (HTTP ${response.status})`);
+              }
+            }
+          }
+
+          main().catch((error) => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+
+      - name: Make fully qualified release public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "${RELEASE_TAG}" --draft=false --latest

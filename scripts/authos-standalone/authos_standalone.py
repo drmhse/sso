@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 
 from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import json
 import os
+import grp
+import pwd
 import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -107,8 +112,13 @@ def install(bundle_dir: Path, config_source: Path | None, no_start: bool) -> Non
             current_paths = desired_paths
         write_install_state(desired_state)
         config = normalize_config(desired_config, install_state=desired_state)
-        write_json(current_paths["config_path"], config, mode=0o640)
-        chown_path(current_paths["config_path"], AUTHOS_USER, AUTHOS_USER)
+        write_json(
+            current_paths["config_path"],
+            config,
+            mode=0o640,
+            owner=AUTHOS_USER,
+            group=AUTHOS_USER,
+        )
     else:
         current_state = load_install_state()
         write_install_state(current_state)
@@ -144,14 +154,15 @@ def apply(bundle_dir: Path, print_link: bool, start_service: bool) -> None:
     })
 
     env_values = build_env(config, state, paths)
-    write_json(paths["config_path"], config, mode=0o640)
-    write_json(paths["state_path"], state, mode=0o640)
-    write_env(ENV_PATH, env_values, mode=0o640)
-    chown_path(paths["config_path"], AUTHOS_USER, AUTHOS_USER)
-    chown_path(paths["state_path"], AUTHOS_USER, AUTHOS_USER)
+    write_json(
+        paths["config_path"], config, mode=0o640, owner=AUTHOS_USER, group=AUTHOS_USER
+    )
+    write_json(
+        paths["state_path"], state, mode=0o640, owner=AUTHOS_USER, group=AUTHOS_USER
+    )
+    write_env(ENV_PATH, env_values, mode=0o640, owner="root", group=AUTHOS_USER)
     chown_path(paths["status_path"], AUTHOS_USER, AUTHOS_USER)
     chown_path(paths["request_path"], AUTHOS_USER, AUTHOS_USER)
-    chown_path(ENV_PATH, "root", AUTHOS_USER)
 
     install_apply_wrapper()
     write_systemd_unit(config, paths)
@@ -507,6 +518,9 @@ def build_env(config: dict, state: dict, paths: dict) -> dict:
         "JWT_PRIVATE_KEY_BASE64": state["jwt"]["privateKeyBase64"],
         "JWT_PUBLIC_KEY_BASE64": state["jwt"]["publicKeyBase64"],
         "JWT_KID": state["jwt"]["kid"],
+        "JWT_PREVIOUS_PUBLIC_KEYS_JSON": json.dumps(
+            state["jwt"].get("previousPublicKeys", {}), separators=(",", ":")
+        ),
         "JWT_EXPIRATION_HOURS": "24",
         "BILLING_PROVIDER": billing["provider"],
         "SERVER_HOST": deployment["serverHost"],
@@ -752,26 +766,44 @@ def ensure_api_key(client: "StandaloneAuthOsClient", paths: dict, service: dict,
                 "prefix": candidate.get("prefix") or "",
             }
 
-    write_to = str(api_key.get("writeTo") or "").strip()
+    write_to = str(api_key.get("writeTo") or "")
     if not write_to:
         raise RuntimeError(
             f"API key {name} needs writeTo because new API key secrets are shown once"
         )
 
-    created = client.request(
-        f"/api/organizations/{quote(service['org'])}/services/{quote(service['service'])}/api-keys",
-        method="POST",
-        body={
-            "name": name,
-            "permissions": api_key.get("permissions") or [],
-        },
-    )
-
+    # Open and retain the destination directory before creating a one-time
+    # secret. Managed configuration is writable through the lite client while
+    # this apply process runs as root, so every component is opened without
+    # following symlinks and the directory identity is rechecked before write.
     target = resolve_output_path(paths["data_dir"], write_to)
-    ensure_dir(target.parent, mode=0o700)
-    target.write_text(f"AUTHOS_API_KEY={created['key']}\n", encoding="utf-8")
-    os.chmod(target, 0o600)
-    chown_path(target, AUTHOS_USER, AUTHOS_USER)
+    parent_fd, filename, parent_identity = open_managed_output_parent(
+        paths["data_dir"], write_to, owner=AUTHOS_USER, group=AUTHOS_USER
+    )
+    try:
+        target_identity = managed_output_target_identity(parent_fd, filename)
+        created = client.request(
+            f"/api/organizations/{quote(service['org'])}/services/{quote(service['service'])}/api-keys",
+            method="POST",
+            body={
+                "name": name,
+                "permissions": api_key.get("permissions") or [],
+            },
+        )
+        assert_managed_output_parent_unchanged(
+            paths["data_dir"], write_to, parent_identity
+        )
+        atomic_write_text_at(
+            parent_fd,
+            filename,
+            f"AUTHOS_API_KEY={created['key']}\n",
+            mode=0o600,
+            owner=AUTHOS_USER,
+            group=AUTHOS_USER,
+            expected_identity=target_identity,
+        )
+    finally:
+        os.close(parent_fd)
     return {
         "name": name,
         "status": "created",
@@ -781,10 +813,172 @@ def ensure_api_key(client: "StandaloneAuthOsClient", paths: dict, service: dict,
 
 
 def resolve_output_path(data_dir: Path, write_to: str) -> Path:
+    parts = validate_managed_output_name(write_to)
+    if not data_dir.is_absolute():
+        raise RuntimeError("standalone.dataDir must be an absolute path")
+    return data_dir.joinpath(*parts)
+
+
+def validate_managed_output_name(write_to: str) -> tuple[str, ...]:
+    if not write_to or write_to != write_to.strip():
+        raise RuntimeError("apiKeys[].writeTo must be a non-empty relative path")
+    if any(ord(character) < 32 or ord(character) == 127 for character in write_to):
+        raise RuntimeError("apiKeys[].writeTo must not contain control characters")
     target = Path(write_to)
     if target.is_absolute():
-        return target
-    return (data_dir / target).resolve()
+        raise RuntimeError("apiKeys[].writeTo must be relative to standalone.dataDir")
+    raw_parts = write_to.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        raise RuntimeError(
+            "apiKeys[].writeTo must contain only non-empty child path components"
+        )
+    return tuple(raw_parts)
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _open_directory_tree_nofollow(
+    path: Path,
+    *,
+    create: bool,
+    owner: str | None = None,
+    group: str | None = None,
+) -> int:
+    if not path.is_absolute():
+        raise RuntimeError("managed directory must be absolute")
+    current_fd = os.open("/", _directory_open_flags())
+    try:
+        for component in path.parts[1:]:
+            if component in {"", ".", ".."} or any(
+                ord(character) < 32 or ord(character) == 127 for character in component
+            ):
+                raise RuntimeError("managed directory contains an unsafe path component")
+            try:
+                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise RuntimeError("managed output parent changed during API-key creation")
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+                uid = pwd.getpwnam(owner).pw_uid if owner else os.geteuid()
+                gid = grp.getgrnam(group).gr_gid if group else os.getegid()
+                os.fchown(next_fd, uid, gid)
+                os.fchmod(next_fd, 0o700)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise RuntimeError(
+                        "managed output path contains a symlink or non-directory component"
+                    ) from error
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def open_managed_output_parent(
+    data_dir: Path,
+    write_to: str,
+    *,
+    owner: str | None = None,
+    group: str | None = None,
+) -> tuple[int, str, tuple[int, int]]:
+    parts = validate_managed_output_name(write_to)
+    parent = data_dir.joinpath(*parts[:-1])
+    parent_fd = _open_directory_tree_nofollow(
+        parent, create=True, owner=owner, group=group
+    )
+    stat_result = os.fstat(parent_fd)
+    return parent_fd, parts[-1], (stat_result.st_dev, stat_result.st_ino)
+
+
+def assert_managed_output_parent_unchanged(
+    data_dir: Path, write_to: str, expected: tuple[int, int]
+) -> None:
+    parts = validate_managed_output_name(write_to)
+    check_fd = _open_directory_tree_nofollow(
+        data_dir.joinpath(*parts[:-1]), create=False
+    )
+    try:
+        actual_stat = os.fstat(check_fd)
+        actual = (actual_stat.st_dev, actual_stat.st_ino)
+        if actual != expected:
+            raise RuntimeError("managed output parent changed during API-key creation")
+    finally:
+        os.close(check_fd)
+
+
+def managed_output_target_identity(
+    parent_fd: int, filename: str
+) -> tuple[int, int] | None:
+    try:
+        target = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(target.st_mode):
+        raise RuntimeError("managed output target must be a regular file")
+    if target.st_nlink != 1:
+        raise RuntimeError("managed output target must not be hard-linked")
+    return target.st_dev, target.st_ino
+
+
+def atomic_write_text_at(
+    parent_fd: int,
+    filename: str,
+    payload: str,
+    *,
+    mode: int,
+    owner: str | None = None,
+    group: str | None = None,
+    expected_identity: tuple[int, int] | None | object = Ellipsis,
+) -> None:
+    before_identity = managed_output_target_identity(parent_fd, filename)
+    if expected_identity is not Ellipsis and before_identity != expected_identity:
+        raise RuntimeError("managed output target changed before atomic write")
+
+    temporary_name = f".{filename}.{secrets.token_hex(16)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(temporary_name, flags, mode, dir_fd=parent_fd)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(payload.encode("utf-8"))
+            handle.flush()
+            uid = pwd.getpwnam(owner).pw_uid if owner else os.geteuid()
+            gid = grp.getgrnam(group).gr_gid if group else os.getegid()
+            os.fchown(fd, uid, gid)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+
+        after = None
+        try:
+            after = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        after_identity = None if after is None else (after.st_dev, after.st_ino)
+        if before_identity != after_identity:
+            raise RuntimeError("managed output target changed during atomic write")
+        if after is not None and (
+            not stat.S_ISREG(after.st_mode) or after.st_nlink != 1
+        ):
+            raise RuntimeError("managed output target became unsafe during atomic write")
+
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
 
 
 def same_string_set(left: list[str], right: list[str]) -> bool:
@@ -847,7 +1041,13 @@ def configure_caddy(config: dict, paths: dict) -> None:
 
     ensure_dir(CADDY_SITE_DIR, mode=0o755)
     ensure_caddy_main_file()
-    CADDY_SITE_PATH.write_text(render_caddy_site(config, paths), encoding="utf-8")
+    atomic_write_text(
+        CADDY_SITE_PATH,
+        render_caddy_site(config, paths),
+        mode=0o644,
+        owner="root",
+        group="root",
+    )
     run(["caddy", "validate", "--config", str(CADDY_ROOT / "Caddyfile")])
     run(["systemctl", "enable", "caddy.service"])
     run(["systemctl", "restart", "caddy.service"])
@@ -865,14 +1065,24 @@ def ensure_caddy_main_file() -> None:
     ensure_dir(CADDY_ROOT, mode=0o755)
     caddyfile = CADDY_ROOT / "Caddyfile"
     if not caddyfile.exists():
-        caddyfile.write_text("import /etc/caddy/sites-enabled/*.caddy\n", encoding="utf-8")
+        atomic_write_text(
+            caddyfile,
+            "import /etc/caddy/sites-enabled/*.caddy\n",
+            mode=0o644,
+            owner="root",
+            group="root",
+        )
         return
 
     content = caddyfile.read_text(encoding="utf-8")
     include_line = "import /etc/caddy/sites-enabled/*.caddy"
     if include_line not in content:
         content = content.rstrip() + "\n\n" + include_line + "\n"
-        caddyfile.write_text(content, encoding="utf-8")
+        atomic_write_text(
+            caddyfile,
+            content,
+            mode=stat.S_IMODE(caddyfile.stat().st_mode),
+        )
 
 
 def render_caddy_site(config: dict, paths: dict) -> str:
@@ -918,7 +1128,9 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 """
-    SERVICE_PATH.write_text(service_text, encoding="utf-8")
+    atomic_write_text(
+        SERVICE_PATH, service_text, mode=0o644, owner="root", group="root"
+    )
 
 
 def install_apply_wrapper() -> None:
@@ -926,8 +1138,9 @@ def install_apply_wrapper() -> None:
 set -euo pipefail
 exec python3 {INSTALL_ROOT / 'standalone' / 'authos_standalone.py'} "$@"
 """
-    APPLY_WRAPPER.write_text(wrapper, encoding="utf-8")
-    os.chmod(APPLY_WRAPPER, 0o755)
+    atomic_write_text(
+        APPLY_WRAPPER, wrapper, mode=0o755, owner="root", group="root"
+    )
 
 
 def write_apply_service_unit(paths: dict) -> None:
@@ -938,7 +1151,9 @@ Description=AuthOS standalone apply worker
 Type=oneshot
 ExecStart={APPLY_WRAPPER} apply --bundle-dir {INSTALL_ROOT} --no-print-link
 """
-    APPLY_SERVICE_PATH.write_text(service_text, encoding="utf-8")
+    atomic_write_text(
+        APPLY_SERVICE_PATH, service_text, mode=0o644, owner="root", group="root"
+    )
 
 
 def write_apply_path_unit(paths: dict) -> None:
@@ -951,18 +1166,38 @@ PathModified={paths['request_path']}
 [Install]
 WantedBy=multi-user.target
 """
-    APPLY_PATH_UNIT_PATH.write_text(path_text, encoding="utf-8")
+    atomic_write_text(
+        APPLY_PATH_UNIT_PATH, path_text, mode=0o644, owner="root", group="root"
+    )
 
 
 def copy_bundle(bundle_dir: Path) -> None:
     ensure_dir(INSTALL_ROOT, mode=0o755)
     ensure_dir(INSTALL_ROOT / "standalone", mode=0o755)
 
-    shutil.copy2(bundle_dir / "authos", INSTALL_BINARY)
-    os.chmod(INSTALL_BINARY, 0o755)
-    shutil.copy2(bundle_dir / "authos.config.example.json", INSTALL_ROOT / "authos.config.example.json")
-    shutil.copy2(bundle_dir / "standalone" / "authos_standalone.py", INSTALL_ROOT / "standalone" / "authos_standalone.py")
-    os.chmod(INSTALL_ROOT / "standalone" / "authos_standalone.py", 0o755)
+    atomic_copy_file(bundle_dir / "authos", INSTALL_BINARY, mode=0o755, owner="root", group="root")
+    atomic_copy_file(
+        bundle_dir / "authos.config.example.json",
+        INSTALL_ROOT / "authos.config.example.json",
+        mode=0o644,
+        owner="root",
+        group="root",
+    )
+    atomic_copy_file(
+        bundle_dir / "standalone" / "authos_standalone.py",
+        INSTALL_ROOT / "standalone" / "authos_standalone.py",
+        mode=0o755,
+        owner="root",
+        group="root",
+    )
+    for notice in ("LICENSE", "AGPL-3.0.txt", "README.txt"):
+        atomic_copy_file(
+            bundle_dir / notice,
+            INSTALL_ROOT / notice,
+            mode=0o644,
+            owner="root",
+            group="root",
+        )
 
 
 def managed_data_dir() -> Path:
@@ -1008,13 +1243,20 @@ def build_install_state(config: dict) -> dict:
 
 def write_install_state(payload: dict) -> None:
     ensure_dir(CONFIG_DIR, mode=0o755)
-    write_json(INSTALL_STATE_PATH, payload, mode=0o640)
-    chown_path(INSTALL_STATE_PATH, "root", AUTHOS_USER)
+    write_json(
+        INSTALL_STATE_PATH, payload, mode=0o640, owner="root", group=AUTHOS_USER
+    )
 
 
 def ensure_apply_request_file(paths: dict) -> None:
     if not paths["request_path"].exists():
-        write_json(paths["request_path"], {"requested_at": None}, mode=0o640)
+        write_json(
+            paths["request_path"],
+            {"requested_at": None},
+            mode=0o640,
+            owner=AUTHOS_USER,
+            group=AUTHOS_USER,
+        )
 
 
 def relocate_managed_paths(current_paths: dict, desired_paths: dict) -> None:
@@ -1083,24 +1325,116 @@ def load_json(path: Path, default=None):
         return json.load(handle)
 
 
-def write_json(path: Path, value, mode: int) -> None:
-    ensure_dir(path.parent, mode=0o755)
-    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    os.chmod(path, mode)
+def _owner_ids(path: Path, owner: str | None, group: str | None) -> tuple[int, int]:
+    existing = path.stat() if path.exists() else None
+    uid = pwd.getpwnam(owner).pw_uid if owner else (existing.st_uid if existing else os.geteuid())
+    gid = grp.getgrnam(group).gr_gid if group else (existing.st_gid if existing else os.getegid())
+    return uid, gid
+
+
+def _atomic_replace_file(path: Path, mode: int, writer, owner: str | None = None, group: str | None = None) -> None:
+    parent = path.parent
+    parent_existed = parent.exists()
+    parent.mkdir(parents=True, exist_ok=True)
+    if not parent_existed:
+        os.chmod(parent, 0o755)
+
+    uid, gid = _owner_ids(path, owner, group)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=parent)
+    temporary = Path(temporary_name)
+    directory_fd = None
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            writer(handle)
+            handle.flush()
+            os.fchown(handle.fileno(), uid, gid)
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+
+        os.replace(temporary, path)
+        directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(directory_fd)
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_bytes(
+    path: Path,
+    payload: bytes,
+    mode: int,
+    owner: str | None = None,
+    group: str | None = None,
+) -> None:
+    _atomic_replace_file(path, mode, lambda handle: handle.write(payload), owner, group)
+
+
+def atomic_write_text(
+    path: Path,
+    payload: str,
+    mode: int,
+    owner: str | None = None,
+    group: str | None = None,
+) -> None:
+    atomic_write_bytes(path, payload.encode("utf-8"), mode, owner, group)
+
+
+def atomic_copy_file(
+    source: Path,
+    target: Path,
+    mode: int,
+    owner: str | None = None,
+    group: str | None = None,
+) -> None:
+    def copy(handle) -> None:
+        with source.open("rb") as source_handle:
+            shutil.copyfileobj(source_handle, handle, length=1024 * 1024)
+
+    _atomic_replace_file(target, mode, copy, owner, group)
+
+
+def write_json(
+    path: Path,
+    value,
+    mode: int,
+    owner: str | None = None,
+    group: str | None = None,
+) -> None:
+    atomic_write_bytes(
+        path,
+        (json.dumps(value, indent=2) + "\n").encode("utf-8"),
+        mode,
+        owner,
+        group,
+    )
 
 
 def persist_state(paths: dict, state: dict) -> None:
-    write_json(paths["state_path"], state, mode=0o640)
-    chown_path(paths["state_path"], AUTHOS_USER, AUTHOS_USER)
+    write_json(
+        paths["state_path"],
+        state,
+        mode=0o640,
+        owner=AUTHOS_USER,
+        group=AUTHOS_USER,
+    )
 
 
-def write_env(path: Path, values: dict, mode: int) -> None:
+def write_env(
+    path: Path,
+    values: dict,
+    mode: int,
+    owner: str | None = None,
+    group: str | None = None,
+) -> None:
     lines = ["# Generated by AuthOS standalone apply. Edit config.json and rerun authos-apply instead."]
     for key in sorted(values.keys()):
         value = str(values[key])
         lines.append(f"{key}={quote_env(value)}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.chmod(path, mode)
+    atomic_write_bytes(path, ("\n".join(lines) + "\n").encode("utf-8"), mode, owner, group)
 
 
 def quote_env(value: str) -> str:
@@ -1246,11 +1580,14 @@ def add_if(target: dict, key: str, value) -> None:
 
 
 def write_status(path: Path, payload: dict) -> None:
-    ensure_dir(path.parent, mode=0o755)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     try:
-        chown_path(path, AUTHOS_USER, AUTHOS_USER)
-        os.chmod(path, 0o640)
+        write_json(
+            path,
+            payload,
+            mode=0o640,
+            owner=AUTHOS_USER,
+            group=AUTHOS_USER,
+        )
     except Exception:
         pass
 

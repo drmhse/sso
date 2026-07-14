@@ -24,7 +24,7 @@ impl MigrationTrait for Migration {
 
         match backend {
             DbBackend::Sqlite => {
-                // SQLite requires table recreation to add foreign keys
+                // SQLite accepts a nullable REFERENCES column in place.
                 self.up_sqlite(manager, db).await?;
             }
             DbBackend::Postgres => {
@@ -62,117 +62,29 @@ impl MigrationTrait for Migration {
 
 impl Migration {
     // ===== SQLITE =====
-    // SQLite table modification with foreign key dependencies requires special handling.
-    // This migration now includes RECOVERY LOGIC for databases left in a corrupted state
-    // from previous failed migration attempts.
+    // SQLite supports adding a nullable REFERENCES column in place. Avoid the
+    // older table-copy/drop/rename strategy: when migrations run through a
+    // multi-connection pool, its PRAGMA and DDL statements can execute on
+    // different connections and leave the database at `users_new`.
+    //
+    // The recovery branch remains intentionally supported for databases left
+    // by that older implementation.
     async fn up_sqlite<'a>(
         &self,
         manager: &SchemaManager<'a>,
         db: &SchemaManagerConnection<'a>,
     ) -> Result<(), DbErr> {
-        // 1. Disable foreign keys during table manipulation
-        db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
-
-        // 2. Check current database state to determine the right recovery path
+        // Check current database state to determine the right recovery path.
         let users_exists = self.table_exists(db, "users").await?;
         let users_new_exists = self.table_exists(db, "users_new").await?;
 
         if !users_exists && users_new_exists {
-            // RECOVERY PATH: Previous migration dropped "users" but failed before renaming "users_new"
-            // The data is in users_new - we need to check if it has org_id already
-            let has_org_id = self.column_exists(db, "users_new", "org_id").await?;
-
-            if has_org_id {
-                // users_new already has the new schema - just rename it
-                db.execute_unprepared("ALTER TABLE users_new RENAME TO users")
-                    .await?;
-            } else {
-                // users_new has old schema - we need to recreate with new schema
-                // First, save the data
-                db.execute_unprepared("ALTER TABLE users_new RENAME TO users_old_backup")
-                    .await?;
-
-                // Create the proper new table
-                db.execute_unprepared(
-                    "CREATE TABLE users (
-                        id TEXT NOT NULL PRIMARY KEY,
-                        email TEXT NOT NULL,
-                        org_id TEXT NULL REFERENCES organizations(id) ON DELETE SET NULL,
-                        is_platform_owner BOOLEAN NOT NULL DEFAULT 0,
-                        password_hash TEXT NULL,
-                        email_verified_at TEXT NULL,
-                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TEXT NULL,
-                        deleted_at TEXT NULL
-                    )",
-                )
-                .await?;
-
-                // Copy data from backup
-                db.execute_unprepared(
-                    "INSERT INTO users (id, email, is_platform_owner, password_hash, email_verified_at, created_at, updated_at, deleted_at)
-                     SELECT id, email, is_platform_owner, password_hash, email_verified_at, created_at, updated_at, deleted_at FROM users_old_backup"
-                ).await?;
-
-                // Drop the backup
-                db.execute_unprepared("DROP TABLE users_old_backup").await?;
-            }
-        } else if users_exists {
-            // NORMAL PATH: users table exists, perform standard migration
-
-            // Check if org_id column already exists (migration already partially applied)
-            let has_org_id = self.column_exists(db, "users", "org_id").await?;
-            if has_org_id {
-                // Already migrated, just ensure indexes exist
-                db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
-                return self.ensure_indexes(manager, db).await;
-            }
-
-            // Drop existing indexes on users table (ignore errors)
-            let _ = manager
-                .drop_index(
-                    Index::drop()
-                        .name("idx_users_email")
-                        .table(Users::Table)
-                        .to_owned(),
-                )
-                .await;
-
-            // Drop any leftover users_new from previous failed attempts
-            db.execute_unprepared("DROP TABLE IF EXISTS users_new")
-                .await?;
-
-            // Create NEW table with temp name "users_new" including org_id column
-            db.execute_unprepared(
-                "CREATE TABLE users_new (
-                    id TEXT NOT NULL PRIMARY KEY,
-                    email TEXT NOT NULL,
-                    org_id TEXT NULL REFERENCES organizations(id) ON DELETE SET NULL,
-                    is_platform_owner BOOLEAN NOT NULL DEFAULT 0,
-                    password_hash TEXT NULL,
-                    email_verified_at TEXT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NULL,
-                    deleted_at TEXT NULL
-                )",
-            )
-            .await?;
-
-            // Copy data from old users table to users_new
-            db.execute_unprepared(
-                "INSERT INTO users_new (id, email, is_platform_owner, password_hash, email_verified_at, created_at, updated_at, deleted_at)
-                 SELECT id, email, is_platform_owner, password_hash, email_verified_at, created_at, updated_at, deleted_at FROM users"
-            ).await?;
-
-            // Drop the original users table
-            manager
-                .drop_table(Table::drop().table(Users::Table).to_owned())
-                .await?;
-
-            // Rename users_new to users
+            // Recovery path: the previous implementation copied all user rows,
+            // dropped `users`, and failed before this rename. Rename first, then
+            // use the same in-place column path as a normal upgrade if required.
             db.execute_unprepared("ALTER TABLE users_new RENAME TO users")
                 .await?;
-        } else {
+        } else if !users_exists {
             // CATASTROPHIC: Neither table exists - cannot proceed
             // This should not happen if initial_schema migration ran properly
             return Err(DbErr::Custom(
@@ -180,8 +92,31 @@ impl Migration {
             ));
         }
 
-        // Re-enable foreign keys
-        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+        if !self.column_exists(db, "users", "org_id").await? {
+            db.execute_unprepared(
+                "ALTER TABLE users ADD COLUMN org_id TEXT NULL \
+                 REFERENCES organizations(id) ON DELETE SET NULL",
+            )
+            .await?;
+        }
+
+        // The original global email index must not prevent the intended
+        // platform-versus-tenant uniqueness rules below.
+        let _ = manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_users_email")
+                    .table(Users::Table)
+                    .to_owned(),
+            )
+            .await;
+
+        // A stale temp table can exist only when the canonical users table also
+        // survived an older interrupted attempt. It is safe to remove after the
+        // canonical schema and data have been selected above.
+        if self.table_exists(db, "users_new").await? {
+            db.execute_unprepared("DROP TABLE users_new").await?;
+        }
 
         // Verify foreign key integrity
         db.execute_unprepared("PRAGMA foreign_key_check").await?;
@@ -546,4 +481,211 @@ enum Users {
 enum Organizations {
     Table,
     Id,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Migrator;
+    use sea_orm_migration::sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement,
+    };
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    struct TestDatabase {
+        connection: DatabaseConnection,
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        async fn connect() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("authos-users-org-migration-{}.db", Uuid::new_v4()));
+            let mut options = ConnectOptions::new(format!("sqlite:{}?mode=rwc", path.display()));
+            options.min_connections(1).max_connections(10);
+
+            let connection = Database::connect(options)
+                .await
+                .expect("connect to pooled SQLite test database");
+
+            Self { connection, path }
+        }
+
+        async fn assert_org_scope_schema(&self) {
+            let columns = self
+                .connection
+                .query_all(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA table_info(users)".to_owned(),
+                ))
+                .await
+                .expect("read users columns");
+            assert!(columns
+                .iter()
+                .any(|row| { row.try_get::<String>("", "name").as_deref() == Ok("org_id") }));
+
+            let foreign_keys = self
+                .connection
+                .query_all(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA foreign_key_list(users)".to_owned(),
+                ))
+                .await
+                .expect("read users foreign keys");
+            assert!(foreign_keys.iter().any(|row| {
+                row.try_get::<String>("", "table").as_deref() == Ok("organizations")
+                    && row.try_get::<String>("", "from").as_deref() == Ok("org_id")
+                    && row.try_get::<String>("", "on_delete").as_deref() == Ok("SET NULL")
+            }));
+
+            for index_name in [
+                "idx_users_email_org",
+                "idx_users_email_platform",
+                "idx_users_org_id",
+            ] {
+                let index = self
+                    .connection
+                    .query_one(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+                        [index_name.into()],
+                    ))
+                    .await
+                    .expect("query users index");
+                assert!(index.is_some(), "missing users index {index_name}");
+            }
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            for suffix in ["", "-shm", "-wal"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.path.display(), suffix));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_sqlite_database_migrates_with_a_connection_pool() {
+        let database = TestDatabase::connect().await;
+
+        Migrator::up(&database.connection, Some(9))
+            .await
+            .expect("run migrations through add-org-id-to-users");
+
+        database.assert_org_scope_schema().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_upgrade_preserves_existing_users() {
+        let database = TestDatabase::connect().await;
+        Migrator::up(&database.connection, Some(8))
+            .await
+            .expect("prepare schema immediately before users org migration");
+
+        database
+            .connection
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO users (id, email, is_platform_owner, password_hash, created_at) \
+                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                [
+                    "existing-user".into(),
+                    "existing@example.test".into(),
+                    true.into(),
+                    "existing-password-hash".into(),
+                ],
+            ))
+            .await
+            .expect("insert user using the pre-migration schema");
+
+        Migrator::up(&database.connection, Some(1))
+            .await
+            .expect("upgrade existing users schema");
+
+        let user = database
+            .connection
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT email, password_hash, org_id FROM users WHERE id = 'existing-user'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("query upgraded user")
+            .expect("existing user remains after migration");
+        assert_eq!(
+            user.try_get::<String>("", "email").as_deref(),
+            Ok("existing@example.test")
+        );
+        assert_eq!(
+            user.try_get::<String>("", "password_hash").as_deref(),
+            Ok("existing-password-hash")
+        );
+        assert_eq!(user.try_get::<Option<String>>("", "org_id"), Ok(None));
+
+        database.assert_org_scope_schema().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_upgrade_recovers_users_new_after_interrupted_rename() {
+        let database = TestDatabase::connect().await;
+        Migrator::up(&database.connection, Some(8))
+            .await
+            .expect("prepare schema immediately before users org migration");
+
+        database
+            .connection
+            .execute_unprepared(
+                "INSERT INTO users (id, email, is_platform_owner, password_hash, created_at) \
+                 VALUES ('recovery-user', 'recovery@example.test', 0, \
+                 'recovery-password-hash', CURRENT_TIMESTAMP)",
+            )
+            .await
+            .expect("insert user before simulating interrupted migration");
+        database
+            .connection
+            .execute_unprepared(
+                "ALTER TABLE users ADD COLUMN org_id TEXT NULL \
+                 REFERENCES organizations(id) ON DELETE SET NULL",
+            )
+            .await
+            .expect("prepare copied schema with org_id");
+        database
+            .connection
+            .execute_unprepared("ALTER TABLE users RENAME TO users_new")
+            .await
+            .expect("simulate interruption before users_new rename");
+
+        Migrator::up(&database.connection, Some(1))
+            .await
+            .expect("recover interrupted users migration");
+
+        let recovered_user = database
+            .connection
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT email, password_hash, org_id FROM users WHERE id = 'recovery-user'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("query recovered user")
+            .expect("user data remains after recovery");
+        assert_eq!(
+            recovered_user.try_get::<String>("", "email").as_deref(),
+            Ok("recovery@example.test")
+        );
+        assert_eq!(
+            recovered_user
+                .try_get::<String>("", "password_hash")
+                .as_deref(),
+            Ok("recovery-password-hash")
+        );
+        assert_eq!(
+            recovered_user.try_get::<Option<String>>("", "org_id"),
+            Ok(None)
+        );
+
+        database.assert_org_scope_schema().await;
+    }
 }

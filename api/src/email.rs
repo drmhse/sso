@@ -84,7 +84,6 @@ impl EmailService {
         tracing::info!(
             host = %config.host,
             port = %config.port,
-            from = %config.from_email,
             has_auth = has_auth,
             "Email service initialized"
         );
@@ -193,12 +192,7 @@ impl EmailService {
         match self.smtp_transport.send(email).await {
             Ok(_) => Ok(()),
             Err(e) => {
-                tracing::error!(
-                    to = %to_email,
-                    subject = %subject,
-                    error = ?e,
-                    "SMTP send failed"
-                );
+                tracing::error!("SMTP send failed");
                 Err(anyhow::Error::new(e).context("SMTP error"))
             }
         }
@@ -273,7 +267,14 @@ pub async fn get_email_service_for_org(
             })?;
 
             let password = encryption
-                .decrypt(&password_encrypted)
+                .decrypt_with_context(
+                    &password_encrypted,
+                    crate::encryption::EncryptionContext::new(
+                        "organizations",
+                        org_id,
+                        "smtp_password_encrypted",
+                    ),
+                )
                 .map_err(|e| anyhow::anyhow!("Failed to decrypt SMTP password: {}", e))?;
 
             let config = SmtpConfig {

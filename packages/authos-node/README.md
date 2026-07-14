@@ -5,6 +5,9 @@
 
 Node.js adapter for AuthOS with token verification and Express middleware helpers.
 
+This package is pre-1.0 and Beta. Pin an exact version and review the
+[current AuthOS support matrix](https://github.com/drmhse/AuthOS/blob/main/PROJECT_STATUS.md).
+
 Full documentation: [authos.dev/docs/packages/authos-node/](https://authos.dev/docs/packages/authos-node/)
 
 AI agent skills: [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-agent-skills/) and [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill)

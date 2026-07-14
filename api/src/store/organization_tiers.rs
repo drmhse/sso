@@ -19,6 +19,22 @@ impl OrganizationTierStore {
         Ok(result)
     }
 
+    /// Find tiers by IDs.
+    pub async fn find_by_ids(
+        db: DB<'_>,
+        tier_ids: &[String],
+    ) -> Result<Vec<organization_tiers::Model>> {
+        if tier_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let result = OrganizationTiers::find()
+            .filter(organization_tiers::Column::Id.is_in(tier_ids.iter().cloned()))
+            .all(&db)
+            .await?;
+        Ok(result)
+    }
+
     /// Find a tier by its name
     pub async fn find_by_name(db: DB<'_>, name: &str) -> Result<Option<organization_tiers::Model>> {
         let result = OrganizationTiers::find()

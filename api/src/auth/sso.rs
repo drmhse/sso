@@ -430,20 +430,12 @@ pub async fn oauth_http_client(
         let body_str = String::from_utf8_lossy(response.body());
 
         if response.status().is_success() {
-            tracing::debug!("OAuth success response body: {}", body_str);
-
             // Check if the response body contains an error (GitHub's quirk)
             if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&body_str) {
                 if let Some(error) = json_value.get("error").and_then(|e| e.as_str()) {
-                    let error_description = json_value
-                        .get("error_description")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or(error);
-
                     tracing::error!(
-                        "OAuth provider returned error in success response: error={}, description={}",
                         error,
-                        error_description
+                        "OAuth provider returned an error in a success response"
                     );
 
                     // Convert to a proper error by returning a 400 status

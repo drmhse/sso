@@ -28,6 +28,7 @@ pub use super::saml_states::Entity as SamlStates;
 pub use super::scim_tokens::Entity as ScimTokens;
 pub use super::service_provider_grants::Entity as ServiceProviderGrants;
 pub use super::services::Entity as Services;
+pub use super::session_refresh_token_history::Entity as SessionRefreshTokenHistory;
 pub use super::sessions::Entity as Sessions;
 pub use super::subscriptions::Entity as Subscriptions;
 pub use super::system_jobs::Entity as SystemJobs;

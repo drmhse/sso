@@ -1,12 +1,17 @@
-use crate::db::models::{SamlCertificateInfo, User};
+use crate::db::models::{SamlCertificateInfo, SamlPublishedCertificateInfo, User};
 use crate::error::{with_retrying_transaction, AppError, Json400, Result};
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::services::permission_service::{PermissionService, CAP_SERVICES_MANAGE};
 use crate::services::tier_enforcement::TierService;
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
-    saml_signing_keys::SamlSigningKeysStore, saml_states::SamlStateStore, services::ServiceStore,
+    identities::IdentityStore,
+    memberships::MembershipStore,
+    organizations::OrganizationStore,
+    permissions::PermissionsStore,
+    saml_signing_keys::{SamlSigningKeysStore, SAML_CERTIFICATE_OVERLAP_DAYS},
+    saml_states::SamlStateStore,
+    services::ServiceStore,
     DB,
 };
 use axum::{
@@ -15,7 +20,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use chrono::{Duration, Utc};
+use chrono::{Duration, Timelike, Utc};
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
@@ -25,7 +30,112 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
 use uuid::Uuid;
+
+/// Maximum decoded XML accepted from a SAML request. This bound is applied
+/// after HTTP-Redirect DEFLATE expansion so a small compressed query cannot
+/// cause unbounded allocation.
+const MAX_SAML_REQUEST_XML_BYTES: usize = 1_048_576;
+const MAX_SAML_REQUEST_ENCODED_BYTES: usize = 262_144;
+const MAX_SAML_XML_DEPTH: usize = 32;
+const MAX_SAML_XML_EVENTS: usize = 4_096;
+const MAX_SAML_XML_ATTRIBUTES_PER_ELEMENT: usize = 64;
+const MAX_SAML_XML_ATTRIBUTES_TOTAL: usize = 512;
+const SAML_CERTIFICATE_EXPIRY_WARNING_DAYS: i64 = 30;
+
+#[derive(Default)]
+struct SamlXmlWorkBudget {
+    depth: usize,
+    events: usize,
+    attributes: usize,
+}
+
+impl SamlXmlWorkBudget {
+    fn observe_event(&mut self) -> Result<()> {
+        self.events += 1;
+        if self.events > MAX_SAML_XML_EVENTS {
+            return Err(AppError::BadRequest(format!(
+                "SAML XML exceeds the {MAX_SAML_XML_EVENTS}-event limit"
+            )));
+        }
+        Ok(())
+    }
+
+    fn observe_element(&mut self, attribute_count: usize, empty: bool) -> Result<()> {
+        if attribute_count > MAX_SAML_XML_ATTRIBUTES_PER_ELEMENT {
+            return Err(AppError::BadRequest(format!(
+                "SAML XML element exceeds the {MAX_SAML_XML_ATTRIBUTES_PER_ELEMENT}-attribute limit"
+            )));
+        }
+        self.attributes = self
+            .attributes
+            .checked_add(attribute_count)
+            .ok_or_else(|| AppError::BadRequest("SAML XML attribute count overflow".to_string()))?;
+        if self.attributes > MAX_SAML_XML_ATTRIBUTES_TOTAL {
+            return Err(AppError::BadRequest(format!(
+                "SAML XML exceeds the {MAX_SAML_XML_ATTRIBUTES_TOTAL}-attribute limit"
+            )));
+        }
+        if !empty {
+            self.depth += 1;
+            if self.depth > MAX_SAML_XML_DEPTH {
+                return Err(AppError::BadRequest(format!(
+                    "SAML XML exceeds the {MAX_SAML_XML_DEPTH}-element depth limit"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn leave_element(&mut self) -> Result<()> {
+        self.depth = self.depth.checked_sub(1).ok_or_else(|| {
+            AppError::BadRequest("SAML XML contains an unexpected closing element".to_string())
+        })?;
+        Ok(())
+    }
+}
+
+fn generate_saml_key_material(
+    organization_name: String,
+    valid_from: chrono::DateTime<Utc>,
+    valid_until: chrono::DateTime<Utc>,
+) -> Result<(String, String)> {
+    let rsa_key = Rsa::generate(2048)
+        .map_err(|_| AppError::InternalServerError("Failed to generate SAML key".into()))?;
+    let key_pair_pem = PKey::from_rsa(rsa_key)
+        .and_then(|key| key.private_key_to_pem_pkcs8())
+        .map_err(|_| AppError::InternalServerError("Failed to encode SAML key".into()))?;
+    let private_key_pem = String::from_utf8(key_pair_pem)
+        .map_err(|_| AppError::InternalServerError("Failed to encode SAML key".into()))?;
+    let key_pair = KeyPair::from_pem(&private_key_pem)
+        .map_err(|_| AppError::InternalServerError("Failed to load generated SAML key".into()))?;
+
+    // A SAML signing certificate does not identify a DNS service endpoint.
+    // Keep the display name in the UTF-8 DN and do not mis-encode it as a DNS SAN.
+    let mut params = CertificateParams::new(Vec::<String>::new()).map_err(|_| {
+        AppError::InternalServerError("Failed to configure SAML certificate".into())
+    })?;
+    params.not_before = time::OffsetDateTime::from_unix_timestamp(valid_from.timestamp())
+        .map_err(|_| AppError::InternalServerError("Invalid SAML validity start".into()))?;
+    params.not_after = time::OffsetDateTime::from_unix_timestamp(valid_until.timestamp())
+        .map_err(|_| AppError::InternalServerError("Invalid SAML validity end".into()))?;
+    params.serial_number = Some(SerialNumber::from(Uuid::new_v4().as_bytes().to_vec()));
+
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(
+        DnType::CommonName,
+        format!("{} SAML IdP", organization_name),
+    );
+    distinguished_name.push(DnType::OrganizationName, &organization_name);
+    params.distinguished_name = distinguished_name;
+
+    let public_cert_pem = params
+        .self_signed(&key_pair)
+        .map_err(|_| AppError::InternalServerError("Failed to generate SAML certificate".into()))?
+        .pem();
+    Ok((private_key_pem, public_cert_pem))
+}
 
 // Security Audit Item 7: XXE (XML External Entity) Prevention
 // This function validates XML input to prevent XXE attacks which could lead to:
@@ -73,6 +183,258 @@ fn validate_xml_no_xxe(xml: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedAuthnRequest {
+    request_id: Option<String>,
+    issuer: Option<String>,
+    acs_url: Option<String>,
+    destination: Option<String>,
+}
+
+fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Result<String> {
+    let name = reference.decode().map_err(|error| {
+        AppError::BadRequest(format!("Invalid SAMLRequest entity encoding: {}", error))
+    })?;
+    let encoded = format!("&{};", name);
+
+    quick_xml::escape::unescape(&encoded)
+        .map(|value| value.into_owned())
+        .map_err(|error| {
+            AppError::BadRequest(format!(
+                "Invalid or unknown SAMLRequest entity reference: {}",
+                error
+            ))
+        })
+}
+
+fn is_authn_request_element(name: &[u8]) -> bool {
+    matches!(name, b"samlp:AuthnRequest" | b"AuthnRequest")
+}
+
+fn read_saml_xml_bounded(reader: impl Read, operation: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_SAML_REQUEST_XML_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| AppError::BadRequest(format!("Failed to {operation}: {error}")))?;
+
+    if bytes.len() > MAX_SAML_REQUEST_XML_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "Decoded SAMLRequest exceeds the {MAX_SAML_REQUEST_XML_BYTES}-byte limit"
+        )));
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|error| AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {error}")))
+}
+
+/// Decode a SAML request for either HTTP-Redirect (raw RFC 1951 DEFLATE) or
+/// HTTP-POST (plain XML) binding while bounding the decoded representation.
+fn decode_saml_request_xml(encoded: &str, redirect_binding: bool) -> Result<String> {
+    if encoded.len() > MAX_SAML_REQUEST_ENCODED_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "Encoded SAMLRequest exceeds the {MAX_SAML_REQUEST_ENCODED_BYTES}-byte limit"
+        )));
+    }
+
+    let payload = BASE64
+        .decode(encoded)
+        .map_err(|error| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {error}")))?;
+
+    if redirect_binding {
+        let decoder = flate2::read::DeflateDecoder::new(payload.as_slice());
+        read_saml_xml_bounded(decoder, "inflate SAMLRequest")
+    } else {
+        read_saml_xml_bounded(payload.as_slice(), "read SAMLRequest")
+    }
+}
+
+/// Parse the fields AuthOS consumes from an SP-initiated AuthnRequest.
+///
+/// This stays intentionally separate from XML signature validation. It rejects
+/// DTD/entity declarations, malformed XML, malformed attributes, and unknown
+/// entity references before returning any request data.
+fn parse_authn_request(xml: &str) -> Result<ParsedAuthnRequest> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    validate_xml_no_xxe(xml)?;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut parsed = ParsedAuthnRequest::default();
+    let mut in_issuer = false;
+    let mut open_elements = 0_usize;
+    let mut seen_authn_request = false;
+    let mut work_budget = SamlXmlWorkBudget::default();
+    let mut buf = Vec::new();
+
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        if event.is_ok() {
+            work_budget.observe_event()?;
+        }
+        match event {
+            Ok(Event::Start(element)) => {
+                work_budget.observe_element(element.attributes().count(), false)?;
+                if open_elements == 0 {
+                    if seen_authn_request || !is_authn_request_element(element.name().as_ref()) {
+                        return Err(AppError::BadRequest(
+                            "SAMLRequest root element must be AuthnRequest".into(),
+                        ));
+                    }
+                    seen_authn_request = true;
+                } else if is_authn_request_element(element.name().as_ref()) {
+                    return Err(AppError::BadRequest(
+                        "SAMLRequest must contain exactly one AuthnRequest element".into(),
+                    ));
+                }
+                open_elements += 1;
+                match element.name().as_ref() {
+                    b"samlp:AuthnRequest" | b"AuthnRequest" => {
+                        for attribute in element.attributes() {
+                            let attribute = attribute.map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid SAMLRequest attribute: {}",
+                                    error
+                                ))
+                            })?;
+                            let value = attribute
+                                .decoded_and_normalized_value(
+                                    quick_xml::XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| {
+                                    AppError::BadRequest(format!(
+                                        "Invalid SAMLRequest attribute value: {}",
+                                        error
+                                    ))
+                                })?
+                                .into_owned();
+
+                            match attribute.key.as_ref() {
+                                b"ID" => parsed.request_id = Some(value),
+                                b"AssertionConsumerServiceURL" => parsed.acs_url = Some(value),
+                                b"Destination" => parsed.destination = Some(value),
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"saml:Issuer" | b"Issuer" => {
+                        in_issuer = true;
+                        parsed.issuer = Some(String::new());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                work_budget.observe_element(element.attributes().count(), true)?;
+                if open_elements == 0 {
+                    if seen_authn_request || !is_authn_request_element(element.name().as_ref()) {
+                        return Err(AppError::BadRequest(
+                            "SAMLRequest root element must be AuthnRequest".into(),
+                        ));
+                    }
+                    seen_authn_request = true;
+                } else if is_authn_request_element(element.name().as_ref()) {
+                    return Err(AppError::BadRequest(
+                        "SAMLRequest must contain exactly one AuthnRequest element".into(),
+                    ));
+                }
+
+                if is_authn_request_element(element.name().as_ref()) {
+                    for attribute in element.attributes() {
+                        let attribute = attribute.map_err(|error| {
+                            AppError::BadRequest(format!(
+                                "Invalid SAMLRequest attribute: {}",
+                                error
+                            ))
+                        })?;
+                        let value = attribute
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid SAMLRequest attribute value: {}",
+                                    error
+                                ))
+                            })?
+                            .into_owned();
+
+                        match attribute.key.as_ref() {
+                            b"ID" => parsed.request_id = Some(value),
+                            b"AssertionConsumerServiceURL" => parsed.acs_url = Some(value),
+                            b"Destination" => parsed.destination = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(element)) => {
+                work_budget.leave_element()?;
+                if matches!(element.name().as_ref(), b"saml:Issuer" | b"Issuer") {
+                    in_issuer = false;
+                }
+                open_elements = open_elements.checked_sub(1).ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Error parsing SAMLRequest XML: unexpected closing element".into(),
+                    )
+                })?;
+            }
+            Ok(Event::Text(text)) if in_issuer => {
+                let decoded = text.decode().map_err(|error| {
+                    AppError::BadRequest(format!("Invalid SAMLRequest text encoding: {}", error))
+                })?;
+                parsed.issuer.get_or_insert_default().push_str(
+                    &quick_xml::escape::unescape(&decoded).map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "Invalid SAMLRequest text escaping: {}",
+                            error
+                        ))
+                    })?,
+                );
+            }
+            Ok(Event::GeneralRef(reference)) if in_issuer => {
+                parsed
+                    .issuer
+                    .get_or_insert_default()
+                    .push_str(&decode_xml_reference(&reference)?);
+            }
+            Ok(Event::DocType(_)) | Ok(Event::GeneralRef(_)) => {
+                return Err(AppError::BadRequest(
+                    "XML entity declarations and references are forbidden in SAML requests".into(),
+                ));
+            }
+            Ok(Event::Eof) => {
+                if open_elements != 0 {
+                    return Err(AppError::BadRequest(
+                        "Error parsing SAMLRequest XML: unclosed element".into(),
+                    ));
+                }
+                if !seen_authn_request {
+                    return Err(AppError::BadRequest(
+                        "SAMLRequest root element must be AuthnRequest".into(),
+                    ));
+                }
+                break;
+            }
+            Err(error) => {
+                return Err(AppError::BadRequest(format!(
+                    "Error parsing SAMLRequest XML: {}",
+                    error
+                )));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(parsed)
+}
+
 fn escape_html_attr(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -93,7 +455,7 @@ struct SamlResponseBuilder {
     name_id_format: String,
     email: String,
     sp_entity_id: String,
-    attribute_statement: String,
+    attributes: Vec<(String, String)>,
     in_response_to: Option<String>,
 }
 
@@ -104,7 +466,7 @@ impl SamlResponseBuilder {
         acs_url: &str,
         sp_entity_id: &str,
         name_id_format: &str,
-        attribute_statement: String,
+        attributes: Vec<(String, String)>,
         in_response_to: Option<String>,
     ) -> Self {
         let now = Utc::now();
@@ -120,17 +482,20 @@ impl SamlResponseBuilder {
             name_id_format: name_id_format.to_string(),
             email: user_email.to_string(),
             sp_entity_id: sp_entity_id.to_string(),
-            attribute_statement,
+            attributes,
             in_response_to,
         }
     }
 
-    fn build_assertion(&self) -> String {
+    fn build_assertion(&self) -> Result<String> {
         use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use quick_xml::Writer;
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let write_error = |error| {
+            AppError::InternalServerError(format!("Failed to build SAML assertion XML: {error}"))
+        };
 
         // Start saml:Assertion
         let mut assertion = BytesStart::new("saml:Assertion");
@@ -138,27 +503,45 @@ impl SamlResponseBuilder {
         assertion.push_attribute(("ID", self.assertion_id.as_str()));
         assertion.push_attribute(("Version", "2.0"));
         assertion.push_attribute(("IssueInstant", self.issue_instant.to_rfc3339().as_str()));
-        let _ = writer.write_event(Event::Start(assertion));
+        writer
+            .write_event(Event::Start(assertion))
+            .map_err(write_error)?;
 
         // Issuer - properly escaped
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Issuer")));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.entity_id)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Issuer")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Issuer")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.entity_id)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Issuer")))
+            .map_err(write_error)?;
 
         // Subject
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Subject")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Subject")))
+            .map_err(write_error)?;
 
         // NameID - user email is properly escaped to prevent injection
         let mut name_id = BytesStart::new("saml:NameID");
         name_id.push_attribute(("Format", self.name_id_format.as_str()));
-        let _ = writer.write_event(Event::Start(name_id));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.email)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:NameID")));
+        writer
+            .write_event(Event::Start(name_id))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.email)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:NameID")))
+            .map_err(write_error)?;
 
         // SubjectConfirmation
         let mut subj_conf = BytesStart::new("saml:SubjectConfirmation");
         subj_conf.push_attribute(("Method", "urn:oasis:names:tc:SAML:2.0:cm:bearer"));
-        let _ = writer.write_event(Event::Start(subj_conf));
+        writer
+            .write_event(Event::Start(subj_conf))
+            .map_err(write_error)?;
 
         // SubjectConfirmationData
         let mut subj_conf_data = BytesStart::new("saml:SubjectConfirmationData");
@@ -167,59 +550,117 @@ impl SamlResponseBuilder {
         }
         subj_conf_data.push_attribute(("NotOnOrAfter", self.not_on_or_after.to_rfc3339().as_str()));
         subj_conf_data.push_attribute(("Recipient", self.acs_url.as_str()));
-        let _ = writer.write_event(Event::Empty(subj_conf_data));
+        writer
+            .write_event(Event::Empty(subj_conf_data))
+            .map_err(write_error)?;
 
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:SubjectConfirmation")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Subject")));
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:SubjectConfirmation")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Subject")))
+            .map_err(write_error)?;
 
         // Conditions
         let mut conditions = BytesStart::new("saml:Conditions");
         conditions.push_attribute(("NotBefore", self.issue_instant.to_rfc3339().as_str()));
         conditions.push_attribute(("NotOnOrAfter", self.not_on_or_after.to_rfc3339().as_str()));
-        let _ = writer.write_event(Event::Start(conditions));
+        writer
+            .write_event(Event::Start(conditions))
+            .map_err(write_error)?;
 
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AudienceRestriction")));
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Audience")));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.sp_entity_id)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Audience")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AudienceRestriction")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Conditions")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AudienceRestriction")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Audience")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.sp_entity_id)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Audience")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AudienceRestriction")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Conditions")))
+            .map_err(write_error)?;
 
         // AuthnStatement
         let mut authn_stmt = BytesStart::new("saml:AuthnStatement");
         authn_stmt.push_attribute(("AuthnInstant", self.issue_instant.to_rfc3339().as_str()));
-        let _ = writer.write_event(Event::Start(authn_stmt));
+        writer
+            .write_event(Event::Start(authn_stmt))
+            .map_err(write_error)?;
 
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AuthnContext")));
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AuthnContextClassRef")));
-        let _ = writer.write_event(Event::Text(BytesText::new(
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified",
-        )));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AuthnContextClassRef")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AuthnContext")));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AuthnStatement")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AuthnContext")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AuthnContextClassRef")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(
+                "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified",
+            )))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AuthnContextClassRef")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AuthnContext")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AuthnStatement")))
+            .map_err(write_error)?;
 
-        // AttributeStatement - already formatted, write as raw XML
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:AttributeStatement")));
-        // Note: attribute_statement is pre-built; in a full refactor, this should also use Writer
-        let _ = writer
-            .get_mut()
-            .get_mut()
-            .extend_from_slice(self.attribute_statement.as_bytes());
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:AttributeStatement")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:AttributeStatement")))
+            .map_err(write_error)?;
+        for (name, value) in &self.attributes {
+            let mut attribute = BytesStart::new("saml:Attribute");
+            attribute.push_attribute(("Name", name.as_str()));
+            writer
+                .write_event(Event::Start(attribute))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::Start(BytesStart::new("saml:AttributeValue")))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::Text(BytesText::new(value)))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::End(BytesEnd::new("saml:AttributeValue")))
+                .map_err(write_error)?;
+            writer
+                .write_event(Event::End(BytesEnd::new("saml:Attribute")))
+                .map_err(write_error)?;
+        }
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:AttributeStatement")))
+            .map_err(write_error)?;
 
         // End Assertion
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Assertion")));
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Assertion")))
+            .map_err(write_error)?;
 
-        String::from_utf8(writer.into_inner().into_inner()).unwrap_or_default()
+        String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+            AppError::InternalServerError(format!("SAML assertion was not valid UTF-8: {error}"))
+        })
     }
 
-    fn build_response(&self, assertion_with_signature: &str) -> String {
+    fn build_response(&self, assertion_with_signature: &str) -> Result<String> {
         use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
         use quick_xml::Writer;
         use std::io::Cursor;
 
         let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let write_error = |error| {
+            AppError::InternalServerError(format!("Failed to build SAML response XML: {error}"))
+        };
 
         // Start samlp:Response
         let mut response = BytesStart::new("samlp:Response");
@@ -234,30 +675,50 @@ impl SamlResponseBuilder {
 
         response.push_attribute(("IssueInstant", self.issue_instant.to_rfc3339().as_str()));
         response.push_attribute(("Destination", self.acs_url.as_str()));
-        let _ = writer.write_event(Event::Start(response));
+        writer
+            .write_event(Event::Start(response))
+            .map_err(write_error)?;
 
         // Issuer
-        let _ = writer.write_event(Event::Start(BytesStart::new("saml:Issuer")));
-        let _ = writer.write_event(Event::Text(BytesText::new(&self.entity_id)));
-        let _ = writer.write_event(Event::End(BytesEnd::new("saml:Issuer")));
+        writer
+            .write_event(Event::Start(BytesStart::new("saml:Issuer")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(&self.entity_id)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("saml:Issuer")))
+            .map_err(write_error)?;
 
         // Status
-        let _ = writer.write_event(Event::Start(BytesStart::new("samlp:Status")));
+        writer
+            .write_event(Event::Start(BytesStart::new("samlp:Status")))
+            .map_err(write_error)?;
         let mut status_code = BytesStart::new("samlp:StatusCode");
         status_code.push_attribute(("Value", "urn:oasis:names:tc:SAML:2.0:status:Success"));
-        let _ = writer.write_event(Event::Empty(status_code));
-        let _ = writer.write_event(Event::End(BytesEnd::new("samlp:Status")));
+        writer
+            .write_event(Event::Empty(status_code))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("samlp:Status")))
+            .map_err(write_error)?;
 
         // Write the signed assertion raw (since it's already built and signed)
         // Use from_escaped to treat the input as raw XML (not escaping it)
-        let _ = writer.write_event(Event::Text(BytesText::from_escaped(
-            assertion_with_signature,
-        )));
+        writer
+            .write_event(Event::Text(BytesText::from_escaped(
+                assertion_with_signature,
+            )))
+            .map_err(write_error)?;
 
         // End samlp:Response
-        let _ = writer.write_event(Event::End(BytesEnd::new("samlp:Response")));
+        writer
+            .write_event(Event::End(BytesEnd::new("samlp:Response")))
+            .map_err(write_error)?;
 
-        String::from_utf8(writer.into_inner().into_inner()).unwrap_or_default()
+        String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+            AppError::InternalServerError(format!("SAML response was not valid UTF-8: {error}"))
+        })
     }
 
     fn get_assertion_id(&self) -> &str {
@@ -267,6 +728,211 @@ impl SamlResponseBuilder {
     fn get_response_id(&self) -> &str {
         &self.response_id
     }
+}
+
+fn insert_signature_after_issuer(xml: &str, signature: &str) -> Result<String> {
+    const ISSUER_END: &str = "</saml:Issuer>";
+    let insertion_point = xml.find(ISSUER_END).ok_or_else(|| {
+        AppError::InternalServerError(
+            "Generated SAML XML did not contain the expected Issuer element".into(),
+        )
+    })? + ISSUER_END.len();
+
+    let mut signed = String::with_capacity(xml.len() + signature.len());
+    signed.push_str(&xml[..insertion_point]);
+    signed.push_str(signature);
+    signed.push_str(&xml[insertion_point..]);
+    Ok(signed)
+}
+
+fn build_logout_response_xml(
+    response_id: &str,
+    issue_instant: &chrono::DateTime<Utc>,
+    destination: &str,
+    in_response_to: &str,
+    entity_id: &str,
+) -> Result<String> {
+    use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+    use quick_xml::Writer;
+    use std::io::Cursor;
+
+    let mut writer = Writer::new(Cursor::new(Vec::new()));
+    let write_error = |error| {
+        AppError::InternalServerError(format!("Failed to build SAML logout response: {error}"))
+    };
+
+    let mut response = BytesStart::new("samlp:LogoutResponse");
+    response.push_attribute(("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol"));
+    response.push_attribute(("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion"));
+    response.push_attribute(("ID", response_id));
+    response.push_attribute(("Version", "2.0"));
+    response.push_attribute(("IssueInstant", issue_instant.to_rfc3339().as_str()));
+    response.push_attribute(("Destination", destination));
+    response.push_attribute(("InResponseTo", in_response_to));
+    writer
+        .write_event(Event::Start(response))
+        .map_err(write_error)?;
+
+    writer
+        .write_event(Event::Start(BytesStart::new("saml:Issuer")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::Text(BytesText::new(entity_id)))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("saml:Issuer")))
+        .map_err(write_error)?;
+
+    writer
+        .write_event(Event::Start(BytesStart::new("samlp:Status")))
+        .map_err(write_error)?;
+    let mut status = BytesStart::new("samlp:StatusCode");
+    status.push_attribute(("Value", "urn:oasis:names:tc:SAML:2.0:status:Success"));
+    writer
+        .write_event(Event::Empty(status))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("samlp:Status")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("samlp:LogoutResponse")))
+        .map_err(write_error)?;
+
+    String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+        AppError::InternalServerError(format!("SAML logout response was not valid UTF-8: {error}"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_saml_metadata_xml(
+    entity_id: &str,
+    certificates: &[String],
+    name_id_format: &str,
+    sso_url: &str,
+    slo_url: &str,
+    organization_name: &str,
+    organization_url: &str,
+) -> Result<String> {
+    use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+    use quick_xml::Writer;
+    use std::io::Cursor;
+
+    let mut writer = Writer::new(Cursor::new(Vec::new()));
+    let write_error = |error| {
+        AppError::InternalServerError(format!("Failed to build SAML metadata XML: {error}"))
+    };
+    writer
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .map_err(write_error)?;
+
+    let mut entity = BytesStart::new("EntityDescriptor");
+    entity.push_attribute(("xmlns", "urn:oasis:names:tc:SAML:2.0:metadata"));
+    entity.push_attribute(("entityID", entity_id));
+    writer
+        .write_event(Event::Start(entity))
+        .map_err(write_error)?;
+
+    let mut idp = BytesStart::new("IDPSSODescriptor");
+    idp.push_attribute(("WantAuthnRequestsSigned", "false"));
+    idp.push_attribute((
+        "protocolSupportEnumeration",
+        "urn:oasis:names:tc:SAML:2.0:protocol",
+    ));
+    writer.write_event(Event::Start(idp)).map_err(write_error)?;
+
+    for certificate in certificates {
+        let mut key_descriptor = BytesStart::new("KeyDescriptor");
+        key_descriptor.push_attribute(("use", "signing"));
+        writer
+            .write_event(Event::Start(key_descriptor))
+            .map_err(write_error)?;
+        let mut key_info = BytesStart::new("KeyInfo");
+        key_info.push_attribute(("xmlns", "http://www.w3.org/2000/09/xmldsig#"));
+        writer
+            .write_event(Event::Start(key_info))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("X509Data")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("X509Certificate")))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(certificate)))
+            .map_err(write_error)?;
+        for name in ["X509Certificate", "X509Data", "KeyInfo", "KeyDescriptor"] {
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(write_error)?;
+        }
+    }
+
+    writer
+        .write_event(Event::Start(BytesStart::new("NameIDFormat")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::Text(BytesText::new(name_id_format)))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("NameIDFormat")))
+        .map_err(write_error)?;
+
+    for binding in [
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+    ] {
+        let mut service = BytesStart::new("SingleSignOnService");
+        service.push_attribute(("Binding", binding));
+        service.push_attribute(("Location", sso_url));
+        writer
+            .write_event(Event::Empty(service))
+            .map_err(write_error)?;
+    }
+    for binding in [
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+        "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+    ] {
+        let mut service = BytesStart::new("SingleLogoutService");
+        service.push_attribute(("Binding", binding));
+        service.push_attribute(("Location", slo_url));
+        writer
+            .write_event(Event::Empty(service))
+            .map_err(write_error)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new("IDPSSODescriptor")))
+        .map_err(write_error)?;
+
+    writer
+        .write_event(Event::Start(BytesStart::new("Organization")))
+        .map_err(write_error)?;
+    for (element_name, value) in [
+        ("OrganizationName", organization_name),
+        ("OrganizationDisplayName", organization_name),
+        ("OrganizationURL", organization_url),
+    ] {
+        let mut element = BytesStart::new(element_name);
+        element.push_attribute(("xml:lang", "en"));
+        writer
+            .write_event(Event::Start(element))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::Text(BytesText::new(value)))
+            .map_err(write_error)?;
+        writer
+            .write_event(Event::End(BytesEnd::new(element_name)))
+            .map_err(write_error)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new("Organization")))
+        .map_err(write_error)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("EntityDescriptor")))
+        .map_err(write_error)?;
+
+    String::from_utf8(writer.into_inner().into_inner()).map_err(|error| {
+        AppError::InternalServerError(format!("SAML metadata was not valid UTF-8: {error}"))
+    })
 }
 
 // XML Signing Helper Functions
@@ -287,7 +953,7 @@ fn sign_xml_element(
     })?;
 
     // Canonicalize the XML element (basic C14N - remove extra whitespace, normalize)
-    let canonical_xml = canonicalize_xml(xml_element);
+    let canonical_xml = canonicalize_xml(xml_element)?;
 
     // Compute SHA-256 digest
     let mut hasher = Sha256::new();
@@ -332,7 +998,7 @@ fn sign_xml_element(
     );
 
     // Canonicalize SignedInfo (use version with namespace)
-    let canonical_signed_info = canonicalize_xml(&signed_info_for_signing);
+    let canonical_signed_info = canonicalize_xml(&signed_info_for_signing)?;
 
     let mut signer = Signer::new(MessageDigest::sha256(), &private_key)
         .map_err(|e| AppError::InternalServerError(format!("Failed to create signer: {}", e)))?;
@@ -373,15 +1039,15 @@ fn sign_xml_element(
 
 /// Exclusive XML Canonicalization (exc-c14n) implementation
 /// Implements http://www.w3.org/2001/10/xml-exc-c14n# algorithm
-fn canonicalize_xml(xml: &str) -> String {
+fn canonicalize_xml(xml: &str) -> Result<String> {
     use quick_xml::events::{BytesEnd, BytesText, Event};
     use quick_xml::{Reader, Writer};
     use std::borrow::Cow;
     use std::io::Cursor;
 
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(false); // Don't auto-trim - we handle whitespace
-    reader.expand_empty_elements(true); // Convert empty elements to start/end pairs
+    reader.config_mut().trim_text(false); // Don't auto-trim - we handle whitespace
+    reader.config_mut().expand_empty_elements = true; // Convert empty elements to start/end pairs
 
     let mut output = Vec::new();
     let mut writer = Writer::new(Cursor::new(&mut output));
@@ -390,6 +1056,8 @@ fn canonicalize_xml(xml: &str) -> String {
     let mut ns_stack: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
 
     let mut buf = Vec::new();
+    let mut open_elements = 0_usize;
+    let mut root_elements = 0_usize;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -397,35 +1065,78 @@ fn canonicalize_xml(xml: &str) -> String {
                 // XML declaration is omitted in canonical form
             }
             Ok(Event::Start(e)) => {
-                let sorted_element = canonicalize_start_element(&e, &mut ns_stack);
-                writer.write_event(Event::Start(sorted_element)).ok();
+                if open_elements == 0 {
+                    root_elements += 1;
+                }
+                open_elements += 1;
+                let sorted_element = canonicalize_start_element(&e, &mut ns_stack)?;
+                writer
+                    .write_event(Event::Start(sorted_element))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML start element: {error}"
+                        ))
+                    })?;
             }
             Ok(Event::End(e)) => {
+                open_elements = open_elements.checked_sub(1).ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "Cannot canonicalize XML with an unexpected closing element".into(),
+                    )
+                })?;
                 // Pop namespace scope
                 if ns_stack.len() > 1 {
                     ns_stack.pop();
                 }
-                writer.write_event(Event::End(e.to_owned())).ok();
+                writer
+                    .write_event(Event::End(e.to_owned()))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML end element: {error}"
+                        ))
+                    })?;
             }
             Ok(Event::Empty(e)) => {
                 // Empty elements are expanded to start/end pairs by reader config
                 // But handle if we still get one
-                let sorted_element = canonicalize_start_element(&e, &mut ns_stack);
+                if open_elements == 0 {
+                    root_elements += 1;
+                }
+                let sorted_element = canonicalize_start_element(&e, &mut ns_stack)?;
                 let end_name: Cow<'static, str> =
                     Cow::Owned(String::from_utf8_lossy(e.name().as_ref()).into_owned());
-                writer.write_event(Event::Start(sorted_element)).ok();
-                writer.write_event(Event::End(BytesEnd::new(end_name))).ok();
+                writer
+                    .write_event(Event::Start(sorted_element))
+                    .and_then(|_| writer.write_event(Event::End(BytesEnd::new(end_name))))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize empty XML element: {error}"
+                        ))
+                    })?;
                 if ns_stack.len() > 1 {
                     ns_stack.pop();
                 }
             }
             Ok(Event::Text(e)) => {
                 // Normalize text content - preserve significant whitespace
-                let text = e.unescape().unwrap_or_default();
+                let decoded = e.decode().map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "Cannot canonicalize invalid XML text encoding: {error}"
+                    ))
+                })?;
+                let text = quick_xml::escape::unescape(&decoded).map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "Cannot canonicalize invalid XML text escaping: {error}"
+                    ))
+                })?;
                 let normalized = normalize_text(&text);
                 writer
                     .write_event(Event::Text(BytesText::new(&normalized)))
-                    .ok();
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML text: {error}"
+                        ))
+                    })?;
             }
             Ok(Event::Comment(_)) => {
                 // Comments are omitted in canonical form (without comments variant)
@@ -435,27 +1146,59 @@ fn canonicalize_xml(xml: &str) -> String {
             }
             Ok(Event::CData(e)) => {
                 // CDATA sections are replaced with their character content
-                let text = String::from_utf8_lossy(&e);
+                let text = e.decode().map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "Cannot canonicalize invalid XML CDATA encoding: {error}"
+                    ))
+                })?;
                 let normalized = normalize_text(&text);
                 writer
                     .write_event(Event::Text(BytesText::new(&normalized)))
-                    .ok();
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML CDATA: {error}"
+                        ))
+                    })?;
             }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Ok(Event::GeneralRef(reference)) => {
+                let decoded = decode_xml_reference(&reference)?;
+                writer
+                    .write_event(Event::Text(BytesText::new(&decoded)))
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "Failed to canonicalize XML entity reference: {error}"
+                        ))
+                    })?;
+            }
+            Ok(Event::Eof) => {
+                if open_elements != 0 || root_elements != 1 {
+                    return Err(AppError::InternalServerError(
+                        "Cannot canonicalize malformed XML: expected exactly one closed root element"
+                            .into(),
+                    ));
+                }
+                break;
+            }
+            Err(error) => {
+                return Err(AppError::InternalServerError(format!(
+                    "Cannot canonicalize malformed XML: {error}"
+                )))
+            }
             _ => {}
         }
         buf.clear();
     }
 
-    String::from_utf8_lossy(&output).into_owned()
+    String::from_utf8(output).map_err(|error| {
+        AppError::InternalServerError(format!("Canonical XML was not valid UTF-8: {error}"))
+    })
 }
 
 /// Canonicalize a start element by sorting namespaces and attributes
 fn canonicalize_start_element(
     element: &quick_xml::events::BytesStart,
     ns_stack: &mut Vec<BTreeMap<String, String>>,
-) -> quick_xml::events::BytesStart<'static> {
+) -> Result<quick_xml::events::BytesStart<'static>> {
     use quick_xml::events::BytesStart;
 
     // Collect namespaces and attributes from the element
@@ -467,33 +1210,43 @@ fn canonicalize_start_element(
     let mut current_ns = parent_ns.clone();
 
     // Parse all attributes
-    for attr_result in element.attributes() {
-        if let Ok(attr) = attr_result {
-            let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-            let value = attr.unescape_value().unwrap_or_default().into_owned();
+    for attr in element.attributes() {
+        let attr = attr.map_err(|error| {
+            AppError::InternalServerError(format!(
+                "Cannot canonicalize malformed XML attribute: {error}"
+            ))
+        })?;
+        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        let value = attr
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|error| {
+                AppError::InternalServerError(format!(
+                    "Cannot canonicalize invalid XML attribute value: {error}"
+                ))
+            })?
+            .into_owned();
 
-            if key == "xmlns" {
-                // Default namespace declaration
-                namespaces.insert(String::new(), value.clone());
-                current_ns.insert(String::new(), value);
-            } else if let Some(prefix) = key.strip_prefix("xmlns:") {
-                // Prefixed namespace declaration
-                namespaces.insert(prefix.to_string(), value.clone());
-                current_ns.insert(prefix.to_string(), value);
+        if key == "xmlns" {
+            // Default namespace declaration
+            namespaces.insert(String::new(), value.clone());
+            current_ns.insert(String::new(), value);
+        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+            // Prefixed namespace declaration
+            namespaces.insert(prefix.to_string(), value.clone());
+            current_ns.insert(prefix.to_string(), value);
+        } else {
+            // Regular attribute - store with empty namespace for now
+            let (ns_uri, local_name) = if key.contains(':') {
+                let parts: Vec<&str> = key.splitn(2, ':').collect();
+                let prefix = parts[0];
+                let local = parts[1];
+                // Look up namespace URI from current scope
+                let uri = current_ns.get(prefix).cloned().unwrap_or_default();
+                (uri, local.to_string())
             } else {
-                // Regular attribute - store with empty namespace for now
-                let (ns_uri, local_name) = if key.contains(':') {
-                    let parts: Vec<&str> = key.splitn(2, ':').collect();
-                    let prefix = parts[0];
-                    let local = parts[1];
-                    // Look up namespace URI from current scope
-                    let uri = current_ns.get(prefix).cloned().unwrap_or_default();
-                    (uri, local.to_string())
-                } else {
-                    (String::new(), key)
-                };
-                attributes.insert((ns_uri, local_name), value);
-            }
+                (String::new(), key)
+            };
+            attributes.insert((ns_uri, local_name), value);
         }
     }
 
@@ -576,7 +1329,7 @@ fn canonicalize_start_element(
         }
     }
 
-    new_element
+    Ok(new_element)
 }
 
 /// Normalize attribute values according to XML C14N spec
@@ -632,6 +1385,12 @@ pub struct ConfigureSamlResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RetireSamlCertificateOverlapResponse {
+    pub success: bool,
+    pub retired_certificates: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SamlConfigResponse {
     pub enabled: bool,
     pub entity_id: Option<String>,
@@ -652,13 +1411,24 @@ pub struct SamlSsoQuery {
     pub relay_state: Option<String>,
 }
 
-// Helper function to check if user can manage service
-async fn can_manage_service(
-    pool: &sea_orm::DatabaseConnection,
+async fn can_manage_specific_service_in(
+    db: DB<'_>,
     user_id: &str,
     org_id: &str,
+    service_id: &str,
 ) -> Result<bool> {
-    PermissionService::check(DB::Conn(pool), org_id, user_id, CAP_SERVICES_MANAGE).await
+    if PermissionService::check(db.clone(), org_id, user_id, CAP_SERVICES_MANAGE).await? {
+        return Ok(true);
+    }
+
+    if MembershipStore::find_by_org_and_user(db.clone(), org_id, user_id)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+
+    PermissionsStore::check(db, "service", service_id, "manager", user_id).await
 }
 
 async fn can_manage_specific_service(
@@ -667,18 +1437,127 @@ async fn can_manage_specific_service(
     org_id: &str,
     service_id: &str,
 ) -> Result<bool> {
-    if can_manage_service(pool, user_id, org_id).await? {
+    can_manage_specific_service_in(DB::Conn(pool), user_id, org_id, service_id).await
+}
+
+fn saml_idp_entity_id(base_url: &str, org_slug: &str, service_slug: &str) -> String {
+    format!("{base_url}/saml/{org_slug}/{service_slug}")
+}
+
+/// Assertion access is deliberately narrower than management authority. In
+/// particular, platform ownership does not imply access to a tenant's users or
+/// permission to mint an assertion into that tenant's service.
+async fn has_current_saml_assertion_access(
+    db: DB<'_>,
+    user_id: &str,
+    org_id: &str,
+    service_id: &str,
+) -> Result<bool> {
+    if IdentityStore::exists_for_user_and_service_context(db.clone(), user_id, org_id, service_id)
+        .await?
+    {
         return Ok(true);
     }
 
-    if MembershipStore::find_by_org_and_user(DB::Conn(pool), org_id, user_id)
+    Ok(MembershipStore::find_by_org_and_user(db, org_id, user_id)
         .await?
-        .is_none()
-    {
-        return Ok(false);
+        .is_some())
+}
+
+async fn load_current_saml_completion_context(
+    db: DB<'_>,
+    saml_state: &crate::entities::saml_states::Model,
+    user_id: &str,
+) -> Result<(
+    crate::entities::services::Model,
+    crate::entities::organizations::Model,
+)> {
+    let service = ServiceStore::find_by_id(db.clone(), &saml_state.service_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+    let org = OrganizationStore::find_by_id(db.clone(), &service.org_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
+
+    if org.status != "active" {
+        return Err(AppError::Forbidden("Organization is not active".into()));
+    }
+    if !service.saml_enabled {
+        return Err(AppError::BadRequest(
+            "SAML is no longer enabled for this service".into(),
+        ));
+    }
+    if service.saml_acs_url.as_deref() != Some(saml_state.acs_url.as_str()) {
+        return Err(AppError::BadRequest(
+            "SAML configuration changed after authentication started".into(),
+        ));
+    }
+    if service.saml_entity_id.as_deref() != saml_state.issuer.as_deref() {
+        return Err(AppError::BadRequest(
+            "SAML configuration changed after authentication started".into(),
+        ));
+    }
+    if !has_current_saml_assertion_access(db, user_id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You do not currently have access to this service".into(),
+        ));
     }
 
-    PermissionsStore::check(DB::Conn(pool), "service", service_id, "manager", user_id).await
+    Ok((service, org))
+}
+
+pub(crate) async fn validate_saml_completion_context(
+    state: &AppState,
+    saml_state_id: &str,
+    expected_service_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let saml_state = SamlStateStore::find_by_state_id(DB::Conn(&state.db), saml_state_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Invalid or expired SAML state".into()))?;
+    if saml_state.service_id != expected_service_id {
+        return Err(AppError::BadRequest(
+            "SAML state does not belong to the MFA service context".into(),
+        ));
+    }
+    load_current_saml_completion_context(DB::Conn(&state.db), &saml_state, user_id).await?;
+    Ok(())
+}
+
+async fn ensure_saml_assertion_snapshot_is_current(
+    db: DB<'_>,
+    user_id: &str,
+    org: &crate::entities::organizations::Model,
+    service: &crate::entities::services::Model,
+) -> Result<()> {
+    let current_service = ServiceStore::find_by_id(db.clone(), &service.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+    let current_org = OrganizationStore::find_by_id(db.clone(), &org.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
+
+    if current_org.status != "active"
+        || current_org.slug != org.slug
+        || current_service.org_id != org.id
+        || !current_service.saml_enabled
+        || current_service.saml_acs_url != service.saml_acs_url
+        || current_service.saml_entity_id != service.saml_entity_id
+        || current_service.saml_name_id_format != service.saml_name_id_format
+        || current_service.saml_attribute_mapping != service.saml_attribute_mapping
+        || current_service.saml_sign_assertions != service.saml_sign_assertions
+        || current_service.saml_sign_response != service.saml_sign_response
+    {
+        return Err(AppError::BadRequest(
+            "SAML configuration changed while the assertion was being prepared".into(),
+        ));
+    }
+    if !has_current_saml_assertion_access(db, user_id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You do not currently have access to this service".into(),
+        ));
+    }
+    Ok(())
 }
 
 // Handler: Configure SAML for a service
@@ -788,8 +1667,21 @@ pub async fn configure_saml(
             AppError::InternalServerError(format!("Failed to serialize attribute mapping: {}", e))
         })?;
 
-    // Update service SAML configuration
-    // Update service configuration with retry
+    use crate::services::audit_builder::OrgAuditBuilder;
+    let event = OrgAuditBuilder::new(&org.id, Some(&user.user.id), "saml.configured")
+        .target("service", &service.id)
+        .ip_address(Some(&req_info.ip_address))
+        .user_agent(Some(req_info.user_agent.clone()))
+        .success(true)
+        .details_json(Some(serde_json::json!({
+            "action": if req.enabled { "saml_configured" } else { "saml_disabled" },
+            "entity_id": req.entity_id,
+            "acs_url": req.acs_url
+        })))
+        .build();
+    let audit_actor = state.audit_actor.clone();
+
+    // Update the configuration and its success event atomically.
     with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
@@ -798,12 +1690,14 @@ pub async fn configure_saml(
         |db| {
             let service_id = service.id.clone();
             let req = req.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
                 let name_id_format = req.name_id_format.clone().unwrap_or_else(|| {
                     "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_string()
                 });
 
-                ServiceStore::update_saml_config(
+                let updated = ServiceStore::update_saml_config(
                     db.clone(),
                     &service_id,
                     req.enabled,
@@ -818,26 +1712,13 @@ pub async fn configure_saml(
                     req.sign_assertions.unwrap_or(true),
                     req.sign_response.unwrap_or(true),
                 )
-                .await
+                .await?;
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(updated)
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    use crate::services::audit_builder::OrgAuditBuilder;
-    let event = OrgAuditBuilder::new(&org.id, Some(&user.user.id), "saml.configured")
-        .target("service", &service.id)
-        .ip_address(Some(&req_info.ip_address))
-        .user_agent(Some(req_info.user_agent.clone()))
-        .success(true)
-        .details_json(Some(serde_json::json!({
-            "action": if req.enabled { "saml_configured" } else { "saml_disabled" },
-            "entity_id": req.entity_id,
-            "acs_url": req.acs_url
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(Json(ConfigureSamlResponse {
         success: true,
@@ -895,6 +1776,77 @@ pub async fn get_saml_config(
     }))
 }
 
+fn saml_certificate_lifecycle_status(
+    certificate: &crate::entities::saml_signing_keys::Model,
+    now: chrono::DateTime<Utc>,
+) -> &'static str {
+    let valid_from =
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(certificate.valid_from, Utc);
+    let valid_until =
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(certificate.valid_until, Utc);
+    if valid_from > now {
+        "not_yet_valid"
+    } else if valid_until <= now {
+        "expired"
+    } else if valid_until - now <= Duration::days(SAML_CERTIFICATE_EXPIRY_WARNING_DAYS) {
+        "expiring_soon"
+    } else {
+        "healthy"
+    }
+}
+
+async fn build_saml_certificate_info(
+    db: DB<'_>,
+    certificate: crate::entities::saml_signing_keys::Model,
+    now: chrono::DateTime<Utc>,
+) -> Result<SamlCertificateInfo> {
+    let previous =
+        SamlSigningKeysStore::find_published_verification_keys_at(db, &certificate.service_id, now)
+            .await?
+            .into_iter()
+            .filter(|key| !key.is_active)
+            .filter_map(|key| {
+                Some(SamlPublishedCertificateInfo {
+                    public_key: key.public_key,
+                    valid_from: chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                        key.valid_from,
+                        Utc,
+                    ),
+                    valid_until: chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                        key.valid_until,
+                        Utc,
+                    ),
+                    publish_until: chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                        key.publish_until?,
+                        Utc,
+                    ),
+                    created_at: chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                        key.created_at,
+                        Utc,
+                    ),
+                })
+            })
+            .collect();
+    let valid_from =
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(certificate.valid_from, Utc);
+    let valid_until =
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(certificate.valid_until, Utc);
+    let created_at =
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(certificate.created_at, Utc);
+    let lifecycle_status = saml_certificate_lifecycle_status(&certificate, now).to_string();
+
+    Ok(SamlCertificateInfo {
+        public_key: certificate.public_key,
+        valid_from,
+        valid_until,
+        is_active: certificate.is_active,
+        created_at,
+        lifecycle_status,
+        expires_in_seconds: (valid_until - now).num_seconds(),
+        published_previous_certificates: previous,
+    })
+}
+
 // Handler: Generate SAML signing certificate
 pub async fn generate_saml_certificate(
     State(state): State<AppState>,
@@ -938,143 +1890,48 @@ pub async fn generate_saml_certificate(
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("Encryption service not available".into()))?;
 
-    let rsa_key = Rsa::generate(2048)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to generate RSA key: {}", e)))?;
-    let key_pair_pem = PKey::from_rsa(rsa_key)
-        .and_then(|key| key.private_key_to_pem_pkcs8())
-        .map_err(|e| {
-            AppError::InternalServerError(format!("Failed to encode RSA key to PKCS#8 PEM: {}", e))
-        })?;
-
-    let private_key_pem = String::from_utf8(key_pair_pem).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to encode private key PEM as UTF-8: {}", e))
-    })?;
-
-    // Create rcgen KeyPair from the PEM-encoded private key
-    let key_pair = KeyPair::from_pem(&private_key_pem).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to create KeyPair from PEM: {}", e))
-    })?;
-
-    // Create certificate parameters
-    // rcgen 0.13 requires SANs in new()
-    let mut params = CertificateParams::new(vec![org.name.clone()]).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to create certificate params: {}", e))
-    })?;
-
-    // Set validity period using time crate
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + time::Duration::days(365 * 10); // 10 years
-    params.serial_number = Some(SerialNumber::from(42));
-
-    // Set Distinguished Name (Subject)
-    let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, format!("{} SAML IdP", org.name));
-    distinguished_name.push(DnType::OrganizationName, &org.name);
-    params.distinguished_name = distinguished_name;
-
-    // Create certificate using the specific key pair (RSA)
-    let cert = params.self_signed(&key_pair).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to generate certificate: {}", e))
-    })?;
-
-    // Get the certificate PEM (public part)
-    let public_cert_pem = cert.pem();
+    let keygen_permit = crate::services::concurrency::ASYMMETRIC_KEYGEN_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|_| AppError::InternalServerError("SAML key generation unavailable".into()))?;
+    let organization_name = org.name.clone();
+    let valid_from = Utc::now()
+        .with_nanosecond(0)
+        .ok_or_else(|| AppError::InternalServerError("Failed to set SAML validity start".into()))?;
+    let valid_until = valid_from + Duration::days(365 * 3);
+    let (private_key_pem, public_cert_pem) = tokio::task::spawn_blocking(move || {
+        generate_saml_key_material(organization_name, valid_from, valid_until)
+    })
+    .await
+    .map_err(|_| AppError::InternalServerError("SAML key generation failed".into()))??;
+    drop(keygen_permit);
 
     // Encrypt the PKCS#8 private key
-    let private_key_encrypted = encryption.encrypt(&private_key_pem).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to encrypt private key: {}", e))
-    })?;
+    let key_id = Uuid::new_v4().to_string();
+    let private_key_encrypted = encryption
+        .encrypt_with_context(
+            &private_key_pem,
+            crate::encryption::EncryptionContext::new(
+                "saml_signing_keys",
+                &key_id,
+                "private_key_encrypted",
+            ),
+        )
+        .map_err(|e| {
+            AppError::InternalServerError(format!("Failed to encrypt private key: {}", e))
+        })?;
 
-    let _key_id = Uuid::new_v4().to_string();
-    let valid_from = Utc::now();
-    let valid_until = Utc::now() + Duration::days(365 * 3);
     let encryption_key_id = encryption.key_id().to_string();
 
     // Use standard retry wrapper
     let helper_service_id = service.id.clone();
+    let helper_org_id = org.id.clone();
     let helper_private_key = private_key_encrypted.clone();
     let helper_public_cert = public_cert_pem.clone();
     let helper_key_id = encryption_key_id.clone();
+    let helper_record_id = key_id.clone();
+    let helper_user_id = user.user.id.clone();
 
-    let cert_info = with_retrying_transaction(
-        &state.db,
-        #[cfg(feature = "db_sqlite")]
-        &state.db_writer,
-        "generate_saml_cert",
-        |db| {
-            let service_id = helper_service_id.clone();
-            let private_key_encrypted = helper_private_key.clone();
-            let public_cert_pem = helper_public_cert.clone();
-            let encryption_key_id = helper_key_id.clone();
-            let valid_from = valid_from;
-            let valid_until = valid_until;
-
-            Box::pin(async move {
-                use sea_orm::{EntityTrait, QuerySelect};
-                // 1. LOCKING: Select the Service row "FOR UPDATE" to serialize concurrent requests
-                let _service_lock = crate::entities::services::Entity::find_by_id(&service_id)
-                    .lock_exclusive()
-                    .one(&db)
-                    .await
-                    .map_err(|e| {
-                        AppError::InternalServerError(format!("Failed to lock service: {}", e))
-                    })?
-                    .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
-
-                // 2. Check if a recent active certificate already exists
-                if let Some(existing_cert) =
-                    SamlSigningKeysStore::find_active_by_service(db.clone(), &service_id).await?
-                {
-                    let created_at =
-                        chrono::DateTime::from_naive_utc_and_offset(existing_cert.created_at, Utc);
-                    let age = Utc::now().signed_duration_since(created_at);
-                    if age.num_seconds() < 1 {
-                        return Ok(SamlCertificateInfo {
-                            public_key: existing_cert.public_key,
-                            valid_from: chrono::DateTime::from_naive_utc_and_offset(
-                                existing_cert.valid_from,
-                                Utc,
-                            ),
-                            valid_until: chrono::DateTime::from_naive_utc_and_offset(
-                                existing_cert.valid_until,
-                                Utc,
-                            ),
-                            is_active: existing_cert.is_active,
-                            created_at,
-                        });
-                    }
-                }
-
-                // 3. Deactivate any existing active keys
-                SamlSigningKeysStore::deactivate_all_for_service(db.clone(), &service_id).await?;
-
-                // 4. Insert new certificate
-                SamlSigningKeysStore::create(
-                    db.clone(),
-                    &service_id,
-                    private_key_encrypted,
-                    &public_cert_pem,
-                    &encryption_key_id,
-                    valid_from,
-                    valid_until,
-                    true, // is_active
-                )
-                .await?;
-
-                Ok(SamlCertificateInfo {
-                    public_key: public_cert_pem,
-                    valid_from,
-                    valid_until,
-                    is_active: true,
-                    created_at: Utc::now(),
-                })
-            })
-        },
-    )
-    .await?;
-
-    // Non-blocking audit via actor
     use crate::services::audit_builder::OrgAuditBuilder;
     let event = OrgAuditBuilder::new(&org.id, Some(&user.user.id), "saml.certificate_generated")
         .target("service", &service.id)
@@ -1086,7 +1943,123 @@ pub async fn generate_saml_certificate(
             "valid_until": valid_until.naive_utc()
         })))
         .build();
-    state.audit_actor.log_org(event).await;
+    let audit_actor = state.audit_actor.clone();
+
+    let cert_info = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "generate_saml_cert",
+        |db| {
+            let service_id = helper_service_id.clone();
+            let org_id = helper_org_id.clone();
+            let private_key_encrypted = helper_private_key.clone();
+            let public_cert_pem = helper_public_cert.clone();
+            let encryption_key_id = helper_key_id.clone();
+            let record_id = helper_record_id.clone();
+            let user_id = helper_user_id.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
+            Box::pin(async move {
+                use sea_orm::{EntityTrait, QuerySelect};
+                let locked_org = crate::entities::organizations::Entity::find_by_id(&org_id)
+                    .lock_exclusive()
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
+                if locked_org.status != "active" {
+                    return Err(AppError::Forbidden(
+                        "Organization must be active to generate SAML certificate".into(),
+                    ));
+                }
+
+                // Serialize rotation with other service-scoped configuration
+                // mutations and revalidate both tenancy and authority after
+                // the potentially expensive key generation step.
+                let locked_service = crate::entities::services::Entity::find_by_id(&service_id)
+                    .lock_exclusive()
+                    .one(&db)
+                    .await
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!("Failed to lock service: {}", e))
+                    })?
+                    .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+
+                // Revalidate the state protected by the row lock rather than
+                // relying on the snapshot read before key generation.
+                if locked_service.org_id != org_id {
+                    return Err(AppError::Forbidden(
+                        "Service no longer belongs to this organization".into(),
+                    ));
+                }
+                if !locked_service.saml_enabled {
+                    return Err(AppError::BadRequest(
+                        "SAML is no longer enabled for this service".into(),
+                    ));
+                }
+                if !can_manage_specific_service_in(db.clone(), &user_id, &org_id, &service_id)
+                    .await?
+                {
+                    return Err(AppError::Forbidden(
+                        "You no longer have permission to manage this service".into(),
+                    ));
+                }
+
+                // 2. Check if a concurrent request just installed a certificate.
+                let certificate = if let Some(existing_cert) =
+                    SamlSigningKeysStore::find_active_by_service(db.clone(), &service_id).await?
+                {
+                    let created_at = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                        existing_cert.created_at,
+                        Utc,
+                    );
+                    let age = Utc::now().signed_duration_since(created_at);
+                    if (0..1).contains(&age.num_seconds()) {
+                        existing_cert
+                    } else {
+                        let rotation_now = Utc::now().with_nanosecond(0).ok_or_else(|| {
+                            AppError::InternalServerError("Failed to set SAML rotation time".into())
+                        })?;
+                        SamlSigningKeysStore::rotate_with_overlap(
+                            db.clone(),
+                            &record_id,
+                            &service_id,
+                            private_key_encrypted,
+                            &public_cert_pem,
+                            &encryption_key_id,
+                            valid_from,
+                            valid_until,
+                            rotation_now,
+                            rotation_now + Duration::days(SAML_CERTIFICATE_OVERLAP_DAYS),
+                        )
+                        .await?
+                    }
+                } else {
+                    let rotation_now = Utc::now().with_nanosecond(0).ok_or_else(|| {
+                        AppError::InternalServerError("Failed to set SAML rotation time".into())
+                    })?;
+                    SamlSigningKeysStore::rotate_with_overlap(
+                        db.clone(),
+                        &record_id,
+                        &service_id,
+                        private_key_encrypted,
+                        &public_cert_pem,
+                        &encryption_key_id,
+                        valid_from,
+                        valid_until,
+                        rotation_now,
+                        rotation_now + Duration::days(SAML_CERTIFICATE_OVERLAP_DAYS),
+                    )
+                    .await?
+                };
+                let cert_info =
+                    build_saml_certificate_info(db.clone(), certificate, Utc::now()).await?;
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(cert_info)
+            })
+        },
+    )
+    .await?;
 
     Ok(Json(cert_info))
 }
@@ -1118,12 +2091,101 @@ pub async fn get_saml_certificate(
         .await?
         .ok_or_else(|| AppError::NotFound("No active SAML certificate found".into()))?;
 
-    Ok(Json(SamlCertificateInfo {
-        public_key: cert.public_key,
-        valid_from: chrono::DateTime::from_naive_utc_and_offset(cert.valid_from, Utc),
-        valid_until: chrono::DateTime::from_naive_utc_and_offset(cert.valid_until, Utc),
-        is_active: cert.is_active,
-        created_at: chrono::DateTime::from_naive_utc_and_offset(cert.created_at, Utc),
+    Ok(Json(
+        build_saml_certificate_info(DB::Conn(&state.db), cert, Utc::now()).await?,
+    ))
+}
+
+// Handler: Immediately retire every verification-only overlap certificate.
+pub async fn retire_saml_certificate_overlap(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((org_slug, service_slug)): Path<(String, String)>,
+    Extension(req_info): Extension<RequestInfo>,
+) -> Result<Json<RetireSamlCertificateOverlapResponse>> {
+    let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
+    let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, &service_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+
+    if !can_manage_specific_service(&state.db, &user.user.id, &org.id, &service.id).await? {
+        return Err(AppError::Forbidden(
+            "You don't have permission to manage this service".into(),
+        ));
+    }
+
+    let retired = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "retire_saml_certificate_overlap",
+        |db| {
+            let service_id = service.id.clone();
+            let org_id = org.id.clone();
+            let user_id = user.user.id.clone();
+            let req_ip = req_info.ip_address.clone();
+            let req_user_agent = req_info.user_agent.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                use sea_orm::{EntityTrait, QuerySelect};
+                let locked_org = crate::entities::organizations::Entity::find_by_id(&org_id)
+                    .lock_exclusive()
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
+                if locked_org.status != "active" {
+                    return Err(AppError::Forbidden("Organization is not active".into()));
+                }
+                let locked_service = crate::entities::services::Entity::find_by_id(&service_id)
+                    .lock_exclusive()
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+                if locked_service.org_id != org_id {
+                    return Err(AppError::Forbidden(
+                        "Service no longer belongs to this organization".into(),
+                    ));
+                }
+                if !can_manage_specific_service_in(db.clone(), &user_id, &org_id, &service_id)
+                    .await?
+                {
+                    return Err(AppError::Forbidden(
+                        "You no longer have permission to manage this service".into(),
+                    ));
+                }
+                let retired = SamlSigningKeysStore::retire_overlaps_for_service(
+                    db.clone(),
+                    &service_id,
+                    Utc::now(),
+                )
+                .await?;
+                use crate::services::audit_builder::OrgAuditBuilder;
+                let event = OrgAuditBuilder::new(
+                    &org_id,
+                    Some(&user_id),
+                    "saml.certificate_overlap_retired",
+                )
+                .target("service", &service_id)
+                .ip_address(Some(&req_ip))
+                .user_agent(Some(req_user_agent))
+                .success(true)
+                .details_json(Some(serde_json::json!({
+                    "action": "saml_certificate_overlap_retired",
+                    "retired_certificates": retired
+                })))
+                .build();
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(retired)
+            })
+        },
+    )
+    .await?;
+
+    Ok(Json(RetireSamlCertificateOverlapResponse {
+        success: true,
+        retired_certificates: retired,
     }))
 }
 
@@ -1150,8 +2212,18 @@ pub async fn delete_saml_config(
         ));
     }
 
-    // Delete SAML configuration
-    // Delete SAML configuration with retry
+    use crate::services::audit_builder::OrgAuditBuilder;
+    let event = OrgAuditBuilder::new(&org.id, Some(&user.user.id), "saml.deleted")
+        .target("service", &service.id)
+        .ip_address(Some(&req_info.ip_address))
+        .user_agent(Some(req_info.user_agent.clone()))
+        .success(true)
+        .details_json(Some(serde_json::json!({"action": "saml_config_deleted"})))
+        .build();
+    let audit_actor = state.audit_actor.clone();
+
+    // Delete the configuration, retire keys, and enqueue the success event in
+    // one transaction.
     with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
@@ -1159,7 +2231,38 @@ pub async fn delete_saml_config(
         "delete_saml_config",
         |db| {
             let service_id = service.id.clone();
+            let org_id = org.id.clone();
+            let user_id = user.user.id.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
+                use sea_orm::{EntityTrait, QuerySelect};
+                let locked_org = crate::entities::organizations::Entity::find_by_id(&org_id)
+                    .lock_exclusive()
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
+                if locked_org.status != "active" {
+                    return Err(AppError::Forbidden("Organization is not active".into()));
+                }
+                let locked_service = crate::entities::services::Entity::find_by_id(&service_id)
+                    .lock_exclusive()
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
+                if locked_service.org_id != org_id {
+                    return Err(AppError::Forbidden(
+                        "Service no longer belongs to this organization".into(),
+                    ));
+                }
+                if !can_manage_specific_service_in(db.clone(), &user_id, &org_id, &service_id)
+                    .await?
+                {
+                    return Err(AppError::Forbidden(
+                        "You no longer have permission to manage this service".into(),
+                    ));
+                }
+
                 ServiceStore::update_saml_config(
                     db.clone(),
                     &service_id,
@@ -1174,23 +2277,20 @@ pub async fn delete_saml_config(
                 )
                 .await?;
 
-                // Deactivate certificates
-                SamlSigningKeysStore::deactivate_all_for_service(db.clone(), &service_id).await
+                // SAML deletion removes the active signer and every overlap
+                // certificate from metadata in the same transaction.
+                let retired = SamlSigningKeysStore::retire_all_for_service(
+                    db.clone(),
+                    &service_id,
+                    Utc::now(),
+                )
+                .await?;
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(retired)
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    use crate::services::audit_builder::OrgAuditBuilder;
-    let event = OrgAuditBuilder::new(&org.id, Some(&user.user.id), "saml.deleted")
-        .target("service", &service.id)
-        .ip_address(Some(&req_info.ip_address))
-        .user_agent(Some(req_info.user_agent.clone()))
-        .success(true)
-        .details_json(Some(serde_json::json!({"action": "saml_config_deleted"})))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(Json(ConfigureSamlResponse {
         success: true,
@@ -1225,71 +2325,53 @@ pub async fn saml_metadata(
         ));
     }
 
-    // Get active certificate
-    let cert = SamlSigningKeysStore::find_active_by_service(DB::Conn(&state.db), &service.id)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(
-                "No active SAML certificate found. Please generate a certificate first.".into(),
-            )
-        })?;
+    // Publish the active certificate first, followed by the bounded set of
+    // still-eligible previous verification certificates. Expired or manually
+    // retired material is excluded by the store query.
+    let published = SamlSigningKeysStore::find_published_verification_keys_at(
+        DB::Conn(&state.db),
+        &service.id,
+        Utc::now(),
+    )
+    .await?;
+    if !published.iter().any(|certificate| certificate.is_active) {
+        return Err(AppError::NotFound(
+            "No valid active SAML certificate found. Please generate a certificate first.".into(),
+        ));
+    }
 
-    // Generate metadata XML
-    // Use the configured entity_id from service, fallback to default if not configured
-    let entity_id = service
-        .saml_entity_id
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| format!("{}/saml/{}/{}", state.base_url, org_slug, service_slug));
+    // The configured entity ID belongs to the downstream SP and is used as
+    // assertion audience. AuthOS's IdP issuer is the stable SAML route that is
+    // also emitted in signed assertions and responses.
+    let entity_id = saml_idp_entity_id(&state.base_url, &org_slug, &service_slug);
     let sso_url = format!("{}/saml/{}/{}/sso", state.base_url, org_slug, service_slug);
     let slo_url = format!("{}/saml/{}/{}/slo", state.base_url, org_slug, service_slug);
 
-    // Extract certificate without PEM headers
-    let cert_content = cert
-        .public_key
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect::<Vec<_>>()
-        .join("");
+    // Extract certificates without PEM headers.
+    let cert_contents: Vec<String> = published
+        .into_iter()
+        .map(|certificate| {
+            certificate
+                .public_key
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect();
 
-    // Build metadata XML manually (samael crate has limited builder support)
-    let metadata = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{}">
-  <IDPSSODescriptor WantAuthnRequestsSigned="false" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
-    <KeyDescriptor use="signing">
-      <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
-        <X509Data>
-          <X509Certificate>{}</X509Certificate>
-        </X509Data>
-      </KeyInfo>
-    </KeyDescriptor>
-    <NameIDFormat>{}</NameIDFormat>
-    <SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="{}"/>
-    <SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="{}"/>
-    <SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="{}"/>
-    <SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="{}"/>
-  </IDPSSODescriptor>
-  <Organization>
-    <OrganizationName xml:lang="en">{}</OrganizationName>
-    <OrganizationDisplayName xml:lang="en">{}</OrganizationDisplayName>
-    <OrganizationURL xml:lang="en">{}</OrganizationURL>
-  </Organization>
-</EntityDescriptor>"#,
-        entity_id,
-        cert_content,
+    let metadata = build_saml_metadata_xml(
+        &entity_id,
+        &cert_contents,
         service
             .saml_name_id_format
             .as_deref()
             .unwrap_or("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"),
-        sso_url,
-        sso_url,
-        slo_url,
-        slo_url,
-        org.name,
-        org.name,
-        state.base_url
-    );
+        &sso_url,
+        &slo_url,
+        &org.name,
+        &state.base_url,
+    )?;
 
     Ok((
         [(
@@ -1334,92 +2416,13 @@ pub async fn saml_sso(
         .saml_request
         .ok_or_else(|| AppError::BadRequest("SAMLRequest parameter is required".into()))?;
 
-    // Decode base64
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-    let saml_request_bytes = BASE64
-        .decode(&saml_request_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {}", e)))?;
+    let saml_request_xml = decode_saml_request_xml(&saml_request_b64, true)?;
 
-    // Try to inflate (SAMLRequest is typically deflated for HTTP-Redirect binding)
-    // SAML HTTP-Redirect uses raw DEFLATE (RFC 1951) without zlib/gzip wrappers
-    use flate2::read::DeflateDecoder;
-    use std::io::Read;
-
-    // Try to inflate as raw deflate first (standard for SAML HTTP-Redirect)
-    let mut decoder = DeflateDecoder::new(&saml_request_bytes[..]);
-    let mut inflated = String::new();
-    let saml_request_xml =
-        if decoder.read_to_string(&mut inflated).is_ok() && inflated.starts_with("<?xml") {
-            // Successfully inflated and looks like XML
-            inflated
-        } else {
-            // Not deflated or inflation failed, treat as raw XML
-            String::from_utf8(saml_request_bytes)
-                .map_err(|e| AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {}", e)))?
-        };
-
-    // Parse XML to extract important fields
-    use quick_xml::events::Event;
-    use quick_xml::Reader;
-
-    // Security Audit Item 7: Validate XML for XXE attacks before parsing
-    validate_xml_no_xxe(&saml_request_xml)?;
-
-    let mut reader = Reader::from_str(&saml_request_xml);
-    reader.trim_text(true);
-
-    let mut request_id: Option<String> = None;
-    let mut issuer: Option<String> = None;
-    let mut acs_url_from_request: Option<String> = None;
-    let mut destination: Option<String> = None;
-    let mut in_issuer = false;
-
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                match e.name().as_ref() {
-                    b"samlp:AuthnRequest" | b"AuthnRequest" => {
-                        // Extract attributes from AuthnRequest element
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"ID" => {
-                                    request_id =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
-                                }
-                                b"AssertionConsumerServiceURL" => {
-                                    acs_url_from_request =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
-                                }
-                                b"Destination" => {
-                                    destination =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    b"saml:Issuer" | b"Issuer" => {
-                        in_issuer = true;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(e)) if in_issuer => {
-                issuer = Some(e.unescape().unwrap_or_default().to_string());
-                in_issuer = false;
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(AppError::BadRequest(format!(
-                    "Error parsing SAMLRequest XML: {}",
-                    e
-                )));
-            }
-            _ => {}
-        }
-        buf.clear();
-    }
+    let parsed_request = parse_authn_request(&saml_request_xml)?;
+    let request_id = parsed_request.request_id;
+    let issuer = parsed_request.issuer;
+    let acs_url_from_request = parsed_request.acs_url;
+    let destination = parsed_request.destination;
 
     let configured_acs_url = service
         .saml_acs_url
@@ -1495,6 +2498,43 @@ pub async fn saml_sso(
 #[derive(Debug, Deserialize)]
 pub struct SamlAuthQuery {
     pub state: String,
+}
+
+fn saml_mfa_challenge_html(preauth_token: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Verify your identity</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+    <main>
+        <h1>Multi-factor authentication</h1>
+        <p>Enter your authenticator or backup code to continue to the service.</p>
+        <form method="post" action="/saml/mfa/verify">
+            <input type="hidden" name="preauth_token" value="{}">
+            <label for="code">Verification code</label>
+            <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+            <button type="submit">Continue</button>
+        </form>
+    </main>
+</body>
+</html>"#,
+        escape_html_attr(preauth_token)
+    )
+}
+
+pub(crate) fn saml_mfa_challenge_response(preauth_token: &str) -> Response {
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
+        Html(saml_mfa_challenge_html(preauth_token)),
+    )
+        .into_response()
 }
 
 pub async fn saml_authenticate(
@@ -1578,6 +2618,14 @@ pub async fn saml_idp_login(
         ));
     }
 
+    if !has_current_saml_assertion_access(DB::Conn(&state.db), &user.user.id, &org.id, &service.id)
+        .await?
+    {
+        return Err(AppError::Forbidden(
+            "You do not currently have access to this service".into(),
+        ));
+    }
+
     // Get ACS URL from service configuration
     let acs_url = service
         .saml_acs_url
@@ -1585,12 +2633,13 @@ pub async fn saml_idp_login(
         .ok_or_else(|| AppError::BadRequest("No ACS URL configured for this service".into()))?;
 
     // Get signing key
-    let signing_key =
-        SamlSigningKeysStore::find_active_by_service(DB::Conn(&state.db), &service.id)
-            .await?
-            .ok_or_else(|| {
-                AppError::InternalServerError("No active SAML signing key found".into())
-            })?;
+    let signing_key = SamlSigningKeysStore::find_signing_key_by_service_at(
+        DB::Conn(&state.db),
+        &service.id,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| AppError::InternalServerError("No active SAML signing key found".into()))?;
 
     // Decrypt private key
     let encryption = state
@@ -1599,13 +2648,20 @@ pub async fn saml_idp_login(
         .ok_or_else(|| AppError::InternalServerError("Encryption service not available".into()))?;
 
     let private_key_pem = encryption
-        .decrypt(&signing_key.private_key_encrypted)
+        .decrypt_with_context(
+            &signing_key.private_key_encrypted,
+            crate::encryption::EncryptionContext::new(
+                "saml_signing_keys",
+                &signing_key.id,
+                "private_key_encrypted",
+            ),
+        )
         .map_err(|e| {
             AppError::InternalServerError(format!("Failed to decrypt private key: {}", e))
         })?;
 
     // Build SAML response using SamlResponseBuilder
-    let entity_id = format!("{}/saml/{}/{}", state.base_url, org.slug, service.slug);
+    let entity_id = saml_idp_entity_id(&state.base_url, &org.slug, &service.slug);
 
     // Build SAML response XML
     let name_id_format = service
@@ -1638,36 +2694,22 @@ pub async fn saml_idp_login(
         }
     }
 
-    // Build AttributeStatement XML
-    let attribute_statement = attributes
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                r#"      <saml:Attribute Name="{}">
-        <saml:AttributeValue>{}</saml:AttributeValue>
-      </saml:Attribute>"#,
-                name, value
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
     // Create SAML Response Builder (IdP-initiated, no InResponseTo)
     let saml_builder = SamlResponseBuilder::new(
         &user.user.email,
         &entity_id,
-        &acs_url,
+        acs_url,
         service
             .saml_entity_id
             .as_deref()
             .unwrap_or(&service.client_id),
         name_id_format,
-        attribute_statement,
+        attributes,
         None, // No InResponseTo for IdP-initiated flow
     );
 
     // Build the Assertion element using the builder
-    let assertion_xml = saml_builder.build_assertion();
+    let assertion_xml = saml_builder.build_assertion()?;
 
     // Check if we should sign the assertion
     let sign_assertions = service.saml_sign_assertions;
@@ -1680,18 +2722,13 @@ pub async fn saml_idp_login(
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element (use replacen to only match first occurrence)
-        assertion_xml.replacen(
-            &format!("<saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!("<saml:Issuer>{}</saml:Issuer>{}", entity_id, signature),
-            1,
-        )
+        insert_signature_after_issuer(&assertion_xml, &signature)?
     } else {
         assertion_xml
     };
 
     // Build the complete SAML Response using the builder
-    let response_xml = saml_builder.build_response(&assertion_with_signature);
+    let response_xml = saml_builder.build_response(&assertion_with_signature)?;
 
     // Check if we should sign the response
     let sign_response = service.saml_sign_response;
@@ -1704,15 +2741,13 @@ pub async fn saml_idp_login(
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element (use replacen to only match first occurrence)
-        response_xml.replacen(
-            &format!("<saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!("<saml:Issuer>{}</saml:Issuer>{}", entity_id, signature),
-            1,
-        )
+        insert_signature_after_issuer(&response_xml, &signature)?
     } else {
         response_xml
     };
+
+    ensure_saml_assertion_snapshot_is_current(DB::Conn(&state.db), &user.user.id, &org, &service)
+        .await?;
 
     // Base64 encode the response
     let saml_response_b64 = BASE64.encode(saml_response_xml.as_bytes());
@@ -1772,29 +2807,19 @@ pub async fn complete_saml_authentication(
         ));
     }
 
-    if !SamlStateStore::update_user_id(DB::Conn(&state.db), saml_state_id, &user.id).await? {
-        return Err(AppError::BadRequest(
-            "Invalid, expired, or already used SAML state".into(),
-        ));
-    }
-
-    // Get service
-    let service = ServiceStore::find_by_id(DB::Conn(&state.db), &saml_state.service_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Service not found".into()))?;
-
-    // Get organization
-    let org = OrganizationStore::find_by_id(DB::Conn(&state.db), &service.org_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Organization not found".into()))?;
+    // Re-read all mutable tenant/service state before consuming the one-time
+    // state and, critically, before signing an assertion.
+    let (service, org) =
+        load_current_saml_completion_context(DB::Conn(&state.db), &saml_state, &user.id).await?;
 
     // Get signing key
-    let signing_key =
-        SamlSigningKeysStore::find_active_by_service(DB::Conn(&state.db), &service.id)
-            .await?
-            .ok_or_else(|| {
-                AppError::InternalServerError("No active SAML signing key found".into())
-            })?;
+    let signing_key = SamlSigningKeysStore::find_signing_key_by_service_at(
+        DB::Conn(&state.db),
+        &service.id,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| AppError::InternalServerError("No active SAML signing key found".into()))?;
 
     // Decrypt private key
     let encryption = state
@@ -1803,31 +2828,25 @@ pub async fn complete_saml_authentication(
         .ok_or_else(|| AppError::InternalServerError("Encryption service not available".into()))?;
 
     let private_key_pem = encryption
-        .decrypt(&signing_key.private_key_encrypted)
+        .decrypt_with_context(
+            &signing_key.private_key_encrypted,
+            crate::encryption::EncryptionContext::new(
+                "saml_signing_keys",
+                &signing_key.id,
+                "private_key_encrypted",
+            ),
+        )
         .map_err(|e| {
             AppError::InternalServerError(format!("Failed to decrypt private key: {}", e))
         })?;
 
-    // Generate SAML Response
-    let response_id = format!("_{}", Uuid::new_v4());
-    let assertion_id = format!("_{}", Uuid::new_v4());
-    let issue_instant = Utc::now();
-    let not_on_or_after = issue_instant + Duration::minutes(5);
-
-    let entity_id = format!("{}/saml/{}/{}", state.base_url, org.slug, service.slug);
+    let entity_id = saml_idp_entity_id(&state.base_url, &org.slug, &service.slug);
 
     // Build SAML response XML
     let name_id_format = service
         .saml_name_id_format
         .as_deref()
         .unwrap_or("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress");
-
-    // Build InResponseTo attribute if we have a request ID
-    let in_response_to_attr = if let Some(ref req_id) = saml_state.request_id {
-        format!(r#" InResponseTo="{}"#, req_id)
-    } else {
-        String::new()
-    };
 
     // Parse attribute mapping if available
     let mut attributes: Vec<(String, String)> = Vec::new();
@@ -1858,59 +2877,21 @@ pub async fn complete_saml_authentication(
         }
     }
 
-    // Build AttributeStatement XML
-    let attribute_statement = attributes
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                r#"      <saml:Attribute Name="{}">
-        <saml:AttributeValue>{}</saml:AttributeValue>
-      </saml:Attribute>"#,
-                name, value
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Build the Assertion element
-    let assertion_xml = format!(
-        r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{assertion_id}" Version="2.0" IssueInstant="{issue_instant}">
-    <saml:Issuer>{entity_id}</saml:Issuer>
-    <saml:Subject>
-      <saml:NameID Format="{name_id_format}">{email}</saml:NameID>
-      <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
-        <saml:SubjectConfirmationData{in_response_to} NotOnOrAfter="{not_on_or_after}" Recipient="{acs_url}"/>
-      </saml:SubjectConfirmation>
-    </saml:Subject>
-    <saml:Conditions NotBefore="{issue_instant}" NotOnOrAfter="{not_on_or_after}">
-      <saml:AudienceRestriction>
-        <saml:Audience>{sp_entity_id}</saml:Audience>
-      </saml:AudienceRestriction>
-    </saml:Conditions>
-    <saml:AuthnStatement AuthnInstant="{issue_instant}">
-      <saml:AuthnContext>
-        <saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified</saml:AuthnContextClassRef>
-      </saml:AuthnContext>
-    </saml:AuthnStatement>
-    <saml:AttributeStatement>
-{attribute_statement}
-    </saml:AttributeStatement>
-  </saml:Assertion>"#,
-        assertion_id = assertion_id,
-        in_response_to = in_response_to_attr,
-        issue_instant = issue_instant.naive_utc(),
-        not_on_or_after = not_on_or_after.naive_utc(),
-        entity_id = entity_id,
-        acs_url = saml_state.acs_url,
-        name_id_format = name_id_format,
-        email = user.email,
-        sp_entity_id = saml_state
+    let saml_builder = SamlResponseBuilder::new(
+        &user.email,
+        &entity_id,
+        &saml_state.acs_url,
+        saml_state
             .issuer
             .as_deref()
             .or(service.saml_entity_id.as_deref())
             .unwrap_or(&service.client_id),
-        attribute_statement = attribute_statement,
+        name_id_format,
+        attributes,
+        saml_state.request_id.clone(),
     );
+
+    let assertion_xml = saml_builder.build_assertion()?;
 
     // Check if we should sign the assertion
     let sign_assertions = service.saml_sign_assertions;
@@ -1918,39 +2899,17 @@ pub async fn complete_saml_authentication(
         // Sign the assertion
         let signature = sign_xml_element(
             &assertion_xml,
-            &assertion_id,
+            saml_builder.get_assertion_id(),
             &private_key_pem,
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element
-        assertion_xml.replace(
-            &format!("    <saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!(
-                "    <saml:Issuer>{}</saml:Issuer>\n    {}",
-                entity_id, signature
-            ),
-        )
+        insert_signature_after_issuer(&assertion_xml, &signature)?
     } else {
         assertion_xml
     };
 
-    // Build the complete SAML Response
-    let response_xml = format!(
-        r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{response_id}" Version="2.0"{in_response_to} IssueInstant="{issue_instant}" Destination="{acs_url}">
-  <saml:Issuer>{entity_id}</saml:Issuer>
-  <samlp:Status>
-    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
-  </samlp:Status>
-  {assertion}
-</samlp:Response>"#,
-        response_id = response_id,
-        in_response_to = in_response_to_attr,
-        issue_instant = issue_instant.naive_utc(),
-        acs_url = saml_state.acs_url,
-        entity_id = entity_id,
-        assertion = assertion_with_signature,
-    );
+    let response_xml = saml_builder.build_response(&assertion_with_signature)?;
 
     // Check if we should sign the response
     let sign_response = service.saml_sign_response;
@@ -1958,22 +2917,36 @@ pub async fn complete_saml_authentication(
         // Sign the response
         let signature = sign_xml_element(
             &response_xml,
-            &response_id,
+            saml_builder.get_response_id(),
             &private_key_pem,
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element
-        response_xml.replace(
-            &format!("  <saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!(
-                "  <saml:Issuer>{}</saml:Issuer>\n  {}",
-                entity_id, signature
-            ),
-        )
+        insert_signature_after_issuer(&response_xml, &signature)?
     } else {
         response_xml
     };
+
+    // Finish every fallible validation/build/signing step before consuming the
+    // one-time state. Multiple contenders may prepare an in-memory response,
+    // but exactly one can cross this boundary and return it to a caller.
+    let (current_service, current_org) =
+        load_current_saml_completion_context(DB::Conn(&state.db), &saml_state, &user.id).await?;
+    if current_org.slug != org.slug
+        || current_service.saml_name_id_format != service.saml_name_id_format
+        || current_service.saml_attribute_mapping != service.saml_attribute_mapping
+        || current_service.saml_sign_assertions != service.saml_sign_assertions
+        || current_service.saml_sign_response != service.saml_sign_response
+    {
+        return Err(AppError::BadRequest(
+            "SAML configuration changed after authentication started".into(),
+        ));
+    }
+    if !SamlStateStore::update_user_id(DB::Conn(&state.db), saml_state_id, &user.id).await? {
+        return Err(AppError::BadRequest(
+            "Invalid, expired, or already used SAML state".into(),
+        ));
+    }
 
     // Base64 encode the response
     let saml_response_b64 = BASE64.encode(saml_response_xml.as_bytes());
@@ -2105,50 +3078,7 @@ async fn process_saml_logout_request(
         ));
     }
 
-    // Decode base64
-    let saml_request_bytes = BASE64
-        .decode(saml_request_b64)
-        .map_err(|e| AppError::BadRequest(format!("Invalid base64 SAMLRequest: {}", e)))?;
-
-    // Try to inflate if deflated (HTTP-Redirect binding)
-    let saml_request_xml = if is_deflated {
-        use flate2::read::DeflateDecoder;
-        use std::io::Read;
-
-        // Check for various compression formats
-        if saml_request_bytes.len() > 2
-            && saml_request_bytes[0] == 0x78
-            && (saml_request_bytes[1] == 0x9C
-                || saml_request_bytes[1] == 0xDA
-                || saml_request_bytes[1] == 0x01)
-        {
-            // Looks like deflated data (zlib header)
-            let mut decoder = DeflateDecoder::new(&saml_request_bytes[..]);
-            let mut inflated = String::new();
-            decoder.read_to_string(&mut inflated).map_err(|e| {
-                AppError::BadRequest(format!("Failed to inflate SAMLRequest: {}", e))
-            })?;
-            inflated
-        } else {
-            // Try raw deflate without zlib header
-            let mut decoder =
-                flate2::read::DeflateDecoder::new(std::io::Cursor::new(&saml_request_bytes));
-            let mut inflated = String::new();
-            match decoder.read_to_string(&mut inflated) {
-                Ok(_) => inflated,
-                Err(_) => {
-                    // Not compressed, treat as raw XML
-                    String::from_utf8(saml_request_bytes.clone()).map_err(|e| {
-                        AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {}", e))
-                    })?
-                }
-            }
-        }
-    } else {
-        // Not compressed (HTTP-POST binding)
-        String::from_utf8(saml_request_bytes)
-            .map_err(|e| AppError::BadRequest(format!("Invalid UTF-8 in SAMLRequest: {}", e)))?
-    };
+    let saml_request_xml = decode_saml_request_xml(saml_request_b64, is_deflated)?;
 
     // Parse XML to extract important fields
     use quick_xml::events::Event;
@@ -2158,7 +3088,7 @@ async fn process_saml_logout_request(
     validate_xml_no_xxe(&saml_request_xml)?;
 
     let mut reader = Reader::from_str(&saml_request_xml);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
 
     let mut request_id: Option<String> = None;
     let mut issuer: Option<String> = None;
@@ -2167,10 +3097,25 @@ async fn process_saml_logout_request(
     let mut destination: Option<String> = None;
     let mut in_issuer = false;
     let mut in_name_id = false;
+    let mut work_budget = SamlXmlWorkBudget::default();
 
     let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        if let Ok(event) = &event {
+            work_budget.observe_event()?;
+            match event {
+                Event::Start(element) => {
+                    work_budget.observe_element(element.attributes().count(), false)?;
+                }
+                Event::Empty(element) => {
+                    work_budget.observe_element(element.attributes().count(), true)?;
+                }
+                Event::End(_) => work_budget.leave_element()?,
+                _ => {}
+            }
+        }
+        match event {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 match e.name().as_ref() {
                     b"samlp:LogoutRequest" | b"LogoutRequest" => {
@@ -2207,10 +3152,40 @@ async fn process_saml_logout_request(
             }
             Ok(Event::Text(e)) => {
                 if in_issuer {
-                    issuer = Some(e.unescape().unwrap_or_default().to_string());
+                    let decoded = e.decode().map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "Invalid LogoutRequest issuer encoding: {}",
+                            error
+                        ))
+                    })?;
+                    issuer = Some(
+                        quick_xml::escape::unescape(&decoded)
+                            .map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid LogoutRequest issuer escaping: {}",
+                                    error
+                                ))
+                            })?
+                            .into_owned(),
+                    );
                     in_issuer = false;
                 } else if in_name_id {
-                    name_id = Some(e.unescape().unwrap_or_default().to_string());
+                    let decoded = e.decode().map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "Invalid LogoutRequest NameID encoding: {}",
+                            error
+                        ))
+                    })?;
+                    name_id = Some(
+                        quick_xml::escape::unescape(&decoded)
+                            .map_err(|error| {
+                                AppError::BadRequest(format!(
+                                    "Invalid LogoutRequest NameID escaping: {}",
+                                    error
+                                ))
+                            })?
+                            .into_owned(),
+                    );
                     in_name_id = false;
                 }
             }
@@ -2268,12 +3243,13 @@ async fn process_saml_logout_request(
     );
 
     // Get signing key for response
-    let signing_key =
-        SamlSigningKeysStore::find_active_by_service(DB::Conn(&state.db), &service.id)
-            .await?
-            .ok_or_else(|| {
-                AppError::InternalServerError("No active SAML signing key found".into())
-            })?;
+    let signing_key = SamlSigningKeysStore::find_signing_key_by_service_at(
+        DB::Conn(&state.db),
+        &service.id,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| AppError::InternalServerError("No active SAML signing key found".into()))?;
 
     // Decrypt private key
     let encryption = state
@@ -2282,7 +3258,14 @@ async fn process_saml_logout_request(
         .ok_or_else(|| AppError::InternalServerError("Encryption service not available".into()))?;
 
     let private_key_pem = encryption
-        .decrypt(&signing_key.private_key_encrypted)
+        .decrypt_with_context(
+            &signing_key.private_key_encrypted,
+            crate::encryption::EncryptionContext::new(
+                "saml_signing_keys",
+                &signing_key.id,
+                "private_key_encrypted",
+            ),
+        )
         .map_err(|e| {
             AppError::InternalServerError(format!("Failed to decrypt private key: {}", e))
         })?;
@@ -2290,27 +3273,20 @@ async fn process_saml_logout_request(
     // Generate SAML LogoutResponse
     let response_id = format!("_{}", Uuid::new_v4());
     let issue_instant = Utc::now();
-    let entity_id = format!("{}/saml/{}/{}", state.base_url, org_slug, service_slug);
+    let entity_id = saml_idp_entity_id(&state.base_url, org_slug, service_slug);
 
     let slo_response_url = service
         .saml_slo_url
         .as_ref()
         .ok_or_else(|| AppError::BadRequest("No SLO URL configured for this service".into()))?;
 
-    // Build the SAML LogoutResponse
-    let logout_response_xml = format!(
-        r#"<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{response_id}" Version="2.0" IssueInstant="{issue_instant}" Destination="{slo_url}" InResponseTo="{in_response_to}">
-  <saml:Issuer>{entity_id}</saml:Issuer>
-  <samlp:Status>
-    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
-  </samlp:Status>
-</samlp:LogoutResponse>"#,
-        response_id = response_id,
-        issue_instant = issue_instant.naive_utc(),
-        slo_url = slo_response_url,
-        in_response_to = request_id,
-        entity_id = entity_id,
-    );
+    let logout_response_xml = build_logout_response_xml(
+        &response_id,
+        &issue_instant,
+        slo_response_url,
+        &request_id,
+        &entity_id,
+    )?;
 
     // Sign the LogoutResponse if configured
     let sign_response = service.saml_sign_response;
@@ -2322,14 +3298,7 @@ async fn process_saml_logout_request(
             &signing_key.public_key,
         )?;
 
-        // Insert signature after the Issuer element
-        logout_response_xml.replace(
-            &format!("  <saml:Issuer>{}</saml:Issuer>", entity_id),
-            &format!(
-                "  <saml:Issuer>{}</saml:Issuer>\n  {}",
-                entity_id, signature
-            ),
-        )
+        insert_signature_after_issuer(&logout_response_xml, &signature)?
     } else {
         logout_response_xml
     };
@@ -2383,4 +3352,738 @@ async fn process_saml_logout_request(
     );
 
     Ok(Html(html).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use flate2::{write::DeflateEncoder, Compression};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ConnectionTrait, Database};
+    use std::io::Write;
+
+    fn redirect_encode(xml: &str) -> String {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(xml.as_bytes()).expect("compress XML");
+        BASE64.encode(encoder.finish().expect("finish compression"))
+    }
+
+    #[test]
+    fn generated_saml_certificate_matches_private_key_and_has_unique_serial() {
+        let valid_from = Utc::now().with_nanosecond(0).unwrap();
+        let valid_until = valid_from + Duration::days(365 * 3);
+        let (private_key, first_certificate) =
+            generate_saml_key_material("München Identity".to_string(), valid_from, valid_until)
+                .expect("generate first SAML certificate");
+        let (_, second_certificate) =
+            generate_saml_key_material("Example Organization".to_string(), valid_from, valid_until)
+                .expect("generate second SAML certificate");
+        let private_key = openssl::pkey::PKey::private_key_from_pem(private_key.as_bytes())
+            .expect("parse private key");
+        let first = openssl::x509::X509::from_pem(first_certificate.as_bytes())
+            .expect("parse first certificate");
+        let second = openssl::x509::X509::from_pem(second_certificate.as_bytes())
+            .expect("parse second certificate");
+
+        assert!(first
+            .public_key()
+            .expect("certificate public key")
+            .public_eq(&private_key));
+        assert_ne!(
+            first.serial_number().to_bn().unwrap(),
+            second.serial_number().to_bn().unwrap()
+        );
+        assert_eq!(
+            first
+                .not_before()
+                .compare(&openssl::asn1::Asn1Time::from_unix(valid_from.timestamp()).unwrap())
+                .unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            first
+                .not_after()
+                .compare(&openssl::asn1::Asn1Time::from_unix(valid_until.timestamp()).unwrap())
+                .unwrap(),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn idp_entity_id_is_owned_by_authos_and_not_the_configured_sp() {
+        assert_eq!(
+            saml_idp_entity_id("https://auth.example.test", "acme", "salesforce"),
+            "https://auth.example.test/saml/acme/salesforce"
+        );
+        assert_ne!(
+            saml_idp_entity_id("https://auth.example.test", "acme", "salesforce"),
+            "https://salesforce.example.test"
+        );
+    }
+
+    #[test]
+    fn saml_mfa_challenge_contains_only_the_bound_continuation_not_an_assertion() {
+        let html = saml_mfa_challenge_html("header.payload.signature<&");
+        assert!(html.contains("method=\"post\" action=\"/saml/mfa/verify\""));
+        assert!(html.contains("header.payload.signature&lt;&amp;"));
+        assert!(!html.contains("SAMLResponse"));
+        assert!(!html.contains("SAML_COMPLETE"));
+    }
+
+    #[tokio::test]
+    async fn certificate_route_authority_is_bound_to_the_selected_tenant_and_service() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "saml-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "other-saml-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+        let (owner_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "saml-owner-org",
+            "SAML Owner Org",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create owner org");
+        let (other_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "other-saml-org",
+            "Other SAML Org",
+            &other_owner.id,
+            None,
+        )
+        .await
+        .expect("create other org");
+        let owner_service = ServiceStore::create(
+            DB::Conn(&db),
+            &owner_org.id,
+            "owner-service",
+            "Owner Service",
+            "web",
+            "owner-saml-client",
+        )
+        .await
+        .expect("create owner service");
+        let other_service = ServiceStore::create(
+            DB::Conn(&db),
+            &other_org.id,
+            "other-service",
+            "Other Service",
+            "web",
+            "other-saml-client",
+        )
+        .await
+        .expect("create other service");
+
+        assert!(
+            can_manage_specific_service(&db, &owner.id, &owner_org.id, &owner_service.id,)
+                .await
+                .expect("check own authority")
+        );
+        assert!(
+            !can_manage_specific_service(&db, &owner.id, &other_org.id, &other_service.id,)
+                .await
+                .expect("check cross-tenant authority")
+        );
+    }
+
+    #[tokio::test]
+    async fn assertion_access_and_completion_context_are_bound_to_live_tenant_state() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let user = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "saml-user@example.test",
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create user")
+        .0;
+        let (org, membership) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "assertion-org",
+            "Assertion Org",
+            &user.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        let service = ServiceStore::create(
+            DB::Conn(&db),
+            &org.id,
+            "assertion-service",
+            "Assertion Service",
+            "web",
+            "assertion-client",
+        )
+        .await
+        .expect("create service");
+        let other_service = ServiceStore::create(
+            DB::Conn(&db),
+            &org.id,
+            "other-service",
+            "Other Service",
+            "web",
+            "other-client",
+        )
+        .await
+        .expect("create other service");
+        let acs = "https://sp.example.test/acs";
+        ServiceStore::update_saml_config(
+            DB::Conn(&db),
+            &service.id,
+            true,
+            Some("https://sp.example.test/metadata"),
+            Some(acs),
+            None,
+            None,
+            None,
+            true,
+            true,
+        )
+        .await
+        .expect("enable SAML");
+        let state = SamlStateStore::create(
+            DB::Conn(&db),
+            "assertion-state",
+            &service.id,
+            "<AuthnRequest/>",
+            None,
+            acs,
+            Some("request-1"),
+            Some("https://sp.example.test/metadata"),
+            Some("redirect"),
+            &(Utc::now() + Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .expect("create state");
+
+        load_current_saml_completion_context(DB::Conn(&db), &state, &user.id)
+            .await
+            .expect("live membership grants access");
+        MembershipStore::delete(DB::Conn(&db), &membership.id)
+            .await
+            .expect("remove membership");
+        assert!(matches!(
+            load_current_saml_completion_context(DB::Conn(&db), &state, &user.id).await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        // Platform ownership and an identity from another service do not grant
+        // an assertion into this service.
+        IdentityStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "google",
+            "wrong-service-identity",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&other_service.id),
+        )
+        .await
+        .expect("create wrong-context identity");
+        assert!(
+            !has_current_saml_assertion_access(DB::Conn(&db), &user.id, &org.id, &service.id,)
+                .await
+                .expect("check cross-service identity")
+        );
+
+        IdentityStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "github",
+            "exact-service-identity",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&service.id),
+        )
+        .await
+        .expect("create exact-context identity");
+        load_current_saml_completion_context(DB::Conn(&db), &state, &user.id)
+            .await
+            .expect("exact service identity grants access");
+
+        ServiceStore::update_saml_config(
+            DB::Conn(&db),
+            &service.id,
+            true,
+            Some("https://sp.example.test/metadata"),
+            Some("https://sp.example.test/new-acs"),
+            None,
+            None,
+            None,
+            true,
+            true,
+        )
+        .await
+        .expect("change ACS");
+        assert!(matches!(
+            load_current_saml_completion_context(DB::Conn(&db), &state, &user.id).await,
+            Err(AppError::BadRequest(message)) if message.contains("configuration changed")
+        ));
+
+        ServiceStore::update_saml_config(
+            DB::Conn(&db),
+            &service.id,
+            true,
+            Some("https://replacement-sp.example.test/metadata"),
+            Some(acs),
+            None,
+            None,
+            None,
+            true,
+            true,
+        )
+        .await
+        .expect("change SP entity ID");
+        assert!(matches!(
+            load_current_saml_completion_context(DB::Conn(&db), &state, &user.id).await,
+            Err(AppError::BadRequest(message)) if message.contains("configuration changed")
+        ));
+
+        ServiceStore::update_saml_config(
+            DB::Conn(&db),
+            &service.id,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("disable SAML");
+        assert!(matches!(
+            load_current_saml_completion_context(DB::Conn(&db), &state, &user.id).await,
+            Err(AppError::BadRequest(message)) if message.contains("no longer enabled")
+        ));
+
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "suspended")
+            .await
+            .expect("suspend org");
+        assert!(matches!(
+            load_current_saml_completion_context(DB::Conn(&db), &state, &user.id).await,
+            Err(AppError::Forbidden(message)) if message.contains("not active")
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_mfa_saml_continuation_state_has_exactly_one_winner() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("disable foreign keys for isolated state fixture");
+        let expires_at = (Utc::now() + Duration::minutes(5)).naive_utc();
+        SamlStateStore::create(
+            DB::Conn(&db),
+            "post-mfa-state",
+            "service-id",
+            "<AuthnRequest/>",
+            None,
+            "https://sp.example.test/acs",
+            Some("request-id"),
+            Some("https://sp.example.test/metadata"),
+            Some("HTTP-POST"),
+            &expires_at,
+        )
+        .await
+        .expect("create continuation state");
+
+        assert!(
+            SamlStateStore::update_user_id(DB::Conn(&db), "post-mfa-state", "user-a")
+                .await
+                .expect("consume state once")
+        );
+        assert!(
+            !SamlStateStore::update_user_id(DB::Conn(&db), "post-mfa-state", "user-a")
+                .await
+                .expect("reject replay by same user")
+        );
+        assert!(
+            !SamlStateStore::update_user_id(DB::Conn(&db), "post-mfa-state", "user-b")
+                .await
+                .expect("reject replay by another user")
+        );
+    }
+
+    #[test]
+    fn redirect_binding_accepts_deflated_xml_without_declaration() {
+        let xml = r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="request-1"><Issuer>sp.example</Issuer></samlp:AuthnRequest>"#;
+        let encoded = redirect_encode(xml);
+
+        assert_eq!(
+            decode_saml_request_xml(&encoded, true).expect("decode Redirect request"),
+            xml
+        );
+    }
+
+    #[test]
+    fn saml_request_decode_enforces_encoded_and_expanded_limits() {
+        let oversized_encoded = "A".repeat(MAX_SAML_REQUEST_ENCODED_BYTES + 1);
+        assert!(matches!(
+            decode_saml_request_xml(&oversized_encoded, false),
+            Err(AppError::BadRequest(message)) if message.contains("Encoded SAMLRequest exceeds")
+        ));
+
+        let expanded = "A".repeat(MAX_SAML_REQUEST_XML_BYTES + 1);
+        let compressed = redirect_encode(&expanded);
+        assert!(compressed.len() < MAX_SAML_REQUEST_ENCODED_BYTES);
+        assert!(matches!(
+            decode_saml_request_xml(&compressed, true),
+            Err(AppError::BadRequest(message)) if message.contains("Decoded SAMLRequest exceeds")
+        ));
+    }
+
+    #[test]
+    fn saml_parser_enforces_deterministic_depth_event_and_attribute_corpora() {
+        for nested_elements in [
+            MAX_SAML_XML_DEPTH - 2,
+            MAX_SAML_XML_DEPTH - 1,
+            MAX_SAML_XML_DEPTH,
+        ] {
+            let xml = format!(
+                "<AuthnRequest>{}{}</AuthnRequest>",
+                "<x>".repeat(nested_elements),
+                "</x>".repeat(nested_elements)
+            );
+            let result = parse_authn_request(&xml);
+            if nested_elements < MAX_SAML_XML_DEPTH {
+                assert!(result.is_ok(), "depth boundary {nested_elements}");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AppError::BadRequest(message)) if message.contains("depth limit")
+                ));
+            }
+        }
+
+        for empty_children in [MAX_SAML_XML_EVENTS - 3, MAX_SAML_XML_EVENTS - 2] {
+            let xml = format!(
+                "<AuthnRequest>{}</AuthnRequest>",
+                "<x/>".repeat(empty_children)
+            );
+            let result = parse_authn_request(&xml);
+            if empty_children + 3 <= MAX_SAML_XML_EVENTS {
+                assert!(result.is_ok(), "event boundary {empty_children}");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AppError::BadRequest(message)) if message.contains("event limit")
+                ));
+            }
+        }
+
+        let too_many_on_one_element = (0..=MAX_SAML_XML_ATTRIBUTES_PER_ELEMENT)
+            .map(|index| format!(" a{index}=\"v\""))
+            .collect::<String>();
+        let xml = format!("<AuthnRequest{too_many_on_one_element}/>");
+        assert!(matches!(
+            parse_authn_request(&xml),
+            Err(AppError::BadRequest(message)) if message.contains("attribute limit")
+        ));
+
+        let attributes = (0..MAX_SAML_XML_ATTRIBUTES_PER_ELEMENT)
+            .map(|index| format!(" a{index}=\"v\""))
+            .collect::<String>();
+        let children = format!("<x{attributes}/>")
+            .repeat(MAX_SAML_XML_ATTRIBUTES_TOTAL / MAX_SAML_XML_ATTRIBUTES_PER_ELEMENT + 1);
+        assert!(matches!(
+            parse_authn_request(&format!("<AuthnRequest>{children}</AuthnRequest>")),
+            Err(AppError::BadRequest(message)) if message.contains("attribute limit")
+        ));
+    }
+
+    #[test]
+    fn post_binding_accepts_bounded_plain_xml() {
+        let xml = r#"<LogoutRequest ID="logout-1"/>"#;
+        assert_eq!(
+            decode_saml_request_xml(&BASE64.encode(xml), false).expect("decode POST request"),
+            xml
+        );
+    }
+
+    #[test]
+    fn authn_request_parser_decodes_escaped_text_and_attributes() {
+        let parsed = parse_authn_request(
+            r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                    xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                    ID="request&amp;42"
+                    AssertionConsumerServiceURL="https://sp.example.test/acs?one=1&amp;two=2"
+                    Destination="https://idp.example.test/sso?realm=R&amp;mode=login">
+                <saml:Issuer>sp&amp;partner&lt;production&gt;</saml:Issuer>
+            </samlp:AuthnRequest>"#,
+        )
+        .expect("valid AuthnRequest should parse");
+
+        assert_eq!(parsed.request_id.as_deref(), Some("request&42"));
+        assert_eq!(
+            parsed.acs_url.as_deref(),
+            Some("https://sp.example.test/acs?one=1&two=2")
+        );
+        assert_eq!(
+            parsed.destination.as_deref(),
+            Some("https://idp.example.test/sso?realm=R&mode=login")
+        );
+        assert_eq!(parsed.issuer.as_deref(), Some("sp&partner<production>"));
+    }
+
+    #[test]
+    fn authn_request_parser_rejects_mismatched_and_unclosed_xml() {
+        let mismatched = r#"<AuthnRequest><Issuer>sp.example</AuthnRequest>"#;
+        let unclosed = r#"<AuthnRequest><Issuer>sp.example</Issuer>"#;
+
+        assert!(parse_authn_request(mismatched).is_err());
+        assert!(parse_authn_request(unclosed).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_requires_one_authn_request_root() {
+        let wrong_root = r#"<Issuer>sp.example</Issuer>"#;
+        let duplicate_root = r#"<AuthnRequest/><AuthnRequest/>"#;
+        let nested_request = r#"<AuthnRequest><AuthnRequest/></AuthnRequest>"#;
+
+        assert!(parse_authn_request(wrong_root).is_err());
+        assert!(parse_authn_request(duplicate_root).is_err());
+        assert!(parse_authn_request(nested_request).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_rejects_malformed_attributes() {
+        let duplicate_attribute = r#"<AuthnRequest ID="one" ID="two"/>"#;
+        let unterminated_attribute = r#"<AuthnRequest ID="one/>"#;
+
+        assert!(parse_authn_request(duplicate_attribute).is_err());
+        assert!(parse_authn_request(unterminated_attribute).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_rejects_xxe_doctype() {
+        let xxe = r#"<!DOCTYPE AuthnRequest [
+            <!ENTITY secret SYSTEM "file:///etc/passwd">
+        ]>
+        <AuthnRequest ID="request-1">
+            <Issuer>&secret;</Issuer>
+        </AuthnRequest>"#;
+
+        assert!(parse_authn_request(xxe).is_err());
+    }
+
+    #[test]
+    fn authn_request_parser_does_not_expand_unknown_entity_references() {
+        let entity_reference =
+            r#"<AuthnRequest ID="request-1"><Issuer>&external;</Issuer></AuthnRequest>"#;
+
+        assert!(parse_authn_request(entity_reference).is_err());
+    }
+
+    #[test]
+    fn canonicalization_decodes_then_safely_reescapes_xml_values() {
+        let canonical = canonicalize_xml(
+            r#"<root z="one&amp;two" a="&quot;quoted&quot;">Tom &amp; Jerry</root>"#,
+        )
+        .expect("canonicalize valid XML");
+
+        assert_eq!(
+            canonical,
+            r#"<root a="&quot;quoted&quot;" z="one&amp;two">Tom &amp; Jerry</root>"#
+        );
+        assert!(!canonical.contains("<Jerry"));
+    }
+
+    #[test]
+    fn canonicalization_rejects_malformed_xml_instead_of_signing_partial_output() {
+        assert!(canonicalize_xml("<root><child></root>").is_err());
+        assert!(canonicalize_xml("<one/><two/>").is_err());
+        assert!(canonicalize_xml("not XML").is_err());
+    }
+
+    #[test]
+    fn response_builder_escapes_configurable_and_user_values() {
+        let builder = SamlResponseBuilder::new(
+            "user<&@example.test",
+            "https://idp.example.test/a?x=1&y=2",
+            "https://sp.example.test/acs?x=1&y=2",
+            "sp<&audience",
+            "format\"<&",
+            vec![(
+                "role\"><evil injected=\"true".to_string(),
+                "admin</saml:AttributeValue><evil>".to_string(),
+            )],
+            Some("request\"<&".to_string()),
+        );
+
+        let assertion = builder.build_assertion().expect("build safe assertion");
+        let response = builder
+            .build_response(&assertion)
+            .expect("build safe response");
+
+        assert!(assertion.contains("Name=\"role&quot;&gt;&lt;evil injected=&quot;true\""));
+        assert!(assertion.contains("admin&lt;/saml:AttributeValue&gt;&lt;evil&gt;"));
+        assert!(!assertion.contains("<evil"));
+        assert!(response.contains("Destination=\"https://sp.example.test/acs?x=1&amp;y=2\""));
+        assert!(canonicalize_xml(&response).is_ok());
+    }
+
+    #[test]
+    fn metadata_and_logout_response_escape_configurable_and_request_values() {
+        let metadata = build_saml_metadata_xml(
+            "entity\"><evil>",
+            &["certificate<&data".to_string()],
+            "format<&value",
+            "https://idp.example.test/sso?x=1&y=2",
+            "https://idp.example.test/slo?x=1&y=2",
+            "Org </OrganizationName><evil>",
+            "https://idp.example.test/?x=1&y=2",
+        )
+        .expect("build metadata");
+        assert!(metadata.contains("entityID=\"entity&quot;&gt;&lt;evil&gt;\""));
+        assert!(metadata.contains("Org &lt;/OrganizationName&gt;&lt;evil&gt;"));
+        assert!(!metadata.contains("<evil>"));
+        assert!(canonicalize_xml(&metadata).is_ok());
+
+        let logout = build_logout_response_xml(
+            "response\"><evil>",
+            &Utc::now(),
+            "https://sp.example.test/slo?x=1&y=2",
+            "request\"><evil>",
+            "entity<&value",
+        )
+        .expect("build logout response");
+        assert!(logout.contains("InResponseTo=\"request&quot;&gt;&lt;evil&gt;\""));
+        assert!(logout.contains("Destination=\"https://sp.example.test/slo?x=1&amp;y=2\""));
+        assert!(!logout.contains("<evil>"));
+        assert!(canonicalize_xml(&logout).is_ok());
+    }
+
+    #[test]
+    fn metadata_publishes_active_then_eligible_overlap_certificates() {
+        let metadata = build_saml_metadata_xml(
+            "https://idp.example.test",
+            &[
+                "active-certificate".to_string(),
+                "previous-certificate".to_string(),
+            ],
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+            "https://idp.example.test/sso",
+            "https://idp.example.test/slo",
+            "Example",
+            "https://idp.example.test",
+        )
+        .expect("build rollover metadata");
+
+        assert_eq!(
+            metadata.matches("<KeyDescriptor use=\"signing\">").count(),
+            2
+        );
+        assert!(
+            metadata.find("active-certificate").expect("active cert")
+                < metadata
+                    .find("previous-certificate")
+                    .expect("previous cert")
+        );
+        assert!(canonicalize_xml(&metadata).is_ok());
+    }
+
+    #[test]
+    fn certificate_lifecycle_status_observes_near_expiry_and_expiry() {
+        let now = Utc::now();
+        let model = |valid_from: chrono::DateTime<Utc>, valid_until: chrono::DateTime<Utc>| {
+            crate::entities::saml_signing_keys::Model {
+                id: "key".to_string(),
+                service_id: "service".to_string(),
+                private_key_encrypted: vec![],
+                public_key: "certificate".to_string(),
+                encryption_key_id: "encryption-key".to_string(),
+                valid_from: valid_from.naive_utc(),
+                valid_until: valid_until.naive_utc(),
+                is_active: true,
+                publish_until: None,
+                retired_at: None,
+                created_at: now.naive_utc(),
+            }
+        };
+
+        assert_eq!(
+            saml_certificate_lifecycle_status(
+                &model(now - Duration::days(1), now + Duration::days(31)),
+                now,
+            ),
+            "healthy"
+        );
+        assert_eq!(
+            saml_certificate_lifecycle_status(
+                &model(now - Duration::days(1), now + Duration::days(30)),
+                now,
+            ),
+            "expiring_soon"
+        );
+        assert_eq!(
+            saml_certificate_lifecycle_status(
+                &model(now - Duration::days(2), now - Duration::seconds(1)),
+                now,
+            ),
+            "expired"
+        );
+        assert_eq!(
+            saml_certificate_lifecycle_status(
+                &model(now + Duration::seconds(1), now + Duration::days(365)),
+                now,
+            ),
+            "not_yet_valid"
+        );
+    }
+
+    #[test]
+    fn html_attribute_escaping_covers_markup_and_quotes() {
+        assert_eq!(escape_html_attr(r#"&<>"'"#), "&amp;&lt;&gt;&quot;&#x27;");
+    }
 }

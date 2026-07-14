@@ -96,30 +96,95 @@ fn to_response(model: crate::entities::siem_configs::Model) -> SiemConfigRespons
 fn decode_siem_secret(
     encryption: &crate::encryption::EncryptionService,
     value: &str,
-    field_name: &str,
-) -> String {
+    record_id: &str,
+    field_name: &'static str,
+) -> Result<String> {
     let encrypted = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
     {
         Ok(bytes) => bytes,
         Err(_) => {
-            tracing::debug!(
-                field = field_name,
-                "SIEM secret is stored as plaintext; using legacy fallback"
-            );
-            return value.to_string();
+            return Err(AppError::InternalServerError(
+                "SIEM secret requires migration; run rewrap-secrets --apply".to_string(),
+            ))
         }
     };
 
-    match encryption.decrypt(&encrypted) {
-        Ok(decrypted) => decrypted,
-        Err(error) => {
-            tracing::warn!(
-                field = field_name,
-                error = %error,
-                "SIEM secret could not be decrypted; using legacy plaintext fallback"
-            );
-            value.to_string()
+    encryption
+        .decrypt_with_context(
+            &encrypted,
+            crate::encryption::EncryptionContext::new("siem_configs", record_id, field_name),
+        )
+        .map_err(|_| AppError::InternalServerError(
+            "SIEM secret could not be authenticated; verify the encryption keyring and run rewrap-secrets".to_string(),
+        ))
+}
+
+fn siem_auth_headers(
+    provider: &str,
+    encryption: Option<&crate::encryption::EncryptionService>,
+    config_id: &str,
+    api_key: Option<String>,
+    auth_header: Option<String>,
+) -> Result<Vec<(String, String)>> {
+    let require_encryption = || {
+        encryption.ok_or_else(|| {
+            AppError::InternalServerError(
+                "Encryption service is required to test SIEM credentials".to_string(),
+            )
+        })
+    };
+    let required_api_key = |header_name: &str, scheme: Option<&str>| -> Result<_> {
+        let stored = api_key.as_deref().ok_or_else(|| {
+            AppError::BadRequest(format!("{provider} SIEM configuration requires an API key"))
+        })?;
+        let key = decode_siem_secret(require_encryption()?, stored, config_id, "api_key")?;
+        let value = scheme.map_or(key.clone(), |scheme| format!("{scheme} {key}"));
+        Ok(vec![(header_name.to_string(), value)])
+    };
+
+    match provider {
+        "Datadog" => required_api_key("DD-API-KEY", None),
+        "Splunk" => required_api_key("Authorization", Some("Splunk")),
+        "Elastic" => required_api_key("Authorization", Some("ApiKey")),
+        "Custom" => {
+            let Some(stored) = auth_header.as_deref() else {
+                return Ok(Vec::new());
+            };
+            let header =
+                decode_siem_secret(require_encryption()?, stored, config_id, "auth_header")?;
+            let (name, value) = header
+                .split_once(':')
+                .map(|(name, value)| (name.trim(), value.trim()))
+                .unwrap_or(("Authorization", header.trim()));
+            if name.is_empty() || value.is_empty() {
+                return Err(AppError::BadRequest(
+                    "Custom SIEM authentication header is malformed".to_string(),
+                ));
+            }
+            let parsed_name =
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    AppError::BadRequest(
+                        "Custom SIEM authentication header name is invalid".to_string(),
+                    )
+                })?;
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                AppError::BadRequest(
+                    "Custom SIEM authentication header value is invalid".to_string(),
+                )
+            })?;
+            if matches!(
+                parsed_name.as_str(),
+                "host" | "content-length" | "transfer-encoding" | "connection"
+            ) {
+                return Err(AppError::BadRequest(
+                    "Custom SIEM authentication header name is not allowed".to_string(),
+                ));
+            }
+            Ok(vec![(parsed_name.to_string(), value.to_string())])
         }
+        _ => Err(AppError::BadRequest(
+            "Unsupported SIEM provider type".to_string(),
+        )),
     }
 }
 
@@ -180,15 +245,31 @@ pub async fn create_siem_config(
     let name = req.name.clone();
     let provider_type = req.provider_type.clone();
 
-    // Encrypt sensitive fields if encryption service is available
+    let config_id = uuid::Uuid::new_v4().to_string();
+    // Encrypt sensitive fields. The unencrypted-development escape hatch does
+    // not permit writing operational credentials in plaintext.
     let mut api_key = req.api_key.clone();
     let mut auth_header = req.auth_header.clone();
 
-    if let Some(encryption) = &state.encryption {
+    if api_key.is_some() || auth_header.is_some() {
+        let encryption = state.encryption.as_ref().ok_or_else(|| {
+            AppError::InternalServerError(
+                "Encryption service is required to store SIEM credentials".to_string(),
+            )
+        })?;
         if let Some(key) = &api_key {
-            let encrypted = encryption.encrypt(key).map_err(|e| {
-                AppError::InternalServerError(format!("Failed to encrypt SIEM API key: {}", e))
-            })?;
+            let encrypted = encryption
+                .encrypt_with_context(
+                    key,
+                    crate::encryption::EncryptionContext::new(
+                        "siem_configs",
+                        &config_id,
+                        "api_key",
+                    ),
+                )
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("Failed to encrypt SIEM API key: {}", e))
+                })?;
             api_key = Some(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 encrypted,
@@ -196,9 +277,21 @@ pub async fn create_siem_config(
         }
 
         if let Some(header) = &auth_header {
-            let encrypted = encryption.encrypt(header).map_err(|e| {
-                AppError::InternalServerError(format!("Failed to encrypt SIEM auth header: {}", e))
-            })?;
+            let encrypted = encryption
+                .encrypt_with_context(
+                    header,
+                    crate::encryption::EncryptionContext::new(
+                        "siem_configs",
+                        &config_id,
+                        "auth_header",
+                    ),
+                )
+                .map_err(|e| {
+                    AppError::InternalServerError(format!(
+                        "Failed to encrypt SIEM auth header: {}",
+                        e
+                    ))
+                })?;
             auth_header = Some(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 encrypted,
@@ -207,12 +300,24 @@ pub async fn create_siem_config(
     }
 
     // Execute transaction with automatic retry on database contention
-    let config_id = with_retrying_transaction(
+    let desired_config_id = config_id.clone();
+    let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "siem_config.created")
+        .target("siem_config", &config_id)
+        .success(true)
+        .details_json(Some(json!({
+            "siem_config_id": &config_id,
+            "name": &name,
+            "provider_type": &provider_type
+        })))
+        .build();
+    let audit_actor = state.audit_actor.clone();
+    let config = with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
         &state.db_writer,
         "create_siem_config",
         |db| {
+            let config_id = desired_config_id.clone();
             let org_id = org_id.clone();
             let name = name.clone();
             let provider_type = provider_type.clone();
@@ -220,9 +325,12 @@ pub async fn create_siem_config(
             let api_key = api_key.clone();
             let auth_header = auth_header.clone();
             let batch_size = req.batch_size;
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
                 let config_id = SiemConfigStore::create(
                     db.clone(),
+                    &config_id,
                     &org_id,
                     &name,
                     &provider_type,
@@ -233,30 +341,19 @@ pub async fn create_siem_config(
                 )
                 .await?;
 
-                Ok(config_id)
+                let config = SiemConfigStore::get_by_id(db.clone(), &config_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(
+                            "Failed to retrieve created config".to_string(),
+                        )
+                    })?;
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(config)
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "siem_config.created")
-        .target("siem_config", &config_id)
-        .success(true)
-        .details_json(Some(json!({
-            "siem_config_id": config_id,
-            "name": name,
-            "provider_type": provider_type
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
-
-    // Fetch the created config
-    let config = SiemConfigStore::get_by_id(DB::Conn(&state.db), &config_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::InternalServerError("Failed to retrieve created config".to_string())
-        })?;
 
     Ok((StatusCode::CREATED, Json(to_response(config))))
 }
@@ -358,15 +455,31 @@ pub async fn update_siem_config(
     let org_id = org.id.clone();
     let user_id = auth_user.user.id.clone();
 
-    // Encrypt sensitive fields if encryption service is available
+    // Encrypt sensitive fields; plaintext writes are never permitted.
     let mut api_key = req.api_key.clone();
     let mut auth_header = req.auth_header.clone();
 
-    if let Some(encryption) = &state.encryption {
+    if api_key.as_ref().is_some_and(Option::is_some)
+        || auth_header.as_ref().is_some_and(Option::is_some)
+    {
+        let encryption = state.encryption.as_ref().ok_or_else(|| {
+            AppError::InternalServerError(
+                "Encryption service is required to store SIEM credentials".to_string(),
+            )
+        })?;
         if let Some(Some(key)) = &api_key {
-            let encrypted = encryption.encrypt(key).map_err(|e| {
-                AppError::InternalServerError(format!("Failed to encrypt SIEM API key: {}", e))
-            })?;
+            let encrypted = encryption
+                .encrypt_with_context(
+                    key,
+                    crate::encryption::EncryptionContext::new(
+                        "siem_configs",
+                        &config_id,
+                        "api_key",
+                    ),
+                )
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("Failed to encrypt SIEM API key: {}", e))
+                })?;
             api_key = Some(Some(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 encrypted,
@@ -374,9 +487,21 @@ pub async fn update_siem_config(
         }
 
         if let Some(Some(header)) = &auth_header {
-            let encrypted = encryption.encrypt(header).map_err(|e| {
-                AppError::InternalServerError(format!("Failed to encrypt SIEM auth header: {}", e))
-            })?;
+            let encrypted = encryption
+                .encrypt_with_context(
+                    header,
+                    crate::encryption::EncryptionContext::new(
+                        "siem_configs",
+                        &config_id,
+                        "auth_header",
+                    ),
+                )
+                .map_err(|e| {
+                    AppError::InternalServerError(format!(
+                        "Failed to encrypt SIEM auth header: {}",
+                        e
+                    ))
+                })?;
             auth_header = Some(Some(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 encrypted,
@@ -384,23 +509,33 @@ pub async fn update_siem_config(
         }
     }
 
+    let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "siem_config.updated")
+        .target("siem_config", &config_id)
+        .success(true)
+        .details_json(Some(json!({"siem_config_id": &config_id})))
+        .build();
+    let audit_actor = state.audit_actor.clone();
     // Execute transaction with automatic retry on database contention
-    with_retrying_transaction(
+    let config = with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
         &state.db_writer,
         "update_siem_config",
         |db| {
             let config_id = config_id.clone();
+            let org_id = org_id.clone();
             let name = req.name.clone();
             let endpoint_url = req.endpoint_url.clone();
             let api_key = api_key.clone();
             let auth_header = auth_header.clone();
             let batch_size = req.batch_size;
             let enabled = req.enabled;
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
                 SiemConfigStore::update(
                     db.clone(),
+                    &org_id,
                     &config_id,
                     name,
                     endpoint_url,
@@ -411,26 +546,19 @@ pub async fn update_siem_config(
                 )
                 .await?;
 
-                Ok(())
+                let config = SiemConfigStore::get_by_id(db.clone(), &config_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(
+                            "Failed to retrieve updated config".to_string(),
+                        )
+                    })?;
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(config)
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "siem_config.updated")
-        .target("siem_config", &config_id)
-        .success(true)
-        .details_json(Some(json!({"siem_config_id": config_id})))
-        .build();
-    state.audit_actor.log_org(event).await;
-
-    // Fetch the updated config
-    let config = SiemConfigStore::get_by_id(DB::Conn(&state.db), &config_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::InternalServerError("Failed to retrieve updated config".to_string())
-        })?;
 
     Ok(Json(to_response(config)))
 }
@@ -467,6 +595,12 @@ pub async fn delete_siem_config(
 
     let org_id = org.id.clone();
     let user_id = auth_user.user.id.clone();
+    let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "siem_config.deleted")
+        .target("siem_config", &config_id)
+        .success(true)
+        .details_json(Some(json!({"siem_config_id": &config_id})))
+        .build();
+    let audit_actor = state.audit_actor.clone();
 
     // Execute transaction with automatic retry on database contention
     with_retrying_transaction(
@@ -476,21 +610,17 @@ pub async fn delete_siem_config(
         "delete_siem_config",
         |db| {
             let config_id = config_id.clone();
+            let org_id = org_id.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
-                SiemConfigStore::delete(db.clone(), &config_id).await?;
+                SiemConfigStore::delete(db.clone(), &org_id, &config_id).await?;
+                audit_actor.log_org_with_db(db, event).await?;
                 Ok(())
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "siem_config.deleted")
-        .target("siem_config", &config_id)
-        .success(true)
-        .details_json(Some(json!({"siem_config_id": config_id})))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -525,19 +655,15 @@ pub async fn test_siem_connection(
         ));
     }
 
-    // Decrypt sensitive fields if encryption service is available
-    let mut api_key = config.api_key.clone();
-    let mut auth_header = config.auth_header.clone();
-
-    if let Some(encryption) = &state.encryption {
-        if let Some(key_b64) = &api_key {
-            api_key = Some(decode_siem_secret(encryption, key_b64, "api_key"));
-        }
-
-        if let Some(header_b64) = &auth_header {
-            auth_header = Some(decode_siem_secret(encryption, header_b64, "auth_header"));
-        }
-    }
+    // Stored credentials are ciphertext. Fail closed when the runtime keyring
+    // is absent rather than sending encoded ciphertext to an external system.
+    let auth_headers = siem_auth_headers(
+        &config.provider,
+        state.encryption.as_deref(),
+        &config.id,
+        config.api_key.clone(),
+        config.auth_header.clone(),
+    )?;
 
     let test_payload = json!({
         "test": true,
@@ -550,59 +676,174 @@ pub async fn test_siem_connection(
 
     let safe_client = crate::services::safe_http::SafeHttpClient::new()?;
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-
-    // Add authentication based on provider type
-    match config.provider.as_str() {
-        "Datadog" => {
-            if let Some(key) = &api_key {
-                headers.push(("DD-API-KEY".to_string(), key.clone()));
-            }
-        }
-        "Splunk" => {
-            if let Some(key) = &api_key {
-                headers.push(("Authorization".to_string(), format!("Splunk {}", key)));
-            }
-        }
-        "Elastic" => {
-            if let Some(key) = &api_key {
-                headers.push(("Authorization".to_string(), format!("ApiKey {}", key)));
-            }
-        }
-        "Custom" => {
-            if let Some(header) = &auth_header {
-                if let Some((name, value)) = header.split_once(':') {
-                    headers.push((name.trim().to_string(), value.trim().to_string()));
-                } else {
-                    headers.push(("Authorization".to_string(), header.clone()));
-                }
-            }
-        }
-        _ => {}
-    }
+    headers.extend(auth_headers);
 
     let response = safe_client
         .post_with_owned_headers(&config.endpoint_url, test_body, headers)
         .await;
 
     match response {
-        Ok(resp) if resp.status().is_success() => Ok(Json(TestConnectionResponse {
-            success: true,
-            message: format!(
-                "Successfully connected to SIEM endpoint (status: {})",
-                resp.status()
-            ),
-        })),
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            Ok(Json(TestConnectionResponse {
-                success: false,
-                message: format!("SIEM endpoint returned error status {}: {}", status, body),
-            }))
+        Ok(response) => {
+            match crate::services::safe_http::SafeHttpClient::read_body_limited(response, 8 * 1024)
+                .await
+            {
+                Ok((status, _)) if status.is_success() => Ok(Json(TestConnectionResponse {
+                    success: true,
+                    message: format!("Successfully connected to SIEM endpoint (status: {status})"),
+                })),
+                Ok((status, _)) => Ok(Json(TestConnectionResponse {
+                    success: false,
+                    message: format!("SIEM endpoint returned error status {status}"),
+                })),
+                Err(_) => Ok(Json(TestConnectionResponse {
+                    success: false,
+                    message: "SIEM endpoint response could not be safely processed".to_string(),
+                })),
+            }
         }
-        Err(e) => Ok(Json(TestConnectionResponse {
+        Err(_) => Ok(Json(TestConnectionResponse {
             success: false,
-            message: format!("Failed to connect to SIEM endpoint: {}", e),
+            message: "Failed to connect to SIEM endpoint".to_string(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn encryption() -> crate::encryption::EncryptionService {
+        crate::encryption::EncryptionService::from_keyring_values("active", &"11".repeat(32), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn siem_runtime_rejects_plaintext_and_wrong_context_without_fallback() {
+        let encryption = encryption();
+        assert!(decode_siem_secret(&encryption, "plaintext!", "config-a", "api_key").is_err());
+
+        let ciphertext = encryption
+            .encrypt_with_context(
+                "siem-secret",
+                crate::encryption::EncryptionContext::new("siem_configs", "config-a", "api_key"),
+            )
+            .unwrap();
+        let stored = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+        assert_eq!(
+            decode_siem_secret(&encryption, &stored, "config-a", "api_key").unwrap(),
+            "siem-secret"
+        );
+        assert!(decode_siem_secret(&encryption, &stored, "config-b", "api_key").is_err());
+        assert!(decode_siem_secret(&encryption, &stored, "config-a", "auth_header").is_err());
+    }
+
+    #[test]
+    fn siem_test_credentials_are_provider_specific_and_fail_closed() {
+        let encryption = encryption();
+        let api_key = base64::engine::general_purpose::STANDARD.encode(
+            encryption
+                .encrypt_with_context(
+                    "siem-secret",
+                    crate::encryption::EncryptionContext::new(
+                        "siem_configs",
+                        "config-a",
+                        "api_key",
+                    ),
+                )
+                .unwrap(),
+        );
+        let auth_header = base64::engine::general_purpose::STANDARD.encode(
+            encryption
+                .encrypt_with_context(
+                    "Bearer secret",
+                    crate::encryption::EncryptionContext::new(
+                        "siem_configs",
+                        "config-a",
+                        "auth_header",
+                    ),
+                )
+                .unwrap(),
+        );
+
+        assert!(
+            siem_auth_headers("Datadog", None, "config-a", Some(api_key.clone()), None).is_err()
+        );
+        assert!(siem_auth_headers("Datadog", Some(&encryption), "config-a", None, None).is_err());
+        assert_eq!(
+            siem_auth_headers(
+                "Datadog",
+                Some(&encryption),
+                "config-a",
+                Some(api_key.clone()),
+                Some("corrupt-unused-auth-header".to_string()),
+            )
+            .unwrap(),
+            vec![("DD-API-KEY".to_string(), "siem-secret".to_string())]
+        );
+        assert_eq!(
+            siem_auth_headers(
+                "Custom",
+                Some(&encryption),
+                "config-a",
+                Some("corrupt-unused-api-key".to_string()),
+                Some(auth_header),
+            )
+            .unwrap(),
+            vec![("authorization".to_string(), "Bearer secret".to_string())]
+        );
+        assert!(siem_auth_headers(
+            "Custom",
+            Some(&encryption),
+            "config-a",
+            None,
+            Some(
+                base64::engine::general_purpose::STANDARD.encode(
+                    encryption
+                        .encrypt_with_context(
+                            "Host: attacker.example",
+                            crate::encryption::EncryptionContext::new(
+                                "siem_configs",
+                                "config-a",
+                                "auth_header",
+                            ),
+                        )
+                        .unwrap(),
+                )
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            siem_auth_headers("Custom", None, "config-a", None, None).unwrap(),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn siem_api_response_never_serializes_credential_columns() {
+        let now = chrono::Utc::now().naive_utc();
+        let response = to_response(crate::entities::siem_configs::Model {
+            id: "config-a".to_string(),
+            org_id: "org-a".to_string(),
+            name: "SIEM".to_string(),
+            provider: "Custom".to_string(),
+            endpoint_url: "https://siem.example.test/events".to_string(),
+            api_key: Some("encrypted-api-key-canary".to_string()),
+            auth_header: Some("encrypted-auth-header-canary".to_string()),
+            batch_size: "100".to_string(),
+            enabled: true,
+            last_successful_batch_at: None,
+            last_processed_log_id: None,
+            failure_count: 0,
+            created_at: now,
+            updated_at: now,
+        });
+        let serialized = serde_json::to_value(response).expect("serialize SIEM response");
+        let object = serialized.as_object().expect("response object");
+        assert!(!object.contains_key("api_key"));
+        assert!(!object.contains_key("auth_header"));
+        let serialized = serialized.to_string();
+        assert!(!serialized.contains("encrypted-api-key-canary"));
+        assert!(!serialized.contains("encrypted-auth-header-canary"));
     }
 }

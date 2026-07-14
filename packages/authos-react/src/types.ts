@@ -1,4 +1,4 @@
-import type { SsoClient, SsoClientOptions, UserProfile, Organization, OAuthProvider } from '@drmhse/sso-sdk';
+import type { SsoClient, SsoClientOptions, UserProfile, Organization } from '@drmhse/sso-sdk';
 
 /**
  * Extended configuration options for the AuthOS React provider.

@@ -4,7 +4,7 @@ use crate::auth::sso::{
 };
 use crate::constants::OAUTH_STATE_EXPIRE_MINUTES;
 use crate::db::models::{DeviceCode, Service, User};
-use crate::error::{AppError, Result};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
@@ -24,12 +24,10 @@ use chrono::Utc;
 use oauth2::url;
 use oauth2::{CsrfToken, PkceCodeChallenge, PkceCodeVerifier};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    Set,
+    ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, Set,
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 struct OidcDiscoveryDocument {
@@ -77,29 +75,67 @@ async fn grant_connected_account_to_service(
     connected_account_id: &str,
     scopes: &[String],
 ) -> Result<()> {
-    ServiceProviderGrantStore::upsert(
-        DB::Conn(&state.db),
-        user_id,
-        service_id,
-        connected_account_id,
-        provider_key,
-        scopes,
+    let service = ServiceStore::find_by_id(DB::Conn(&state.db), service_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+    use crate::services::audit_builder::OrgAuditBuilder;
+    use serde_json::json;
+    let event = OrgAuditBuilder::new(&service.org_id, Some(user_id), "provider_account.linked")
+        .target("connected_account", connected_account_id)
+        .details_json(Some(json!({
+            "service_id": service_id,
+            "provider": provider_key,
+            "scopes": scopes,
+        })))
+        .build();
+    let service_org_id = service.org_id.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "grant_connected_account_to_service_with_audit",
+        |db| {
+            let user_id = user_id.to_string();
+            let service_id = service_id.to_string();
+            let service_org_id = service_org_id.clone();
+            let connected_account_id = connected_account_id.to_string();
+            let provider_key = provider_key.to_string();
+            let scopes = scopes.to_vec();
+            let event = event.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                validate_live_oauth_tenant_context(
+                    db.clone(),
+                    Some(&service_org_id),
+                    None,
+                    Some(&service_id),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+                validate_live_oauth_user_entitlement(
+                    db.clone(),
+                    &user_id,
+                    &service_org_id,
+                    Some(&service_id),
+                )
+                .await?;
+                ServiceProviderGrantStore::upsert(
+                    db.clone(),
+                    &user_id,
+                    &service_id,
+                    &connected_account_id,
+                    &provider_key,
+                    &scopes,
+                )
+                .await?;
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(())
+            })
+        },
     )
     .await?;
-    if let Some(service) = ServiceStore::find_by_id(DB::Conn(&state.db), service_id).await? {
-        use crate::services::audit_builder::OrgAuditBuilder;
-        use serde_json::json;
-
-        let event = OrgAuditBuilder::new(&service.org_id, Some(user_id), "provider_account.linked")
-            .target("connected_account", connected_account_id)
-            .details_json(Some(json!({
-                "service_id": service_id,
-                "provider": provider_key,
-                "scopes": scopes,
-            })))
-            .build();
-        state.audit_actor.log_org(event).await;
-    }
     Ok(())
 }
 
@@ -211,6 +247,38 @@ fn provider_token_redirect_url(
     Ok(redirect.to_string())
 }
 
+fn validate_service_device_oauth_context(
+    device_org_slug: &str,
+    device_service_slug: &str,
+    oauth_org_slug: &str,
+    oauth_service_slug: &str,
+) -> Result<()> {
+    if device_org_slug != oauth_org_slug || device_service_slug != oauth_service_slug {
+        return Err(AppError::BadRequest(
+            "Device authorization context is invalid or expired".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_platform_device_oauth_context(
+    device_org_slug: &str,
+    device_service_slug: &str,
+    oauth_org_slug: Option<&str>,
+    is_current_platform_owner: bool,
+) -> Result<()> {
+    if device_org_slug != "platform"
+        || device_service_slug != "admin-cli"
+        || oauth_org_slug != Some("platform")
+        || !is_current_platform_owner
+    {
+        return Err(AppError::Forbidden(
+            "Platform device authorization requires a current platform owner".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn complete_provider_token_request_from_oauth(
     state: &AppState,
     request_state: &str,
@@ -247,19 +315,11 @@ async fn complete_provider_token_request_from_oauth(
         ));
     }
 
-    ServiceProviderGrantStore::upsert(
-        DB::Conn(&state.db),
-        user_id,
-        &request.service_id,
-        connected_account_id,
-        provider_key,
-        &requested_scopes,
-    )
-    .await?;
-
     let service = ServiceStore::find_by_id(DB::Conn(&state.db), &request.service_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+    // Validate the stored redirect before consuming the one-time request.
+    let redirect_url = provider_token_redirect_url(&request)?;
 
     use crate::services::audit_builder::OrgAuditBuilder;
     use serde_json::json;
@@ -274,9 +334,7 @@ async fn complete_provider_token_request_from_oauth(
                 "provider_token_request": &request.state,
             })))
             .build();
-    state.audit_actor.log_org(grant_event).await;
 
-    ProviderTokenRequestStore::complete(DB::Conn(&state.db), &request.state, user_id).await?;
     let completed_event = OrgAuditBuilder::new(
         &service.org_id,
         Some(user_id),
@@ -289,9 +347,66 @@ async fn complete_provider_token_request_from_oauth(
         "connected_account_id": connected_account_id,
     })))
     .build();
-    state.audit_actor.log_org(completed_event).await;
 
-    provider_token_redirect_url(&request)
+    let request_state = request.state.clone();
+    let service_id = request.service_id.clone();
+    let user_id = user_id.to_string();
+    let provider_key = provider_key.to_string();
+    let connected_account_id = connected_account_id.to_string();
+    let service_org_id = service.org_id.clone();
+    let audit_actor = state.audit_actor.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "complete_provider_token_request_from_oauth",
+        |db| {
+            let request_state = request_state.clone();
+            let service_id = service_id.clone();
+            let service_org_id = service_org_id.clone();
+            let user_id = user_id.clone();
+            let provider_key = provider_key.clone();
+            let connected_account_id = connected_account_id.clone();
+            let requested_scopes = requested_scopes.clone();
+            let audit_actor = audit_actor.clone();
+            let grant_event = grant_event.clone();
+            let completed_event = completed_event.clone();
+            Box::pin(async move {
+                validate_live_oauth_tenant_context(
+                    db.clone(),
+                    Some(&service_org_id),
+                    None,
+                    Some(&service_id),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+                validate_live_oauth_user_entitlement(
+                    db.clone(),
+                    &user_id,
+                    &service_org_id,
+                    Some(&service_id),
+                )
+                .await?;
+                ProviderTokenRequestStore::complete_with_grant_and_audits_in_transaction(
+                    db,
+                    &audit_actor,
+                    &request_state,
+                    &user_id,
+                    &service_id,
+                    &connected_account_id,
+                    &provider_key,
+                    &requested_scopes,
+                    vec![grant_event, completed_event],
+                )
+                .await
+            })
+        },
+    )
+    .await?;
+
+    Ok(redirect_url)
 }
 
 async fn is_safe_orphan_provider_duplicate(
@@ -331,17 +446,16 @@ async fn is_safe_orphan_provider_duplicate(
         }
     }
 
-    let identity_count = Identities::find()
+    let non_matching_identity_count = Identities::find()
         .filter(identities::Column::UserId.eq(duplicate_user_id))
+        .filter(
+            Condition::any()
+                .add(identities::Column::Provider.ne(provider))
+                .add(identities::Column::ProviderUserId.ne(provider_user_id)),
+        )
         .count(&db)
         .await?;
-    let matching_identity_count = Identities::find()
-        .filter(identities::Column::UserId.eq(duplicate_user_id))
-        .filter(identities::Column::Provider.eq(provider))
-        .filter(identities::Column::ProviderUserId.eq(provider_user_id))
-        .count(&db)
-        .await?;
-    if identity_count != matching_identity_count {
+    if non_matching_identity_count != 0 {
         return Ok(false);
     }
 
@@ -375,14 +489,13 @@ async fn is_safe_orphan_provider_duplicate(
         .filter(service_provider_grants::Column::UserId.eq(duplicate_user_id))
         .count(&db)
         .await?;
-    let account_count = ConnectedAccounts::find()
+    let non_matching_account_count = ConnectedAccounts::find()
         .filter(connected_accounts::Column::UserId.eq(duplicate_user_id))
-        .count(&db)
-        .await?;
-    let matching_account_count = ConnectedAccounts::find()
-        .filter(connected_accounts::Column::UserId.eq(duplicate_user_id))
-        .filter(connected_accounts::Column::Provider.eq(provider))
-        .filter(connected_accounts::Column::ProviderUserId.eq(provider_user_id))
+        .filter(
+            Condition::any()
+                .add(connected_accounts::Column::Provider.ne(provider))
+                .add(connected_accounts::Column::ProviderUserId.ne(provider_user_id)),
+        )
         .count(&db)
         .await?;
 
@@ -390,7 +503,7 @@ async fn is_safe_orphan_provider_duplicate(
         && passkey_count == 0
         && totp_count == 0
         && grant_count == 0
-        && account_count == matching_account_count)
+        && non_matching_account_count == 0)
 }
 
 async fn transfer_orphan_provider_duplicate(
@@ -405,63 +518,82 @@ async fn transfer_orphan_provider_duplicate(
     use crate::entities::prelude::{ConnectedAccounts, Identities};
     use crate::entities::{connected_accounts, identities};
 
-    if !is_safe_orphan_provider_duplicate(
-        DB::Conn(&state.db),
-        duplicate_user_id,
-        target_org_id,
-        target_service_id,
-        provider,
-        provider_user_id,
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "transfer_orphan_provider_duplicate_with_audit",
+        |db| {
+            let duplicate_user_id = duplicate_user_id.to_string();
+            let target_user_id = target_user_id.to_string();
+            let target_org_id = target_org_id.map(str::to_string);
+            let target_service_id = target_service_id.map(str::to_string);
+            let provider = provider.to_string();
+            let provider_user_id = provider_user_id.to_string();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                if !is_safe_orphan_provider_duplicate(
+                    db.clone(),
+                    &duplicate_user_id,
+                    target_org_id.as_deref(),
+                    target_service_id.as_deref(),
+                    &provider,
+                    &provider_user_id,
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+
+                Identities::update_many()
+                    .set(identities::ActiveModel {
+                        user_id: Set(target_user_id.to_string()),
+                        ..Default::default()
+                    })
+                    .filter(identities::Column::UserId.eq(duplicate_user_id.clone()))
+                    .filter(identities::Column::Provider.eq(provider.clone()))
+                    .filter(identities::Column::ProviderUserId.eq(provider_user_id.clone()))
+                    .exec(&db)
+                    .await?;
+
+                ConnectedAccounts::update_many()
+                    .set(connected_accounts::ActiveModel {
+                        user_id: Set(target_user_id.to_string()),
+                        updated_at: Set(chrono::Utc::now().naive_utc()),
+                        ..Default::default()
+                    })
+                    .filter(connected_accounts::Column::UserId.eq(duplicate_user_id.clone()))
+                    .filter(connected_accounts::Column::Provider.eq(provider.clone()))
+                    .filter(connected_accounts::Column::ProviderUserId.eq(provider_user_id.clone()))
+                    .exec(&db)
+                    .await?;
+
+                if let Some(org_id) = target_org_id {
+                    use crate::services::audit_builder::OrgAuditBuilder;
+                    use serde_json::json;
+
+                    let event = OrgAuditBuilder::new(
+                        &org_id,
+                        Some(&target_user_id),
+                        "provider_account.transferred",
+                    )
+                    .target("user", &duplicate_user_id)
+                    .details_json(Some(json!({
+                        "provider": provider,
+                        "provider_user_id": provider_user_id,
+                        "from_user_id": duplicate_user_id,
+                        "to_user_id": target_user_id,
+                        "service_id": target_service_id,
+                    })))
+                    .build();
+                    audit_actor.log_org_with_db(db, event).await?;
+                }
+
+                Ok(true)
+            })
+        },
     )
-    .await?
-    {
-        return Ok(false);
-    }
-
-    let identities_to_transfer = Identities::find()
-        .filter(identities::Column::UserId.eq(duplicate_user_id))
-        .filter(identities::Column::Provider.eq(provider))
-        .filter(identities::Column::ProviderUserId.eq(provider_user_id))
-        .all(&state.db)
-        .await?;
-    for identity in identities_to_transfer {
-        let mut active: identities::ActiveModel = identity.into();
-        active.user_id = Set(target_user_id.to_string());
-        active.update(&state.db).await?;
-    }
-
-    let accounts_to_transfer = ConnectedAccounts::find()
-        .filter(connected_accounts::Column::UserId.eq(duplicate_user_id))
-        .filter(connected_accounts::Column::Provider.eq(provider))
-        .filter(connected_accounts::Column::ProviderUserId.eq(provider_user_id))
-        .all(&state.db)
-        .await?;
-    for account in accounts_to_transfer {
-        let mut active: connected_accounts::ActiveModel = account.into();
-        active.user_id = Set(target_user_id.to_string());
-        active.updated_at = Set(chrono::Utc::now().naive_utc());
-        active.update(&state.db).await?;
-    }
-
-    if let Some(org_id) = target_org_id {
-        use crate::services::audit_builder::OrgAuditBuilder;
-        use serde_json::json;
-
-        let event =
-            OrgAuditBuilder::new(org_id, Some(target_user_id), "provider_account.transferred")
-                .target("user", duplicate_user_id)
-                .details_json(Some(json!({
-                    "provider": provider,
-                    "provider_user_id": provider_user_id,
-                    "from_user_id": duplicate_user_id,
-                    "to_user_id": target_user_id,
-                    "service_id": target_service_id,
-                })))
-                .build();
-        state.audit_actor.log_org(event).await;
-    }
-
-    Ok(true)
+    .await
 }
 
 async fn ensure_provider_account_can_link(
@@ -520,7 +652,7 @@ async fn ensure_provider_account_can_link(
                 "service_id": target_service_id,
             })))
             .build();
-        state.audit_actor.log_org(event).await;
+        state.audit_actor.log_org(event).await?;
     }
 
     Err(AppError::BadRequest(
@@ -695,6 +827,13 @@ pub struct CallbackQuery {
 }
 
 impl CallbackQuery {
+    fn state_parameter(&self) -> Result<&str> {
+        self.state
+            .as_deref()
+            .filter(|state| !state.is_empty())
+            .ok_or_else(|| AppError::BadRequest("Missing state parameter".to_string()))
+    }
+
     fn authorization_code(&self) -> Result<&str> {
         self.code.as_deref().ok_or_else(|| {
             AppError::BadRequest("OAuth callback did not include an authorization code".to_string())
@@ -810,7 +949,14 @@ pub async fn auth_provider(
                 AppError::InternalServerError("Encryption unavailable".to_string())
             })?;
             let secret = encryption
-                .decrypt(&provider_model.client_secret_encrypted)
+                .decrypt_with_context(
+                    &provider_model.client_secret_encrypted,
+                    crate::encryption::EncryptionContext::new(
+                        "upstream_providers",
+                        &provider_model.id,
+                        "client_secret_encrypted",
+                    ),
+                )
                 .map_err(|e| {
                     AppError::InternalServerError(format!("Failed to decrypt secret: {}", e))
                 })?;
@@ -976,8 +1122,11 @@ pub async fn auth_saml_callback(
         .await?
         .ok_or_else(|| AppError::BadRequest("Invalid or expired state parameter".to_string()))?;
 
-    // 2. Clean up state
-    let _ = OAuthStateStore::delete(DB::Conn(&state.db), state_param).await;
+    // 2. Atomically consume state. A concurrent callback that loaded the same
+    // row must lose here and cannot continue processing the assertion.
+    OAuthStateStore::delete(DB::Conn(&state.db), state_param)
+        .await
+        .map_err(|_| AppError::BadRequest("Invalid or expired state parameter".to_string()))?;
 
     // 3. Get provider info
     let conn_id = oauth_state.upstream_connection_id.as_ref().ok_or_else(|| {
@@ -1110,21 +1259,20 @@ async fn auth_callback_impl(
     let config = crate::config::Config::from_env()
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    // Get OAuth state (includes PKCE verifier, redirect_uri, org/service context)
+    // OAuth callbacks are never accepted without the state issued at the start
+    // of the flow. Preserve the optional wrapper below for the existing flow
+    // context plumbing after requiring a concrete state here.
+    let state_param = callback.state_parameter()?;
     let oauth_state: Option<crate::db::models::OAuthState> =
-        if let Some(ref state_param) = callback.state {
-            OAuthStateStore::find_by_state(DB::Conn(&state.db), state_param)
-                .await?
-                .map(Into::into)
-        } else {
-            None
-        };
+        OAuthStateStore::find_by_state(DB::Conn(&state.db), state_param)
+            .await?
+            .map(Into::into);
 
     // Clean up OAuth state immediately to prevent replay attacks
     // We extract all needed info first, then delete the state before token exchange
-    if let Some(ref state_param) = callback.state {
-        let _ = OAuthStateStore::delete(DB::Conn(&state.db), state_param).await;
-    }
+    OAuthStateStore::delete(DB::Conn(&state.db), state_param)
+        .await
+        .map_err(|_| AppError::BadRequest("Invalid or expired state parameter".to_string()))?;
 
     // Validate that we have a valid OAuth state (required for SSO flows)
     // If state was provided but not found (expired or invalid), reject the request
@@ -1178,7 +1326,14 @@ async fn auth_callback_impl(
                 AppError::InternalServerError("Encryption unavailable".to_string())
             })?;
             let secret = encryption
-                .decrypt(&provider_model.client_secret_encrypted)
+                .decrypt_with_context(
+                    &provider_model.client_secret_encrypted,
+                    crate::encryption::EncryptionContext::new(
+                        "upstream_providers",
+                        &provider_model.id,
+                        "client_secret_encrypted",
+                    ),
+                )
                 .map_err(|e| {
                     AppError::InternalServerError(format!("Failed to decrypt secret: {}", e))
                 })?;
@@ -1379,6 +1534,29 @@ async fn auth_callback_impl(
         // Standard providers
         get_provider_user_info(provider, &token_details.access_token, &config).await?
     };
+
+    // OAuth state proves what was selected when authorization started, not
+    // that the tenant is still permitted to complete authentication now.
+    // Re-authorize before any user, identity, grant, or session mutation.
+    validate_live_oauth_tenant_context(
+        DB::Conn(&state.db),
+        issuing_org_id.as_deref(),
+        oauth_state
+            .as_ref()
+            .and_then(|context| context.org_slug.as_deref()),
+        issuing_service_id.as_deref(),
+        oauth_state
+            .as_ref()
+            .and_then(|context| context.service_slug.as_deref()),
+        oauth_state
+            .as_ref()
+            .and_then(|context| context.redirect_uri.as_deref()),
+        oauth_state
+            .as_ref()
+            .and_then(|context| context.resource.as_deref()),
+    )
+    .await?;
+
     let requested_scopes = oauth_state
         .as_ref()
         .map(|ctx| parse_stored_scopes(&ctx.requested_scopes))
@@ -1422,6 +1600,14 @@ async fn auth_callback_impl(
             )
             .await?;
 
+            validate_live_oauth_linking_user(
+                DB::Conn(&state.db),
+                linking_user_id,
+                issuing_org_id.as_deref(),
+                issuing_service_id.as_deref(),
+            )
+            .await?;
+
             // Create or update identity for the linking user
             IdentityStore::upsert_with_details(
                 DB::Conn(&state.db),
@@ -1447,17 +1633,6 @@ async fn auth_callback_impl(
                 &effective_scopes,
             )
             .await?;
-            if let Some(service_id) = issuing_service_id.as_deref() {
-                grant_connected_account_to_service(
-                    &state,
-                    linking_user_id,
-                    service_id,
-                    provider_key,
-                    &connected_account.id,
-                    &effective_scopes,
-                )
-                .await?;
-            }
             if let Some(request_state) = oauth_ctx.provider_token_request_state.as_deref() {
                 let redirect_url = complete_provider_token_request_from_oauth(
                     &state,
@@ -1469,6 +1644,17 @@ async fn auth_callback_impl(
                 )
                 .await?;
                 return Ok(Redirect::to(&redirect_url).into_response());
+            }
+            if let Some(service_id) = issuing_service_id.as_deref() {
+                grant_connected_account_to_service(
+                    &state,
+                    linking_user_id,
+                    service_id,
+                    provider_key,
+                    &connected_account.id,
+                    &effective_scopes,
+                )
+                .await?;
             }
 
             // Redirect to frontend callback URL
@@ -1494,6 +1680,11 @@ async fn auth_callback_impl(
         .await?;
 
         if let Some(u) = existing {
+            if u.deleted_at.is_some() {
+                return Err(AppError::Unauthorized(
+                    "OAuth user is no longer active".to_string(),
+                ));
+            }
             (u, false)
         } else {
             // Create scoped user
@@ -1510,8 +1701,15 @@ async fn auth_callback_impl(
         // Platform-scoped lookup (issuing_org_id is None)
         // matches behavior of find_or_create but explicitly using the context logic if we wanted,
         // strictly speaking find_or_create calls create() which defaults org_id to NULL, which is what we want for platform users.
-        crate::store::users::UserStore::find_or_create(DB::Conn(&state.db), &user_info.email)
-            .await?
+        let result =
+            crate::store::users::UserStore::find_or_create(DB::Conn(&state.db), &user_info.email)
+                .await?;
+        if result.0.deleted_at.is_some() {
+            return Err(AppError::Unauthorized(
+                "OAuth user is no longer active".to_string(),
+            ));
+        }
+        result
     };
     let user: User = user_model.into();
 
@@ -1534,7 +1732,6 @@ async fn auth_callback_impl(
         // Log risk assessment
         tracing::info!(
             user_id = %user.id,
-            email = %user.email,
             provider = %provider.as_str(),
             risk_score = assessment.score,
             risk_action = ?assessment.action,
@@ -1618,17 +1815,55 @@ async fn auth_callback_impl(
         .await?;
     }
 
-    // Check if this is a SAML flow - complete SAML response if so
+    // SAML assertion issuance is an authentication completion, so it must pass
+    // the same risk and MFA gates as the ordinary OAuth login path. Do not
+    // consume the one-time SAML state until those gates have completed.
     if let Some(ref oauth_ctx) = oauth_state {
         if let Some(ref saml_state_id) = oauth_ctx.saml_state_id {
-            // This is a SAML authentication flow - complete SAML response
-            return crate::handlers::saml::complete_saml_authentication(
-                &state,
-                saml_state_id,
-                oauth_ctx.service_id.as_deref(),
-                &user,
-            )
-            .await;
+            let mfa_enabled = is_mfa_enabled(&state.db, &user.id).await?;
+            let risk_action = risk_assessment.as_ref().map(|assessment| assessment.action);
+
+            match saml_login_gate(risk_action, mfa_enabled) {
+                SamlLoginGate::Block => {
+                    tracing::warn!(
+                        user_id = %user.id,
+                        provider = %provider.as_str(),
+                        saml_state_id = %saml_state_id,
+                        "SAML login blocked by risk engine before assertion issuance"
+                    );
+                    return Ok((
+                        axum::http::StatusCode::FORBIDDEN,
+                        Html(
+                            "<!DOCTYPE html><html><head><title>Login Blocked</title></head><body><h1>Login Suspended</h1><p>For security reasons, this login attempt was blocked.</p></body></html>"
+                                .to_string(),
+                        ),
+                    )
+                        .into_response());
+                }
+                SamlLoginGate::ChallengeMfa => {
+                    let preauth_token = state.jwt_service.create_mfa_preauth_token_with_resource(
+                        &user.id,
+                        &user.email,
+                        user.is_platform_owner,
+                        oauth_ctx.org_slug.as_deref(),
+                        oauth_ctx.service_slug.as_deref(),
+                        Some(saml_state_id),
+                        oauth_ctx.resource.as_deref(),
+                    )?;
+                    return Ok(crate::handlers::saml::saml_mfa_challenge_response(
+                        &preauth_token,
+                    ));
+                }
+                SamlLoginGate::Complete => {
+                    return crate::handlers::saml::complete_saml_authentication(
+                        &state,
+                        saml_state_id,
+                        oauth_ctx.service_id.as_deref(),
+                        &user,
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -1650,6 +1885,12 @@ async fn auth_callback_impl(
                         .map(Into::into);
 
                 if let Some(dc) = device_code {
+                    validate_service_device_oauth_context(
+                        &dc.org_slug,
+                        &dc.service_slug,
+                        org_slug,
+                        service_slug,
+                    )?;
                     // Check if user has MFA enabled
                     let mfa_enabled = is_mfa_enabled(&state.db, &user.id).await?;
 
@@ -1663,15 +1904,16 @@ async fn auth_callback_impl(
 
                         // Redirect to MFA challenge with device flow context
                         // Create pre-auth token with device context
-                        let preauth_token =
-                            state.jwt_service.create_mfa_preauth_token_with_resource(
+                        let preauth_token = state
+                            .jwt_service
+                            .create_mfa_preauth_token_for_device_with_resource(
                                 &user.id,
                                 &user.email,
                                 user.is_platform_owner,
                                 Some(org_slug),
                                 Some(service_slug),
-                                oauth_ctx.saml_state_id.as_deref(),
                                 oauth_ctx.resource.as_deref(),
+                                &dc.id,
                             )?;
 
                         // Get the device activation URI for redirect
@@ -1803,7 +2045,6 @@ async fn auth_callback_impl(
                     RiskAction::Block => {
                         tracing::warn!(
                             user_id = %user.id,
-                            email = %user.email,
                             provider = %provider.as_str(),
                             risk_score = risk_assessment.score,
                             factors = ?risk_assessment.factors,
@@ -1811,8 +2052,7 @@ async fn auth_callback_impl(
                         );
 
                         // Return error page instead of redirect
-                        let html = format!(
-                            r#"
+                        let html = r#"
                             <!DOCTYPE html>
                             <html>
                             <head><title>Login Blocked</title></head>
@@ -1823,7 +2063,7 @@ async fn auth_callback_impl(
                             </body>
                             </html>
                             "#
-                        );
+                        .to_string();
                         return Ok((axum::http::StatusCode::FORBIDDEN, Html(html)).into_response());
                     }
                     RiskAction::Allow | RiskAction::LogOnly => {
@@ -1875,7 +2115,7 @@ async fn auth_callback_impl(
             )?;
 
             // Generate refresh token
-            let refresh_token = uuid::Uuid::new_v4().to_string();
+            let refresh_token = crate::auth::refresh_tokens::generate();
 
             // Store session with refresh token
             let token_hash = JwtService::hash_token(&jwt);
@@ -1883,25 +2123,20 @@ async fn auth_callback_impl(
             let expires_at = now + chrono::Duration::hours(config.jwt_expiration_hours);
             let refresh_expires_at = now + chrono::Duration::days(30);
 
-            SessionStore::create(
-                DB::Conn(&state.db),
+            create_oauth_session_with_login_audit(
+                &state,
                 &user.id,
                 &token_hash,
                 expires_at.naive_utc(),
-                Some(&refresh_token),
-                Some(refresh_expires_at.naive_utc()),
+                &refresh_token,
+                refresh_expires_at.naive_utc(),
                 oauth_ctx.org_slug.as_deref(),
                 oauth_ctx.service_id.as_deref(),
+                service_slug.as_deref(),
                 oauth_ctx.resource.as_deref(),
-                None, // user_agent
-                None, // ip_address
+                provider,
             )
             .await?;
-
-            // Record login event if service_id is available
-            if let Some(ref service_id) = oauth_ctx.service_id {
-                record_login_event(&state.audit_actor, &user.id, service_id, provider).await;
-            }
 
             // Publish login success event for webhooks
             publish_login_event(
@@ -1915,7 +2150,7 @@ async fn auth_callback_impl(
             .await;
 
             // Check if JSON response is requested (to avoid header overflow in API flows)
-            if callback.format.as_ref().map_or(false, |f| f == "json") {
+            if callback.format.as_ref().is_some_and(|f| f == "json") {
                 // Return JSON response instead of redirect for API flows
                 use serde_json::json;
                 let response_body = json!({
@@ -2086,7 +2321,9 @@ async fn auth_admin_callback_impl(
 
     if let Some((error, description)) = callback.oauth_error() {
         if let Some(ref state_param) = callback.state {
-            let _ = OAuthStateStore::delete(DB::Conn(&state.db), state_param).await;
+            OAuthStateStore::delete(DB::Conn(&state.db), state_param)
+                .await
+                .map_err(|_| AppError::BadRequest("Invalid state parameter".to_string()))?;
         }
 
         if !oauth_state.is_admin_flow {
@@ -2111,7 +2348,9 @@ async fn auth_admin_callback_impl(
             // Service context present - this is an end-user login via admin callback
             // Clean up OAuth state first
             if let Some(ref state_param) = callback.state {
-                let _ = OAuthStateStore::delete(DB::Conn(&state.db), state_param).await;
+                OAuthStateStore::delete(DB::Conn(&state.db), state_param)
+                    .await
+                    .map_err(|_| AppError::BadRequest("Invalid state parameter".to_string()))?;
             }
             // Delegate to service flow handler
             let redirect_uri = oauth_state.redirect_uri.clone();
@@ -2147,7 +2386,9 @@ async fn auth_admin_callback_impl(
     // Clean up OAuth state immediately to prevent replay attacks
     // Do this before token exchange so even if exchange fails, state cannot be reused
     if let Some(ref state_param) = callback.state {
-        let _ = OAuthStateStore::delete(DB::Conn(&state.db), state_param).await;
+        OAuthStateStore::delete(DB::Conn(&state.db), state_param)
+            .await
+            .map_err(|_| AppError::BadRequest("Invalid state parameter".to_string()))?;
     }
 
     // Build admin OAuth client with PLATFORM_* credentials
@@ -2231,6 +2472,12 @@ async fn auth_admin_callback_impl(
             DeviceCodeStore::find_pending_by_user_code(DB::Conn(&state.db), user_code).await?;
 
         if let Some(dc) = device_code {
+            validate_platform_device_oauth_context(
+                &dc.org_slug,
+                &dc.service_slug,
+                oauth_state.org_slug.as_deref(),
+                user.is_platform_owner,
+            )?;
             // Check if user has MFA enabled
             let mfa_enabled = is_mfa_enabled(&state.db, &user.id).await?;
 
@@ -2242,13 +2489,13 @@ async fn auth_admin_callback_impl(
                 DeviceCodeStore::set_user_id(DB::Conn(&state.db), &dc.id, &user.id).await?;
 
                 // Redirect to MFA challenge with device flow context
-                let preauth_token = state.jwt_service.create_mfa_preauth_token(
+                let preauth_token = state.jwt_service.create_mfa_preauth_token_for_device(
                     &user.id,
                     &user.email,
                     user.is_platform_owner,
                     oauth_state.org_slug.as_deref(),
                     None,
-                    None,
+                    &dc.id,
                 )?;
 
                 // Determine redirect URL based on org/service for MFA challenge
@@ -2419,7 +2666,7 @@ async fn auth_admin_callback_impl(
     };
 
     // Generate refresh token
-    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_token = crate::auth::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&jwt);
@@ -2454,7 +2701,7 @@ async fn auth_admin_callback_impl(
     .await;
 
     // Check if JSON response is requested (to avoid header overflow in API flows)
-    if callback.format.as_ref().map_or(false, |f| f == "json") {
+    if callback.format.as_ref().is_some_and(|f| f == "json") {
         // Return JSON response instead of redirect for API flows
         use serde_json::json;
         let response_body = json!({
@@ -2511,6 +2758,17 @@ async fn handle_service_flow_via_admin_callback(
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?
             .into();
 
+    validate_live_oauth_tenant_context(
+        DB::Conn(&state.db),
+        Some(&service.org_id),
+        oauth_state.org_slug.as_deref(),
+        Some(service_id),
+        oauth_state.service_slug.as_deref(),
+        oauth_state.redirect_uri.as_deref(),
+        oauth_state.resource.as_deref(),
+    )
+    .await?;
+
     // Security: Enforce PKCE for public clients (mobile/desktop)
     // These clients cannot securely store client_secret, so PKCE is mandatory
     let pkce_verifier = oauth_state
@@ -2562,6 +2820,14 @@ async fn handle_service_flow_via_admin_callback(
         )
         .await?;
 
+        validate_live_oauth_linking_user(
+            DB::Conn(&state.db),
+            linking_user_id,
+            Some(&org_id),
+            Some(service_id),
+        )
+        .await?;
+
         IdentityStore::upsert_with_details(
             DB::Conn(&state.db),
             state.encryption.as_ref(),
@@ -2586,15 +2852,6 @@ async fn handle_service_flow_via_admin_callback(
             &effective_scopes,
         )
         .await?;
-        grant_connected_account_to_service(
-            &state,
-            linking_user_id,
-            service_id,
-            provider.as_str(),
-            &connected_account.id,
-            &effective_scopes,
-        )
-        .await?;
         if let Some(request_state) = oauth_state.provider_token_request_state.as_deref() {
             let redirect_url = complete_provider_token_request_from_oauth(
                 &state,
@@ -2607,6 +2864,15 @@ async fn handle_service_flow_via_admin_callback(
             .await?;
             return Ok(Redirect::to(&redirect_url).into_response());
         }
+        grant_connected_account_to_service(
+            &state,
+            linking_user_id,
+            service_id,
+            provider.as_str(),
+            &connected_account.id,
+            &effective_scopes,
+        )
+        .await?;
 
         let redirect_uri = oauth_state.redirect_uri.as_ref().ok_or_else(|| {
             AppError::InternalServerError(
@@ -2625,6 +2891,11 @@ async fn handle_service_flow_via_admin_callback(
     .await?;
 
     let (user_model, was_created) = if let Some(u) = existing {
+        if u.deleted_at.is_some() {
+            return Err(AppError::Unauthorized(
+                "OAuth user is no longer active".to_string(),
+            ));
+        }
         (u, false)
     } else {
         let u = crate::store::users::UserStore::create_with_org_id(
@@ -2655,7 +2926,6 @@ async fn handle_service_flow_via_admin_callback(
 
         tracing::info!(
             user_id = %user.id,
-            email = %user.email,
             provider = %provider.as_str(),
             risk_score = assessment.score,
             risk_action = ?assessment.action,
@@ -2807,7 +3077,7 @@ async fn handle_service_flow_via_admin_callback(
     )?;
 
     // Generate refresh token
-    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_token = crate::auth::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&jwt);
@@ -2815,23 +3085,20 @@ async fn handle_service_flow_via_admin_callback(
     let expires_at = now + chrono::Duration::hours(config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
 
-    SessionStore::create(
-        DB::Conn(&state.db),
+    create_oauth_session_with_login_audit(
+        &state,
         &user.id,
         &token_hash,
         expires_at.naive_utc(),
-        Some(&refresh_token),
-        Some(refresh_expires_at.naive_utc()),
+        &refresh_token,
+        refresh_expires_at.naive_utc(),
         oauth_state.org_slug.as_deref(),
         Some(service_id),
+        oauth_state.service_slug.as_deref(),
         oauth_state.resource.as_deref(),
-        None, // user_agent
-        None, // ip_address
+        provider,
     )
     .await?;
-
-    // Record login event
-    record_login_event(&state.audit_actor, &user.id, service_id, provider).await;
 
     // Publish login success event for webhooks
     publish_login_event(
@@ -2845,7 +3112,7 @@ async fn handle_service_flow_via_admin_callback(
     .await;
 
     // Check if JSON response is requested
-    if callback.format.as_ref().map_or(false, |f| f == "json") {
+    if callback.format.as_ref().is_some_and(|f| f == "json") {
         use serde_json::json;
         let response_body = json!({
             "access_token": jwt,
@@ -2934,33 +3201,33 @@ fn create_admin_oauth_client(
         Provider::Github => {
             let client_id = config.platform_github_client_id.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.")
+                    "GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             let client_secret = config.platform_github_client_secret.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.")
+                    "GitHub OAuth provider is not configured. Please set PLATFORM_GITHUB_CLIENT_ID and PLATFORM_GITHUB_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             (client_id.clone(), client_secret.clone())
         }
         Provider::Google => {
             let client_id = config.platform_google_client_id.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")
+                    "Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             let client_secret = config.platform_google_client_secret.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.")
+                    "Google OAuth provider is not configured. Please set PLATFORM_GOOGLE_CLIENT_ID and PLATFORM_GOOGLE_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             (client_id.clone(), client_secret.clone())
         }
         Provider::Microsoft => {
             let client_id = config.platform_microsoft_client_id.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")
+                    "Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             let client_secret = config.platform_microsoft_client_secret.as_ref()
                 .ok_or_else(|| AppError::BadRequest(
-                    format!("Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.")
+                    "Microsoft OAuth provider is not configured. Please set PLATFORM_MICROSOFT_CLIENT_ID and PLATFORM_MICROSOFT_CLIENT_SECRET environment variables.".to_string()
                 ))?;
             (client_id.clone(), client_secret.clone())
         }
@@ -3178,6 +3445,29 @@ fn service_mfa_redirect_uri(
     redirect_uri_with_fragment(redirect_uri, &pairs)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SamlLoginGate {
+    Block,
+    ChallengeMfa,
+    Complete,
+}
+
+fn saml_login_gate(
+    risk_action: Option<crate::services::risk_engine::RiskAction>,
+    mfa_enabled: bool,
+) -> SamlLoginGate {
+    use crate::services::risk_engine::RiskAction;
+
+    match risk_action {
+        Some(RiskAction::Block) => SamlLoginGate::Block,
+        Some(RiskAction::ChallengeMFA) => SamlLoginGate::ChallengeMfa,
+        Some(RiskAction::Allow | RiskAction::LogOnly) | None if mfa_enabled => {
+            SamlLoginGate::ChallengeMfa
+        }
+        Some(RiskAction::Allow | RiskAction::LogOnly) | None => SamlLoginGate::Complete,
+    }
+}
+
 fn redirect_oauth_error_to_uri(
     redirect_uri: &str,
     error: &str,
@@ -3320,7 +3610,40 @@ async fn get_provider_user_info(
     access_token: &str,
     config: &crate::config::Config,
 ) -> Result<crate::auth::sso::UserInfo> {
+    use serde::de::DeserializeOwned;
     use serde::Deserialize;
+
+    async fn fetch_json<T: DeserializeOwned>(
+        client: &crate::services::safe_http::SafeHttpClient,
+        url: &str,
+        access_token: &str,
+        include_user_agent: bool,
+    ) -> Result<T> {
+        let mut headers = vec![(
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        )];
+        if include_user_agent {
+            headers.push(("User-Agent".to_string(), "AuthOS".to_string()));
+        }
+
+        let response = client.get_with_owned_headers(url, headers).await?;
+        let (status, body) = crate::services::safe_http::SafeHttpClient::read_body_limited(
+            response,
+            crate::services::safe_http::MAX_OAUTH_RESPONSE_BYTES,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(AppError::OAuth(format!(
+                "OAuth provider user-info request failed with status {status}"
+            )));
+        }
+
+        serde_json::from_slice(&body)
+            .map_err(|_| AppError::OAuth("OAuth provider returned invalid user info".to_string()))
+    }
+
+    let client = crate::services::safe_http::SafeHttpClient::new()?;
 
     match provider {
         Provider::Github => {
@@ -3338,32 +3661,24 @@ async fn get_provider_user_info(
                 verified: bool,
             }
 
-            let client = reqwest::Client::new();
-
-            let user: GithubUser = client
-                .get(&config.get_github_user_api_url())
-                .header("Authorization", format!("Bearer {}", access_token))
-                .header("User-Agent", "SSO-Service")
-                .send()
-                .await
-                .map_err(|e| AppError::OAuth(format!("Failed to fetch user: {}", e)))?
-                .json()
-                .await
-                .map_err(|e| AppError::OAuth(format!("Failed to parse user: {}", e)))?;
+            let user: GithubUser = fetch_json(
+                &client,
+                &config.get_github_user_api_url(),
+                access_token,
+                true,
+            )
+            .await?;
 
             let email = if let Some(email) = user.email {
                 email
             } else {
-                let emails: Vec<GithubEmail> = client
-                    .get(&config.get_github_user_emails_api_url())
-                    .header("Authorization", format!("Bearer {}", access_token))
-                    .header("User-Agent", "SSO-Service")
-                    .send()
-                    .await
-                    .map_err(|e| AppError::OAuth(format!("Failed to fetch emails: {}", e)))?
-                    .json()
-                    .await
-                    .map_err(|e| AppError::OAuth(format!("Failed to parse emails: {}", e)))?;
+                let emails: Vec<GithubEmail> = fetch_json(
+                    &client,
+                    &config.get_github_user_emails_api_url(),
+                    access_token,
+                    true,
+                )
+                .await?;
 
                 emails
                     .into_iter()
@@ -3388,16 +3703,13 @@ async fn get_provider_user_info(
                 verified_email: Option<bool>,
             }
 
-            let client = reqwest::Client::new();
-            let user: GoogleUser = client
-                .get(&config.get_google_user_api_url())
-                .header("Authorization", format!("Bearer {}", access_token))
-                .send()
-                .await
-                .map_err(|e| AppError::OAuth(format!("Failed to fetch user: {}", e)))?
-                .json()
-                .await
-                .map_err(|e| AppError::OAuth(format!("Failed to parse user: {}", e)))?;
+            let user: GoogleUser = fetch_json(
+                &client,
+                &config.get_google_user_api_url(),
+                access_token,
+                false,
+            )
+            .await?;
 
             require_google_verified_email(user.verified_email)?;
 
@@ -3418,16 +3730,13 @@ async fn get_provider_user_info(
                 name: Option<String>,
             }
 
-            let client = reqwest::Client::new();
-            let user: MicrosoftUser = client
-                .get(&config.get_microsoft_user_api_url())
-                .header("Authorization", format!("Bearer {}", access_token))
-                .send()
-                .await
-                .map_err(|e| AppError::OAuth(format!("Failed to fetch user: {}", e)))?
-                .json()
-                .await
-                .map_err(|e| AppError::OAuth(format!("Failed to parse user: {}", e)))?;
+            let user: MicrosoftUser = fetch_json(
+                &client,
+                &config.get_microsoft_user_api_url(),
+                access_token,
+                false,
+            )
+            .await?;
 
             let email = user.mail.or(user.user_principal_name).ok_or_else(|| {
                 AppError::OAuth("Microsoft user profile did not include an email".to_string())
@@ -3439,26 +3748,29 @@ async fn get_provider_user_info(
                 name: user.name,
             })
         }
-        Provider::Oidc => {
-            return Err(AppError::BadRequest(
-                "OIDC not supported in generic get_provider_user_info".to_string(),
-            ));
-        }
-        Provider::Password => {
-            return Err(AppError::BadRequest(
-                "Password provider not supported in generic get_provider_user_info".to_string(),
-            ));
-        }
+        Provider::Oidc => Err(AppError::BadRequest(
+            "OIDC not supported in generic get_provider_user_info".to_string(),
+        )),
+        Provider::Password => Err(AppError::BadRequest(
+            "Password provider not supported in generic get_provider_user_info".to_string(),
+        )),
     }
 }
 
-/// Record login event for analytics (via buffered audit actor)
-async fn record_login_event(
-    audit_actor: &crate::services::audit_actor::AuditHandle,
+#[allow(clippy::too_many_arguments)]
+async fn create_oauth_session_with_login_audit(
+    state: &AppState,
     user_id: &str,
-    service_id: &str,
+    token_hash: &str,
+    expires_at: chrono::NaiveDateTime,
+    refresh_token: &str,
+    refresh_expires_at: chrono::NaiveDateTime,
+    org_slug: Option<&str>,
+    service_id: Option<&str>,
+    service_slug: Option<&str>,
+    resource: Option<&str>,
     provider: Provider,
-) {
+) -> Result<()> {
     use crate::entities::login_events;
     use sea_orm::Set;
     use uuid::Uuid;
@@ -3466,13 +3778,194 @@ async fn record_login_event(
     let event_model = login_events::ActiveModel {
         id: Set(Uuid::new_v4().to_string()),
         user_id: Set(user_id.to_string()),
-        service_id: Set(Some(service_id.to_string())),
+        service_id: Set(service_id.map(str::to_string)),
         provider: Set(provider.as_str().to_string()),
         ..Default::default()
     };
+    let user_id = user_id.to_string();
+    let token_hash = token_hash.to_string();
+    let refresh_token = refresh_token.to_string();
+    let org_slug = org_slug.map(str::to_string);
+    let service_id = service_id.map(str::to_string);
+    let service_slug = service_slug.map(str::to_string);
+    let resource = resource.map(str::to_string);
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_oauth_session_with_login_audit",
+        |db| {
+            let user_id = user_id.clone();
+            let token_hash = token_hash.clone();
+            let refresh_token = refresh_token.clone();
+            let org_slug = org_slug.clone();
+            let service_id = service_id.clone();
+            let service_slug = service_slug.clone();
+            let resource = resource.clone();
+            let event_model = event_model.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                validate_live_oauth_tenant_context(
+                    db.clone(),
+                    None,
+                    org_slug.as_deref(),
+                    service_id.as_deref(),
+                    service_slug.as_deref(),
+                    None,
+                    resource.as_deref(),
+                )
+                .await?;
+                if let Some(org_slug) = org_slug.as_deref() {
+                    let org = OrganizationStore::find_by_slug(db.clone(), org_slug)
+                        .await?
+                        .filter(|org| org.status == "active")
+                        .ok_or_else(|| {
+                            AppError::Unauthorized("OAuth organization is not active".to_string())
+                        })?;
+                    validate_live_oauth_user_entitlement(
+                        db.clone(),
+                        &user_id,
+                        &org.id,
+                        service_id.as_deref(),
+                    )
+                    .await?;
+                } else {
+                    validate_live_oauth_linking_user(db.clone(), &user_id, None, None).await?;
+                }
+                SessionStore::create(
+                    db.clone(),
+                    &user_id,
+                    &token_hash,
+                    expires_at,
+                    Some(&refresh_token),
+                    Some(refresh_expires_at),
+                    org_slug.as_deref(),
+                    service_id.as_deref(),
+                    resource.as_deref(),
+                    None,
+                    None,
+                )
+                .await?;
+                audit_actor.log_login_with_db(db, event_model).await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+}
 
-    // Non-blocking: queues to actor, doesn't wait for DB
-    audit_actor.log_login(event_model).await;
+async fn validate_live_oauth_tenant_context(
+    db: DB<'_>,
+    expected_org_id: Option<&str>,
+    expected_org_slug: Option<&str>,
+    expected_service_id: Option<&str>,
+    expected_service_slug: Option<&str>,
+    expected_redirect_uri: Option<&str>,
+    expected_resource: Option<&str>,
+) -> Result<()> {
+    if expected_org_id.is_none() && expected_org_slug.is_none() {
+        if expected_service_id.is_some() {
+            return Err(AppError::Unauthorized(
+                "OAuth service context is missing its organization".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let org = if let Some(org_id) = expected_org_id {
+        OrganizationStore::find_by_id(db.clone(), org_id).await?
+    } else {
+        OrganizationStore::find_by_slug(
+            db.clone(),
+            expected_org_slug.expect("checked organization context"),
+        )
+        .await?
+    }
+    .filter(|org| org.status == "active")
+    .ok_or_else(|| AppError::Unauthorized("OAuth organization is not active".to_string()))?;
+
+    if expected_org_id.is_some_and(|org_id| org.id != org_id)
+        || expected_org_slug.is_some_and(|org_slug| org.slug != org_slug)
+    {
+        return Err(AppError::Unauthorized(
+            "OAuth organization context changed".to_string(),
+        ));
+    }
+
+    if let Some(service_id) = expected_service_id {
+        let service = ServiceStore::find_by_id(db, service_id)
+            .await?
+            .filter(|service| service.org_id == org.id)
+            .ok_or_else(|| {
+                AppError::Unauthorized(
+                    "OAuth service does not belong to the selected organization".to_string(),
+                )
+            })?;
+        if expected_service_slug.is_some_and(|slug| service.slug != slug) {
+            return Err(AppError::Unauthorized(
+                "OAuth service context changed".to_string(),
+            ));
+        }
+        let service: crate::db::models::Service = service.into();
+        if let Some(redirect_uri) = expected_redirect_uri {
+            validate_redirect_uri(redirect_uri, &service)?;
+        }
+        validate_requested_resource(expected_resource, service.resource_uris.as_deref())?;
+    } else if expected_service_slug.is_some()
+        || expected_redirect_uri.is_some()
+        || expected_resource.is_some()
+    {
+        return Err(AppError::Unauthorized(
+            "OAuth service context is incomplete".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn validate_live_oauth_user_entitlement(
+    db: DB<'_>,
+    user_id: &str,
+    org_id: &str,
+    service_id: Option<&str>,
+) -> Result<()> {
+    let user = crate::store::users::UserStore::find_by_id(db.clone(), user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Unauthorized("OAuth user is no longer active".to_string()))?;
+    if user.is_platform_owner
+        || MembershipStore::find_by_org_and_user(db.clone(), org_id, user_id)
+            .await?
+            .is_some()
+    {
+        return Ok(());
+    }
+    if let Some(service_id) = service_id {
+        if IdentityStore::exists_for_user_and_service_context(db, user_id, org_id, service_id)
+            .await?
+        {
+            return Ok(());
+        }
+    }
+    Err(AppError::Unauthorized(
+        "OAuth user no longer has tenant entitlement".to_string(),
+    ))
+}
+
+async fn validate_live_oauth_linking_user(
+    db: DB<'_>,
+    user_id: &str,
+    org_id: Option<&str>,
+    service_id: Option<&str>,
+) -> Result<()> {
+    if let Some(org_id) = org_id {
+        return validate_live_oauth_user_entitlement(db, user_id, org_id, service_id).await;
+    }
+    crate::store::users::UserStore::find_by_id(db, user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Unauthorized("OAuth user is no longer active".to_string()))?;
+    Ok(())
 }
 
 /// Helper function to publish login success event
@@ -3540,8 +4033,373 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use openssl::rsa::Rsa;
-    use sea_orm::Database;
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, Database, EntityTrait, PaginatorTrait, QueryFilter,
+    };
     use std::sync::Arc;
+
+    #[test]
+    fn device_oauth_completion_requires_exact_stored_context_and_current_owner() {
+        assert!(validate_service_device_oauth_context("acme", "portal", "acme", "portal").is_ok());
+        assert!(
+            validate_service_device_oauth_context("other", "portal", "acme", "portal").is_err()
+        );
+        assert!(validate_service_device_oauth_context("acme", "other", "acme", "portal").is_err());
+
+        assert!(validate_platform_device_oauth_context(
+            "platform",
+            "admin-cli",
+            Some("platform"),
+            true,
+        )
+        .is_ok());
+        assert!(validate_platform_device_oauth_context(
+            "platform",
+            "admin-cli",
+            Some("platform"),
+            false,
+        )
+        .is_err());
+        assert!(
+            validate_platform_device_oauth_context("acme", "portal", Some("platform"), true,)
+                .is_err()
+        );
+    }
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn oauth_completion_reauthorizes_active_exact_tenant_service_and_registered_targets() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let owner = UserStore::create(
+            DB::Conn(&db),
+            "oauth-context-owner@example.test",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let org_a = OrganizationStore::create(
+            DB::Conn(&db),
+            "oauth-context-a",
+            "OAuth context A",
+            &owner.id,
+            None,
+        )
+        .await
+        .unwrap();
+        let org_b = OrganizationStore::create(
+            DB::Conn(&db),
+            "oauth-context-b",
+            "OAuth context B",
+            &owner.id,
+            None,
+        )
+        .await
+        .unwrap();
+        OrganizationStore::update_status(DB::Conn(&db), &org_a.id, "active")
+            .await
+            .unwrap();
+        OrganizationStore::update_status(DB::Conn(&db), &org_b.id, "active")
+            .await
+            .unwrap();
+        let service_a = ServiceStore::create(
+            DB::Conn(&db),
+            &org_a.id,
+            "portal-a",
+            "Portal A",
+            "web",
+            "oauth-context-client-a",
+        )
+        .await
+        .unwrap();
+        let service_b = ServiceStore::create(
+            DB::Conn(&db),
+            &org_b.id,
+            "portal-b",
+            "Portal B",
+            "web",
+            "oauth-context-client-b",
+        )
+        .await
+        .unwrap();
+        let mut service_a_active: crate::entities::services::ActiveModel = service_a.clone().into();
+        service_a_active.redirect_uris = Set(Some(
+            serde_json::json!(["https://client.example.test/callback"]).to_string(),
+        ));
+        service_a_active.resource_uris = Set(Some(
+            serde_json::json!(["https://api.example.test/"]).to_string(),
+        ));
+        let service_a = service_a_active.update(&db).await.unwrap();
+
+        assert!(validate_live_oauth_tenant_context(
+            DB::Conn(&db),
+            Some(&org_a.id),
+            Some(&org_a.slug),
+            Some(&service_a.id),
+            Some(&service_a.slug),
+            Some("https://client.example.test/callback"),
+            Some("https://api.example.test/")
+        )
+        .await
+        .is_ok());
+        assert!(validate_live_oauth_tenant_context(
+            DB::Conn(&db),
+            Some(&org_a.id),
+            Some(&org_a.slug),
+            Some(&service_b.id),
+            Some(&service_b.slug),
+            Some("https://client.example.test/callback"),
+            None
+        )
+        .await
+        .is_err());
+        assert!(validate_live_oauth_tenant_context(
+            DB::Conn(&db),
+            Some(&org_a.id),
+            Some(&org_a.slug),
+            Some(&service_a.id),
+            Some("substituted-service"),
+            Some("https://attacker.example.test/callback"),
+            Some("https://attacker.example.test/")
+        )
+        .await
+        .is_err());
+
+        OrganizationStore::update_status(DB::Conn(&db), &org_a.id, "suspended")
+            .await
+            .unwrap();
+        assert!(validate_live_oauth_tenant_context(
+            DB::Conn(&db),
+            Some(&org_a.id),
+            Some(&org_a.slug),
+            Some(&service_a.id),
+            Some(&service_a.slug),
+            Some("https://client.example.test/callback"),
+            Some("https://api.example.test/")
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn suspended_tenant_session_completion_leaves_session_and_audit_unchanged() {
+        let state = setup_oauth_state().await;
+        let user = UserStore::create(
+            DB::Conn(&state.db),
+            "oauth-suspended-user@example.test",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let org = OrganizationStore::create(
+            DB::Conn(&state.db),
+            "oauth-suspended",
+            "OAuth suspended",
+            &user.id,
+            None,
+        )
+        .await
+        .unwrap();
+        let service = ServiceStore::create(
+            DB::Conn(&state.db),
+            &org.id,
+            "portal",
+            "Portal",
+            "web",
+            "oauth-suspended-client",
+        )
+        .await
+        .unwrap();
+        OrganizationStore::update_status(DB::Conn(&state.db), &org.id, "suspended")
+            .await
+            .unwrap();
+        let before_audits = crate::entities::login_events::Entity::find()
+            .count(&state.db)
+            .await
+            .unwrap();
+        let now = Utc::now();
+
+        assert!(create_oauth_session_with_login_audit(
+            &state,
+            &user.id,
+            "suspended-token-hash",
+            (now + Duration::hours(1)).naive_utc(),
+            "suspended-refresh-token",
+            (now + Duration::days(30)).naive_utc(),
+            Some(&org.slug),
+            Some(&service.id),
+            Some(&service.slug),
+            None,
+            Provider::Github,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            crate::entities::sessions::Entity::find()
+                .count(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::entities::login_events::Entity::find()
+                .count(&state.db)
+                .await
+                .unwrap(),
+            before_audits
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_user_session_completion_leaves_session_and_audit_unchanged() {
+        let state = setup_oauth_state().await;
+        let user = UserStore::create(
+            DB::Conn(&state.db),
+            "oauth-deleted-user@example.test",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut deleted_user: crate::entities::users::ActiveModel = user.clone().into();
+        deleted_user.deleted_at = Set(Some(Utc::now().naive_utc()));
+        deleted_user.update(&state.db).await.unwrap();
+        let before_audits = crate::entities::login_events::Entity::find()
+            .count(&state.db)
+            .await
+            .unwrap();
+        let now = Utc::now();
+
+        assert!(create_oauth_session_with_login_audit(
+            &state,
+            &user.id,
+            "deleted-token-hash",
+            (now + Duration::hours(1)).naive_utc(),
+            "deleted-refresh-token",
+            (now + Duration::days(30)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            Provider::Github,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            crate::entities::sessions::Entity::find()
+                .count(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::entities::login_events::Entity::find()
+                .count(&state.db)
+                .await
+                .unwrap(),
+            before_audits
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_session_rolls_back_when_success_audit_cannot_enqueue() {
+        let state = setup_oauth_state().await;
+        let user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "oauth-audit-rollback@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        state
+            .db
+            .execute_unprepared("DROP TABLE audit_outbox")
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        assert!(create_oauth_session_with_login_audit(
+            &state,
+            &user.id,
+            "token-hash",
+            (now + Duration::hours(1)).naive_utc(),
+            "refresh-token",
+            (now + Duration::days(30)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            Provider::Github,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            crate::entities::sessions::Entity::find()
+                .count(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn saml_login_gate_blocks_or_challenges_before_assertion_issuance() {
+        use crate::services::risk_engine::RiskAction;
+
+        assert_eq!(
+            saml_login_gate(Some(RiskAction::Block), false),
+            SamlLoginGate::Block
+        );
+        assert_eq!(
+            saml_login_gate(Some(RiskAction::Block), true),
+            SamlLoginGate::Block
+        );
+        assert_eq!(
+            saml_login_gate(Some(RiskAction::ChallengeMFA), false),
+            SamlLoginGate::ChallengeMfa
+        );
+        assert_eq!(
+            saml_login_gate(Some(RiskAction::Allow), true),
+            SamlLoginGate::ChallengeMfa
+        );
+        assert_eq!(
+            saml_login_gate(Some(RiskAction::LogOnly), false),
+            SamlLoginGate::Complete
+        );
+        assert_eq!(saml_login_gate(None, false), SamlLoginGate::Complete);
+    }
+
+    #[test]
+    fn callback_requires_nonempty_state() {
+        for state in [None, Some(String::new())] {
+            let callback = CallbackQuery {
+                code: Some("authorization-code".to_string()),
+                state,
+                error: None,
+                error_description: None,
+                format: None,
+            };
+            assert!(matches!(
+                callback.state_parameter(),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+
+        let callback = CallbackQuery {
+            code: Some("authorization-code".to_string()),
+            state: Some("issued-state".to_string()),
+            error: None,
+            error_description: None,
+            format: None,
+        };
+        assert_eq!(callback.state_parameter().unwrap(), "issued-state");
+    }
 
     fn test_config() -> Config {
         Config {
@@ -3706,6 +4564,212 @@ mod tests {
                 (key == "state" || key == "RelayState").then(|| value.into_owned())
             })
             .expect("state in redirect")
+    }
+
+    #[tokio::test]
+    async fn orphan_provider_duplicate_transfer_updates_matching_rows_in_bulk() {
+        use crate::entities::prelude::{ConnectedAccounts, Identities};
+        use crate::entities::{connected_accounts, identities};
+
+        let state = setup_oauth_state().await;
+        let target_user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "target@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create target user")
+        .0;
+        let duplicate_user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "duplicate@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create duplicate user")
+        .0;
+
+        IdentityStore::create(
+            DB::Conn(&state.db),
+            &duplicate_user.id,
+            "github",
+            "provider-user-1",
+            Some("access-token"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create duplicate identity");
+        connected_accounts::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(duplicate_user.id.clone()),
+            provider: Set("github".to_string()),
+            provider_user_id: Set("provider-user-1".to_string()),
+            email: Set(Some("duplicate@example.com".to_string())),
+            display_name: Set(Some("Duplicate".to_string())),
+            access_token: Set(Some("access-token".to_string())),
+            refresh_token: Set(None),
+            access_token_encrypted: Set(None),
+            refresh_token_encrypted: Set(None),
+            encryption_key_id: Set(None),
+            expires_at: Set(None),
+            scopes: Set(Some(r#"["read:user"]"#.to_string())),
+            last_refreshed_at: Set(None),
+            status: Set("active".to_string()),
+            linked_at: Set(Utc::now().naive_utc()),
+            updated_at: Set(Utc::now().naive_utc()),
+            revoked_at: Set(None),
+        }
+        .insert(&state.db)
+        .await
+        .expect("create duplicate connected account");
+
+        let transferred = transfer_orphan_provider_duplicate(
+            &state,
+            &duplicate_user.id,
+            &target_user.id,
+            None,
+            None,
+            "github",
+            "provider-user-1",
+        )
+        .await
+        .expect("transfer duplicate");
+
+        assert!(transferred);
+        assert_eq!(
+            Identities::find()
+                .filter(identities::Column::UserId.eq(&target_user.id))
+                .count(&state.db)
+                .await
+                .expect("count target identities"),
+            1
+        );
+        assert_eq!(
+            ConnectedAccounts::find()
+                .filter(connected_accounts::Column::UserId.eq(&target_user.id))
+                .count(&state.db)
+                .await
+                .expect("count target accounts"),
+            1
+        );
+        assert_eq!(
+            Identities::find()
+                .filter(identities::Column::UserId.eq(&duplicate_user.id))
+                .count(&state.db)
+                .await
+                .expect("count duplicate identities"),
+            0
+        );
+        assert_eq!(
+            ConnectedAccounts::find()
+                .filter(connected_accounts::Column::UserId.eq(&duplicate_user.id))
+                .count(&state.db)
+                .await
+                .expect("count duplicate accounts"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_provider_duplicate_transfer_rejects_extra_identity_rows() {
+        use crate::entities::identities;
+        use crate::entities::prelude::Identities;
+
+        let state = setup_oauth_state().await;
+        let target_user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "target-extra@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create target user")
+        .0;
+        let duplicate_user = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "duplicate-extra@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create duplicate user")
+        .0;
+
+        IdentityStore::create(
+            DB::Conn(&state.db),
+            &duplicate_user.id,
+            "github",
+            "provider-user-1",
+            Some("access-token"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create matching identity");
+        IdentityStore::create(
+            DB::Conn(&state.db),
+            &duplicate_user.id,
+            "google",
+            "other-provider-user",
+            Some("access-token"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create non-matching identity");
+
+        let transferred = transfer_orphan_provider_duplicate(
+            &state,
+            &duplicate_user.id,
+            &target_user.id,
+            None,
+            None,
+            "github",
+            "provider-user-1",
+        )
+        .await
+        .expect("attempt transfer duplicate");
+
+        assert!(!transferred);
+        assert_eq!(
+            Identities::find()
+                .filter(identities::Column::UserId.eq(&duplicate_user.id))
+                .count(&state.db)
+                .await
+                .expect("count duplicate identities"),
+            2
+        );
+        assert_eq!(
+            Identities::find()
+                .filter(identities::Column::UserId.eq(&target_user.id))
+                .count(&state.db)
+                .await
+                .expect("count target identities"),
+            0
+        );
     }
 
     #[tokio::test]

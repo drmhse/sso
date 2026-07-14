@@ -1,0 +1,204 @@
+# AuthOS tenant-resource inventory
+
+Status: source-derived isolation-test scope
+
+Reviewed: 2026-07-14
+
+This inventory identifies data that must be tenant-isolated and the context by
+which that isolation is derived. It is not a claim that every handler is already
+covered. Its purpose is to make omissions visible and to drive a generated
+authorization test matrix.
+
+See the [threat model](./threat-model.md) and
+[security architecture](./security-architecture.md) for the surrounding trust
+boundaries.
+
+## Scoping model
+
+AuthOS uses four principal scope roots:
+
+- **Organization-scoped:** the record contains `org_id` or is the organization.
+- **Service-derived:** the record contains `service_id`; the service contains
+  `org_id`.
+- **User-derived:** the record contains `user_id`; tenant access must be proven
+  through the user's scoped account or membership and, where relevant, a
+  service/organization context. A user may participate in multiple
+  organizations, so `user_id` alone is not always a tenant predicate.
+- **Platform/global:** the record intentionally spans tenants and must be
+  limited to platform-owner or internal-job access, or contain no tenant data.
+
+The reviewed database is shared and no database row-level-security policy was
+found. Foreign keys and cascading deletes protect referential integrity, but do
+not authorize a request. Route path slugs, request headers, JWT organization
+claims, and client-supplied IDs are untrusted selectors until resolved and
+checked against the authenticated principal.
+
+## Organization-direct resources
+
+| Resource/entity | Tenant key or derivation | Security-sensitive contents | Expected enforcement and required deny tests |
+| --- | --- | --- | --- |
+| `organizations` | `id`; unique public `slug` | Owner, status, SMTP ciphertext, domain verification, branding, feature overrides | Resolve slug to ID; require membership/capability for reads and mutations; owner-only destructive/transfer actions; deny other-org slug/ID. |
+| `memberships` | `org_id` + `user_id` | Role and membership authority | Require actor membership-management capability; prevent last-owner/owner escalation errors; deny cross-org target user and membership ID. |
+| `organization_roles` | `org_id` | Custom permission sets | Require role-management capability; bind role ID/slug to org; reject built-in-role mutation and cross-org assignment. |
+| `permissions` | Namespace/object relation; organization and service object IDs | Relationship tuples granting capabilities | Prove object belongs to selected org; prevent tuple injection and stale grants; invalidate caches; deny cross-org object IDs. |
+| `organization_invitations` | `org_id` | Email, invited role, token/state, inviter | Admin/owner management within org; acceptance bound to invite/token/account; concurrency and cross-org invite-ID tests. |
+| `organization_oauth_credentials` | `org_id` | Provider client ID and encrypted secret | Integration-management capability; never return secret; bind provider record to org; deny cross-org provider selection. |
+| `organization_billing_credentials` | `org_id` | Encrypted API key and webhook secret | Billing-management capability; never serialize secrets; deny cross-org credential ID/provider. |
+| Organization SMTP fields | `organizations.id` | Username and encrypted password | Settings-management capability; mask reads; deny cross-org slug; rotation/redaction tests. |
+| `upstream_providers` | `org_id` | Encrypted client secret, endpoints, issuer, metadata | Integration-management capability; provider connection bound to org; SSRF-safe endpoint validation; deny cross-org connection ID/domain routing. |
+| `verified_domains` | `org_id` | Domain, verification state/token, provider routing | Integration-management capability; unique ownership and proof; bind provider to same org; deny cross-org domain ID. |
+| `scim_tokens` | `org_id` | Hashed provisioning bearer token, status, expiry | Integration manager for lifecycle; SCIM middleware derives org only from token; deny cross-org token ID/header/resource. |
+| `webhooks` | `org_id` | Destination URL, plaintext signing secret, event selection | Webhook-management capability; bind webhook ID to org; SSRF-safe delivery; do not expose secret; deny other-org test/update/delete. |
+| `webhook_deliveries` | `webhook_id -> webhooks.org_id` | Payload, response, status, attempts, destination context | Authorize through parent webhook and org; never trust delivery ID alone; deny cross-org listing/detail/retry if added. |
+| `organization_audit_log` | `org_id` | Actor, event, IP/user agent, details | Membership/audit-view capability; platform access separately explicit; deny cross-org filters and IDs; redaction tests. |
+| `risk_rules` | `org_id` | Authentication policy thresholds | Security/settings capability; bind every update/reset/read to org; deny other-org rule ID. |
+| `siem_configs` | `org_id` | Endpoint and record/field-bound AES-GCM V2 API key/auth header in compatibility text columns; runtime plaintext fallback is rejected | SIEM-management capability; never serialize credentials; run the explicit rewrap migration before delivery; retain SSRF-safe test/delivery and deny cross-org config ID. |
+| `mfa_feature_usage` | `org_id`, `user_id` | Factor adoption/security analytics | Authorized tenant analytics only; deny cross-org aggregations and individual IDs. |
+| `billing_customers` | `org_id` | External customer identifier and billing state | Billing-view/manage capability; deny other-org customer/subscription references. |
+
+## Service-derived resources
+
+| Resource/entity | Tenant derivation | Security-sensitive contents | Expected enforcement and required deny tests |
+| --- | --- | --- | --- |
+| `services` | `org_id` | Client secret hash, redirect/resource URIs, SAML config | Resolve by `(org_id, slug)`; require view/manage capability; deny global service ID from another org. |
+| `plans` | `service_id -> services.org_id` | Entitlement/pricing configuration | Authorize parent service in selected org; deny cross-service and cross-org plan ID. |
+| `api_keys` | `service_id -> services.org_id` | Key hash/prefix, permission list, expiry | Service-management capability for lifecycle; service API bound to stored service; deny other-service key ID. |
+| `saml_signing_keys` | `service_id -> services.org_id` | Encrypted private key, certificate, validity/status | Service-management capability; never expose private key; deny other-service certificate mutation/retrieval. |
+| `saml_states` | `service_id -> services.org_id` | Request, ACS, issuer, relay state, user, expiry | Created only for configured service; callback must bind expected service and consume once; deny state substitution/replay. |
+| `oauth_authorization_grants` | `service_id -> services.org_id` plus `user_id` | Hashed short-lived grant, resource, client, scope | Bind client/service/user/resource; atomic one-time exchange; deny client or tenant substitution. |
+| `provider_token_requests` | `service_id -> services.org_id` plus `user_id` | Redirect, scopes, connection/account state | User ownership plus service authorization and registered redirect; consume once; deny state/account/service substitution. |
+| `service_provider_grants` | `service_id -> services.org_id` plus `user_id`/account | User consent to external tokens | Require user ownership and service match; deny connected-account or service substitution. |
+| `subscriptions` | `service_id -> services.org_id` plus `user_id` | Plan and billing/entitlement state | Service principal or authorized user/admin scoped to service; deny cross-service user/subscription IDs. |
+| Service-scoped `sessions` | `service_id -> services.org_id`, optional `org_slug` | Access-token hash, refresh-token hash and consumed-hash history, resource, device metadata | User ownership/admin revocation through proven service/org; deny arbitrary session ID and other-service revocation. |
+| `login_events` | `service_id -> services.org_id` and/or `org_id` | Identity, provider, IP, user agent, outcome | Tenant analytics/audit scope; platform aggregation explicit; deny cross-org filters and raw event IDs. |
+| Service API user operations | Authenticated `ServicePrincipal.service_id` | User accounts and subscriptions managed by service | Ignore client tenant selectors; filter every lookup/mutation by principal service; enforce each API-key permission independently. |
+
+## User-owned and context-dependent resources
+
+| Resource/entity | Scope derivation | Security-sensitive contents | Expected enforcement and required deny tests |
+| --- | --- | --- | --- |
+| `users` | `id`; optional `org_id`; memberships; platform flag | Email, password hash, verification, deletion, platform authority | Self or explicit tenant/platform administration; scoped email lookup; prevent platform-flag mutation; deny other user and same-email cross-context confusion. |
+| `identities` | `user_id` plus optional issuing org/service fields | External provider subject and provider tokens/metadata | Self ownership and issuing context; enforce `(org, service)` pairing; deny cross-user identity link/unlink and provider-subject collision. |
+| `connected_accounts` | `user_id` | Provider tokens, scopes, account identity | Self ownership; encrypted token path; grants separately service-bound; deny other account ID and plaintext disclosure. |
+| `sessions` | `user_id`, optional org/service/resource | Access-token hash, refresh-token hash and consumed-hash history, client metadata | Self/device management or scoped admin revocation; bind admin operations through org's services; deny other-user session ID. |
+| `session_refresh_token_history` | `session_id -> sessions -> user/org/service` | Hashes of consumed refresh tokens used for family replay detection | Internal-only lookup through the parent session; cascade with session deletion; deny cross-session replay effects and qualify atomic family revocation. |
+| `user_devices` | `user_id` | Hashed device token, trust/revocation, IP/user agent | Self only except documented admin action; deny other device ID; atomic trust/revoke and token replay tests. |
+| `user_passkeys` | `user_id` | Credential public data, counter, metadata | Self management; authentication challenge supplies user; deny rename/delete by other user and credential-ID collision. |
+| `webauthn_challenges` | `user_id` | Serialized ceremony state and expiry | Bind challenge to expected user/type, consume once, expire; deny user/type substitution and concurrent reuse. |
+| `user_totp_secrets` | `user_id` | Encrypted TOTP secret and enabled state | Self enrollment/disable or explicit platform action; never expose secret after setup; deny other-user ID. |
+| `totp_backup_codes` | `user_id` | Argon2 backup-code hashes and used state | Self/recovery flow; atomic one-time consume; deny other-user reset/regeneration. |
+| `password_reset_tokens` | `user_id` | Hashed reset token, expiry, used state | Possession plus one-time conditional consume; delete sessions after reset; prevent scoped-email collision and replay. |
+| `email_verification_tokens` | `user_id` | Hashed verification token, expiry/used | Possession plus one-time consume; deny token-to-user/context swapping. |
+| `magic_link_tokens` | optional `user_id`, email, issuing org/service/context | Hashed login bearer and redirect context | Resolve scoped user, bind issued context, consume once; prevent enumeration, redirect changes, replay, and cross-tenant same-email login. |
+| `device_codes` | optional `user_id`, service/client/resource context | Device/user codes, status, expiry, polling state | Bind client/resource, authenticated authorizer, MFA result, and one-time exchange; deny code substitution and concurrent polling/exchange. |
+| `oauth_states` | optional service/org/user/link/device/SAML context | CSRF state, PKCE verifier, redirect and requested scopes | Bind callback to stored context, expiry, provider and flow type; delete atomically; deny cross-flow/state replay. |
+| `provider_token_requests` | `user_id` + service | Requested scopes and redirect | Self ownership plus service grant; deny other user's state/account. |
+| `token_refresh_locks` | `user_id` | Refresh coordination | Internal only; key sufficiently contextual for intended isolation; test multi-service/user concurrency. |
+| `mfa_audit_log` | `user_id`, optional `org_id` | Authentication outcomes, IP/user agent, details | Self/platform or authorized tenant security view; ensure optional org cannot leak into tenant queries. |
+| `mfa_failure_patterns` | optional `user_id`/`org_id` | Detection aggregates | Authorized security/platform use; partition tenant queries and test null/global rows. |
+| `audit_outbox` | serialized event payload re-derives organization/user/service scope by event kind | Durable pending audit events and delivery error state | Internal worker only; validate event-kind payload schema, preserve tenant identifiers during reconciliation, redact secrets, and test dead-letter/replay isolation. |
+
+## Platform and internal resources
+
+| Resource/entity | Intended scope | Required controls and tests |
+| --- | --- | --- |
+| Platform-owner user flag and platform routes | Platform | Check current database user, not client claims alone; test demotion/cache staleness, MFA policy, bootstrap closure, and tenant-admin denial. |
+| `platform_audit_log` | Platform | Platform-owner read access only; redact secrets/PII; test actor/impersonation attribution and cross-role denial. |
+| `organization_tiers` and `plans`/feature governance | Platform definitions with tenant assignments | Platform-owner mutations; tenant reads only where intended; deny tenant write and arbitrary tier escalation. |
+| `mfa_daily_metrics` | Optional organization or platform aggregate | Explicit org filter for tenant views; platform-only global rows; test null-org handling. |
+| `system_jobs` | Internal job queue | No tenant-controlled arbitrary job type/payload; job payload authorization and redaction; idempotency and operator access tests. |
+| `distributed_locks`, `token_refresh_locks` | Internal coordination | Namespaced keys, bounded expiry, multi-replica atomicity, no public CRUD route. |
+| `webhook_deliveries` and job payloads | Derived tenant/internal | Carry immutable parent IDs and reauthorize on administrative reads/retries. |
+| AuthOS capability metadata/JWKS and health/readiness | Public/operational | Publish only implemented capabilities, return `404` for unsupported standards discovery, and restrict operational details at the proxy where required. |
+| Metrics | Operational, disabled by default | Require the configured application bearer token plus network/proxy restriction; test no secrets/tenant labels. |
+| Managed bootstrap config/state files | Host/platform | Platform-owner plus filesystem/process controls; validate paths/content; audit changes; test bootstrap cannot re-open privilege. |
+
+## Cross-resource invariants
+
+Every handler and store operation must preserve these invariants:
+
+1. A service, plan, API key, subscription, SAML key/state, authorization grant,
+   provider-token request, or service-provider grant belongs to the same
+   organization/service context used to authorize the actor.
+2. A resource ID is never authorized merely because the actor can access an
+   organization named elsewhere in the request.
+3. A user's organization membership does not grant access to all of that
+   user's records from other organizations or platform context.
+4. A platform owner uses an explicit platform path/check; tenant checks do not
+   accidentally treat platform ownership as implicit membership unless the
+   operation's policy says so.
+5. API-key and SCIM-token authority comes from the stored principal binding,
+   not from `X-Organization-ID`, path slugs, body fields, or JWT claims supplied
+   alongside it.
+6. Delete, update, rotate, revoke, accept, retry, and test endpoints enforce the
+   same parent scope as list/get endpoints.
+7. Background jobs re-derive tenant ownership from stored parent IDs instead of
+   trusting serialized tenant fields.
+8. Cache keys include every scope dimension that affects authorization, and
+   privilege changes invalidate or safely age out cached results.
+9. Tenant deletion cascades or explicitly handles every derived resource and
+   does not delete a shared user's unrelated identity data.
+10. Platform analytics may aggregate tenants only for platform-authorized
+    callers; tenant analytics always apply an organization predicate before
+    pagination/aggregation.
+
+## Required authorization matrix
+
+For each inventory row and each CRUD/action endpoint, automated tests must
+cover at least:
+
+| Dimension | Required cases |
+| --- | --- |
+| Actor | Unauthenticated, end user/self, other user, member, custom role, admin, owner, platform owner, service key with/without permission, SCIM token. |
+| Tenant | Same organization, different organization, no membership, suspended/pending organization, deleted parent. |
+| Identifier | Correct ID, another tenant's valid ID, nonexistent ID, parent/child mismatch, duplicate slug/email/provider subject. |
+| Operation | List, get, create, update/patch, delete, rotate/revoke, accept/complete, test/retry, export/analytics. |
+| Timing | Concurrent mutation/consume, privilege revoked during cached window, expired credential/state, parent deleted during action. |
+| Database | SQLite, PostgreSQL, and MySQL using the shipped feature combinations. |
+
+Tests should prefer indistinguishable not-found/forbidden behavior where
+resource-existence disclosure matters, and should assert both response and
+database state. A passing happy-path test is not isolation evidence.
+
+## Recorded isolation evidence
+
+The following focused regressions exist on the current development baseline.
+They are evidence for only the cases named here, not completion of the matrix:
+
+| Resource | Database | Test identifier | Covered cases | Remaining gaps |
+| --- | --- | --- | --- | --- |
+| `webhooks` | SQLite | `store::webhooks::tests::webhook_lists_and_event_selection_are_organization_scoped` | Two organizations with valid webhook IDs; organization-scoped list/count and active event selection return only the selected organization's row; a nonexistent organization returns an empty list. | HTTP handler authentication/role cases, delivery-history endpoints, concurrent changes, PostgreSQL, and MySQL. |
+| Organization selection and capability authority | SQLite | `handlers::organizations::core::tests::select_organization_switches_multi_org_member_and_persists_session_scope`; `handlers::organizations::core::tests::select_organization_rejects_inactive_target_org`; `handlers::organizations::core::tests::select_organization_rejects_non_member_target_org`; `handlers::organizations::core::tests::tenant_capability_does_not_trust_stale_platform_owner_snapshot` | A multi-organization member can select only an active organization they belong to, and the resulting signed/session context is rebound to that organization; inactive and non-member targets are denied. Tenant capability helpers re-read a claimed platform owner from the database, so a stale privileged snapshot cannot bypass tenant membership after demotion. | Full organization CRUD actor/child-ID matrix, pending/deleted parents, distributed cache timing, PostgreSQL, and MySQL. |
+| `webhooks` | SQLite | `store::webhooks::tests::webhook_mutations_deny_other_organization_and_missing_ids` | Same-organization update/delete succeeds; another organization's valid ID and nonexistent IDs produce `NotFound`; denied URL/event/status updates and delete leave the row unchanged. | HTTP response equivalence, test-delivery authorization, secret redaction/rotation, concurrent changes, PostgreSQL, and MySQL. |
+| Webhook delivery worker | SQLite | `store::webhook_deliveries::tests::pending_delivery_polling_reauthorizes_active_parent_and_honors_limit` | Pending polling and the worker's exact delivery/webhook lookup join the stored webhook and organization, require both active, reject mismatched payload IDs, and exclude exhausted work. The worker rechecks that exact authority immediately before outbound I/O; suspension after enqueue prevents authorization, and retry/failure bookkeeping cannot select an unrelated earlier delivery. | Suspension in the final database-check-to-network-send interval, multi-replica claim/lease, PostgreSQL, and MySQL. |
+| Billing webhook subscriptions | SQLite | `handlers::webhook::tests::subscription_webhook_rejects_cross_tenant_metadata_and_preserves_state` | A valid customer from organization A cannot use organization B user/service/plan metadata to create or mutate subscriptions; denied state remains equivalent for the asserted fields. | Valid-flow route fixture, other event types, concurrency, PostgreSQL, and MySQL. |
+| Service identities | SQLite | `store::identities::tests::service_principal_queries_reject_inconsistent_cross_tenant_identity_context` | Deliberately inconsistent identity rows cannot make another tenant's user visible through service-principal existence, count, or list queries. | HTTP provider-token non-disclosure, all permissions, PostgreSQL, and MySQL. |
+| `api_keys` | SQLite | `store::api_keys::tests::delete_for_service_denies_cross_tenant_key_and_preserves_target` | A valid key ID from another service returns `NotFound`; the target row is unchanged; same-service deletion succeeds. | HTTP actor/capability matrix, races, PostgreSQL, and MySQL. |
+| `plans` | SQLite | `store::plans::tests::plan_mutations_require_parent_service_and_preserve_other_tenant` | Update and delete use the compound service/plan predicate; another tenant's valid plan ID returns `NotFound` and preserves all asserted fields, while same-service mutations succeed. | HTTP owner/admin/custom/service-grant matrix, subscription races, PostgreSQL, and MySQL. |
+| Organization billing credentials | SQLite | `store::organization_billing_credentials::tests::billing_credential_mutations_are_org_scoped_and_preserve_other_tenant`; `handlers::organizations::billing_credentials::tests::billing_credentials_authority_honors_scoped_capability_and_revocation` | Wrong-organization disable/delete affect zero rows and preserve the other tenant's ciphertext, key ID, and enabled state. A custom billing role is accepted only while its membership and organization are active; suspended-parent and revoked-role checks deny access. | Full provider handler matrix, concurrent upsert, PostgreSQL, and MySQL. |
+| Domain routes | SQLite | `handlers::organizations::domain_routing::tests::domain_route_mutations_reject_cross_org_id_and_preserve_target`; `handlers::organizations::domain_routing::tests::domain_route_mutations_reject_suspended_parent_and_preserve_state` | Cross-organization route IDs are hidden and leave policy, verification state/token, and ownership unchanged. Suspended parents deny update/delete and preserve the row. Verification and deletion stores use compound organization/domain predicates. | DNS/HTTP verification success fixtures, all actor roles, concurrent ownership changes, PostgreSQL, and MySQL. |
+| SIEM configurations | SQLite | `store::siem_configs::tests::siem_config_mutations_are_org_scoped_and_preserve_results`; `handlers::siem_configs::secret_tests::siem_runtime_rejects_plaintext_and_wrong_context_without_fallback`; `handlers::siem_configs::secret_tests::siem_test_credentials_are_provider_specific_and_fail_closed`; `handlers::siem_configs::secret_tests::siem_api_response_never_serializes_credential_columns` | Update/delete use compound organization/config predicates; a valid other-tenant config ID returns `NotFound` and leaves the endpoint, encrypted API key, enabled state, name, and owner unchanged. SIEM test authentication decrypts only the provider-selected credential with authenticated record/field context, requires API keys for named providers, rejects unsafe custom header names, bounds downstream bodies, and returns no downstream body/error detail. API responses omit both credential columns and ciphertext canaries. | Full handler actor/test-action network matrix, concurrent delivery/rotation, PostgreSQL, and MySQL. |
+| SCIM token lifecycle | SQLite | `store::scim_tokens::tests::scim_token_lifecycle_is_org_scoped_and_preserves_other_tenant` | Revoke and delete use compound organization/token predicates; another tenant's valid ID is a no-op and remains active/present, while same-organization operations succeed. | HTTP actor/status matrix, remaining resource-ID cases, PostgreSQL, and MySQL. |
+| Organization audit authority | SQLite | `handlers::organization_audit::tests::audit_route_authority_is_bound_to_selected_organization`; `handlers::organization_audit::tests::audit_metadata_recursively_redacts_credentials_but_preserves_identifiers`; `handlers::platform::audit_redaction_tests::platform_audit_metadata_uses_recursive_credential_redaction` | Access is resolved from the selected organization, requires its scoped capability and active status, and rejects other/missing organizations. Target/action filters keep the organization predicate, filtered totals match the selected query, and target pagination never returns the other tenant's same target ID. Pagination uses a stable created-time/ID order, including when rows share a timestamp. Structured organization and platform response metadata recursively redacts credential keys while retaining non-secret identifiers; malformed platform metadata fails closed instead of returning raw text. | Remaining PII/free-form metadata policy and export behavior, remaining filter combinations and actor roles, PostgreSQL, and MySQL. |
+| Tenant login analytics authority | SQLite | `handlers::analytics::tests::tenant_analytics_requires_live_scoped_capability_and_excludes_other_scopes` | All tenant analytics routes resolve a currently active parent and require `audit_logs.view`: owner/admin/custom-capability actors are allowed, while member/non-member/other-tenant actors, suspended parents, and live capability revocation are denied. Tenant aggregation includes explicit-org service-less events and compatible legacy service-derived events, while excluding null-scope, other-service, and inconsistent org/service pairs. Recent-login service IDs are nullable and signed limits are clamped before unsigned query conversion. The same predicate scopes risk-event reads. | Date-filter response combinations, metadata/redaction and null-org MFA rows, any future export surface, PostgreSQL, and MySQL. |
+| SCIM runtime parent and shared-user isolation | SQLite | `handlers::scim::tests::suspended_parent_rejects_every_scim_route_before_handler_state_changes`; `handlers::scim::tests::shared_user_put_and_patch_cannot_mutate_global_identity`; `handlers::scim::tests::optional_organization_header_must_be_absent_or_exactly_match_token_scope` | SCIM bearer authentication joins the token to a currently active parent organization before every route. PUT/PATCH can update global user fields only for a user record owned by that organization and with a live membership; membership-only/shared users are unchanged and denied. The optional organization header may be absent or exactly match the token scope; mismatched, malformed, whitespace-different, or duplicate values fail closed and never select authority. | Final-check-to-mutation suspension timing, deprovision/reprovision policy for shared identities, PostgreSQL, and MySQL. |
+| Risk rules | SQLite | `store::risk_rules::tests::risk_rule_update_and_delete_preserve_other_organization` | Rule update/delete predicates use the selected organization ID; mutating one organization's policy leaves the other organization's ID, mode, and thresholds unchanged. Risk handlers also reject inactive parents before reads, updates, resets, or event queries. | Handler custom-role/reset/event pagination and unchanged-state matrix, PostgreSQL, and MySQL. |
+| Organization sessions | SQLite | `store::sessions::tests::org_scoped_session_revocation_preserves_other_tenant_and_other_user` | Revocation removes only the selected user and organization scope while preserving the same user's other-tenant session and another user's same-org session. | Handler roles, global/resource sessions, concurrency, PostgreSQL, and MySQL. |
+| Same-email user contexts | SQLite | `store::users::tests::same_email_lookups_and_default_creation_preserve_tenant_context` | Organization A, organization B, and platform users with the same email resolve independently; default/admin-OAuth creation cannot select or promote a tenant account. | Full password/magic/OAuth handler matrix, PostgreSQL, and MySQL. |
+| Magic-link bound context and consumption | SQLite | `handlers::auth::magic::tests::malformed_callback_and_suspension_after_issuance_preserve_magic_link`; `handlers::auth::magic::tests::same_email_and_cross_service_context_cannot_select_or_consume_wrong_identity`; `store::magic_links::tests::concurrent_consumption_has_exactly_one_winner` | Issuance and verification require a currently active bound organization and exact service access. Callback state/redirect and all fallible authorization/risk prerequisites run before consume; malformed, suspended, and cross-service denials preserve the link. Successful consume/session/device creation is one transaction and consume-time authority is rechecked; replay has one winner. | PostgreSQL/MySQL route parity, multi-replica timing, and durable authentication audit coverage. |
+| Invitation same-email tenant binding | SQLite | `handlers::invitations::tests::invitation_acceptance_ignores_platform_and_sibling_same_email_users`; `handlers::invitations::tests::concurrent_invited_user_resolution_has_one_tenant_identity`; `handlers::invitations::tests::suspended_parent_rejects_invitation_acceptance_without_state_changes` | Acceptance reuses a shared identity only when membership already proves the exact organization binding; otherwise it resolves or creates by `(org_id,email)`. Platform and sibling-tenant same-email rows remain unchanged, while concurrent resolution converges on one target-tenant identity. Acceptance conditionally claims a pending invitation only for an active parent before user/membership side effects; a suspended parent leaves the invitation pending and creates neither user nor membership. Create, admin-accept, cancel, and list also require an active parent, and list responses do not expose the stored token hash. | PostgreSQL/MySQL concurrency and the remaining full actor/ID route matrix. |
+| Connected accounts | SQLite | `store::connected_accounts::tests::linked_account_ownership_and_provider_subject_collision_are_enforced` | Other users cannot read or revoke an account, denied mutations preserve token/status state, and one external provider subject cannot be linked to a second user. | Grant and callback handler matrix, encrypted-token canaries, PostgreSQL, and MySQL. |
+| Provider grants and completion state | SQLite | `store::service_provider_grants::tests::provider_grants_require_owned_matching_account_and_preserve_denied_state`; `store::provider_token_requests::tests::provider_token_request_completion_is_user_bound_and_one_time` | Grant creation requires an active account owned by the same user with the same provider; denied cross-user/provider writes preserve active grant state. Request completion is user-bound and has exactly one winner, and handlers claim it before grant mutation. | External callback failure injection, multi-replica races, PostgreSQL, and MySQL. |
+| User devices | SQLite | `store::user_devices::tests::user_scoped_device_mutations_deny_other_user_and_preserve_state` | Rename, trust-extension, revoke, and delete mutations carry the authenticated user predicate; denied writes preserve name, expiry, and trust state. | Full HTTP actor matrix, device-cookie replay, PostgreSQL, and MySQL. |
+| User passkeys | SQLite | `store::user_passkeys::tests::passkey_management_denies_other_user_and_preserves_target` | Other-user lookups, rename, and deletion fail without changing credential state; owner mutations remain available. | Browser/authenticator ceremonies, handler matrix, PostgreSQL, and MySQL. |
+| Platform authority | Structural plus SQLite authority | `router::platform_route_boundary_tests::every_platform_route_is_inside_the_platform_owner_boundary`; `middleware::platform_authority_tests::platform_authority_uses_current_database_role_not_cached_snapshot`; `middleware::impersonation_authority_tests::platform_actor_demotion_immediately_removes_global_impersonation_authority` | Every inventoried platform method is behind JWT extraction and a current-database platform-owner check; tenant roles and stale/demoted impersonation authority do not satisfy it. | Platform audit redaction/attribution, internal job payload authorization, distributed sessions, PostgreSQL, and MySQL. |
+| Public operational responses | SQLite plus pure response tests | `handlers::health::tests::public_health_responses_have_a_bounded_non_tenant_shape`; `jwks_tests::jwks_publishes_active_and_previous_verification_keys`; `http_security::tests::metrics_requires_the_exact_bearer_token` | Health/readiness expose a fixed non-tenant shape, JWKS contains only public verification material, and metrics requires the exact configured bearer token. | Deployment proxy/network-boundary checks and runtime secret canaries. |
+
+## Inventory maintenance
+
+CI compares SeaORM entity tables and route paths from both `api/src/router.rs`
+and `api/src/main.rs` against `tenant-isolation-matrix.json`, verifies every
+entity appears in this prose inventory, and rejects stale named SQLite evidence.
+The current gate is structural: method-level handlers, actor cases, selector
+combinations, background jobs, caches, external exports, and PostgreSQL/MySQL
+results remain explicit matrix gaps rather than inferred coverage.

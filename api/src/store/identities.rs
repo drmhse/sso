@@ -18,9 +18,34 @@ pub struct EndUserIdentityRow {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct ServiceUserRow {
+    pub id: String,
+    pub email: String,
+    pub created_at: chrono::NaiveDateTime,
+}
+
 pub struct IdentityStore;
 
 impl IdentityStore {
+    /// Return whether a user has an identity issued in the exact tenant/service
+    /// context. Global identities and identities issued by another service do
+    /// not grant access to SAML assertions for this service.
+    pub async fn exists_for_user_and_service_context(
+        db: DB<'_>,
+        user_id: &str,
+        org_id: &str,
+        service_id: &str,
+    ) -> Result<bool> {
+        let identity = Identities::find()
+            .filter(identities::Column::UserId.eq(user_id))
+            .filter(identities::Column::IssuingOrgId.eq(org_id))
+            .filter(identities::Column::IssuingServiceId.eq(service_id))
+            .one(&db)
+            .await?;
+        Ok(identity.is_some())
+    }
+
     /// Find an identity by ID
     pub async fn find_by_id(db: DB<'_>, identity_id: &str) -> Result<Option<identities::Model>> {
         let result = Identities::find()
@@ -208,14 +233,110 @@ impl IdentityStore {
         Ok(updated_identity)
     }
 
+    /// Persist refreshed encrypted tokens only if the refresh credential is
+    /// still exactly the one used for the provider request. Revocation or
+    /// replacement while network I/O is in flight must win.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_tokens_encrypted_if_current(
+        db: DB<'_>,
+        identity_id: &str,
+        expected_refresh_token_encrypted: Option<&[u8]>,
+        expected_refresh_token_plaintext: Option<&str>,
+        access_token_encrypted: Option<Vec<u8>>,
+        refresh_token_encrypted: Option<Vec<u8>>,
+        encryption_key_id: &str,
+        expires_at: Option<chrono::NaiveDateTime>,
+    ) -> Result<bool> {
+        use sea_orm::sea_query::Expr;
+
+        let mut update = Identities::update_many()
+            .filter(identities::Column::Id.eq(identity_id))
+            .col_expr(identities::Column::AccessToken, Expr::value(None::<String>))
+            .col_expr(
+                identities::Column::RefreshToken,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                identities::Column::AccessTokenEncrypted,
+                Expr::value(access_token_encrypted),
+            )
+            .col_expr(
+                identities::Column::EncryptionKeyId,
+                Expr::value(Some(encryption_key_id.to_string())),
+            )
+            .col_expr(identities::Column::ExpiresAt, Expr::value(expires_at))
+            .col_expr(
+                identities::Column::LastRefreshedAt,
+                Expr::value(Some(chrono::Utc::now().naive_utc())),
+            );
+        update = match expected_refresh_token_encrypted {
+            Some(expected) => {
+                update.filter(identities::Column::RefreshTokenEncrypted.eq(expected.to_vec()))
+            }
+            None => update.filter(identities::Column::RefreshTokenEncrypted.is_null()),
+        };
+        update = match expected_refresh_token_plaintext {
+            Some(expected) => {
+                update.filter(identities::Column::RefreshToken.eq(expected.to_string()))
+            }
+            None => update.filter(identities::Column::RefreshToken.is_null()),
+        };
+        if let Some(refresh_token_encrypted) = refresh_token_encrypted {
+            update = update.col_expr(
+                identities::Column::RefreshTokenEncrypted,
+                Expr::value(Some(refresh_token_encrypted)),
+            );
+        }
+        Ok(update.exec(&db).await?.rows_affected == 1)
+    }
+
+    /// Development-mode equivalent of encrypted CAS refresh writeback.
+    pub async fn update_tokens_if_current(
+        db: DB<'_>,
+        identity_id: &str,
+        expected_refresh_token: Option<&str>,
+        access_token: Option<&str>,
+        refresh_token: Option<&str>,
+        expires_at: Option<chrono::NaiveDateTime>,
+    ) -> Result<bool> {
+        use sea_orm::sea_query::Expr;
+
+        let mut update = Identities::update_many()
+            .filter(identities::Column::Id.eq(identity_id))
+            .col_expr(
+                identities::Column::AccessToken,
+                Expr::value(access_token.map(str::to_string)),
+            )
+            .col_expr(identities::Column::ExpiresAt, Expr::value(expires_at))
+            .col_expr(
+                identities::Column::LastRefreshedAt,
+                Expr::value(Some(chrono::Utc::now().naive_utc())),
+            );
+        update = match expected_refresh_token {
+            Some(expected) => {
+                update.filter(identities::Column::RefreshToken.eq(expected.to_string()))
+            }
+            None => update.filter(identities::Column::RefreshToken.is_null()),
+        };
+        if let Some(refresh_token) = refresh_token {
+            update = update.col_expr(
+                identities::Column::RefreshToken,
+                Expr::value(Some(refresh_token.to_string())),
+            );
+        }
+        Ok(update.exec(&db).await?.rows_affected == 1)
+    }
+
     /// Delete an identity
     pub async fn delete(db: DB<'_>, identity_id: &str) -> Result<()> {
-        let identity = Self::find_by_id(db.clone(), identity_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Identity not found".to_string()))?;
+        let result = Identities::delete_many()
+            .filter(identities::Column::Id.eq(identity_id))
+            .exec(&db)
+            .await?;
 
-        let identity_active: identities::ActiveModel = identity.into();
-        identity_active.delete(&db).await?;
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound("Identity not found".to_string()));
+        }
 
         Ok(())
     }
@@ -411,7 +532,7 @@ impl IdentityStore {
 
         let identity = if let Some(existing) = existing {
             // Update existing identity
-
+            let identity_id = existing.id.clone();
             let mut active: identities::ActiveModel = existing.into();
 
             active.provider_user_id = Set(provider_user_id.to_string());
@@ -420,19 +541,27 @@ impl IdentityStore {
             active.last_refreshed_at = Set(Some(last_refreshed));
 
             if let Some(enc) = encryption {
-                let access_token_encrypted = enc.encrypt(access_token).map_err(|e| {
+                let access_token_encrypted = encrypt_identity_token(
+                    enc,
+                    &identity_id,
+                    "access_token_encrypted",
+                    access_token,
+                )
+                .map_err(|e| {
                     AppError::InternalServerError(format!("Failed to encrypt access token: {}", e))
                 })?;
                 active.access_token = Set(None);
                 active.refresh_token = Set(None);
                 active.access_token_encrypted = Set(Some(access_token_encrypted));
                 if let Some(rt) = refresh_token {
-                    let refresh_token_encrypted = enc.encrypt(rt).map_err(|e| {
-                        AppError::InternalServerError(format!(
-                            "Failed to encrypt refresh token: {}",
-                            e
-                        ))
-                    })?;
+                    let refresh_token_encrypted =
+                        encrypt_identity_token(enc, &identity_id, "refresh_token_encrypted", rt)
+                            .map_err(|e| {
+                                AppError::InternalServerError(format!(
+                                    "Failed to encrypt refresh token: {}",
+                                    e
+                                ))
+                            })?;
                     active.refresh_token_encrypted = Set(Some(refresh_token_encrypted));
                 }
                 active.encryption_key_id = Set(Some(enc.key_id().to_string()));
@@ -451,15 +580,23 @@ impl IdentityStore {
             let now = chrono::Utc::now().naive_utc();
 
             let new_identity = if let Some(enc) = encryption {
-                let access_token_encrypted = enc.encrypt(access_token).map_err(|e| {
-                    AppError::InternalServerError(format!("Failed to encrypt access token: {}", e))
-                })?;
+                let access_token_encrypted =
+                    encrypt_identity_token(enc, &id, "access_token_encrypted", access_token)
+                        .map_err(|e| {
+                            AppError::InternalServerError(format!(
+                                "Failed to encrypt access token: {}",
+                                e
+                            ))
+                        })?;
                 let refresh_token_encrypted = refresh_token
-                    .map(|rt| enc.encrypt(rt))
+                    .map(|rt| encrypt_identity_token(enc, &id, "refresh_token_encrypted", rt))
                     .transpose()
                     .map_err(|e| {
-                    AppError::InternalServerError(format!("Failed to encrypt refresh token: {}", e))
-                })?;
+                        AppError::InternalServerError(format!(
+                            "Failed to encrypt refresh token: {}",
+                            e
+                        ))
+                    })?;
 
                 identities::ActiveModel {
                     id: Set(id),
@@ -533,31 +670,42 @@ impl IdentityStore {
                                 );
 
                                 // Update the orphaned identity to the correct user
+                                let identity_id = existing_identity.id.clone();
                                 let mut identity_active: identities::ActiveModel =
                                     existing_identity.into();
                                 identity_active.user_id = Set(user_id.to_string());
 
                                 // Update tokens and other fields as well
                                 if let Some(enc) = encryption {
-                                    let access_token_encrypted =
-                                        enc.encrypt(access_token).map_err(|e| {
-                                            AppError::InternalServerError(format!(
-                                                "Failed to encrypt access token: {}",
-                                                e
-                                            ))
-                                        })?;
+                                    let access_token_encrypted = encrypt_identity_token(
+                                        enc,
+                                        &identity_id,
+                                        "access_token_encrypted",
+                                        access_token,
+                                    )
+                                    .map_err(|e| {
+                                        AppError::InternalServerError(format!(
+                                            "Failed to encrypt access token: {}",
+                                            e
+                                        ))
+                                    })?;
                                     identity_active.access_token = Set(None);
                                     identity_active.refresh_token = Set(None);
                                     identity_active.access_token_encrypted =
                                         Set(Some(access_token_encrypted));
                                     if let Some(rt) = refresh_token {
-                                        let refresh_token_encrypted =
-                                            enc.encrypt(rt).map_err(|e| {
-                                                AppError::InternalServerError(format!(
-                                                    "Failed to encrypt refresh token: {}",
-                                                    e
-                                                ))
-                                            })?;
+                                        let refresh_token_encrypted = encrypt_identity_token(
+                                            enc,
+                                            &identity_id,
+                                            "refresh_token_encrypted",
+                                            rt,
+                                        )
+                                        .map_err(|e| {
+                                            AppError::InternalServerError(format!(
+                                                "Failed to encrypt refresh token: {}",
+                                                e
+                                            ))
+                                        })?;
                                         identity_active.refresh_token_encrypted =
                                             Set(Some(refresh_token_encrypted));
                                     }
@@ -579,6 +727,7 @@ impl IdentityStore {
                                 identity_active.update(&db).await?
                             } else {
                                 // Identity belongs to correct user, update tokens
+                                let identity_id = existing_identity.id.clone();
                                 let mut identity_active: identities::ActiveModel =
                                     existing_identity.into();
                                 identity_active.provider_user_id =
@@ -588,25 +737,35 @@ impl IdentityStore {
                                 identity_active.last_refreshed_at = Set(Some(last_refreshed));
 
                                 if let Some(enc) = encryption {
-                                    let access_token_encrypted =
-                                        enc.encrypt(access_token).map_err(|e| {
-                                            AppError::InternalServerError(format!(
-                                                "Failed to encrypt access token: {}",
-                                                e
-                                            ))
-                                        })?;
+                                    let access_token_encrypted = encrypt_identity_token(
+                                        enc,
+                                        &identity_id,
+                                        "access_token_encrypted",
+                                        access_token,
+                                    )
+                                    .map_err(|e| {
+                                        AppError::InternalServerError(format!(
+                                            "Failed to encrypt access token: {}",
+                                            e
+                                        ))
+                                    })?;
                                     identity_active.access_token = Set(None);
                                     identity_active.refresh_token = Set(None);
                                     identity_active.access_token_encrypted =
                                         Set(Some(access_token_encrypted));
                                     if let Some(rt) = refresh_token {
-                                        let refresh_token_encrypted =
-                                            enc.encrypt(rt).map_err(|e| {
-                                                AppError::InternalServerError(format!(
-                                                    "Failed to encrypt refresh token: {}",
-                                                    e
-                                                ))
-                                            })?;
+                                        let refresh_token_encrypted = encrypt_identity_token(
+                                            enc,
+                                            &identity_id,
+                                            "refresh_token_encrypted",
+                                            rt,
+                                        )
+                                        .map_err(|e| {
+                                            AppError::InternalServerError(format!(
+                                                "Failed to encrypt refresh token: {}",
+                                                e
+                                            ))
+                                        })?;
                                         identity_active.refresh_token_encrypted =
                                             Set(Some(refresh_token_encrypted));
                                     }
@@ -793,6 +952,28 @@ impl IdentityStore {
         Ok(count)
     }
 
+    /// Count distinct users whose user row and identity context both belong to
+    /// the service principal's organization.
+    pub async fn count_users_by_org_service(
+        db: DB<'_>,
+        org_id: &str,
+        service_id: &str,
+    ) -> Result<u64> {
+        use crate::entities::users;
+        use sea_orm::{JoinType, PaginatorTrait, RelationTrait};
+
+        Ok(Identities::find()
+            .join(JoinType::InnerJoin, identities::Relation::Users.def())
+            .filter(identities::Column::IssuingOrgId.eq(Some(org_id)))
+            .filter(identities::Column::IssuingServiceId.eq(Some(service_id)))
+            .filter(users::Column::OrgId.eq(Some(org_id)))
+            .select_only()
+            .column(identities::Column::UserId)
+            .distinct()
+            .count(&db)
+            .await?)
+    }
+
     /// List users who have authenticated with a service (with pagination)
     pub async fn list_users_by_service(
         db: DB<'_>,
@@ -802,6 +983,7 @@ impl IdentityStore {
     ) -> Result<Vec<String>> {
         use sea_orm::{QueryOrder, QuerySelect};
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
         // Get distinct user_ids for the service where issuing_service_id matches
         // Note: For PostgreSQL DISTINCT queries, ORDER BY columns must be in SELECT list
         let user_ids = Identities::find()
@@ -811,8 +993,8 @@ impl IdentityStore {
             .column_as(identities::Column::CreatedAt, "created_at")
             .distinct()
             .order_by_desc(identities::Column::CreatedAt)
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .limit(limit)
+            .offset(offset)
             .into_tuple::<(String, String)>()
             .all(&db)
             .await?
@@ -821,6 +1003,70 @@ impl IdentityStore {
             .collect();
 
         Ok(user_ids)
+    }
+
+    /// List users who have authenticated with a service, returning user details directly.
+    pub async fn list_user_details_by_service(
+        db: DB<'_>,
+        service_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ServiceUserRow>> {
+        use crate::entities::users;
+        use sea_orm::{JoinType, QueryOrder, QuerySelect, RelationTrait};
+
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
+        let users = Identities::find()
+            .join(JoinType::InnerJoin, identities::Relation::Users.def())
+            .filter(identities::Column::IssuingServiceId.eq(Some(service_id)))
+            .select_only()
+            .column_as(users::Column::Id, "id")
+            .column_as(users::Column::Email, "email")
+            .column_as(users::Column::CreatedAt, "created_at")
+            .group_by(users::Column::Id)
+            .group_by(users::Column::Email)
+            .group_by(users::Column::CreatedAt)
+            .order_by_desc(identities::Column::CreatedAt.max())
+            .limit(limit)
+            .offset(offset)
+            .into_model::<ServiceUserRow>()
+            .all(&db)
+            .await?;
+
+        Ok(users)
+    }
+
+    /// List service users only when both the user and the issuing identity are
+    /// bound to the service principal's organization.
+    pub async fn list_user_details_by_org_service(
+        db: DB<'_>,
+        org_id: &str,
+        service_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ServiceUserRow>> {
+        use crate::entities::users;
+        use sea_orm::{JoinType, QueryOrder, RelationTrait};
+
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
+        Ok(Identities::find()
+            .join(JoinType::InnerJoin, identities::Relation::Users.def())
+            .filter(identities::Column::IssuingOrgId.eq(Some(org_id)))
+            .filter(identities::Column::IssuingServiceId.eq(Some(service_id)))
+            .filter(users::Column::OrgId.eq(Some(org_id)))
+            .select_only()
+            .column_as(users::Column::Id, "id")
+            .column_as(users::Column::Email, "email")
+            .column_as(users::Column::CreatedAt, "created_at")
+            .group_by(users::Column::Id)
+            .group_by(users::Column::Email)
+            .group_by(users::Column::CreatedAt)
+            .order_by_desc(identities::Column::CreatedAt.max())
+            .limit(limit)
+            .offset(offset)
+            .into_model::<ServiceUserRow>()
+            .all(&db)
+            .await?)
     }
 
     /// Check if a user has authenticated with a service
@@ -837,5 +1083,178 @@ impl IdentityStore {
             .is_some();
 
         Ok(exists)
+    }
+
+    /// Check a user/service link with both identity and user organization
+    /// predicates. This is the only safe form for service-principal APIs.
+    pub async fn user_has_authenticated_with_org_service(
+        db: DB<'_>,
+        user_id: &str,
+        org_id: &str,
+        service_id: &str,
+    ) -> Result<bool> {
+        use crate::entities::users;
+        use sea_orm::{JoinType, RelationTrait};
+
+        Ok(Identities::find()
+            .join(JoinType::InnerJoin, identities::Relation::Users.def())
+            .filter(identities::Column::UserId.eq(user_id))
+            .filter(identities::Column::IssuingOrgId.eq(Some(org_id)))
+            .filter(identities::Column::IssuingServiceId.eq(Some(service_id)))
+            .filter(users::Column::OrgId.eq(Some(org_id)))
+            .one(&db)
+            .await?
+            .is_some())
+    }
+}
+
+fn encrypt_identity_token(
+    encryption: &crate::encryption::EncryptionService,
+    identity_id: &str,
+    field: &'static str,
+    plaintext: &str,
+) -> std::result::Result<Vec<u8>, crate::encryption::EncryptionError> {
+    encryption.encrypt_with_context(
+        plaintext,
+        crate::encryption::EncryptionContext::new("identities", identity_id, field),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{
+        organizations::OrganizationStore, services::ServiceStore, users::UserStore,
+    };
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, Set};
+
+    #[tokio::test]
+    async fn delete_reports_missing_identity_without_preload() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        assert!(matches!(
+            IdentityStore::delete(DB::Conn(&db), "missing").await,
+            Err(AppError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn service_principal_queries_reject_inconsistent_cross_tenant_identity_context() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let user_a = UserStore::create(DB::Conn(&db), "identity-a@example.com", None, false)
+            .await
+            .expect("create user A");
+        let user_b = UserStore::create(DB::Conn(&db), "identity-b@example.com", None, false)
+            .await
+            .expect("create user B");
+        let org_a = OrganizationStore::create(
+            DB::Conn(&db),
+            "identity-org-a",
+            "Identity Org A",
+            &user_a.id,
+            None,
+        )
+        .await
+        .expect("create org A");
+        let org_b = OrganizationStore::create(
+            DB::Conn(&db),
+            "identity-org-b",
+            "Identity Org B",
+            &user_b.id,
+            None,
+        )
+        .await
+        .expect("create org B");
+        let mut user_a_active: crate::entities::users::ActiveModel = user_a.clone().into();
+        user_a_active.org_id = Set(Some(org_a.id.clone()));
+        user_a_active.update(&db).await.expect("scope user A");
+        let mut user_b_active: crate::entities::users::ActiveModel = user_b.clone().into();
+        user_b_active.org_id = Set(Some(org_b.id.clone()));
+        user_b_active.update(&db).await.expect("scope user B");
+        let service_a = ServiceStore::create(
+            DB::Conn(&db),
+            &org_a.id,
+            "identity-service-a",
+            "Identity Service A",
+            "web",
+            "identity-client-a",
+        )
+        .await
+        .expect("create service A");
+        IdentityStore::create(
+            DB::Conn(&db),
+            &user_a.id,
+            "test",
+            "provider-a",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org_a.id),
+            Some(&service_a.id),
+        )
+        .await
+        .expect("create valid identity");
+        IdentityStore::create(
+            DB::Conn(&db),
+            &user_b.id,
+            "test",
+            "provider-b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org_b.id),
+            Some(&service_a.id),
+        )
+        .await
+        .expect("create deliberately inconsistent identity");
+
+        assert!(IdentityStore::user_has_authenticated_with_org_service(
+            DB::Conn(&db),
+            &user_a.id,
+            &org_a.id,
+            &service_a.id
+        )
+        .await
+        .expect("check valid identity"));
+        assert!(!IdentityStore::user_has_authenticated_with_org_service(
+            DB::Conn(&db),
+            &user_b.id,
+            &org_a.id,
+            &service_a.id
+        )
+        .await
+        .expect("reject cross-tenant identity"));
+        assert_eq!(
+            IdentityStore::count_users_by_org_service(DB::Conn(&db), &org_a.id, &service_a.id)
+                .await
+                .expect("count scoped users"),
+            1
+        );
+        let listed = IdentityStore::list_user_details_by_org_service(
+            DB::Conn(&db),
+            &org_a.id,
+            &service_a.id,
+            10,
+            0,
+        )
+        .await
+        .expect("list scoped users");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, user_a.id);
     }
 }

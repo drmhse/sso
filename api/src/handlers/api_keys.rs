@@ -38,6 +38,12 @@ pub struct ListApiKeysResponse {
     pub total: i64,
 }
 
+fn normalize_list_pagination(query: &ListApiKeysQuery) -> (u64, u64) {
+    let (limit, offset) =
+        crate::utils::pagination::signed_limit_offset(query.limit, query.offset, 50, 100);
+    crate::utils::pagination::store_u64(limit, offset, 100)
+}
+
 async fn can_manage_service(state: &AppState, user_id: &str, org_id: &str) -> Result<bool> {
     PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_SERVICES_MANAGE).await
 }
@@ -186,6 +192,9 @@ pub async fn create_api_key(
     let user_id = auth_user.user.id.clone();
     let name = req.name.clone();
     let org_id = org.id.clone();
+    let service_slug_for_audit = service_slug.clone();
+    let permissions_for_audit = req.permissions.clone();
+    let audit_actor = state.audit_actor.clone();
 
     // Execute transaction with automatic retry on database contention
     let api_key_id = with_retrying_transaction(
@@ -200,6 +209,10 @@ pub async fn create_api_key(
             let key_hash = key_hash.clone();
             let permissions_json = permissions_json.clone();
             let user_id = user_id.clone();
+            let org_id = org_id.clone();
+            let service_slug = service_slug_for_audit.clone();
+            let permissions = permissions_for_audit.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
                 let api_key_entity = ApiKeyStore::create(
                     db.clone(),
@@ -213,26 +226,25 @@ pub async fn create_api_key(
                 )
                 .await?;
 
+                let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "api_key.created")
+                    .target("api_key", &api_key_entity.id)
+                    .success(true)
+                    .details_json(Some(json!({
+                        "api_key_id": api_key_entity.id,
+                        "service_id": service_id,
+                        "service_slug": service_slug,
+                        "name": name,
+                        "permissions": permissions,
+                        "expires_at": expires_at
+                    })))
+                    .build();
+                audit_actor.log_org_with_db(db, event).await?;
+
                 Ok(api_key_entity.id.clone())
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "api_key.created")
-        .target("api_key", &api_key_id)
-        .success(true)
-        .details_json(Some(json!({
-            "api_key_id": api_key_id,
-            "service_id": service_id,
-            "service_slug": service_slug,
-            "name": name,
-            "permissions": req.permissions,
-            "expires_at": expires_at
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok((
         StatusCode::CREATED,
@@ -284,8 +296,7 @@ pub async fn list_api_keys(
         ));
     }
 
-    let limit = query.limit.unwrap_or(50).min(100) as u64;
-    let offset = query.offset.unwrap_or(0).max(0) as u64;
+    let (limit, offset) = normalize_list_pagination(&query);
 
     let total = ApiKeyStore::count_by_service(DB::Conn(&state.db), service_id).await?;
 
@@ -380,6 +391,10 @@ pub async fn delete_api_key(
             .ok_or_else(|| AppError::NotFound("API key not found".to_string()))?;
 
     let api_key_name = api_key_entity.name.clone();
+    let org_id = org.id.clone();
+    let actor_user_id = auth_user.user.id.clone();
+    let service_slug_for_audit = service_slug.clone();
+    let audit_actor = state.audit_actor.clone();
 
     // Execute transaction with automatic retry on database contention
     with_retrying_transaction(
@@ -389,26 +404,68 @@ pub async fn delete_api_key(
         "delete_api_key",
         |db| {
             let api_key_id = api_key_id.clone();
+            let service_id = service_id.clone();
+            let api_key_name = api_key_name.clone();
+            let org_id = org_id.clone();
+            let actor_user_id = actor_user_id.clone();
+            let service_slug = service_slug_for_audit.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
-                ApiKeyStore::delete(db.clone(), &api_key_id).await?;
+                ApiKeyStore::delete_for_service(db.clone(), &api_key_id, &service_id).await?;
+
+                let event = OrgAuditBuilder::new(&org_id, Some(&actor_user_id), "api_key.deleted")
+                    .target("api_key", &api_key_id)
+                    .success(true)
+                    .details_json(Some(json!({
+                        "api_key_id": api_key_id,
+                        "service_id": service_id,
+                        "service_slug": service_slug,
+                        "name": api_key_name
+                    })))
+                    .build();
+                audit_actor.log_org_with_db(db, event).await?;
                 Ok(())
             })
         },
     )
     .await?;
 
-    // Non-blocking audit via actor
-    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.user.id), "api_key.deleted")
-        .target("api_key", &api_key_id)
-        .success(true)
-        .details_json(Some(json!({
-            "api_key_id": api_key_id,
-            "service_id": service_id,
-            "service_slug": service_slug,
-            "name": api_key_name
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
-
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_list_pagination_is_bounded_before_unsigned_conversion() {
+        assert_eq!(
+            normalize_list_pagination(&ListApiKeysQuery {
+                limit: None,
+                offset: None,
+            }),
+            (50, 0)
+        );
+        assert_eq!(
+            normalize_list_pagination(&ListApiKeysQuery {
+                limit: Some(-1),
+                offset: Some(-1),
+            }),
+            (1, 0)
+        );
+        assert_eq!(
+            normalize_list_pagination(&ListApiKeysQuery {
+                limit: Some(0),
+                offset: Some(12),
+            }),
+            (1, 12)
+        );
+        assert_eq!(
+            normalize_list_pagination(&ListApiKeysQuery {
+                limit: Some(i64::MAX),
+                offset: Some(3),
+            }),
+            (100, 3)
+        );
+    }
 }

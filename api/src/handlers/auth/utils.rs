@@ -7,7 +7,7 @@ use crate::services::risk_engine::RiskAssessment;
 use sea_orm::Set;
 use uuid::Uuid;
 
-/// Record login event for analytics (via buffered audit actor)
+/// Durably enqueue a login event for analytics and audit reconciliation.
 /// Includes risk assessment data if available
 pub async fn record_login_event(
     audit_actor: &AuditHandle,
@@ -16,7 +16,7 @@ pub async fn record_login_event(
     service_id: Option<&str>,
     provider: Provider,
     risk_assessment: Option<&RiskAssessment>,
-) {
+) -> anyhow::Result<()> {
     let mut event_model = login_events::ActiveModel {
         id: Set(Uuid::new_v4().to_string()),
         user_id: Set(user_id.to_string()),
@@ -40,6 +40,7 @@ pub async fn record_login_event(
         }
     }
 
-    // Non-blocking: queues to actor, doesn't wait for DB
-    audit_actor.log_login(event_model).await;
+    // Await the durable outbox insert; final-table delivery is asynchronous.
+    audit_actor.log_login(event_model).await?;
+    Ok(())
 }

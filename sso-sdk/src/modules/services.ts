@@ -522,8 +522,8 @@ export class ServicesModule {
      * Generate a new SAML signing certificate for the IdP.
      * Requires 'owner' or 'admin' role.
      *
-     * IMPORTANT: This automatically deactivates any existing active certificates.
-     * Provide the returned certificate to your Service Provider during SAML setup.
+     * The prior active certificate remains verification-only in published metadata
+     * for a bounded rollover window. New assertions use only the returned active key.
      *
      * @param orgSlug Organization slug
      * @param serviceSlug Service slug
@@ -568,6 +568,24 @@ export class ServicesModule {
     getCertificate: async (orgSlug: string, serviceSlug: string): Promise<SamlCertificate> => {
       const response = await this.http.get<SamlCertificate>(
         `/api/organizations/${orgSlug}/services/${serviceSlug}/saml/certificate`
+      );
+      return response.data;
+    },
+
+    /**
+     * Immediately remove every previous rollover certificate from metadata.
+     * Use this after a suspected compromise, once service providers trust the
+     * active certificate. The active signing key is not changed.
+     */
+    retireCertificateOverlap: async (
+      orgSlug: string,
+      serviceSlug: string
+    ): Promise<{ success: boolean; retired_certificates: number }> => {
+      const response = await this.http.delete<{
+        success: boolean;
+        retired_certificates: number;
+      }>(
+        `/api/organizations/${orgSlug}/services/${serviceSlug}/saml/certificate/overlap`
       );
       return response.data;
     },

@@ -4,6 +4,7 @@ use crate::error::Result;
 use crate::store::memberships::MembershipStore;
 use crate::store::organization_roles::OrganizationRoleStore;
 use crate::store::DB;
+use std::collections::HashSet;
 
 /// Permission capabilities
 pub const CAP_ORG_SETTINGS_MANAGE: &str = "org.settings.manage";
@@ -80,12 +81,40 @@ impl PermissionService {
         user_id: &str,
         capabilities: &[&str],
     ) -> Result<bool> {
-        for cap in capabilities {
-            if Self::check(db.clone(), org_id, user_id, cap).await? {
-                return Ok(true);
-            }
+        if capabilities.is_empty() {
+            return Ok(false);
         }
-        Ok(false)
+
+        let membership =
+            match MembershipStore::find_by_org_and_user(db.clone(), org_id, user_id).await? {
+                Some(m) => m,
+                None => return Ok(false),
+            };
+
+        match membership.role.as_str() {
+            "owner" | "admin" => return Ok(true),
+            "member" => return Ok(false),
+            _ => {}
+        }
+
+        let role =
+            OrganizationRoleStore::find_by_org_and_slug(db, org_id, &membership.role).await?;
+
+        let Some(role) = role else {
+            return Ok(false);
+        };
+
+        let requested: HashSet<&str> = capabilities.iter().copied().collect();
+        Ok(role
+            .permissions
+            .as_array()
+            .map(|permissions| {
+                permissions
+                    .iter()
+                    .filter_map(|permission| permission.as_str())
+                    .any(|permission| requested.contains(permission))
+            })
+            .unwrap_or(false))
     }
 
     /// Retrieve all capabilities for a user in an organization

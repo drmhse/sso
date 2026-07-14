@@ -145,7 +145,7 @@ export class HttpClient {
             _retry: true,
             headers: { ...options.headers, Authorization: `Bearer ${newToken}` },
           });
-        } catch (refreshError) {
+        } catch {
           // Refresh failed, session is already cleared by manager, proceed to throw original 401
         }
       }

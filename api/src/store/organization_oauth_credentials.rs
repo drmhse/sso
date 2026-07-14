@@ -3,7 +3,6 @@ use crate::entities::prelude::OrganizationOauthCredentials;
 use crate::error::Result;
 use crate::store::DB;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-use uuid::Uuid;
 
 pub struct OrganizationOAuthCredentialsStore;
 
@@ -25,6 +24,7 @@ impl OrganizationOAuthCredentialsStore {
     /// Upsert OAuth credentials (insert or update)
     pub async fn upsert(
         db: DB<'_>,
+        new_record_id: &str,
         org_id: &str,
         provider: &str,
         client_id: &str,
@@ -34,6 +34,11 @@ impl OrganizationOAuthCredentialsStore {
         // Try to find existing credentials
         if let Some(existing) = Self::find_by_org_and_provider(db.clone(), org_id, provider).await?
         {
+            if existing.id != new_record_id {
+                return Err(crate::error::AppError::InternalServerError(
+                    "OAuth credential changed concurrently; retry the request".to_string(),
+                ));
+            }
             // Update existing
             let mut active_model: organization_oauth_credentials::ActiveModel = existing.into();
             active_model.client_id = Set(client_id.to_string());
@@ -47,13 +52,13 @@ impl OrganizationOAuthCredentialsStore {
             // Insert new
             let now = chrono::Utc::now().naive_utc();
             let new_creds = organization_oauth_credentials::ActiveModel {
-                id: Set(Uuid::new_v4().to_string()),
+                id: Set(new_record_id.to_string()),
                 org_id: Set(org_id.to_string()),
                 provider: Set(provider.to_string()),
                 client_id: Set(client_id.to_string()),
                 client_secret_encrypted: Set(client_secret_encrypted),
                 encryption_key_id: Set(encryption_key_id.to_string()),
-                created_at: Set(now.clone()),
+                created_at: Set(now),
                 updated_at: Set(now),
             };
 

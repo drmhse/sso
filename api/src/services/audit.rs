@@ -9,10 +9,7 @@ use crate::services::events::EventDispatcher;
 use anyhow::Result;
 use mfa_audit_log::ActiveModel as MfaAuditLogActiveModel;
 use organization_audit_log::ActiveModel as OrgAuditLogActiveModel;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    Set,
-};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter, Set};
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -98,6 +95,7 @@ impl MfaAuditService {
     /// * `user_agent` - Optional client user agent
     /// * `success` - Whether the operation succeeded
     /// * `details` - Optional details (e.g., failure reason, method used)
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_mfa_event(
         &self,
         org_id: Option<&str>,
@@ -126,9 +124,7 @@ impl MfaAuditService {
             created_at: Set(now),
         };
 
-        // Retry on deadlock errors (common in high-concurrency MySQL)
-
-        audit_log.insert(&self.db).await?;
+        crate::services::audit_actor::enqueue_mfa_with_connection(&self.db, audit_log).await?;
 
         tracing::info!(
             "MFA audit log: org_id={}, user_id={}, event_type={}, success={}, ip={}",
@@ -381,12 +377,13 @@ impl MfaAuditService {
     ) -> Result<Vec<serde_json::Value>> {
         use sea_orm::{QueryOrder, QuerySelect};
 
-        let limit_val = limit.unwrap_or(100);
+        let (limit_val, _) = crate::utils::pagination::signed_limit_offset(limit, None, 100, 1000);
 
+        let (limit_val, _) = crate::utils::pagination::store_u64(limit_val, 0, 1000);
         let logs = mfa_audit_log::Entity::find()
             .filter(mfa_audit_log::Column::UserId.eq(user_id))
             .order_by_desc(mfa_audit_log::Column::CreatedAt)
-            .limit(limit_val as u64)
+            .limit(limit_val)
             .all(&self.db)
             .await?;
 
@@ -418,12 +415,13 @@ impl MfaAuditService {
     ) -> Result<Vec<serde_json::Value>> {
         use sea_orm::{QueryOrder, QuerySelect};
 
-        let limit_val = limit.unwrap_or(100);
+        let (limit_val, _) = crate::utils::pagination::signed_limit_offset(limit, None, 100, 1000);
 
+        let (limit_val, _) = crate::utils::pagination::store_u64(limit_val, 0, 1000);
         let logs = mfa_audit_log::Entity::find()
             .filter(mfa_audit_log::Column::OrgId.eq(org_id))
             .order_by_desc(mfa_audit_log::Column::CreatedAt)
-            .limit(limit_val as u64)
+            .limit(limit_val)
             .all(&self.db)
             .await?;
 
@@ -451,11 +449,12 @@ impl MfaAuditService {
     pub async fn get_all_mfa_logs(&self, limit: Option<i64>) -> Result<Vec<serde_json::Value>> {
         use sea_orm::{QueryOrder, QuerySelect};
 
-        let limit_val = limit.unwrap_or(100);
+        let (limit_val, _) = crate::utils::pagination::signed_limit_offset(limit, None, 100, 1000);
 
+        let (limit_val, _) = crate::utils::pagination::store_u64(limit_val, 0, 1000);
         let logs = mfa_audit_log::Entity::find()
             .order_by_desc(mfa_audit_log::Column::CreatedAt)
-            .limit(limit_val as u64)
+            .limit(limit_val)
             .all(&self.db)
             .await?;
 
@@ -572,6 +571,7 @@ impl OrgAuditService {
     }
 
     /// Log an organization audit event
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_org_event(
         &self,
         org_id: &str,
@@ -601,9 +601,7 @@ impl OrgAuditService {
             target_type: Set(target_type
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "unknown".to_string())),
-            target_id: Set(target_id
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "".to_string())),
+            target_id: Set(target_id.map(|s| s.to_string()).unwrap_or_default()),
             ip_address: Set(ip_str.clone()),
             user_agent: Set(user_agent_str.clone()),
             success: Set(success),
@@ -611,25 +609,7 @@ impl OrgAuditService {
             created_at: Set(now),
         };
 
-        // Retry on deadlock errors (common in high-concurrency MySQL)
-        let mut attempts = 0;
-        let max_retries = 3;
-        loop {
-            attempts += 1;
-            match audit_log.clone().insert(&self.db).await {
-                Ok(_) => break,
-                Err(e) if crate::error::is_deadlock_error(&e) && attempts <= max_retries => {
-                    let delay_ms = 10 * (1 << attempts.min(6));
-                    tracing::warn!(
-                        attempt = attempts,
-                        max_retries = max_retries,
-                        "Org audit log deadlock, retrying"
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        crate::services::audit_actor::enqueue_org_with_connection(&self.db, audit_log).await?;
 
         // Emit event for real-time notifications (if dispatcher is configured)
         // Note: We don't publish audit log events to webhooks by default,
@@ -650,6 +630,7 @@ impl OrgAuditService {
     }
 
     /// Alias for log_org_event for backward compatibility
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_organization_event(
         &self,
         org_id: &str,
@@ -734,11 +715,13 @@ impl OrgAuditService {
     ) -> Result<Vec<OrganizationAuditLogWithUser>> {
         use sea_orm::{QueryOrder, QuerySelect};
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 100);
         let logs = organization_audit_log::Entity::find()
             .filter(organization_audit_log::Column::OrgId.eq(org_id))
             .order_by_desc(organization_audit_log::Column::CreatedAt)
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .order_by_desc(organization_audit_log::Column::Id)
+            .limit(limit)
+            .offset(offset)
             .all(&self.db)
             .await?;
 
@@ -758,12 +741,14 @@ impl OrgAuditService {
     ) -> Result<Vec<OrganizationAuditLogWithUser>> {
         use sea_orm::{QueryOrder, QuerySelect};
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 100);
         let logs = organization_audit_log::Entity::find()
             .filter(organization_audit_log::Column::OrgId.eq(org_id))
             .filter(organization_audit_log::Column::Action.eq(action))
             .order_by_desc(organization_audit_log::Column::CreatedAt)
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .order_by_desc(organization_audit_log::Column::Id)
+            .limit(limit)
+            .offset(offset)
             .all(&self.db)
             .await?;
 
@@ -780,15 +765,19 @@ impl OrgAuditService {
         target_type: &str,
         target_id: &str,
         limit: i64,
+        offset: i64,
     ) -> Result<Vec<OrganizationAuditLogWithUser>> {
         use sea_orm::{QueryOrder, QuerySelect};
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 100);
         let logs = organization_audit_log::Entity::find()
             .filter(organization_audit_log::Column::OrgId.eq(org_id))
             .filter(organization_audit_log::Column::TargetType.eq(target_type))
             .filter(organization_audit_log::Column::TargetId.eq(target_id))
             .order_by_desc(organization_audit_log::Column::CreatedAt)
-            .limit(limit as u64)
+            .order_by_desc(organization_audit_log::Column::Id)
+            .limit(limit)
+            .offset(offset)
             .all(&self.db)
             .await?;
 
@@ -808,6 +797,29 @@ impl OrgAuditService {
             .await?;
 
         Ok(count as i64)
+    }
+
+    /// Count audit logs using the same organization-first filter shape as list routes.
+    pub async fn get_audit_log_count_filtered(
+        &self,
+        org_id: &str,
+        action: Option<&str>,
+        target_type: Option<&str>,
+        target_id: Option<&str>,
+    ) -> Result<i64> {
+        use sea_orm::PaginatorTrait;
+
+        let mut query = organization_audit_log::Entity::find()
+            .filter(organization_audit_log::Column::OrgId.eq(org_id));
+        if let Some(action) = action {
+            query = query.filter(organization_audit_log::Column::Action.eq(action));
+        } else if let (Some(target_type), Some(target_id)) = (target_type, target_id) {
+            query = query
+                .filter(organization_audit_log::Column::TargetType.eq(target_type))
+                .filter(organization_audit_log::Column::TargetId.eq(target_id));
+        }
+
+        Ok(query.count(&self.db).await? as i64)
     }
 
     // Convenience methods for common org events

@@ -1,7 +1,7 @@
 //! Webhook handlers for billing provider events
 
 use crate::billing::{BillingEvent, BillingProvider, BillingProviderType, SubscriptionStatus};
-use crate::entities::{billing_customers, services, subscriptions};
+use crate::entities::{billing_customers, memberships, plans, services, subscriptions};
 use crate::error::{AppError, Result};
 use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse, Json};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -194,6 +194,7 @@ async fn process_billing_event(
 }
 
 /// Handle subscription created/updated events
+#[allow(clippy::too_many_arguments)]
 async fn handle_subscription_event(
     pool: &DatabaseConnection,
     #[cfg(feature = "db_sqlite")] db_writer: &DatabaseConnection,
@@ -233,6 +234,34 @@ async fn handle_subscription_event(
         );
         return Ok(());
     };
+
+    let Some(org_id) = metadata.get("org_id") else {
+        tracing::warn!(
+            provider = %provider,
+            customer = %external_customer_id,
+            "Subscription event missing org_id in metadata, skipping"
+        );
+        return Ok(());
+    };
+
+    if !subscription_event_context_is_valid(
+        pool,
+        provider,
+        external_customer_id,
+        org_id,
+        user_id,
+        service_id,
+        plan_id,
+    )
+    .await?
+    {
+        tracing::warn!(
+            provider = %provider,
+            customer = %external_customer_id,
+            "Subscription event context crosses tenant or service boundaries, skipping"
+        );
+        return Ok(());
+    }
 
     let status_str = status.to_string();
     let user_id = user_id.clone();
@@ -304,6 +333,55 @@ async fn handle_subscription_event(
         },
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn subscription_event_context_is_valid(
+    db: &DatabaseConnection,
+    provider: BillingProviderType,
+    external_customer_id: &str,
+    org_id: &str,
+    user_id: &str,
+    service_id: &str,
+    plan_id: &str,
+) -> Result<bool> {
+    let customer_matches = billing_customers::Entity::find()
+        .filter(billing_customers::Column::Provider.eq(provider.to_string()))
+        .filter(billing_customers::Column::ExternalCustomerId.eq(external_customer_id))
+        .filter(billing_customers::Column::OrgId.eq(org_id))
+        .one(db)
+        .await?
+        .is_some();
+    if !customer_matches {
+        return Ok(false);
+    }
+
+    let service_matches = services::Entity::find()
+        .filter(services::Column::Id.eq(service_id))
+        .filter(services::Column::OrgId.eq(org_id))
+        .one(db)
+        .await?
+        .is_some();
+    if !service_matches {
+        return Ok(false);
+    }
+
+    let plan_matches = plans::Entity::find()
+        .filter(plans::Column::Id.eq(plan_id))
+        .filter(plans::Column::ServiceId.eq(service_id))
+        .one(db)
+        .await?
+        .is_some();
+    if !plan_matches {
+        return Ok(false);
+    }
+
+    Ok(memberships::Entity::find()
+        .filter(memberships::Column::OrgId.eq(org_id))
+        .filter(memberships::Column::UserId.eq(user_id))
+        .one(db)
+        .await?
+        .is_some())
 }
 
 /// Handle subscription deleted events
@@ -387,10 +465,14 @@ async fn update_customer_subscription_status(
     }
 
     use crate::error::with_retrying_transaction;
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::Set;
 
     let status = status.to_string();
     let external_customer_id = external_customer_id.to_string();
+    let subscription_ids = found_subscriptions
+        .iter()
+        .map(|subscription| subscription.id.clone())
+        .collect::<Vec<_>>();
 
     with_retrying_transaction(
         pool,
@@ -398,17 +480,18 @@ async fn update_customer_subscription_status(
         db_writer,
         "update_customer_subscription_status",
         |db| {
-            let found_subscriptions = found_subscriptions.clone();
             let status = status.clone();
+            let subscription_ids = subscription_ids.clone();
             Box::pin(async move {
-                for subscription in &found_subscriptions {
-                    let mut active_model: subscriptions::ActiveModel = subscription.clone().into();
-                    active_model.status = Set(status.clone());
-                    active_model
-                        .update(&db)
-                        .await
-                        .map_err(AppError::SeaOrmDatabase)?;
-                }
+                subscriptions::Entity::update_many()
+                    .filter(subscriptions::Column::Id.is_in(subscription_ids))
+                    .set(subscriptions::ActiveModel {
+                        status: Set(status),
+                        ..Default::default()
+                    })
+                    .exec(&db)
+                    .await
+                    .map_err(AppError::SeaOrmDatabase)?;
                 Ok(())
             })
         },
@@ -424,4 +507,162 @@ async fn update_customer_subscription_status(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::billing_customers;
+    use crate::store::{
+        organizations::OrganizationStore, plans::PlanStore, services::ServiceStore,
+        users::UserStore, DB,
+    };
+    use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn subscription_webhook_rejects_cross_tenant_metadata_and_preserves_state() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner_a = UserStore::create(DB::Conn(&db), "webhook-a@example.com", None, false)
+            .await
+            .expect("create owner A");
+        let owner_b = UserStore::create(DB::Conn(&db), "webhook-b@example.com", None, false)
+            .await
+            .expect("create owner B");
+        let org_a = OrganizationStore::create(
+            DB::Conn(&db),
+            "webhook-org-a",
+            "Webhook Org A",
+            &owner_a.id,
+            None,
+        )
+        .await
+        .expect("create org A");
+        let org_b = OrganizationStore::create(
+            DB::Conn(&db),
+            "webhook-org-b",
+            "Webhook Org B",
+            &owner_b.id,
+            None,
+        )
+        .await
+        .expect("create org B");
+        let service_a = ServiceStore::create(
+            DB::Conn(&db),
+            &org_a.id,
+            "webhook-service-a",
+            "Webhook Service A",
+            "web",
+            "webhook-client-a",
+        )
+        .await
+        .expect("create service A");
+        let service_b = ServiceStore::create(
+            DB::Conn(&db),
+            &org_b.id,
+            "webhook-service-b",
+            "Webhook Service B",
+            "web",
+            "webhook-client-b",
+        )
+        .await
+        .expect("create service B");
+        PlanStore::create(
+            DB::Conn(&db),
+            "webhook-plan-a",
+            &service_a.id,
+            "Plan A",
+            None,
+            100,
+            "USD",
+            "[]",
+            Some("price-a"),
+            false,
+            Utc::now().naive_utc(),
+        )
+        .await
+        .expect("create plan A");
+        PlanStore::create(
+            DB::Conn(&db),
+            "webhook-plan-b",
+            &service_b.id,
+            "Plan B",
+            None,
+            200,
+            "USD",
+            "[]",
+            Some("price-b"),
+            false,
+            Utc::now().naive_utc(),
+        )
+        .await
+        .expect("create plan B");
+        billing_customers::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            org_id: Set(org_a.id.clone()),
+            provider: Set("stripe".to_string()),
+            external_customer_id: Set("customer-a".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(&db)
+        .await
+        .expect("create org A billing customer");
+        let target = subscriptions::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(owner_b.id.clone()),
+            service_id: Set(service_b.id.clone()),
+            plan_id: Set("webhook-plan-b".to_string()),
+            status: Set("active".to_string()),
+            current_period_end: Set((Utc::now() + Duration::days(30)).naive_utc()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(&db)
+        .await
+        .expect("create org B subscription");
+        let before = target.clone();
+        let metadata = HashMap::from([
+            ("org_id".to_string(), org_b.id.clone()),
+            ("user_id".to_string(), owner_b.id.clone()),
+            ("service_id".to_string(), service_b.id.clone()),
+            ("plan_id".to_string(), "webhook-plan-b".to_string()),
+        ]);
+
+        handle_subscription_event(
+            &db,
+            #[cfg(feature = "db_sqlite")]
+            &db,
+            BillingProviderType::Stripe,
+            "customer-a",
+            "updated",
+            SubscriptionStatus::Canceled,
+            Utc::now() + Duration::days(1),
+            metadata,
+        )
+        .await
+        .expect("cross-tenant webhook is ignored");
+
+        let unchanged = subscriptions::Entity::find_by_id(&target.id)
+            .one(&db)
+            .await
+            .expect("reload subscription")
+            .expect("target subscription remains");
+        assert_eq!(unchanged.status, before.status);
+        assert_eq!(unchanged.plan_id, before.plan_id);
+        assert_eq!(unchanged.current_period_end, before.current_period_end);
+        assert_eq!(
+            subscriptions::Entity::find()
+                .filter(subscriptions::Column::ServiceId.eq(&service_a.id))
+                .all(&db)
+                .await
+                .expect("check org A subscriptions")
+                .len(),
+            0
+        );
+    }
 }

@@ -1,7 +1,7 @@
 {
   "name": "@drmhse/authos-node",
   "version": "0.8.0",
-  "description": "Node.js server adapter for AuthOS authentication - Express middleware and token verification",
+  "description": "Pre-1.0 Node.js adapter for AuthOS Express middleware and token verification",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -35,7 +35,7 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts",
+    "lint": "eslint \"src/**/*.ts\" tsdown.config.mjs --max-warnings 0",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

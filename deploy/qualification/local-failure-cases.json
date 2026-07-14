@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "database-disconnect-readiness",
+      "category": "database",
+      "command": ["cargo", "test", "--manifest-path", "api/Cargo.toml", "handlers::health::tests::readiness_fails_closed_after_database_disconnect", "--", "--exact"],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "database-pool-exhaustion-readiness",
+      "category": "database",
+      "command": ["cargo", "test", "--manifest-path", "api/Cargo.toml", "handlers::health::tests::readiness_fails_within_the_pool_acquire_bound_when_exhausted", "--", "--exact"],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "worker-retry-bound",
+      "category": "worker",
+      "command": ["cargo", "test", "--manifest-path", "api/Cargo.toml", "store::system_jobs::tests::failed_jobs_retry_then_stop_at_the_configured_bound", "--", "--exact"],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "audit-restart-reconciliation",
+      "category": "audit",
+      "command": ["cargo", "test", "--manifest-path", "api/Cargo.toml", "services::audit_actor::tests::durable_enqueue_survives_closed_channel_and_restart_replays_it", "--", "--exact"],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "audit-dead-letter-bound",
+      "category": "audit",
+      "command": ["cargo", "test", "--manifest-path", "api/Cargo.toml", "services::audit_actor::tests::retry_attempts_are_bounded_and_become_observable_dead_letter", "--", "--exact"],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "webhook-retry-parent-reconciliation",
+      "category": "webhook",
+      "command": ["cargo", "test", "--manifest-path", "api/Cargo.toml", "store::webhook_deliveries::tests::pending_delivery_polling_reauthorizes_active_parent_and_honors_limit", "--", "--exact"],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "backup-metadata-disk-full",
+      "category": "storage",
+      "command": ["python3", "scripts/test-authos-sqlite-backup.py", "SqliteBackupTests.test_manifest_failure_does_not_publish_orphan_database"],
+      "timeout_seconds": 60
+    }
+  ]
+}

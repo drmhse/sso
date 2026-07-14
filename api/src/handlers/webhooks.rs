@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 async fn require_webhook_manager(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    crate::handlers::organizations::ensure_organization_active(&state.db, org_id).await?;
     if PermissionService::check(DB::Conn(&state.db), org_id, user_id, CAP_WEBHOOKS_MANAGE).await? {
         return Ok(());
     }
@@ -224,6 +225,19 @@ pub async fn create_webhook(
     // Create webhook
     let webhook_id = Uuid::new_v4().to_string();
     let secret = generate_webhook_secret();
+    let encryption = state.encryption.as_ref().ok_or_else(|| {
+        AppError::InternalServerError(
+            "Encryption service is required to store webhook secrets".to_string(),
+        )
+    })?;
+    let secret_encrypted = encryption
+        .encrypt_with_context(
+            &secret,
+            crate::encryption::EncryptionContext::new("webhooks", &webhook_id, "secret_encrypted"),
+        )
+        .map_err(|_| {
+            AppError::InternalServerError("Failed to encrypt webhook secret".to_string())
+        })?;
     let events_json = serde_json::to_string(&req.events).unwrap();
     let now = Utc::now().naive_utc();
 
@@ -233,7 +247,8 @@ pub async fn create_webhook(
         &organization.id,
         &req.name,
         &req.url,
-        &secret,
+        secret_encrypted,
+        encryption.key_id(),
         &events_json,
         true,
         now,
@@ -549,9 +564,8 @@ pub async fn get_webhook_deliveries(
     }
 
     // Set default pagination values
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = (page - 1) * limit;
+    let (page, limit, offset) =
+        crate::utils::pagination::signed_page(query.page, query.limit, 50, 100);
 
     // Get deliveries with filters
     let deliveries = WebhookDeliveryStore::get_deliveries_with_filters(
@@ -666,10 +680,15 @@ pub async fn test_webhook(
 
 /// Get available webhook event types
 pub async fn get_webhook_event_types(
-    State(_state): State<AppState>,
-    _auth_user: AuthUser,
-    Path(_org_slug): Path<String>,
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(org_slug): Path<String>,
 ) -> Result<Json<Vec<EventTypeInfo>>> {
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    require_webhook_manager(&state, &organization.id, &auth_user.user.id).await?;
+
     let event_types = WEBHOOK_EVENT_TYPES
         .iter()
         .map(|&event| {

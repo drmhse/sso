@@ -98,12 +98,12 @@ pub async fn list_users(
         ));
     }
 
-    let limit_val = params.limit.unwrap_or(50).min(100); // Cap at 100 results
-    let offset_val = params.offset.unwrap_or(0).max(0);
+    let (limit_val, offset_val) =
+        crate::utils::pagination::signed_limit_offset(params.limit, params.offset, 50, 100);
 
     // Get users using store
-    let users =
-        UserStore::list_all(DB::Conn(&state.db), limit_val as u64, offset_val as u64).await?;
+    let (limit_val, offset_val) = crate::utils::pagination::store_u64(limit_val, offset_val, 100);
+    let users = UserStore::list_all(DB::Conn(&state.db), limit_val, offset_val).await?;
     let total = UserStore::count_all(DB::Conn(&state.db), false).await? as i64;
 
     // Convert to response format
@@ -137,11 +137,12 @@ pub async fn search_users(
         ));
     }
 
-    let limit_val = query.limit.unwrap_or(10).min(50); // Cap at 50 results
+    let (limit_val, _) = crate::utils::pagination::signed_limit_offset(query.limit, None, 10, 50);
 
     // Search users using store with relevance-based ordering
+    let (limit_val, _) = crate::utils::pagination::store_u64(limit_val, 0, 50);
     let store_results =
-        UserStore::search_with_relevance(DB::Conn(&state.db), &query.q, limit_val as u64).await?;
+        UserStore::search_with_relevance(DB::Conn(&state.db), &query.q, limit_val).await?;
 
     // Convert store results to handler results
     let results = store_results
@@ -360,22 +361,37 @@ pub async fn force_disable_user_mfa(
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    // Delete TOTP secret and backup codes using TotpStore
-    TotpStore::delete_totp_secret(DB::Conn(&state.db), &user_id).await?;
-    TotpStore::delete_backup_codes(DB::Conn(&state.db), &user_id).await?;
-
-    // Create audit log
-    create_audit_log(
+    let owner_id = auth_user.user.id.clone();
+    let owner_email = auth_user.user.email.clone();
+    with_retrying_transaction(
         &state.db,
-        &auth_user.user.id,
-        "force_disable_mfa",
-        "user",
-        &user_id,
-        Some(json!({
-            "user_email": user_model.email,
-            "admin_id": auth_user.user.id,
-            "admin_email": auth_user.user.email,
-        })),
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "force_disable_user_mfa_with_audit",
+        |db| {
+            let user_id = user_id.clone();
+            let user_email = user_model.email.clone();
+            let owner_id = owner_id.clone();
+            let owner_email = owner_email.clone();
+            Box::pin(async move {
+                TotpStore::delete_totp_secret(db.clone(), &user_id).await?;
+                TotpStore::delete_backup_codes(db.clone(), &user_id).await?;
+                create_audit_log(
+                    &db,
+                    &owner_id,
+                    "force_disable_mfa",
+                    "user",
+                    &user_id,
+                    Some(json!({
+                        "user_email": user_email,
+                        "admin_id": owner_id,
+                        "admin_email": owner_email,
+                    })),
+                )
+                .await?;
+                Ok(())
+            })
+        },
     )
     .await?;
 

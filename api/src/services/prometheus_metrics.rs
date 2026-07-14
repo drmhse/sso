@@ -134,18 +134,24 @@ impl PrometheusMetricsService {
 
     /// Update active users count (called periodically)
     pub async fn update_active_users(&self) -> Result<()> {
+        let count = self.active_user_count().await?;
+        self.record_active_user_metrics(count);
+
+        Ok(())
+    }
+
+    async fn active_user_count(&self) -> Result<u64> {
         use crate::entities::prelude::Users;
         use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 
-        // Count users that are not deleted
-        let count = Users::find()
+        Ok(Users::find()
             .filter(crate::entities::users::Column::DeletedAt.is_null())
             .count(&self.db)
-            .await?;
+            .await?)
+    }
 
-        gauge!("sso_active_users_total", count as f64);
-
-        Ok(())
+    fn record_active_user_metrics(&self, active_users: u64) {
+        gauge!("sso_active_users_total", active_users as f64);
     }
 
     /// Update total organizations count (called periodically)
@@ -162,22 +168,14 @@ impl PrometheusMetricsService {
 
     /// Update job queue depth (called periodically)
     pub async fn update_job_queue_depth(&self) -> Result<()> {
-        use crate::entities::prelude::SystemJobs;
-        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        use crate::store::{system_jobs::SystemJobStore, DB};
 
-        // Count pending jobs
-        let pending_count = SystemJobs::find()
-            .filter(crate::entities::system_jobs::Column::Status.eq("pending"))
-            .count(&self.db)
-            .await?;
-
+        let counts =
+            SystemJobStore::count_by_statuses(DB::Conn(&self.db), &["pending", "processing"])
+                .await?;
+        let pending_count = *counts.get("pending").unwrap_or(&0) as u64;
+        let processing_count = *counts.get("processing").unwrap_or(&0) as u64;
         gauge!("sso_job_queue_depth", pending_count as f64);
-
-        // Also track by status
-        let processing_count = SystemJobs::find()
-            .filter(crate::entities::system_jobs::Column::Status.eq("processing"))
-            .count(&self.db)
-            .await?;
 
         gauge!("sso_pending_jobs_total", pending_count as f64, "status" => "pending");
         gauge!("sso_pending_jobs_total", processing_count as f64, "status" => "processing");
@@ -324,38 +322,47 @@ impl PrometheusMetricsService {
 
     /// Update MFA adoption percentage (called periodically)
     pub async fn update_mfa_adoption(&self) -> Result<()> {
-        use crate::entities::prelude::Users;
+        let total_users = self.active_user_count().await?;
+        let mfa_users = self.mfa_user_count().await?;
+
+        self.record_mfa_adoption_metrics(total_users, mfa_users);
+
+        Ok(())
+    }
+
+    async fn mfa_user_count(&self) -> Result<u64> {
         use crate::entities::user_totp_secrets;
-        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        use sea_orm::{EntityTrait, PaginatorTrait};
 
-        // Count total active users
-        let total_users = Users::find()
-            .filter(crate::entities::users::Column::DeletedAt.is_null())
-            .count(&self.db)
-            .await?;
+        Ok(user_totp_secrets::Entity::find().count(&self.db).await?)
+    }
 
-        // Count users with MFA enabled (have TOTP secrets)
-        let mfa_users = user_totp_secrets::Entity::find().count(&self.db).await?;
-
+    fn record_mfa_adoption_metrics(&self, total_users: u64, mfa_users: u64) {
         gauge!("sso_mfa_enabled_users_total", mfa_users as f64);
 
-        // Calculate adoption percentage
-        if total_users > 0 {
-            let adoption_percentage = (mfa_users as f64 / total_users as f64) * 100.0;
-            gauge!("sso_mfa_adoption_percentage", adoption_percentage);
+        let adoption_percentage = if total_users > 0 {
+            (mfa_users as f64 / total_users as f64) * 100.0
         } else {
-            gauge!("sso_mfa_adoption_percentage", 0.0);
-        }
+            0.0
+        };
+        gauge!("sso_mfa_adoption_percentage", adoption_percentage);
+    }
+
+    async fn update_user_security_metrics(&self) -> Result<()> {
+        let total_users = self.active_user_count().await?;
+        let mfa_users = self.mfa_user_count().await?;
+
+        self.record_active_user_metrics(total_users);
+        self.record_mfa_adoption_metrics(total_users, mfa_users);
 
         Ok(())
     }
 
     /// Update all metrics (called periodically by a background task)
     pub async fn update_all(&self) -> Result<()> {
-        self.update_active_users().await?;
+        self.update_user_security_metrics().await?;
         self.update_organizations_count().await?;
         self.update_job_queue_depth().await?;
-        self.update_mfa_adoption().await?;
         self.update_db_pool_metrics();
         Ok(())
     }
@@ -366,7 +373,7 @@ impl PrometheusMetricsService {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let handle = builder
             .install_recorder()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(handle)
     }

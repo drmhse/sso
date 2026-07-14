@@ -60,6 +60,21 @@ pub struct UpdateTierRequest {
     pub max_users: Option<i64>,
 }
 
+fn checked_organization_limit(value: Option<i64>, field: &str) -> Result<Option<i32>> {
+    value
+        .map(|value| {
+            if value < 0 {
+                return Err(AppError::BadRequest(format!(
+                    "{field} must be non-negative"
+                )));
+            }
+
+            i32::try_from(value)
+                .map_err(|_| AppError::BadRequest(format!("{field} exceeds the supported range")))
+        })
+        .transpose()
+}
+
 /// Request body for updating organization feature overrides
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateFeatureOverridesRequest {
@@ -136,8 +151,8 @@ pub async fn list_organizations(
         ));
     }
 
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = query.offset.unwrap_or(0);
+    let (limit, offset) =
+        crate::utils::pagination::signed_limit_offset(query.limit, query.offset, 50, 100);
 
     // Get total count using store
     let total = OrganizationStore::count_with_filters(
@@ -148,12 +163,13 @@ pub async fn list_organizations(
     .await? as i64;
 
     // Get organizations with owner info using store
+    let (limit_u64, offset_u64) = crate::utils::pagination::store_u64(limit, offset, 100);
     let rows = OrganizationStore::list_with_owner_and_tier(
         DB::Conn(&state.db),
         query.status.as_deref(),
         query.tier_id.as_deref(),
-        limit as u64,
-        offset as u64,
+        limit_u64,
+        offset_u64,
     )
     .await?;
 
@@ -573,8 +589,8 @@ pub async fn update_organization_tier(
 
     let user_id = auth_user.user.id.clone();
     let tier_id = req.tier_id.clone();
-    let max_services = req.max_services;
-    let max_users = req.max_users;
+    let max_services = checked_organization_limit(req.max_services, "max_services")?;
+    let max_users = checked_organization_limit(req.max_users, "max_users")?;
 
     // Execute transaction with automatic retry on database contention
     let updated_org = with_retrying_transaction(
@@ -611,8 +627,8 @@ pub async fn update_organization_tier(
                 let now = Utc::now().naive_utc();
                 let mut org_active: organizations::ActiveModel = org_model.into();
                 org_active.tier_id = Set(Some(tier_id.clone()));
-                org_active.max_services = Set(max_services.map(|v| v as i32));
-                org_active.max_users = Set(max_users.map(|v| v as i32));
+                org_active.max_services = Set(max_services);
+                org_active.max_users = Set(max_users);
                 org_active.updated_at = Set(now);
 
                 let updated_org_model = org_active.update(&db).await?;
@@ -753,4 +769,38 @@ pub async fn update_organization_features(
     );
 
     Ok(Json(updated_org))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn organization_limits_reject_negative_and_out_of_range_values() {
+        assert!(matches!(
+            checked_organization_limit(Some(i64::MIN), "max_users"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            checked_organization_limit(Some(i64::from(i32::MAX) + 1), "max_services"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(
+            checked_organization_limit(Some(0), "max_services").expect("zero limit"),
+            Some(0)
+        );
+        assert_eq!(
+            checked_organization_limit(Some(1), "max_services").expect("minimum positive limit"),
+            Some(1)
+        );
+        assert_eq!(
+            checked_organization_limit(Some(i64::from(i32::MAX)), "max_users")
+                .expect("maximum supported limit"),
+            Some(i32::MAX)
+        );
+        assert_eq!(
+            checked_organization_limit(None, "max_users").expect("unset custom limit"),
+            None
+        );
+    }
 }

@@ -1,6 +1,7 @@
 use crate::constants::VALID_ORG_ROLES;
-use crate::error::{AppError, Result};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::audit_builder::OrgAuditBuilder;
 use crate::services::permission_service::{PermissionService, CAP_ORG_ROLES_MANAGE};
 use crate::state::AppState;
 use crate::store::{
@@ -12,6 +13,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
@@ -192,14 +194,48 @@ pub async fn create_role(
     // Determine permissions JSON
     let permissions_json = serde_json::to_value(req.permissions).unwrap();
 
-    let role = OrganizationRoleStore::create(
-        DB::Conn(&state.db),
-        &Uuid::new_v4().to_string(),
-        &org.id,
-        &req.slug,
-        &req.name,
-        req.description,
-        permissions_json,
+    let role_id = Uuid::new_v4().to_string();
+    let org_id = org.id.clone();
+    let actor_id = auth_user.user.id.clone();
+    let slug = req.slug.clone();
+    let name = req.name.clone();
+    let description = req.description.clone();
+    let audit_actor = state.audit_actor.clone();
+    let role = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_organization_role",
+        |db| {
+            let role_id = role_id.clone();
+            let org_id = org_id.clone();
+            let actor_id = actor_id.clone();
+            let slug = slug.clone();
+            let name = name.clone();
+            let description = description.clone();
+            let permissions_json = permissions_json.clone();
+            let audit_actor = audit_actor.clone();
+            Box::pin(async move {
+                let role = OrganizationRoleStore::create(
+                    db.clone(),
+                    &role_id,
+                    &org_id,
+                    &slug,
+                    &name,
+                    description,
+                    permissions_json,
+                )
+                .await?;
+                let event =
+                    OrgAuditBuilder::new(&org_id, Some(&actor_id), "organization_role.created")
+                        .target("organization_role", &role_id)
+                        .success(true)
+                        .details_json(Some(json!({ "slug": slug, "name": name })))
+                        .build();
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(role)
+            })
+        },
     )
     .await?;
 
@@ -299,12 +335,43 @@ pub async fn update_role(
 
     let description_update = req.description.map(Some);
 
-    let updated_role = OrganizationRoleStore::update(
-        DB::Conn(&state.db),
-        &role_id,
-        req.name,
-        description_update,
-        permissions_json,
+    let org_id = org.id.clone();
+    let actor_id = auth_user.user.id.clone();
+    let role_slug = role.slug.clone();
+    let audit_actor = state.audit_actor.clone();
+    let updated_role = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "update_organization_role",
+        |db| {
+            let role_id = role_id.clone();
+            let org_id = org_id.clone();
+            let actor_id = actor_id.clone();
+            let role_slug = role_slug.clone();
+            let name = req.name.clone();
+            let description = description_update.clone();
+            let permissions = permissions_json.clone();
+            let audit_actor = audit_actor.clone();
+            Box::pin(async move {
+                let updated = OrganizationRoleStore::update(
+                    db.clone(),
+                    &role_id,
+                    name,
+                    description,
+                    permissions,
+                )
+                .await?;
+                let event =
+                    OrgAuditBuilder::new(&org_id, Some(&actor_id), "organization_role.updated")
+                        .target("organization_role", &role_id)
+                        .success(true)
+                        .details_json(Some(json!({ "slug": role_slug })))
+                        .build();
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(updated)
+            })
+        },
     )
     .await?;
 
@@ -345,7 +412,35 @@ pub async fn delete_role(
         ));
     }
 
-    OrganizationRoleStore::delete(DB::Conn(&state.db), &role_id).await?;
+    let org_id = org.id.clone();
+    let actor_id = auth_user.user.id.clone();
+    let role_slug = role.slug.clone();
+    let audit_actor = state.audit_actor.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "delete_organization_role",
+        |db| {
+            let role_id = role_id.clone();
+            let org_id = org_id.clone();
+            let actor_id = actor_id.clone();
+            let role_slug = role_slug.clone();
+            let audit_actor = audit_actor.clone();
+            Box::pin(async move {
+                OrganizationRoleStore::delete(db.clone(), &role_id).await?;
+                let event =
+                    OrgAuditBuilder::new(&org_id, Some(&actor_id), "organization_role.deleted")
+                        .target("organization_role", &role_id)
+                        .success(true)
+                        .details_json(Some(json!({ "slug": role_slug })))
+                        .build();
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(())
+            })
+        },
+    )
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -358,8 +453,11 @@ mod tests {
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::config::Config;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        permission_service::CAP_SERVICES_MANAGE, risk_engine::RiskEngine,
+        audit_actor::AuditHandle,
+        events::EventDispatcher,
+        metrics::MfaMetricsService,
+        permission_service::{CAP_AUDIT_LOGS_VIEW, CAP_SERVICES_MANAGE},
+        risk_engine::RiskEngine,
     };
     use crate::store::{
         memberships::MembershipStore,
@@ -488,6 +586,7 @@ mod tests {
         };
         let auth_user = AuthUser {
             claims: Claims {
+                token_use: crate::auth::jwt::TokenUse::ManagementAccess,
                 sub: owner.id.clone(),
                 email: owner.email.clone(),
                 is_platform_owner: false,
@@ -497,6 +596,7 @@ mod tests {
                 mfa_required: None,
                 mfa_verified: None,
                 saml_state: None,
+                device_code_id: None,
                 act: None,
                 aud: Some(format!("org:{}", org.slug)),
                 iss: Some(state.base_url.clone()),
@@ -599,5 +699,21 @@ mod tests {
         )
         .await
         .expect("check ungranted capability"));
+        assert!(PermissionService::check_any(
+            DB::Conn(&state.db),
+            &org_id,
+            &member.id,
+            &[CAP_ORG_ROLES_MANAGE, CAP_SERVICES_MANAGE],
+        )
+        .await
+        .expect("check any custom-role capability"));
+        assert!(!PermissionService::check_any(
+            DB::Conn(&state.db),
+            &org_id,
+            &member.id,
+            &[CAP_ORG_ROLES_MANAGE, CAP_AUDIT_LOGS_VIEW],
+        )
+        .await
+        .expect("check any ungranted capability"));
     }
 }

@@ -24,7 +24,7 @@ mod tests {
         permissions::PermissionsStore, scim_tokens::ScimTokenStore, users::UserStore, DB,
     };
     use axum::body::{to_bytes, Body};
-    use axum::http::{header, Method, Request, StatusCode};
+    use axum::http::{header, HeaderValue, Method, Request, StatusCode};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use chrono::Utc;
     use migration::{Migrator, MigratorTrait};
@@ -137,21 +137,17 @@ mod tests {
         .await
         .expect("create owner")
         .0;
-        let invitee = UserStore::find_or_create_with_options(
-            DB::Conn(&db),
-            "scim-user@example.com",
-            crate::store::users::UserCreationOptions {
-                mark_email_verified: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("create scim user")
-        .0;
         let (org, _) =
             OrganizationStore::create_with_owner(DB::Conn(&db), "acme", "Acme", &owner.id, None)
                 .await
                 .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate scim test org");
+        let invitee =
+            UserStore::create_with_org_id(DB::Conn(&db), "scim-user@example.com", None, &org.id)
+                .await
+                .expect("create tenant-owned scim user");
         MembershipStore::create(DB::Conn(&db), &org.id, &invitee.id, "member")
             .await
             .expect("create member");
@@ -322,6 +318,19 @@ mod tests {
             .is_some()
     }
 
+    async fn user_updated_at(
+        db: &DatabaseConnection,
+        user_id: &str,
+    ) -> Option<chrono::NaiveDateTime> {
+        Users::find()
+            .filter(users::Column::Id.eq(user_id))
+            .one(db)
+            .await
+            .expect("query user")
+            .expect("user exists")
+            .updated_at
+    }
+
     async fn membership_exists(db: &DatabaseConnection, org_id: &str, user_id: &str) -> bool {
         MembershipStore::find_by_org_and_user(DB::Conn(db), org_id, user_id)
             .await
@@ -348,6 +357,67 @@ mod tests {
         .insert(db)
         .await
         .expect("create org-scoped user")
+    }
+
+    #[tokio::test]
+    async fn optional_organization_header_must_be_absent_or_exactly_match_token_scope() {
+        let fixture = setup_fixture().await;
+        let cases = [
+            (vec![], StatusCode::OK),
+            (
+                vec![HeaderValue::from_str(&fixture.org_id).expect("exact org header")],
+                StatusCode::OK,
+            ),
+            (
+                vec![HeaderValue::from_static("another-organization")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![
+                    HeaderValue::from_bytes(format!("{} ", fixture.org_id).as_bytes())
+                        .expect("whitespace-different org header"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![HeaderValue::from_bytes(&[0xff]).expect("non-UTF-8 header value")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![
+                    HeaderValue::from_str(&fixture.org_id).expect("first duplicate org header"),
+                    HeaderValue::from_str(&fixture.org_id).expect("second duplicate org header"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![
+                    HeaderValue::from_str(&fixture.org_id).expect("matching duplicate org header"),
+                    HeaderValue::from_static("another-organization"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+        ];
+
+        for (organization_headers, expected) in cases {
+            let app = router::scim_routes(&fixture.state).with_state(fixture.state.clone());
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/scim/v2/Users")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", fixture.bearer_token),
+                )
+                .body(Body::empty())
+                .expect("build SCIM request");
+            for organization_header in organization_headers {
+                request
+                    .headers_mut()
+                    .append("X-Organization-ID", organization_header);
+            }
+            let response = app.oneshot(request).await.expect("send SCIM request");
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[tokio::test]
@@ -728,6 +798,297 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_list_rejects_invalid_and_unsupported_filters_as_scim_errors() {
+        let fixture = setup_fixture().await;
+
+        for uri in [
+            "/scim/v2/Users?filter=not%20a%20filter",
+            "/scim/v2/Users?filter=active%20eq%20true",
+            "/scim/v2/Users?filter=userName%20pr",
+        ] {
+            let (status, body) = scim_empty_request(&fixture, Method::GET, uri.to_string()).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["schemas"][0], schemas::SCIM_ERROR_SCHEMA, "{uri}");
+            assert_eq!(body["scimType"], "invalidFilter", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_routes_report_returned_page_size_and_normalize_start_index() {
+        let fixture = setup_fixture().await;
+
+        let (user_status, users) = scim_empty_request(
+            &fixture,
+            Method::GET,
+            "/scim/v2/Users?startIndex=2&count=1".to_string(),
+        )
+        .await;
+        assert_eq!(user_status, StatusCode::OK);
+        assert_eq!(users["totalResults"], 2);
+        assert_eq!(users["startIndex"], 2);
+        assert_eq!(users["itemsPerPage"], 1);
+        assert_eq!(users["Resources"].as_array().unwrap().len(), 1);
+
+        let (_, empty_users) = scim_empty_request(
+            &fixture,
+            Method::GET,
+            "/scim/v2/Users?startIndex=0&count=0".to_string(),
+        )
+        .await;
+        assert_eq!(empty_users["totalResults"], 2);
+        assert_eq!(empty_users["startIndex"], 1);
+        assert_eq!(empty_users["itemsPerPage"], 0);
+        assert!(empty_users["Resources"].as_array().unwrap().is_empty());
+
+        let (_, groups) =
+            scim_empty_request(&fixture, Method::GET, "/scim/v2/Groups".to_string()).await;
+        assert_eq!(groups["totalResults"], 1);
+        assert_eq!(groups["itemsPerPage"], 1);
+
+        let (_, empty_groups) = scim_empty_request(
+            &fixture,
+            Method::GET,
+            "/scim/v2/Groups?startIndex=2&count=100".to_string(),
+        )
+        .await;
+        assert_eq!(empty_groups["totalResults"], 1);
+        assert_eq!(empty_groups["startIndex"], 2);
+        assert_eq!(empty_groups["itemsPerPage"], 0);
+    }
+
+    #[tokio::test]
+    async fn group_list_rejects_unsupported_filter_as_scim_error() {
+        let fixture = setup_fixture().await;
+        let (status, body) = scim_empty_request(
+            &fixture,
+            Method::GET,
+            "/scim/v2/Groups?filter=id%20eq%20ignored".to_string(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["schemas"][0], schemas::SCIM_ERROR_SCHEMA);
+        assert_eq!(body["scimType"], "invalidFilter");
+    }
+
+    #[tokio::test]
+    async fn user_routes_do_not_disclose_members_of_another_tenant() {
+        let fixture = setup_fixture().await;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&fixture.state.db),
+            "other-owner@example.com",
+            crate::store::users::UserCreationOptions::default(),
+        )
+        .await
+        .expect("create other tenant owner")
+        .0;
+        let (other_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&fixture.state.db),
+            "other-tenant",
+            "Other Tenant",
+            &other_owner.id,
+            None,
+        )
+        .await
+        .expect("create other tenant");
+        let other_user =
+            create_org_scoped_user(&fixture.state.db, &other_org.id, "other-member@example.com")
+                .await;
+        MembershipStore::create(
+            DB::Conn(&fixture.state.db),
+            &other_org.id,
+            &other_user.id,
+            "member",
+        )
+        .await
+        .expect("create other tenant member");
+
+        let (get_status, get_body) = scim_empty_request(
+            &fixture,
+            Method::GET,
+            format!("/scim/v2/Users/{}", other_user.id),
+        )
+        .await;
+        assert_eq!(get_status, StatusCode::NOT_FOUND);
+        assert_eq!(get_body["schemas"][0], schemas::SCIM_ERROR_SCHEMA);
+
+        let (list_status, list_body) = scim_empty_request(
+            &fixture,
+            Method::GET,
+            "/scim/v2/Users?filter=userName%20eq%20%22other-member@example.com%22".to_string(),
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(list_body["totalResults"], 0);
+        assert_eq!(list_body["itemsPerPage"], 0);
+    }
+
+    #[tokio::test]
+    async fn user_patch_rejects_unsupported_operation_without_changing_state() {
+        let fixture = setup_fixture().await;
+        let before_updated_at = user_updated_at(&fixture.state.db, &fixture.user_id).await;
+        let (status, body) = scim_request(
+            &fixture,
+            Method::PATCH,
+            format!("/scim/v2/Users/{}", fixture.user_id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                "Operations": [{
+                    "op": "add",
+                    "path": "userName",
+                    "value": "must-not-change@example.com"
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["scimType"], "invalidValue");
+        assert_eq!(
+            user_email(&fixture.state.db, &fixture.user_id).await,
+            "scim-user@example.com"
+        );
+        assert_eq!(
+            user_updated_at(&fixture.state.db, &fixture.user_id).await,
+            before_updated_at
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_user_put_is_idempotent() {
+        let fixture = setup_fixture().await;
+        let before_updated_at = user_updated_at(&fixture.state.db, &fixture.user_id).await;
+        let (status, body) = scim_request(
+            &fixture,
+            Method::PUT,
+            format!("/scim/v2/Users/{}", fixture.user_id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_USER_SCHEMA],
+                "id": fixture.user_id,
+                "userName": "scim-user@example.com",
+                "active": true
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["active"], true);
+        assert_eq!(
+            user_updated_at(&fixture.state.db, &fixture.user_id).await,
+            before_updated_at
+        );
+    }
+
+    #[tokio::test]
+    async fn group_put_validation_failure_leaves_all_memberships_unchanged() {
+        let fixture = setup_fixture().await;
+        let candidate =
+            create_org_scoped_user(&fixture.state.db, &fixture.org_id, "atomic-put@example.com")
+                .await;
+
+        let status = scim_status_request(
+            &fixture,
+            Method::PUT,
+            format!("/scim/v2/Groups/{}", fixture.org_id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_GROUP_SCHEMA],
+                "id": fixture.org_id,
+                "displayName": "Acme",
+                "members": [{"value": candidate.id}]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.owner_id).await);
+        assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.user_id).await);
+        assert!(!membership_exists(&fixture.state.db, &fixture.org_id, &candidate.id).await);
+    }
+
+    #[tokio::test]
+    async fn group_patch_validation_failure_rolls_back_earlier_operations() {
+        let fixture = setup_fixture().await;
+        let candidate = create_org_scoped_user(
+            &fixture.state.db,
+            &fixture.org_id,
+            "atomic-patch@example.com",
+        )
+        .await;
+
+        let status = scim_status_request(
+            &fixture,
+            Method::PATCH,
+            format!("/scim/v2/Groups/{}", fixture.org_id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                "Operations": [
+                    {
+                        "op": "add",
+                        "value": {"members": [{"value": candidate.id}]}
+                    },
+                    {
+                        "op": "remove",
+                        "path": format!("members[value eq \"{}\"]", fixture.owner_id)
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.owner_id).await);
+        assert!(!membership_exists(&fixture.state.db, &fixture.org_id, &candidate.id).await);
+    }
+
+    #[tokio::test]
+    async fn group_patch_rejects_cross_tenant_member_without_changing_state() {
+        let fixture = setup_fixture().await;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&fixture.state.db),
+            "patch-other-owner@example.com",
+            crate::store::users::UserCreationOptions::default(),
+        )
+        .await
+        .expect("create other owner")
+        .0;
+        let (other_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&fixture.state.db),
+            "patch-other-tenant",
+            "Patch Other Tenant",
+            &other_owner.id,
+            None,
+        )
+        .await
+        .expect("create other organization");
+        let other_user = create_org_scoped_user(
+            &fixture.state.db,
+            &other_org.id,
+            "patch-other-member@example.com",
+        )
+        .await;
+
+        let status = scim_status_request(
+            &fixture,
+            Method::PATCH,
+            format!("/scim/v2/Groups/{}", fixture.org_id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                "Operations": [{
+                    "op": "add",
+                    "value": {"members": [{"value": other_user.id}]}
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!membership_exists(&fixture.state.db, &fixture.org_id, &other_user.id).await);
+        assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.owner_id).await);
+        assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.user_id).await);
+    }
+
+    #[tokio::test]
     async fn user_delete_removes_member_membership() {
         let fixture = setup_fixture().await;
         let status = scim_empty_status_request(
@@ -782,5 +1143,117 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.owner_id).await);
         assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.user_id).await);
+    }
+
+    #[tokio::test]
+    async fn suspended_parent_rejects_every_scim_route_before_handler_state_changes() {
+        let fixture = setup_fixture().await;
+        let before = UserStore::find_by_id(DB::Conn(&fixture.state.db), &fixture.user_id)
+            .await
+            .expect("load user")
+            .expect("user exists");
+        OrganizationStore::update_status(DB::Conn(&fixture.state.db), &fixture.org_id, "suspended")
+            .await
+            .expect("suspend scim parent");
+
+        for (method, uri, body) in [
+            (
+                Method::GET,
+                "/scim/v2/Users".to_string(),
+                serde_json::Value::Null,
+            ),
+            (
+                Method::PATCH,
+                format!("/scim/v2/Users/{}", fixture.user_id),
+                serde_json::json!({
+                    "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                    "Operations": [{"op": "replace", "path": "active", "value": false}]
+                }),
+            ),
+            (
+                Method::GET,
+                "/scim/v2/Groups".to_string(),
+                serde_json::Value::Null,
+            ),
+        ] {
+            let status = if body.is_null() {
+                scim_empty_status_request(&fixture, method, uri).await
+            } else {
+                scim_status_request(&fixture, method, uri, body).await
+            };
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        let after = UserStore::find_by_id(DB::Conn(&fixture.state.db), &fixture.user_id)
+            .await
+            .expect("reload user")
+            .expect("user remains");
+        assert_eq!(after, before);
+        assert!(membership_exists(&fixture.state.db, &fixture.org_id, &fixture.user_id).await);
+    }
+
+    #[tokio::test]
+    async fn shared_user_put_and_patch_cannot_mutate_global_identity() {
+        let fixture = setup_fixture().await;
+        let shared = UserStore::find_or_create_with_options(
+            DB::Conn(&fixture.state.db),
+            "shared-scim@example.com",
+            crate::store::users::UserCreationOptions::default(),
+        )
+        .await
+        .expect("create shared user")
+        .0;
+        let (other_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&fixture.state.db),
+            "shared-scim-owner-org",
+            "Shared SCIM Owner Org",
+            &shared.id,
+            None,
+        )
+        .await
+        .expect("create other org owned by shared user");
+        MembershipStore::create(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &shared.id,
+            "member",
+        )
+        .await
+        .expect("add shared user to scim org");
+        let before = shared.clone();
+
+        let (put_status, _) = scim_request(
+            &fixture,
+            Method::PUT,
+            format!("/scim/v2/Users/{}", shared.id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_USER_SCHEMA],
+                "id": shared.id,
+                "userName": "tenant-rewrite@example.com",
+                "active": false
+            }),
+        )
+        .await;
+        assert_eq!(put_status, StatusCode::FORBIDDEN);
+
+        let (patch_status, _) = scim_request(
+            &fixture,
+            Method::PATCH,
+            format!("/scim/v2/Users/{}", shared.id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                "Operations": [{"op": "replace", "path": "active", "value": false}]
+            }),
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::FORBIDDEN);
+
+        let after = UserStore::find_by_id(DB::Conn(&fixture.state.db), &shared.id)
+            .await
+            .expect("reload shared user")
+            .expect("shared user remains");
+        assert_eq!(after, before);
+        assert!(membership_exists(&fixture.state.db, &fixture.org_id, &shared.id).await);
+        assert!(membership_exists(&fixture.state.db, &other_org.id, &shared.id).await);
     }
 }

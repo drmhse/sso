@@ -1,0 +1,316 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-quality:
+    name: Rust format, lint, and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check migration crate formatting
+        run: cargo fmt --manifest-path migration/Cargo.toml --all -- --check
+
+      - name: Run Clippy
+        run: >-
+          cargo clippy --locked --package sso --all-targets --no-deps
+          -- -D warnings
+
+      - name: Run migration Clippy
+        run: >-
+          cargo clippy --manifest-path migration/Cargo.toml --locked
+          --all-targets --no-deps -- -D warnings
+
+      - name: Run SQLite tests
+        run: cargo test --locked --package sso --all-targets
+
+      - name: Run migration crate tests
+        run: cargo test --manifest-path migration/Cargo.toml --locked --all-targets
+
+  rust-backends:
+    name: Rust compile (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: SQLite
+            feature: db_sqlite
+          - backend: PostgreSQL
+            feature: db_psql
+          - backend: MySQL
+            feature: db_mysql
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+          shared-key: backend-${{ matrix.feature }}
+
+      - name: Check backend targets
+        run: >-
+          cargo check --locked --package sso --no-default-features
+          --features ${{ matrix.feature }} --all-targets
+
+  runtime-sqlite:
+    name: Runtime qualification candidate (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+          shared-key: runtime-sqlite
+
+      - name: Build SQLite binary
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: ci-runtime-sqlite
+        run: >-
+          cargo build --locked --bin sso_sqlite --no-default-features
+          --features db_sqlite
+
+      - name: Exercise SQLite runtime
+        env:
+          AUTHOS_BACKEND: sqlite
+          AUTHOS_BINARY: api/target/debug/sso_sqlite
+        run: bash scripts/qualify-runtime-database.sh
+
+      - name: Exercise SQLite backup and restored runtime
+        env:
+          AUTHOS_BINARY: api/target/debug/sso_sqlite
+        run: bash scripts/qualify-sqlite-backup-restore.sh
+
+  runtime-postgres:
+    name: Runtime qualification candidate (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: authos_runtime
+          POSTGRES_USER: authos_runtime
+          POSTGRES_PASSWORD: authos_runtime_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U authos_runtime -d authos_runtime"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+          shared-key: runtime-postgres-16
+
+      - name: Build PostgreSQL binary
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: ci-runtime-postgres-16
+        run: >-
+          cargo build --locked --bin sso_psql --no-default-features
+          --features db_psql
+
+      - name: Install PostgreSQL backup client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Exercise PostgreSQL runtime and logical restore
+        env:
+          AUTHOS_BACKEND: postgres
+          AUTHOS_BINARY: api/target/debug/sso_psql
+          DATABASE_URL: postgres://authos_runtime:authos_runtime_password@127.0.0.1:5432/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: bash scripts/qualify-logical-backup-restore.sh
+
+  runtime-mysql:
+    name: Runtime qualification candidate (MySQL 8.4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: authos_runtime
+          MYSQL_USER: authos_runtime
+          MYSQL_PASSWORD: authos_runtime_password
+          MYSQL_ROOT_PASSWORD: authos_runtime_root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pauthos_runtime_root_password --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+          shared-key: runtime-mysql-8-4
+
+      - name: Build MySQL binary
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: ci-runtime-mysql-8.4
+        run: >-
+          cargo build --locked --bin sso_mysql --no-default-features
+          --features db_mysql
+
+      - name: Install MySQL backup client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client
+
+      - name: Exercise MySQL runtime and logical restore
+        env:
+          AUTHOS_BACKEND: mysql
+          AUTHOS_BINARY: api/target/debug/sso_mysql
+          DATABASE_URL: mysql://authos_runtime:authos_runtime_password@127.0.0.1:3306/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: bash scripts/qualify-logical-backup-restore.sh
+
+  frontend:
+    name: TypeScript checks, tests, and builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Validate trust and release metadata
+        run: npm run check:trust
+
+      - name: Validate public documentation
+        run: npm run check:docs
+
+      - name: Validate bootstrap container configuration
+        run: npm run check:bootstrap
+
+      - name: Validate SQLite backup helper
+        run: npm run check:backup
+
+      - name: Validate monitoring assets
+        run: npm run check:monitoring
+
+      - name: Validate bounded capacity harness
+        run: npm run check:capacity
+
+      - name: Validate local failure harness
+        run: npm run check:failures
+
+      - name: Validate first-party license policy
+        run: npm run check:licenses
+
+      - name: Validate standalone release verifier
+        run: npm run check:release-assets
+
+      - name: Validate release publication policy
+        run: npm run check:release-policy
+
+      - name: Validate outbound HTTP inventory
+        run: npm run check:outbound-http
+
+      - name: Validate tenant isolation matrix
+        run: npm run check:tenant-isolation
+
+      - name: Validate audit transaction policy
+        run: npm run check:audit-policy
+
+      - name: Validate pagination policy
+        run: npm run check:pagination-policy
+
+      - name: Reject sensitive tracing fields
+        run: npm run check:redaction
+
+      - name: Validate installer shell
+        run: bash -n install.sh
+
+      # Several workspaces resolve @drmhse/sso-sdk through its package exports,
+      # whose type entry points live in the ignored dist directory.
+      - name: Build SDK dependency
+        run: npm run build:sdk
+
+      - name: Lint workspaces
+        run: npm run lint
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Test workspaces
+        run: npm run test --workspaces --if-present
+
+      - name: Build workspaces
+        run: npm run build

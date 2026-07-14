@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "name": "password-absent-account",
+      "method": "POST",
+      "path": "/api/auth/login",
+      "expected_statuses": [401],
+      "json": {
+        "email": "absent@example.invalid",
+        "password": "InvalidPassword1!"
+      }
+    },
+    {
+      "name": "password-seeded-passwordless-account",
+      "method": "POST",
+      "path": "/api/auth/login",
+      "expected_statuses": [401],
+      "json": {
+        "email": "replace-with-seeded-passwordless-account@example.invalid",
+        "password": "InvalidPassword1!"
+      }
+    },
+    {
+      "name": "passkey-absent-account",
+      "method": "POST",
+      "path": "/api/auth/passkeys/authenticate/start",
+      "expected_statuses": [400],
+      "json": {
+        "email": "absent@example.invalid"
+      }
+    },
+    {
+      "name": "passkey-seeded-unenrolled-account",
+      "method": "POST",
+      "path": "/api/auth/passkeys/authenticate/start",
+      "expected_statuses": [400],
+      "json": {
+        "email": "replace-with-seeded-unenrolled-account@example.invalid"
+      }
+    },
+    {
+      "name": "device-absent-user-code",
+      "method": "POST",
+      "path": "/auth/device/verify",
+      "expected_statuses": [400],
+      "json": {
+        "user_code": "NONE-0000"
+      }
+    },
+    {
+      "name": "device-seeded-expired-user-code",
+      "method": "POST",
+      "path": "/auth/device/verify",
+      "expected_statuses": [400],
+      "json": {
+        "user_code": "EDIT-THIS"
+      }
+    }
+  ]
+}

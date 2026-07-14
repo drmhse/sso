@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 // Argon2 password hashing imports
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
     Argon2,
 };
 
@@ -43,6 +43,32 @@ static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .expect("Failed to generate dummy hash")
         .to_string()
 });
+
+const GENERIC_LOGIN_FAILURE: &str = "Invalid email or password";
+const GENERIC_REGISTRATION_RESPONSE: &str =
+    "If registration can be completed, a verification email has been sent.";
+const GENERIC_PASSWORD_RESET_RESPONSE: &str =
+    "If an account with that email exists, a password reset link has been sent.";
+const GENERIC_VERIFICATION_RESPONSE: &str =
+    "If an account with that email exists and is not verified, a verification link has been sent.";
+
+fn generic_registration_response() -> Json<RegisterResponse> {
+    Json(RegisterResponse {
+        message: GENERIC_REGISTRATION_RESPONSE.to_string(),
+    })
+}
+
+fn generic_password_reset_response() -> Json<ForgotPasswordResponse> {
+    Json(ForgotPasswordResponse {
+        message: GENERIC_PASSWORD_RESET_RESPONSE.to_string(),
+    })
+}
+
+fn generic_verification_response() -> Json<ResendVerificationResponse> {
+    Json(ResendVerificationResponse {
+        message: GENERIC_VERIFICATION_RESPONSE.to_string(),
+    })
+}
 
 // Helper function to hash JWT tokens for session tracking
 pub fn hash_token(token: &str) -> String {
@@ -173,6 +199,7 @@ fn validate_service_redirect_uri(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_auth_link(
     web_client_url: &str,
     path: &str,
@@ -270,7 +297,7 @@ pub async fn register(
             .is_rate_limited_email(&req.email)
             .await
     {
-        tracing::warn!("Registration request rate limited for email: {}", req.email);
+        tracing::warn!("Registration request rate limited");
         return Err(AppError::TooManyRequests(
             "Too many registration attempts. Please try again later.".to_string(),
         ));
@@ -288,13 +315,8 @@ pub async fn register(
         ));
     }
 
-    // Hash password using Argon2
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(req.password.as_bytes(), &salt)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to hash password: {}", e)))?
-        .to_string();
+    let password_hash =
+        crate::services::concurrency::hash_password_bounded(req.password.clone()).await?;
 
     // Clone values needed inside the closure
     let email = req.email.clone();
@@ -351,9 +373,7 @@ pub async fn register(
     .await?;
 
     if existing_user.is_some() {
-        return Err(AppError::BadRequest(
-            "User with this email already exists".to_string(),
-        ));
+        return Ok(generic_registration_response());
     }
 
     // Execute transaction with automatic retry on database contention
@@ -485,13 +505,18 @@ pub async fn register(
         // Don't fail registration if email enqueueing fails - user can request resend
     }
 
-    Ok(Json(RegisterResponse {
-        message: "Registration successful. Please check your email to verify your account."
-            .to_string(),
-    }))
+    Ok(generic_registration_response())
 }
 
 /// GET /auth/verify-email - Verify email address
+async fn complete_email_verification(db: DB<'_>, token_hash: &str, user_id: &str) -> Result<bool> {
+    if !EmailVerificationStore::mark_as_used(db.clone(), token_hash).await? {
+        return Ok(false);
+    }
+    UserStore::verify_email(db, user_id).await?;
+    Ok(true)
+}
+
 pub async fn verify_email(
     State(state): State<AppState>,
     Query(query): Query<VerifyEmailQuery>,
@@ -518,11 +543,25 @@ pub async fn verify_email(
         ));
     }
 
-    // Mark email as verified
-    UserStore::verify_email(DB::Conn(&state.db), &token_record.user_id).await?;
-
-    // Mark token as used
-    EmailVerificationStore::mark_as_used(DB::Conn(&state.db), &token_hash).await?;
+    let user_id = token_record.user_id.clone();
+    let token_hash_for_transaction = token_hash.clone();
+    let completed = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "complete_email_verification",
+        |db| {
+            let user_id = user_id.clone();
+            let token_hash = token_hash_for_transaction.clone();
+            Box::pin(async move { complete_email_verification(db, &token_hash, &user_id).await })
+        },
+    )
+    .await?;
+    if !completed {
+        return Err(AppError::BadRequest(
+            "Verification token has already been used or expired".to_string(),
+        ));
+    }
 
     Ok(Html(
         "<html><body><h1>Email Verified!</h1><p>Your email has been verified successfully. You can now log in.</p></body></html>".to_string()
@@ -569,56 +608,21 @@ pub async fn login(
     // - If user doesn't exist or has no password: use DUMMY_HASH (timing attack mitigation)
     // Security Audit Item 6: This prevents email enumeration via timing side-channel
     let (user, password_hash, is_dummy) = match &user_result {
-        Some(u) if u.password_hash.is_some() => {
+        Some(u) if u.deleted_at.is_none() && u.password_hash.is_some() => {
             (Some(u), u.password_hash.as_ref().unwrap().clone(), false)
         }
         _ => (user_result.as_ref(), DUMMY_HASH.clone(), true),
     };
 
-    // Verify password using spawn_blocking to avoid blocking the async runtime
-    // Argon2 is CPU-intensive (~50-100ms), so we offload to the blocking thread pool
-    use crate::services::concurrency::ARGON2_SEMAPHORE;
-
-    let password_hash_clone = password_hash;
-    let password_input = req.password.clone();
-
-    // Acquire semaphore permit to limit concurrent hash operations
-    // This prevents exhausting Tokio's blocking thread pool under login floods
-    let _permit = ARGON2_SEMAPHORE.acquire().await.map_err(|_| {
-        AppError::InternalServerError("Password verification unavailable".to_string())
-    })?;
-
-    // Offload to blocking thread pool - frees async runtime for other requests
-    let is_valid = tokio::task::spawn_blocking(move || {
-        // Handle corrupt hash gracefully instead of panicking
-        let parsed_hash = match PasswordHash::new(&password_hash_clone) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("Corrupted password hash in database: {}", e);
-                return false;
-            }
-        };
-        Argon2::default()
-            .verify_password(password_input.as_bytes(), &parsed_hash)
-            .is_ok()
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Password verification failed: {}", e)))?;
+    let is_valid =
+        crate::services::concurrency::verify_password_bounded(req.password.clone(), password_hash)
+            .await?;
 
     // Return error if:
     // - Password verification failed, OR
     // - We were using dummy hash (user doesn't exist or has no password)
     if !is_valid || is_dummy {
-        // Different error messages for OAuth-only accounts vs non-existent users
-        if user.map(|u| u.password_hash.is_none()).unwrap_or(false) {
-            return Err(AppError::Unauthorized(
-                "Password login not available for this account. Please use OAuth login."
-                    .to_string(),
-            ));
-        }
-        return Err(AppError::Unauthorized(
-            "Invalid email or password".to_string(),
-        ));
+        return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.to_string()));
     }
 
     // At this point, user exists and password is valid
@@ -716,7 +720,6 @@ pub async fn login(
     // Log risk assessment
     tracing::info!(
         user_id = %user.id,
-        email = %user.email,
         risk_score = risk_assessment.score,
         risk_action = ?risk_assessment.action,
         risk_factors = ?risk_assessment.factors,
@@ -780,7 +783,6 @@ pub async fn login(
         RiskAction::Block => {
             tracing::warn!(
                 user_id = %user.id,
-                email = %user.email,
                 risk_score = risk_assessment.score,
                 factors = ?risk_assessment.factors,
                 "Password login blocked by risk engine"
@@ -892,7 +894,7 @@ pub async fn login(
 
     // Create session with refresh token
     let token_hash = hash_token(&token);
-    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_token = crate::auth::refresh_tokens::generate();
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
@@ -904,7 +906,7 @@ pub async fn login(
     let helper_org_slug = req.org_slug.clone();
     let helper_service_id = login_event_service_id.clone();
     let helper_ip = request_info.ip_address.clone();
-    let helper_risk_action = risk_assessment.action.clone();
+    let helper_risk_action = risk_assessment.action;
 
     // Generate device token outside transaction to avoid recreating it on retry if possible
     let device_token = state.risk_engine.generate_device_token(&user.id);
@@ -923,7 +925,7 @@ pub async fn login(
             let org_slug = helper_org_slug.clone();
             let service_id = helper_service_id.clone();
             let ip_address = helper_ip.clone();
-            let risk_action = helper_risk_action.clone();
+            let risk_action = helper_risk_action;
             let device_token = helper_device_token.clone();
 
             // Capture time/expirations for inside transaction consistency
@@ -932,6 +934,13 @@ pub async fn login(
             let refresh_expires_at_naive = refresh_expires_at.naive_utc();
 
             Box::pin(async move {
+                validate_password_login_authority(
+                    db.clone(),
+                    &user_id,
+                    org_slug.as_deref(),
+                    service_id.as_deref(),
+                )
+                .await?;
                 SessionStore::create(
                     db.clone(),
                     &user_id,
@@ -1002,6 +1011,54 @@ pub async fn login(
     }))
 }
 
+async fn validate_password_login_authority(
+    db: DB<'_>,
+    user_id: &str,
+    org_slug: Option<&str>,
+    service_id: Option<&str>,
+) -> Result<()> {
+    let user = UserStore::find_by_id(db.clone(), user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Unauthorized(GENERIC_LOGIN_FAILURE.to_string()))?;
+    let Some(org_slug) = org_slug else {
+        if service_id.is_some() {
+            return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.to_string()));
+        }
+        return Ok(());
+    };
+    let org = OrganizationStore::find_by_slug(db.clone(), org_slug)
+        .await?
+        .filter(|org| org.status == "active")
+        .ok_or_else(|| AppError::Unauthorized(GENERIC_LOGIN_FAILURE.to_string()))?;
+    if user.is_platform_owner {
+        return Ok(());
+    }
+    if let Some(service_id) = service_id {
+        let has_membership = MembershipStore::find_by_org_and_user(db.clone(), &org.id, user_id)
+            .await?
+            .is_some();
+        let has_service_identity = IdentityStore::find_by_user_and_provider(
+            db,
+            user_id,
+            "password",
+            Some(&org.id),
+            Some(service_id),
+        )
+        .await?
+        .is_some();
+        if !has_membership && !has_service_identity {
+            return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.to_string()));
+        }
+    } else if MembershipStore::find_by_org_and_user(db, &org.id, user_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.to_string()));
+    }
+    Ok(())
+}
+
 /// POST /api/auth/forgot-password - Request password reset
 pub async fn forgot_password(
     State(state): State<AppState>,
@@ -1019,10 +1076,7 @@ pub async fn forgot_password(
             .is_rate_limited_email(&req.email)
             .await
     {
-        tracing::warn!(
-            "Password reset request rate limited for email: {}",
-            req.email
-        );
+        tracing::warn!("Password reset request rate limited");
         return Err(AppError::TooManyRequests(
             "Too many password reset requests. Please try again later.".to_string(),
         ));
@@ -1055,20 +1109,14 @@ pub async fn forgot_password(
 
     // Always return success to prevent email enumeration
     if user.is_none() {
-        return Ok(Json(ForgotPasswordResponse {
-            message: "If an account with that email exists, a password reset link has been sent."
-                .to_string(),
-        }));
+        return Ok(generic_password_reset_response());
     }
 
     let user = user.unwrap();
 
     // Check if user has a password (can't reset if they only use OAuth)
     if user.password_hash.is_none() {
-        return Ok(Json(ForgotPasswordResponse {
-            message: "If an account with that email exists, a password reset link has been sent."
-                .to_string(),
-        }));
+        return Ok(generic_password_reset_response());
     }
 
     // Generate password reset token
@@ -1119,13 +1167,24 @@ pub async fn forgot_password(
         // Don't fail the request - we don't want to leak info about email existence
     }
 
-    Ok(Json(ForgotPasswordResponse {
-        message: "If an account with that email exists, a password reset link has been sent."
-            .to_string(),
-    }))
+    Ok(generic_password_reset_response())
 }
 
 /// POST /api/auth/reset-password - Reset password with token
+async fn complete_password_reset(
+    db: DB<'_>,
+    token_hash: &str,
+    user_id: &str,
+    password_hash: &str,
+) -> Result<bool> {
+    if !PasswordResetStore::mark_as_used(db.clone(), token_hash).await? {
+        return Ok(false);
+    }
+    UserStore::update_password_hash(db.clone(), user_id, password_hash).await?;
+    SessionStore::delete_all_for_user(db, user_id).await?;
+    Ok(true)
+}
+
 pub async fn reset_password(
     State(state): State<AppState>,
     Json400(req): Json400<ResetPasswordRequest>,
@@ -1168,26 +1227,35 @@ pub async fn reset_password(
     )
     .await?;
 
-    if !PasswordResetStore::mark_as_used(DB::Conn(&state.db), &token_hash).await? {
+    let password_hash =
+        crate::services::concurrency::hash_password_bounded(req.new_password.clone()).await?;
+
+    // Complete all fallible CPU work before the transaction. The conditional
+    // token claim, password update, and session revocation then commit or roll
+    // back together.
+    let user_id = token_record.user_id.clone();
+    let token_hash_for_transaction = token_hash.clone();
+    let password_hash_for_transaction = password_hash.clone();
+    let completed = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "complete_password_reset",
+        |db| {
+            let user_id = user_id.clone();
+            let token_hash = token_hash_for_transaction.clone();
+            let password_hash = password_hash_for_transaction.clone();
+            Box::pin(async move {
+                complete_password_reset(db, &token_hash, &user_id, &password_hash).await
+            })
+        },
+    )
+    .await?;
+    if !completed {
         return Err(AppError::BadRequest(
             "Reset token has already been used".to_string(),
         ));
     }
-
-    // Hash new password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(req.new_password.as_bytes(), &salt)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to hash password: {}", e)))?
-        .to_string();
-
-    // Update user's password
-    UserStore::update_password_hash(DB::Conn(&state.db), &token_record.user_id, &password_hash)
-        .await?;
-
-    // Revoke all existing sessions for security
-    SessionStore::delete_all_for_user(DB::Conn(&state.db), &token_record.user_id).await?;
 
     Ok(Json(ResetPasswordResponse {
         message: "Password has been reset successfully. Please log in with your new password."
@@ -1211,10 +1279,7 @@ pub async fn resend_verification(
             .is_rate_limited_email(&req.email)
             .await
     {
-        tracing::warn!(
-            "Resend verification request rate limited for email: {}",
-            req.email
-        );
+        tracing::warn!("Resend verification request rate limited");
         return Err(AppError::TooManyRequests(
             "Too many requests. Please try again later.".to_string(),
         ));
@@ -1241,20 +1306,14 @@ pub async fn resend_verification(
 
     // If user not found, return generic success to avoid enumeration
     if user.is_none() {
-        return Ok(Json(ResendVerificationResponse {
-            message: "If an account with that email exists and is not verified, a verification link has been sent."
-                .to_string(),
-        }));
+        return Ok(generic_verification_response());
     }
 
     let user = user.unwrap();
 
     // If already verified, return generic success
     if user.email_verified_at.is_some() {
-        return Ok(Json(ResendVerificationResponse {
-            message: "If an account with that email exists and is not verified, a verification link has been sent."
-                .to_string(),
-        }));
+        return Ok(generic_verification_response());
     }
 
     // Generate new verification token
@@ -1305,10 +1364,7 @@ pub async fn resend_verification(
         tracing::error!("Failed to enqueue verification email: {}", e);
     }
 
-    Ok(Json(ResendVerificationResponse {
-        message: "If an account with that email exists and is not verified, a verification link has been sent."
-            .to_string(),
-    }))
+    Ok(generic_verification_response())
 }
 
 #[cfg(test)]
@@ -1318,6 +1374,7 @@ mod tests {
     use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::config::Config;
+    use crate::email::{EmailService, SmtpConfig};
     use crate::entities::users;
     use crate::services::{
         audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
@@ -1579,6 +1636,186 @@ mod tests {
         Ok(response)
     }
 
+    async fn rejected_password_login(fixture: &PasswordLoginFixture, email: &str) -> AppError {
+        login(
+            State(fixture.state.clone()),
+            Extension(RequestInfo {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "password-enumeration-test".to_string(),
+            }),
+            Json400(LoginRequest {
+                email: email.to_string(),
+                password: "DefinitelyWrongPassword1!".to_string(),
+                org_slug: Some(fixture.org_slug.clone()),
+                service_slug: None,
+                redirect_uri: None,
+                state: None,
+                saml_state: None,
+            }),
+        )
+        .await
+        .expect_err("login must be rejected")
+    }
+
+    fn with_inert_email_service(mut state: AppState) -> AppState {
+        state.email_service = Some(Arc::new(
+            EmailService::from_config(SmtpConfig {
+                host: "127.0.0.1".to_string(),
+                port: 1025,
+                username: String::new(),
+                password: String::new(),
+                from_email: "auth@example.com".to_string(),
+                from_name: "AuthOS test".to_string(),
+            })
+            .expect("create inert test email service"),
+        ));
+        state
+    }
+
+    async fn app_error_shape(
+        error: AppError,
+    ) -> (
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        serde_json::Value,
+    ) {
+        let response = axum::response::IntoResponse::into_response(error);
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read bounded error response");
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse error response");
+        assert!(body
+            .as_object_mut()
+            .expect("error response object")
+            .remove("timestamp")
+            .is_some());
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn password_login_normalizes_absent_and_passwordless_accounts() {
+        let fixture = setup_password_login_fixture().await;
+        users::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            email: Set("oauth-only@example.com".to_string()),
+            org_id: Set(Some(fixture.org_id.clone())),
+            is_platform_owner: Set(false),
+            password_hash: Set(None),
+            email_verified_at: Set(Some(Utc::now().naive_utc())),
+            created_at: Set(Utc::now().naive_utc()),
+            updated_at: Set(None),
+            deleted_at: Set(None),
+        }
+        .insert(&fixture.state.db)
+        .await
+        .expect("create passwordless account");
+
+        let absent = rejected_password_login(&fixture, "absent@example.com").await;
+        let passwordless = rejected_password_login(&fixture, "oauth-only@example.com").await;
+        assert!(matches!(
+            absent,
+            AppError::Unauthorized(ref message) if message == GENERIC_LOGIN_FAILURE
+        ));
+        assert!(matches!(
+            passwordless,
+            AppError::Unauthorized(ref message) if message == GENERIC_LOGIN_FAILURE
+        ));
+        assert_eq!(
+            app_error_shape(absent).await,
+            app_error_shape(passwordless).await
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_normalizes_existing_and_new_accounts() {
+        let fixture = setup_password_login_fixture().await;
+        let state = with_inert_email_service(fixture.state.clone());
+
+        let mut messages = Vec::new();
+        for email in [&fixture.email, "new-member@example.com"] {
+            let Json(response) = register(
+                State(state.clone()),
+                Json400(RegisterRequest {
+                    email: email.to_string(),
+                    password: "RegistrationPassword1!".to_string(),
+                    org_slug: Some(fixture.org_slug.clone()),
+                    service_slug: Some(fixture.service_slug.clone()),
+                    redirect_uri: None,
+                    state: None,
+                }),
+            )
+            .await
+            .expect("registration request returns generic success");
+            messages.push(response.message);
+        }
+
+        assert_eq!(messages[0], GENERIC_REGISTRATION_RESPONSE);
+        assert_eq!(messages[0], messages[1]);
+    }
+
+    #[tokio::test]
+    async fn password_recovery_requests_normalize_account_states() {
+        let fixture = setup_password_login_fixture().await;
+        let state = with_inert_email_service(fixture.state.clone());
+
+        let mut reset_messages = Vec::new();
+        for email in [fixture.email.as_str(), "absent@example.com"] {
+            let Json(response) = forgot_password(
+                State(state.clone()),
+                Json(ForgotPasswordRequest {
+                    email: email.to_string(),
+                    org_slug: Some(fixture.org_slug.clone()),
+                    service_slug: None,
+                    redirect_uri: None,
+                    state: None,
+                }),
+            )
+            .await
+            .expect("forgot-password request returns generic success");
+            reset_messages.push(response.message);
+        }
+        assert_eq!(reset_messages[0], GENERIC_PASSWORD_RESET_RESPONSE);
+        assert_eq!(reset_messages[0], reset_messages[1]);
+
+        let mut verification_messages = Vec::new();
+        for email in [fixture.email.as_str(), "another-absent@example.com"] {
+            let Json(response) = resend_verification(
+                State(state.clone()),
+                Json(ResendVerificationRequest {
+                    email: email.to_string(),
+                    org_slug: Some(fixture.org_slug.clone()),
+                    service_slug: None,
+                    redirect_uri: None,
+                    state: None,
+                }),
+            )
+            .await
+            .expect("resend-verification request returns generic success");
+            verification_messages.push(response.message);
+        }
+        assert_eq!(verification_messages[0], GENERIC_VERIFICATION_RESPONSE);
+        assert_eq!(verification_messages[0], verification_messages[1]);
+    }
+
+    #[test]
+    fn public_email_workflow_messages_are_generic_and_stable() {
+        assert_eq!(
+            generic_registration_response().0.message,
+            GENERIC_REGISTRATION_RESPONSE
+        );
+        assert_eq!(
+            generic_password_reset_response().0.message,
+            GENERIC_PASSWORD_RESET_RESPONSE
+        );
+        assert_eq!(
+            generic_verification_response().0.message,
+            GENERIC_VERIFICATION_RESPONSE
+        );
+    }
+
     #[tokio::test]
     async fn org_scoped_password_login_issues_org_claims_and_session_scope() {
         let fixture = setup_password_login_fixture().await;
@@ -1642,6 +1879,67 @@ mod tests {
             session.service_id.as_deref(),
             Some(fixture.service_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn password_session_boundary_rechecks_deleted_user_and_service_entitlement() {
+        let fixture = setup_password_login_fixture().await;
+        let user = UserStore::find_by_email(DB::Conn(&fixture.state.db), &fixture.email)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(validate_password_login_authority(
+            DB::Conn(&fixture.state.db),
+            &user.id,
+            Some(&fixture.org_slug),
+            Some(&fixture.service_id),
+        )
+        .await
+        .is_ok());
+        IdentityStore::delete_by_user_and_service(
+            DB::Conn(&fixture.state.db),
+            &user.id,
+            &fixture.service_id,
+        )
+        .await
+        .unwrap();
+        assert!(validate_password_login_authority(
+            DB::Conn(&fixture.state.db),
+            &user.id,
+            Some(&fixture.org_slug),
+            Some(&fixture.service_id),
+        )
+        .await
+        .is_ok());
+        MembershipStore::delete_by_org_and_user(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &user.id,
+        )
+        .await
+        .unwrap();
+        assert!(validate_password_login_authority(
+            DB::Conn(&fixture.state.db),
+            &user.id,
+            Some(&fixture.org_slug),
+            Some(&fixture.service_id),
+        )
+        .await
+        .is_err());
+
+        let user_id = user.id.clone();
+        let mut deleted_user: users::ActiveModel = user.into();
+        deleted_user.deleted_at = Set(Some(Utc::now().naive_utc()));
+        deleted_user.update(&fixture.state.db).await.unwrap();
+        assert!(validate_password_login_authority(
+            DB::Conn(&fixture.state.db),
+            &user_id,
+            Some(&fixture.org_slug),
+            None,
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -1802,5 +2100,210 @@ mod tests {
             error,
             AppError::Forbidden(ref message) if message.contains("Magic-link sign-in is disabled")
         ));
+    }
+
+    #[tokio::test]
+    async fn email_verification_failure_rolls_back_the_one_time_claim() {
+        use sea_orm::TransactionTrait;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let user = UserStore::create(DB::Conn(&db), "atomic-verify@example.test", None, false)
+            .await
+            .unwrap();
+        EmailVerificationStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "atomic-verify-hash",
+            &(Utc::now() + chrono::Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .unwrap();
+
+        let transaction = db.begin().await.unwrap();
+        assert!(complete_email_verification(
+            DB::Tx(&transaction),
+            "atomic-verify-hash",
+            "missing-user"
+        )
+        .await
+        .is_err());
+        transaction.rollback().await.unwrap();
+
+        assert!(
+            !EmailVerificationStore::find_by_token_hash(DB::Conn(&db), "atomic-verify-hash")
+                .await
+                .unwrap()
+                .unwrap()
+                .used
+        );
+        assert_eq!(
+            UserStore::find_by_id(DB::Conn(&db), &user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified_at,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn password_reset_failure_rolls_back_claim_and_password_update() {
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let user = UserStore::create(
+            DB::Conn(&db),
+            "atomic-reset@example.test",
+            Some("old-password-hash".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        PasswordResetStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "atomic-reset-hash",
+            &(Utc::now() + chrono::Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared("DROP TABLE sessions").await.unwrap();
+
+        let transaction = db.begin().await.unwrap();
+        assert!(complete_password_reset(
+            DB::Tx(&transaction),
+            "atomic-reset-hash",
+            &user.id,
+            "new-password-hash"
+        )
+        .await
+        .is_err());
+        transaction.rollback().await.unwrap();
+
+        assert!(
+            !PasswordResetStore::find_by_token_hash(DB::Conn(&db), "atomic-reset-hash")
+                .await
+                .unwrap()
+                .unwrap()
+                .used
+        );
+        assert_eq!(
+            UserStore::find_by_id(DB::Conn(&db), &user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash
+                .as_deref(),
+            Some("old-password-hash")
+        );
+    }
+
+    #[tokio::test]
+    async fn password_reset_is_user_bound_and_revokes_every_target_session() {
+        use crate::store::sessions::SessionStore;
+        use sea_orm::TransactionTrait;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let owner = UserStore::create(DB::Conn(&db), "reset-owner@example.test", None, true)
+            .await
+            .unwrap();
+        let org_a =
+            OrganizationStore::create(DB::Conn(&db), "reset-context-a", "Reset A", &owner.id, None)
+                .await
+                .unwrap();
+        let org_b =
+            OrganizationStore::create(DB::Conn(&db), "reset-context-b", "Reset B", &owner.id, None)
+                .await
+                .unwrap();
+        let target = UserStore::create_with_org_id(
+            DB::Conn(&db),
+            "same-reset@example.test",
+            Some("target-old".to_string()),
+            &org_a.id,
+        )
+        .await
+        .unwrap();
+        let other = UserStore::create_with_org_id(
+            DB::Conn(&db),
+            "same-reset@example.test",
+            Some("other-old".to_string()),
+            &org_b.id,
+        )
+        .await
+        .unwrap();
+        let expiry = (Utc::now() + chrono::Duration::hours(1)).naive_utc();
+        for (user_id, token_hash) in [
+            (&target.id, "target-session-a"),
+            (&target.id, "target-session-b"),
+            (&other.id, "other-session"),
+        ] {
+            SessionStore::create(
+                DB::Conn(&db),
+                user_id,
+                token_hash,
+                expiry,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        PasswordResetStore::create(
+            DB::Conn(&db),
+            &target.id,
+            "target-reset-hash",
+            &(Utc::now() + chrono::Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .unwrap();
+
+        let transaction = db.begin().await.unwrap();
+        assert!(complete_password_reset(
+            DB::Tx(&transaction),
+            "target-reset-hash",
+            &target.id,
+            "target-new"
+        )
+        .await
+        .unwrap());
+        transaction.commit().await.unwrap();
+
+        assert_eq!(
+            UserStore::find_by_id(DB::Conn(&db), &target.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash
+                .as_deref(),
+            Some("target-new")
+        );
+        assert_eq!(
+            UserStore::find_by_id(DB::Conn(&db), &other.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash
+                .as_deref(),
+            Some("other-old")
+        );
+        assert!(SessionStore::list_by_user(DB::Conn(&db), &target.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            SessionStore::list_by_user(DB::Conn(&db), &other.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

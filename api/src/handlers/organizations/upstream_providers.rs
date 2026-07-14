@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 async fn require_integration_manager(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    crate::handlers::organizations::ensure_organization_active(&state.db, org_id).await?;
     if PermissionService::check(
         DB::Conn(&state.db),
         org_id,
@@ -93,15 +94,22 @@ pub async fn create_upstream_provider(
         AppError::InternalServerError("Encryption service unavailable".to_string())
     })?;
 
+    let id = Uuid::new_v4().to_string();
     let client_secret_encrypted = if let Some(secret) = payload.client_secret {
         encryption
-            .encrypt(&secret)
+            .encrypt_with_context(
+                &secret,
+                crate::encryption::EncryptionContext::new(
+                    "upstream_providers",
+                    &id,
+                    "client_secret_encrypted",
+                ),
+            )
             .map_err(|e| AppError::InternalServerError(e.to_string()))?
     } else {
         Vec::new()
     };
 
-    let id = Uuid::new_v4().to_string();
     let metadata_str = payload.metadata.map(|m| m.to_string());
 
     let provider = UpstreamProviderStore::create(
@@ -166,23 +174,17 @@ pub async fn delete_upstream_provider(
 
     require_integration_manager(&state, &organization.id, &auth_user.user.id).await?;
 
-    // Find provider to verify it belongs to this org
-    let provider = UpstreamProviderStore::find_by_id(DB::Conn(&state.db), &provider_id)
+    if !UpstreamProviderStore::delete_in_org(DB::Conn(&state.db), &organization.id, &provider_id)
         .await?
-        .ok_or_else(|| AppError::NotFound("Provider not found".to_string()))?;
-
-    if provider.org_id != organization.id {
-        return Err(AppError::Forbidden(
-            "Provider does not belong to this organization".to_string(),
-        ));
+    {
+        return Err(AppError::NotFound("Provider not found".to_string()));
     }
-
-    UpstreamProviderStore::delete(DB::Conn(&state.db), &provider_id).await?;
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
 async fn validate_upstream_provider_payload(payload: &CreateUpstreamProviderRequest) -> Result<()> {
+    validate_upstream_client_secret(&payload.provider_type, payload.client_secret.as_deref())?;
     match payload.provider_type.as_str() {
         "oidc" | "oauth2" => {
             let has_discovery = payload.discovery_url.is_some();
@@ -225,6 +227,18 @@ async fn validate_upstream_provider_payload(payload: &CreateUpstreamProviderRequ
     Ok(())
 }
 
+fn validate_upstream_client_secret(provider_type: &str, client_secret: Option<&str>) -> Result<()> {
+    if matches!(provider_type, "oidc" | "oauth2")
+        && client_secret.is_none_or(|secret| secret.trim().is_empty())
+    {
+        return Err(AppError::BadRequest(
+            "OIDC and OAuth2 upstream providers require a non-empty client_secret; public upstream clients are not supported"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_provider_url(url: Option<&str>, field: &str) -> Result<()> {
     let url = url.ok_or_else(|| AppError::BadRequest(format!("Missing {}", field)))?;
     let parsed = reqwest::Url::parse(url)
@@ -237,4 +251,27 @@ async fn validate_provider_url(url: Option<&str>, field: &str) -> Result<()> {
     crate::services::safe_http::SafeHttpClient::new()?
         .validate_external_url(url)
         .await
+}
+
+#[cfg(test)]
+mod secret_validation_tests {
+    use super::*;
+
+    #[test]
+    fn only_saml_upstream_providers_may_omit_client_secret() {
+        for provider_type in ["oidc", "oauth2"] {
+            assert!(matches!(
+                validate_upstream_client_secret(provider_type, None),
+                Err(AppError::BadRequest(_))
+            ));
+            assert!(matches!(
+                validate_upstream_client_secret(provider_type, Some("  ")),
+                Err(AppError::BadRequest(_))
+            ));
+            validate_upstream_client_secret(provider_type, Some("confidential-secret"))
+                .expect("confidential upstream client secret");
+        }
+        validate_upstream_client_secret("saml", None)
+            .expect("SAML uses the documented empty secret sentinel");
+    }
 }

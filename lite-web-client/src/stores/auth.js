@@ -42,7 +42,7 @@ function storageJsonGet(key, fallback) {
 
   try {
     return JSON.parse(raw);
-  } catch (error) {
+  } catch {
     return fallback;
   }
 }

@@ -92,6 +92,7 @@ impl ConnectedAccountStore {
             .one(&db)
             .await?
         {
+            let account_id = existing.id.clone();
             let mut active: connected_accounts::ActiveModel = existing.into();
             active.email = Set(email.map(str::to_string));
             active.display_name = Set(display_name.map(str::to_string));
@@ -102,7 +103,13 @@ impl ConnectedAccountStore {
             active.status = Set("active".to_string());
             active.revoked_at = Set(None);
 
-            Self::set_tokens(&mut active, encryption, access_token, refresh_token)?;
+            Self::set_tokens(
+                &mut active,
+                encryption,
+                &account_id,
+                access_token,
+                refresh_token,
+            )?;
 
             return Ok(active.update(&db).await?);
         }
@@ -117,8 +124,9 @@ impl ConnectedAccountStore {
             }
         }
 
+        let account_id = Uuid::new_v4().to_string();
         let mut active = connected_accounts::ActiveModel {
-            id: Set(Uuid::new_v4().to_string()),
+            id: Set(account_id.clone()),
             user_id: Set(user_id.to_string()),
             provider: Set(provider.to_string()),
             provider_user_id: Set(provider_user_id.to_string()),
@@ -137,7 +145,13 @@ impl ConnectedAccountStore {
             updated_at: Set(now),
             revoked_at: Set(None),
         };
-        Self::set_tokens(&mut active, encryption, access_token, refresh_token)?;
+        Self::set_tokens(
+            &mut active,
+            encryption,
+            &account_id,
+            access_token,
+            refresh_token,
+        )?;
 
         Ok(active.insert(&db).await?)
     }
@@ -158,7 +172,13 @@ impl ConnectedAccountStore {
         active.expires_at = Set(expires_at.map(|dt| dt.naive_utc()));
         active.last_refreshed_at = Set(Some(now));
         active.updated_at = Set(now);
-        Self::set_tokens(&mut active, encryption, access_token, refresh_token)?;
+        Self::set_tokens(
+            &mut active,
+            encryption,
+            account_id,
+            access_token,
+            refresh_token,
+        )?;
         Ok(active.update(&db).await?)
     }
 
@@ -178,15 +198,34 @@ impl ConnectedAccountStore {
     fn set_tokens(
         active: &mut connected_accounts::ActiveModel,
         encryption: Option<&Arc<crate::encryption::EncryptionService>>,
+        account_id: &str,
         access_token: &str,
         refresh_token: Option<&str>,
     ) -> Result<()> {
         if let Some(enc) = encryption {
-            let access_token_encrypted = enc.encrypt(access_token).map_err(|e| {
-                AppError::InternalServerError(format!("Failed to encrypt access token: {}", e))
-            })?;
+            let access_token_encrypted = enc
+                .encrypt_with_context(
+                    access_token,
+                    crate::encryption::EncryptionContext::new(
+                        "connected_accounts",
+                        account_id,
+                        "access_token_encrypted",
+                    ),
+                )
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("Failed to encrypt access token: {}", e))
+                })?;
             let refresh_token_encrypted = refresh_token
-                .map(|rt| enc.encrypt(rt))
+                .map(|rt| {
+                    enc.encrypt_with_context(
+                        rt,
+                        crate::encryption::EncryptionContext::new(
+                            "connected_accounts",
+                            account_id,
+                            "refresh_token_encrypted",
+                        ),
+                    )
+                })
                 .transpose()
                 .map_err(|e| {
                     AppError::InternalServerError(format!("Failed to encrypt refresh token: {}", e))
@@ -206,5 +245,101 @@ impl ConnectedAccountStore {
             active.encryption_key_id = Set(None);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::users::UserStore;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn linked_account_ownership_and_provider_subject_collision_are_enforced() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::create(DB::Conn(&db), "linked-owner@example.test", None, false)
+            .await
+            .expect("create owner");
+        let other = UserStore::create(DB::Conn(&db), "linked-other@example.test", None, false)
+            .await
+            .expect("create other user");
+        let account = ConnectedAccountStore::upsert_from_oauth_details(
+            DB::Conn(&db),
+            None,
+            &owner.id,
+            "github",
+            "provider-subject",
+            None,
+            None,
+            "owner-access-token",
+            Some("owner-refresh-token"),
+            None,
+            &["read:user".to_string()],
+        )
+        .await
+        .expect("create linked account");
+
+        assert!(ConnectedAccountStore::find_active_by_id_for_user(
+            DB::Conn(&db),
+            &account.id,
+            &other.id,
+        )
+        .await
+        .expect("cross-user lookup")
+        .is_none());
+        assert!(matches!(
+            ConnectedAccountStore::revoke(DB::Conn(&db), &account.id, &other.id).await,
+            Err(AppError::NotFound(_))
+        ));
+        let unchanged = ConnectedAccountStore::find_by_id(DB::Conn(&db), &account.id)
+            .await
+            .expect("load account")
+            .expect("account preserved");
+        assert_eq!(unchanged.status, "active");
+        assert_eq!(
+            unchanged.access_token.as_deref(),
+            Some("owner-access-token")
+        );
+        assert_eq!(
+            unchanged.refresh_token.as_deref(),
+            Some("owner-refresh-token")
+        );
+        assert!(
+            ConnectedAccountStore::list_by_user(DB::Conn(&db), &other.id)
+                .await
+                .expect("list other user accounts")
+                .is_empty()
+        );
+
+        assert!(matches!(
+            ConnectedAccountStore::upsert_from_oauth_details(
+                DB::Conn(&db),
+                None,
+                &other.id,
+                "github",
+                "provider-subject",
+                None,
+                None,
+                "attacker-token",
+                None,
+                None,
+                &["read:user".to_string()],
+            )
+            .await,
+            Err(AppError::BadRequest(_))
+        ));
+        let still_unchanged = ConnectedAccountStore::find_by_id(DB::Conn(&db), &account.id)
+            .await
+            .expect("reload account")
+            .expect("account remains");
+        assert_eq!(still_unchanged.user_id, owner.id);
+        assert_eq!(
+            still_unchanged.access_token.as_deref(),
+            Some("owner-access-token")
+        );
     }
 }

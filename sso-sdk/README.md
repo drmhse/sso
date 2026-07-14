@@ -5,6 +5,9 @@
 
 Core TypeScript SDK for AuthOS. It handles authentication flows, session persistence, token refresh, and the multi-tenant API surface used by the framework adapters.
 
+This package is pre-1.0 and Beta. Pin an exact version and review the
+[current AuthOS support matrix](https://github.com/drmhse/AuthOS/blob/main/PROJECT_STATUS.md).
+
 Full documentation: [authos.dev/docs/sdk/](https://authos.dev/docs/sdk/)
 
 AI agent skills: [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-agent-skills/) and [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill)

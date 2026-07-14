@@ -15,6 +15,8 @@ function ensureMaterial(config, state) {
   return {
     jwt,
     encryptionKey: state.encryptionKey || crypto.randomBytes(32).toString('hex'),
+    encryptionKeyId: state.encryptionKeyId || 'default',
+    encryptionPreviousKeys: state.encryptionPreviousKeys || {},
     deviceTrustSecret: state.deviceTrustSecret || crypto.randomBytes(32).toString('hex'),
     platformOwnerPassword:
       config.platformOwner.password ||
@@ -43,6 +45,8 @@ function serializeState(material) {
     updatedAt: new Date().toISOString(),
     jwt: material.jwt,
     encryptionKey: material.encryptionKey,
+    encryptionKeyId: material.encryptionKeyId,
+    encryptionPreviousKeys: material.encryptionPreviousKeys,
     deviceTrustSecret: material.deviceTrustSecret,
     platformOwnerPassword: material.platformOwnerPassword,
     database: material.database,

@@ -106,9 +106,7 @@ impl MigrationTrait for Migration {
                         )).await?;
 
                         // Move relevant identities to new user based on service or org
-                        let update_sql = format!(
-                            "UPDATE identities SET user_id = ? WHERE user_id = ? AND (issuing_org_id = ? OR issuing_service_id IN (SELECT id FROM services WHERE org_id = ?))"
-                        );
+                        let update_sql = "UPDATE identities SET user_id = ? WHERE user_id = ? AND (issuing_org_id = ? OR issuing_service_id IN (SELECT id FROM services WHERE org_id = ?))".to_string();
 
                         db.execute(Statement::from_sql_and_values(
                             backend,

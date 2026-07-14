@@ -9,14 +9,34 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, JoinType, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// OAuth credentials for an organization
 #[derive(Debug, FromQueryResult)]
 pub struct OrgOAuthCredentials {
+    pub id: String,
     pub client_id: String,
     pub client_secret_encrypted: Vec<u8>,
     pub encryption_key_id: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct StatusCount {
+    status: String,
+    count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct CountByOrg {
+    org_id: String,
+    count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DistinctLoginUserByOrg {
+    org_id: String,
+    user_id: String,
 }
 
 pub struct OrganizationStore;
@@ -27,6 +47,19 @@ impl OrganizationStore {
         let result = Organizations::find()
             .filter(organizations::Column::Id.eq(org_id))
             .one(&db)
+            .await?;
+        Ok(result)
+    }
+
+    /// Find organizations by IDs.
+    pub async fn find_by_ids(db: DB<'_>, org_ids: &[String]) -> Result<Vec<organizations::Model>> {
+        if org_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let result = Organizations::find()
+            .filter(organizations::Column::Id.is_in(org_ids.iter().cloned()))
+            .all(&db)
             .await?;
         Ok(result)
     }
@@ -141,7 +174,7 @@ impl OrganizationStore {
         let mut org_active: organizations::ActiveModel = org.into();
         org_active.status = Set("active".to_string());
         org_active.approved_by = Set(Some(approved_by.to_string()));
-        org_active.approved_at = Set(Some(now.clone()));
+        org_active.approved_at = Set(Some(now));
         org_active.updated_at = Set(now);
 
         let updated_org = org_active.update(&db).await?;
@@ -163,7 +196,7 @@ impl OrganizationStore {
         let mut org_active: organizations::ActiveModel = org.into();
         org_active.status = Set("rejected".to_string());
         org_active.rejected_by = Set(Some(rejected_by.to_string()));
-        org_active.rejected_at = Set(Some(now.clone()));
+        org_active.rejected_at = Set(Some(now));
         org_active.rejection_reason = Set(reason.map(|s| s.to_string()));
         org_active.updated_at = Set(now);
 
@@ -187,6 +220,39 @@ impl OrganizationStore {
 
         let updated_org = org_active.update(&db).await?;
         Ok(updated_org)
+    }
+
+    /// Transfer ownership only if the caller still owns the organization.
+    /// This compare-and-swap prevents concurrent transfer requests from both
+    /// succeeding after reading the same previous owner.
+    pub async fn transfer_ownership_if_current(
+        db: DB<'_>,
+        org_id: &str,
+        current_owner_id: &str,
+        new_owner_id: &str,
+    ) -> Result<organizations::Model> {
+        let result = Organizations::update_many()
+            .filter(organizations::Column::Id.eq(org_id))
+            .filter(organizations::Column::OwnerUserId.eq(current_owner_id))
+            .col_expr(
+                organizations::Column::OwnerUserId,
+                sea_orm::sea_query::Expr::value(new_owner_id.to_string()),
+            )
+            .col_expr(
+                organizations::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now().naive_utc()),
+            )
+            .exec(&db)
+            .await?;
+        if result.rows_affected != 1 {
+            return Err(AppError::BadRequest(
+                "Organization ownership changed; retry the transfer".to_string(),
+            ));
+        }
+
+        Self::find_by_id(db, org_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))
     }
 
     /// Update organization tier
@@ -363,6 +429,7 @@ impl OrganizationStore {
             .await?;
 
         Ok(credentials.map(|c| OrgOAuthCredentials {
+            id: c.id,
             client_id: c.client_id,
             client_secret_encrypted: c.client_secret_encrypted,
             encryption_key_id: c.encryption_key_id,
@@ -397,6 +464,7 @@ impl OrganizationStore {
     }
 
     /// Update organization SMTP configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_smtp_config(
         db: DB<'_>,
         org_id: &str,
@@ -540,6 +608,28 @@ impl OrganizationStore {
         Ok(count)
     }
 
+    /// Count organizations grouped by status in one query.
+    pub async fn count_by_statuses(db: DB<'_>, statuses: &[&str]) -> Result<HashMap<String, i64>> {
+        if statuses.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = Organizations::find()
+            .filter(organizations::Column::Status.is_in(statuses.iter().copied()))
+            .select_only()
+            .column(organizations::Column::Status)
+            .column_as(organizations::Column::Id.count(), "count")
+            .group_by(organizations::Column::Status)
+            .into_model::<StatusCount>()
+            .all(&db)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.status, row.count))
+            .collect())
+    }
+
     /// List recent organizations ordered by creation date
     pub async fn list_recent(db: DB<'_>, limit: u64) -> Result<Vec<RecentOrganizationData>> {
         #[derive(FromQueryResult)]
@@ -638,71 +728,137 @@ impl OrganizationStore {
     /// Get top organizations by activity for platform analytics
     pub async fn get_top_organizations(db: DB<'_>, limit: u64) -> Result<Vec<TopOrganizationData>> {
         use chrono::{Duration, Utc};
+        use sea_orm::sea_query::Expr;
 
-        // Get active organizations
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let orgs = Organizations::find()
             .filter(organizations::Column::Status.eq("active"))
             .all(&db)
             .await?;
-
-        let thirty_days_ago = (Utc::now() - Duration::days(30)).naive_utc();
-
-        let mut results = Vec::new();
-
-        for org in orgs {
-            // Count services for this org
-            let service_count = Services::find()
-                .filter(services::Column::OrgId.eq(&org.id))
-                .count(&db)
-                .await? as i64;
-
-            // Get login events for this org's services
-            let svc_models = Services::find()
-                .filter(services::Column::OrgId.eq(&org.id))
-                .all(&db)
-                .await?;
-
-            let service_ids: Vec<String> = svc_models.iter().map(|s| s.id.clone()).collect();
-
-            // Count unique users who logged in (all time)
-            let user_count = if !service_ids.is_empty() {
-                let user_ids: Vec<String> = LoginEvents::find()
-                    .filter(login_events::Column::ServiceId.is_in(service_ids.clone()))
-                    .select_only()
-                    .column(login_events::Column::UserId)
-                    .distinct()
-                    .into_tuple()
-                    .all(&db)
-                    .await?;
-                user_ids.len() as i64
-            } else {
-                0
-            };
-
-            // Count logins in last 30 days using SeaORM
-            let login_count_30d = if !service_ids.is_empty() {
-                use sea_orm::PaginatorTrait;
-
-                let count = LoginEvents::find()
-                    .filter(login_events::Column::ServiceId.is_in(service_ids.clone()))
-                    .filter(login_events::Column::CreatedAt.gte(thirty_days_ago.clone()))
-                    .count(&db)
-                    .await?;
-
-                count as i64
-            } else {
-                0
-            };
-
-            results.push(TopOrganizationData {
-                id: org.id,
-                name: org.name,
-                slug: org.slug,
-                user_count,
-                service_count,
-                login_count_30d,
-            });
+        if orgs.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let org_ids: Vec<String> = orgs.iter().map(|org| org.id.clone()).collect();
+        let thirty_days_ago = (Utc::now() - Duration::days(30)).naive_utc();
+        let service_counts = Services::find()
+            .filter(services::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .select_only()
+            .column(services::Column::OrgId)
+            .column_as(services::Column::Id.count(), "count")
+            .group_by(services::Column::OrgId)
+            .into_model::<CountByOrg>()
+            .all(&db)
+            .await?
+            .into_iter()
+            .map(|row| (row.org_id, row.count))
+            .collect::<HashMap<_, _>>();
+
+        let direct_users = LoginEvents::find()
+            .filter(login_events::Column::ServiceId.is_null())
+            .filter(login_events::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .select_only()
+            .column_as(login_events::Column::OrgId, "org_id")
+            .column_as(login_events::Column::UserId, "user_id")
+            .group_by(login_events::Column::OrgId)
+            .group_by(login_events::Column::UserId)
+            .into_model::<DistinctLoginUserByOrg>()
+            .all(&db)
+            .await?;
+        let service_users = LoginEvents::find()
+            .join(JoinType::InnerJoin, login_events::Relation::Services.def())
+            .filter(services::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(login_events::Column::OrgId.is_null())
+                    .add(
+                        Expr::col((login_events::Entity, login_events::Column::OrgId))
+                            .equals((services::Entity, services::Column::OrgId)),
+                    ),
+            )
+            .select_only()
+            .column_as(services::Column::OrgId, "org_id")
+            .column_as(login_events::Column::UserId, "user_id")
+            .group_by(services::Column::OrgId)
+            .group_by(login_events::Column::UserId)
+            .into_model::<DistinctLoginUserByOrg>()
+            .all(&db)
+            .await?;
+        let user_counts = direct_users
+            .into_iter()
+            .chain(service_users)
+            .map(|row| (row.org_id, row.user_id))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .fold(HashMap::new(), |mut counts, (org_id, _)| {
+                *counts.entry(org_id).or_insert(0) += 1;
+                counts
+            });
+
+        let direct_login_counts = LoginEvents::find()
+            .filter(login_events::Column::ServiceId.is_null())
+            .filter(login_events::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .filter(login_events::Column::CreatedAt.gte(thirty_days_ago))
+            .select_only()
+            .column_as(login_events::Column::OrgId, "org_id")
+            .column_as(
+                Expr::col((login_events::Entity, login_events::Column::Id)).count(),
+                "count",
+            )
+            .group_by(login_events::Column::OrgId)
+            .into_model::<CountByOrg>()
+            .all(&db)
+            .await?;
+        let service_login_counts = LoginEvents::find()
+            .join(JoinType::InnerJoin, login_events::Relation::Services.def())
+            .filter(services::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(login_events::Column::OrgId.is_null())
+                    .add(
+                        Expr::col((login_events::Entity, login_events::Column::OrgId))
+                            .equals((services::Entity, services::Column::OrgId)),
+                    ),
+            )
+            .filter(login_events::Column::CreatedAt.gte(thirty_days_ago))
+            .select_only()
+            .column_as(services::Column::OrgId, "org_id")
+            .column_as(
+                Expr::col((login_events::Entity, login_events::Column::Id)).count(),
+                "count",
+            )
+            .group_by(services::Column::OrgId)
+            .into_model::<CountByOrg>()
+            .all(&db)
+            .await?;
+        let login_counts_30d = direct_login_counts
+            .into_iter()
+            .chain(service_login_counts)
+            .fold(HashMap::new(), |mut counts, row| {
+                *counts.entry(row.org_id).or_insert(0) += row.count;
+                counts
+            });
+
+        let mut results: Vec<TopOrganizationData> = orgs
+            .into_iter()
+            .map(|org| {
+                let user_count = *user_counts.get(&org.id).unwrap_or(&0);
+                let service_count = *service_counts.get(&org.id).unwrap_or(&0);
+                let login_count_30d = *login_counts_30d.get(&org.id).unwrap_or(&0);
+
+                TopOrganizationData {
+                    id: org.id,
+                    name: org.name,
+                    slug: org.slug,
+                    user_count,
+                    service_count,
+                    login_count_30d,
+                }
+            })
+            .collect();
 
         // Sort by login count (desc), then user count (desc)
         results.sort_by(|a, b| {
@@ -712,7 +868,7 @@ impl OrganizationStore {
         });
 
         // Limit results
-        results.truncate(limit as usize);
+        results.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
 
         Ok(results)
     }
@@ -778,7 +934,14 @@ impl OrganizationStore {
 
         // Decrypt the client secret
         let client_secret = encryption_service
-            .decrypt(&credentials.client_secret_encrypted)
+            .decrypt_with_context(
+                &credentials.client_secret_encrypted,
+                crate::encryption::EncryptionContext::new(
+                    "organization_oauth_credentials",
+                    &credentials.id,
+                    "client_secret_encrypted",
+                ),
+            )
             .map_err(|e| {
                 AppError::InternalServerError(format!("Failed to decrypt client secret: {}", e))
             })?;
@@ -954,4 +1117,314 @@ pub struct TopOrganizationData {
 pub struct GrowthTrendData {
     pub date: String,
     pub count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::login_events::LoginEventStore;
+    use crate::store::services::ServiceStore;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, IntoActiveModel, PaginatorTrait};
+
+    #[tokio::test]
+    async fn count_by_statuses_groups_requested_statuses_in_one_result() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "org-status-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+
+        let org_a =
+            OrganizationStore::create(DB::Conn(&db), "status-a", "Status A", &owner.id, None)
+                .await
+                .expect("create org a");
+        let org_b =
+            OrganizationStore::create(DB::Conn(&db), "status-b", "Status B", &owner.id, None)
+                .await
+                .expect("create org b");
+        let org_c =
+            OrganizationStore::create(DB::Conn(&db), "status-c", "Status C", &owner.id, None)
+                .await
+                .expect("create org c");
+
+        let mut active_a = org_a.into_active_model();
+        active_a.status = Set("active".to_string());
+        active_a.update(&db).await.expect("set active");
+
+        let mut active_c = org_c.into_active_model();
+        active_c.status = Set("suspended".to_string());
+        active_c.update(&db).await.expect("set suspended");
+
+        let counts = OrganizationStore::count_by_statuses(
+            DB::Conn(&db),
+            &["active", "pending", "suspended", "rejected"],
+        )
+        .await
+        .expect("count statuses");
+
+        assert_eq!(*counts.get("active").unwrap_or(&0), 1);
+        assert_eq!(*counts.get("pending").unwrap_or(&0), 1);
+        assert_eq!(*counts.get("suspended").unwrap_or(&0), 1);
+        assert_eq!(*counts.get("rejected").unwrap_or(&0), 0);
+        assert!(!counts.contains_key("status-a"));
+        assert_eq!(org_b.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn get_top_organizations_groups_activity_without_per_org_queries() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let audit_reconciler = crate::services::audit_actor::AuditHandle::new(db.clone());
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "top-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let user_a = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "top-user-a@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create user a")
+        .0;
+        let user_b = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "top-user-b@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create user b")
+        .0;
+
+        let active_high =
+            OrganizationStore::create(DB::Conn(&db), "active-high", "Active High", &owner.id, None)
+                .await
+                .expect("create active high");
+        let active_low =
+            OrganizationStore::create(DB::Conn(&db), "active-low", "Active Low", &owner.id, None)
+                .await
+                .expect("create active low");
+        let pending =
+            OrganizationStore::create(DB::Conn(&db), "pending", "Pending", &owner.id, None)
+                .await
+                .expect("create pending");
+
+        for org in [&active_high, &active_low] {
+            let mut model = org.clone().into_active_model();
+            model.status = Set("active".to_string());
+            model.update(&db).await.expect("activate org");
+        }
+
+        let high_service_a = ServiceStore::create_with_options(
+            DB::Conn(&db),
+            "svc-high-a",
+            &active_high.id,
+            "high-a",
+            "High A",
+            "web",
+            "client-high-a",
+            "secret-hash",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create high service a");
+        ServiceStore::create_with_options(
+            DB::Conn(&db),
+            "svc-high-b",
+            &active_high.id,
+            "high-b",
+            "High B",
+            "web",
+            "client-high-b",
+            "secret-hash",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create high service b");
+        let low_service = ServiceStore::create_with_options(
+            DB::Conn(&db),
+            "svc-low",
+            &active_low.id,
+            "low",
+            "Low",
+            "web",
+            "client-low",
+            "secret-hash",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create low service");
+        let pending_service = ServiceStore::create_with_options(
+            DB::Conn(&db),
+            "svc-pending",
+            &pending.id,
+            "pending",
+            "Pending",
+            "web",
+            "client-pending",
+            "secret-hash",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create pending service");
+
+        LoginEventStore::create(
+            DB::Conn(&db),
+            &user_a.id,
+            Some(&high_service_a.id),
+            "password",
+        )
+        .await
+        .expect("create high login 1");
+        LoginEventStore::create(
+            DB::Conn(&db),
+            &user_a.id,
+            Some(&high_service_a.id),
+            "password",
+        )
+        .await
+        .expect("create high login 2");
+        LoginEventStore::create(
+            DB::Conn(&db),
+            &user_b.id,
+            Some(&high_service_a.id),
+            "github",
+        )
+        .await
+        .expect("create high login 3");
+        LoginEventStore::create(DB::Conn(&db), &user_a.id, Some(&low_service.id), "password")
+            .await
+            .expect("create low login");
+        LoginEventStore::create(
+            DB::Conn(&db),
+            &user_a.id,
+            Some(&pending_service.id),
+            "password",
+        )
+        .await
+        .expect("create pending login");
+
+        for _ in 0..50 {
+            if crate::entities::login_events::Entity::find()
+                .count(&db)
+                .await
+                .expect("count delivered login events")
+                == 5
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            crate::entities::login_events::Entity::find()
+                .count(&db)
+                .await
+                .expect("count delivered login events"),
+            5
+        );
+
+        login_events::ActiveModel {
+            id: Set("old-low-login".to_string()),
+            user_id: Set(user_b.id.clone()),
+            service_id: Set(Some(low_service.id.clone())),
+            provider: Set("password".to_string()),
+            created_at: Set((Utc::now() - Duration::days(45)).naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("create old login");
+
+        login_events::ActiveModel {
+            id: Set("service-less-low-login".to_string()),
+            user_id: Set(user_b.id.clone()),
+            org_id: Set(Some(active_low.id.clone())),
+            service_id: Set(None),
+            provider: Set("magic".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("create directly scoped service-less login");
+
+        login_events::ActiveModel {
+            id: Set("inconsistent-low-login".to_string()),
+            user_id: Set(user_b.id.clone()),
+            org_id: Set(Some(active_low.id.clone())),
+            service_id: Set(Some(high_service_a.id.clone())),
+            provider: Set("passkey".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("create inconsistent org/service login");
+
+        let top = OrganizationStore::get_top_organizations(DB::Conn(&db), 10)
+            .await
+            .expect("get top organizations");
+
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].slug, "active-high");
+        assert_eq!(top[0].service_count, 2);
+        assert_eq!(top[0].user_count, 2);
+        assert_eq!(top[0].login_count_30d, 3);
+        assert_eq!(top[1].slug, "active-low");
+        assert_eq!(top[1].service_count, 1);
+        assert_eq!(top[1].user_count, 2);
+        assert_eq!(top[1].login_count_30d, 2);
+        assert!(top.iter().all(|org| org.slug != "pending"));
+        audit_reconciler.shutdown().await;
+    }
 }

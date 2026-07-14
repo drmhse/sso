@@ -1,56 +1,222 @@
 use crate::db::models::WebhookDeliveryWithWebhook;
-use crate::entities::prelude::{WebhookDeliveries, Webhooks};
+use crate::entities::prelude::WebhookDeliveries;
 use crate::entities::webhook_deliveries;
 use crate::error::Result;
 use crate::store::DB;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, JoinType, QueryFilter, QueryOrder,
+    QuerySelect, RelationTrait, Set,
+};
 use uuid::Uuid;
 
 pub struct WebhookDeliveryStore;
 
+#[derive(Debug, Clone)]
+pub struct AuthorizedWebhookDelivery {
+    pub delivery: webhook_deliveries::Model,
+    pub webhook: crate::entities::webhooks::Model,
+}
+
 impl WebhookDeliveryStore {
+    /// Load one exact open delivery together with its live authorization
+    /// parents. This is the worker boundary: payload IDs must agree, the
+    /// webhook must still be enabled, and its organization must still be
+    /// active immediately before outbound I/O.
+    pub async fn find_authorized_open_delivery(
+        db: DB<'_>,
+        delivery_id: &str,
+        webhook_id: &str,
+    ) -> Result<Option<AuthorizedWebhookDelivery>> {
+        use crate::entities::{organizations, webhooks};
+
+        let row = WebhookDeliveries::find()
+            .find_also_related(webhooks::Entity)
+            .join(JoinType::InnerJoin, webhooks::Relation::Organizations.def())
+            .filter(webhook_deliveries::Column::Id.eq(delivery_id))
+            .filter(webhook_deliveries::Column::WebhookId.eq(webhook_id))
+            .filter(webhook_deliveries::Column::Delivered.eq(false))
+            .filter(
+                Expr::col((
+                    webhook_deliveries::Entity,
+                    webhook_deliveries::Column::AttemptCount,
+                ))
+                .lt(Expr::col((
+                    webhook_deliveries::Entity,
+                    webhook_deliveries::Column::MaxAttempts,
+                ))),
+            )
+            .filter(webhooks::Column::IsActive.eq(true))
+            .filter(organizations::Column::Status.eq("active"))
+            .one(&db)
+            .await?;
+
+        Ok(row.and_then(|(delivery, webhook)| {
+            webhook.map(|webhook| AuthorizedWebhookDelivery { delivery, webhook })
+        }))
+    }
+
+    pub async fn mark_as_successful_with_response_for_webhook(
+        db: DB<'_>,
+        delivery_id: &str,
+        webhook_id: &str,
+        status_code: i32,
+        response_body: Option<String>,
+    ) -> Result<bool> {
+        let result = WebhookDeliveries::update_many()
+            .filter(webhook_deliveries::Column::Id.eq(delivery_id))
+            .filter(webhook_deliveries::Column::WebhookId.eq(webhook_id))
+            .filter(webhook_deliveries::Column::Delivered.eq(false))
+            .col_expr(webhook_deliveries::Column::Delivered, Expr::value(true))
+            .col_expr(
+                webhook_deliveries::Column::NextRetryAt,
+                Expr::value(None::<chrono::NaiveDateTime>),
+            )
+            .col_expr(
+                webhook_deliveries::Column::DeliveryError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                webhook_deliveries::Column::ResponseStatusCode,
+                Expr::value(Some(status_code)),
+            )
+            .col_expr(
+                webhook_deliveries::Column::ResponseBody,
+                Expr::value(response_body),
+            )
+            .col_expr(
+                webhook_deliveries::Column::UpdatedAt,
+                Expr::value(Utc::now().naive_utc()),
+            )
+            .exec(&db)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    pub async fn schedule_retry_for_webhook(
+        db: DB<'_>,
+        delivery_id: &str,
+        webhook_id: &str,
+        next_retry_at: chrono::NaiveDateTime,
+        error: Option<String>,
+        response: Option<(i32, Option<String>)>,
+    ) -> Result<bool> {
+        let mut update = WebhookDeliveries::update_many()
+            .filter(webhook_deliveries::Column::Id.eq(delivery_id))
+            .filter(webhook_deliveries::Column::WebhookId.eq(webhook_id))
+            .filter(webhook_deliveries::Column::Delivered.eq(false))
+            .filter(
+                Expr::col(webhook_deliveries::Column::AttemptCount)
+                    .lt(Expr::col(webhook_deliveries::Column::MaxAttempts)),
+            )
+            .col_expr(
+                webhook_deliveries::Column::AttemptCount,
+                Expr::col(webhook_deliveries::Column::AttemptCount).add(1),
+            )
+            .col_expr(
+                webhook_deliveries::Column::NextRetryAt,
+                Expr::value(Some(next_retry_at)),
+            )
+            .col_expr(
+                webhook_deliveries::Column::DeliveryError,
+                Expr::value(error.or_else(|| Some("Retry scheduled".to_string()))),
+            )
+            .col_expr(
+                webhook_deliveries::Column::UpdatedAt,
+                Expr::value(Utc::now().naive_utc()),
+            );
+        if let Some((status_code, body)) = response {
+            update = update
+                .col_expr(
+                    webhook_deliveries::Column::ResponseStatusCode,
+                    Expr::value(Some(status_code)),
+                )
+                .col_expr(webhook_deliveries::Column::ResponseBody, Expr::value(body));
+        }
+        let result = update.exec(&db).await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    pub async fn mark_as_failed_permanently_for_webhook(
+        db: DB<'_>,
+        delivery_id: &str,
+        webhook_id: &str,
+        error: Option<String>,
+        response: Option<(i32, Option<String>)>,
+    ) -> Result<bool> {
+        let mut update = WebhookDeliveries::update_many()
+            .filter(webhook_deliveries::Column::Id.eq(delivery_id))
+            .filter(webhook_deliveries::Column::WebhookId.eq(webhook_id))
+            .filter(webhook_deliveries::Column::Delivered.eq(false))
+            .col_expr(
+                webhook_deliveries::Column::AttemptCount,
+                Expr::col(webhook_deliveries::Column::MaxAttempts).into(),
+            )
+            .col_expr(
+                webhook_deliveries::Column::NextRetryAt,
+                Expr::value(None::<chrono::NaiveDateTime>),
+            )
+            .col_expr(
+                webhook_deliveries::Column::DeliveryError,
+                Expr::value(error.or_else(|| Some("Max retries exceeded".to_string()))),
+            )
+            .col_expr(
+                webhook_deliveries::Column::UpdatedAt,
+                Expr::value(Utc::now().naive_utc()),
+            );
+        if let Some((status_code, body)) = response {
+            update = update
+                .col_expr(
+                    webhook_deliveries::Column::ResponseStatusCode,
+                    Expr::value(Some(status_code)),
+                )
+                .col_expr(webhook_deliveries::Column::ResponseBody, Expr::value(body));
+        }
+        let result = update.exec(&db).await?;
+        Ok(result.rows_affected == 1)
+    }
+
     /// Get pending webhook deliveries that are ready to be processed
     pub async fn get_pending_deliveries(
         db: DB<'_>,
         limit: u64,
     ) -> Result<Vec<webhook_deliveries::Model>> {
-        use sea_orm::{Condition, QueryOrder};
+        use crate::entities::{organizations, webhooks};
+        use sea_orm::Condition;
 
         let now = Utc::now().naive_utc();
 
-        // Get all pending deliveries using SeaORM for database agnosticism
-        let all_deliveries = WebhookDeliveries::find()
+        let deliveries = WebhookDeliveries::find()
+            .join(
+                JoinType::InnerJoin,
+                webhook_deliveries::Relation::Webhooks.def(),
+            )
+            .join(JoinType::InnerJoin, webhooks::Relation::Organizations.def())
             .filter(webhook_deliveries::Column::Delivered.eq(false))
             .filter(
                 Condition::any()
                     .add(webhook_deliveries::Column::NextRetryAt.is_null())
                     .add(webhook_deliveries::Column::NextRetryAt.lte(now)),
             )
+            .filter(
+                Expr::col((
+                    webhook_deliveries::Entity,
+                    webhook_deliveries::Column::AttemptCount,
+                ))
+                .lt(Expr::col((
+                    webhook_deliveries::Entity,
+                    webhook_deliveries::Column::MaxAttempts,
+                ))),
+            )
+            .filter(webhooks::Column::IsActive.eq(true))
+            .filter(organizations::Column::Status.eq("active"))
             .order_by_asc(webhook_deliveries::Column::CreatedAt)
+            .limit(limit)
             .all(&db)
             .await?;
 
-        // Filter in application layer to check webhook is_active and attempt_count
-        let mut result = Vec::new();
-        for delivery in all_deliveries {
-            if delivery.attempt_count >= delivery.max_attempts {
-                continue;
-            }
-
-            // Check if webhook is active
-            if let Ok(Some(webhook)) = Webhooks::find_by_id(&delivery.webhook_id).one(&db).await {
-                if webhook.is_active {
-                    result.push(delivery);
-                    if result.len() >= limit as usize {
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(result)
+        Ok(deliveries)
     }
 
     /// Create a new webhook delivery record
@@ -311,6 +477,7 @@ impl WebhookDeliveryStore {
             query = query.filter(webhook_deliveries::Column::Delivered.eq(d));
         }
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 100);
         let deliveries = query
             .select_only()
             .column(webhook_deliveries::Column::Id)
@@ -344,8 +511,8 @@ impl WebhookDeliveryStore {
                 webhook_deliveries::Entity,
                 webhook_deliveries::Column::CreatedAt,
             )))
-            .limit(limit as u64)
-            .offset(offset as u64)
+            .limit(limit)
+            .offset(offset)
             .into_model::<WebhookDeliveryWithWebhook>()
             .all(&db)
             .await?;
@@ -376,5 +543,232 @@ impl WebhookDeliveryStore {
         let total = query.count(&db).await? as i64;
 
         Ok(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{
+        organizations::OrganizationStore,
+        users::{UserCreationOptions, UserStore},
+        webhooks::WebhookStore,
+        DB,
+    };
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database};
+
+    async fn setup_db() -> sea_orm::DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    #[tokio::test]
+    async fn pending_delivery_polling_reauthorizes_active_parent_and_honors_limit() {
+        let db = setup_db().await;
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "webhook-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "webhook-test",
+            "Webhook Test",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        let now = Utc::now().naive_utc();
+
+        WebhookStore::create(
+            DB::Conn(&db),
+            "active-webhook",
+            &org.id,
+            "Active",
+            "https://example.com/active",
+            vec![1, 2, 3],
+            "test-key",
+            r#"["user.created"]"#,
+            true,
+            now,
+            now,
+        )
+        .await
+        .expect("create active webhook");
+        WebhookStore::create(
+            DB::Conn(&db),
+            "inactive-webhook",
+            &org.id,
+            "Inactive",
+            "https://example.com/inactive",
+            vec![1, 2, 3],
+            "test-key",
+            r#"["user.created"]"#,
+            false,
+            now,
+            now,
+        )
+        .await
+        .expect("create inactive webhook");
+
+        let eligible_id = WebhookDeliveryStore::create_delivery(
+            DB::Conn(&db),
+            "active-webhook",
+            "user.created",
+            &serde_json::json!({ "id": "eligible" }),
+            3,
+        )
+        .await
+        .expect("create eligible delivery");
+        let unrelated_id = WebhookDeliveryStore::create_delivery(
+            DB::Conn(&db),
+            "active-webhook",
+            "user.created",
+            &serde_json::json!({ "id": "unrelated" }),
+            3,
+        )
+        .await
+        .expect("create unrelated delivery");
+        WebhookDeliveryStore::create_delivery(
+            DB::Conn(&db),
+            "inactive-webhook",
+            "user.created",
+            &serde_json::json!({ "id": "inactive" }),
+            3,
+        )
+        .await
+        .expect("create inactive delivery");
+
+        let exhausted = webhook_deliveries::ActiveModel {
+            id: Set("exhausted-delivery".to_string()),
+            webhook_id: Set("active-webhook".to_string()),
+            event_type: Set("user.created".to_string()),
+            payload: Set(r#"{"id":"exhausted"}"#.to_string()),
+            response_status_code: Set(None),
+            response_body: Set(None),
+            attempt_count: Set(3),
+            max_attempts: Set(3),
+            next_retry_at: Set(Some(now)),
+            delivered: Set(false),
+            delivery_error: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        exhausted
+            .insert(&db)
+            .await
+            .expect("create exhausted delivery");
+
+        let deliveries = WebhookDeliveryStore::get_pending_deliveries(DB::Conn(&db), 10)
+            .await
+            .expect("poll pending deliveries");
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().any(|delivery| delivery.id == eligible_id));
+        assert!(deliveries
+            .iter()
+            .any(|delivery| delivery.id == unrelated_id));
+
+        let authorized = WebhookDeliveryStore::find_authorized_open_delivery(
+            DB::Conn(&db),
+            &unrelated_id,
+            "active-webhook",
+        )
+        .await
+        .expect("load exact authorized delivery")
+        .expect("unrelated delivery is independently addressable");
+        assert_eq!(authorized.delivery.id, unrelated_id);
+        assert_eq!(authorized.webhook.id, "active-webhook");
+        assert!(WebhookDeliveryStore::find_authorized_open_delivery(
+            DB::Conn(&db),
+            &unrelated_id,
+            "inactive-webhook",
+        )
+        .await
+        .expect("reject mismatched webhook identity")
+        .is_none());
+
+        WebhookDeliveryStore::schedule_retry_for_webhook(
+            DB::Conn(&db),
+            &unrelated_id,
+            "active-webhook",
+            now + chrono::Duration::minutes(1),
+            Some("targeted retry".to_string()),
+            None,
+        )
+        .await
+        .expect("schedule exact target retry");
+        let unrelated = WebhookDeliveries::find_by_id(&unrelated_id)
+            .one(&db)
+            .await
+            .expect("load unrelated")
+            .expect("unrelated exists");
+        let eligible = WebhookDeliveries::find_by_id(&eligible_id)
+            .one(&db)
+            .await
+            .expect("load eligible")
+            .expect("eligible exists");
+        assert_eq!(unrelated.attempt_count, 1);
+        assert_eq!(eligible.attempt_count, 0);
+
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "suspended")
+            .await
+            .expect("suspend org");
+        assert!(
+            WebhookDeliveryStore::get_pending_deliveries(DB::Conn(&db), 10)
+                .await
+                .expect("poll suspended organization")
+                .is_empty()
+        );
+        assert!(WebhookDeliveryStore::find_authorized_open_delivery(
+            DB::Conn(&db),
+            &eligible_id,
+            "active-webhook",
+        )
+        .await
+        .expect("reauthorize after enqueue")
+        .is_none());
+
+        assert!(
+            WebhookDeliveryStore::mark_as_failed_permanently_for_webhook(
+                DB::Conn(&db),
+                &eligible_id,
+                "active-webhook",
+                Some("parent suspended".to_string()),
+                None,
+            )
+            .await
+            .expect("fail exact suspended delivery")
+        );
+        let failed = WebhookDeliveries::find_by_id(&eligible_id)
+            .one(&db)
+            .await
+            .expect("load failed target")
+            .expect("failed target exists");
+        let untouched = WebhookDeliveries::find_by_id(&unrelated_id)
+            .one(&db)
+            .await
+            .expect("load unrelated after target failure")
+            .expect("unrelated remains");
+        assert_eq!(failed.delivery_error.as_deref(), Some("parent suspended"));
+        assert_eq!(untouched.delivery_error.as_deref(), Some("targeted retry"));
+
+        let limited = WebhookDeliveryStore::get_pending_deliveries(DB::Conn(&db), 0)
+            .await
+            .expect("poll with zero limit");
+        assert!(limited.is_empty());
     }
 }

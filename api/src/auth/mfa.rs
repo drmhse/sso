@@ -1,8 +1,4 @@
 use anyhow::Result;
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use qrcode::{render::svg, QrCode};
 use rand::Rng;
 use totp_rs::{Algorithm, Secret, TOTP};
@@ -83,26 +79,6 @@ impl MfaService {
         codes
     }
 
-    /// Hash a backup code using Argon2
-    pub fn hash_backup_code(&self, code: &str) -> Result<String> {
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        let password_hash = argon2
-            .hash_password(code.as_bytes(), &salt)
-            .map_err(|e| anyhow::anyhow!("Failed to hash backup code: {}", e))?
-            .to_string();
-        Ok(password_hash)
-    }
-
-    /// Verify a backup code against its hash
-    pub fn verify_backup_code(&self, code: &str, hash: &str) -> Result<bool> {
-        let parsed_hash = PasswordHash::new(hash)
-            .map_err(|e| anyhow::anyhow!("Failed to parse password hash: {}", e))?;
-        Ok(Argon2::default()
-            .verify_password(code.as_bytes(), &parsed_hash)
-            .is_ok())
-    }
-
     /// Format backup codes for display (groups of 4)
     pub fn format_backup_codes(codes: &[String]) -> Vec<String> {
         codes
@@ -153,16 +129,6 @@ mod tests {
             assert_eq!(code.len(), BACKUP_CODE_LENGTH);
             assert!(code.chars().all(|c| c.is_alphanumeric()));
         }
-    }
-
-    #[test]
-    fn test_hash_and_verify_backup_code() {
-        let service = MfaService::new();
-        let code = "ABCD1234";
-        let hash = service.hash_backup_code(code).unwrap();
-
-        assert!(service.verify_backup_code(code, &hash).unwrap());
-        assert!(!service.verify_backup_code("WRONG123", &hash).unwrap());
     }
 
     #[test]

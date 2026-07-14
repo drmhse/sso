@@ -19,6 +19,7 @@ x-common-env: &common-env
   JWT_PRIVATE_KEY_BASE64: ${JWT_PRIVATE_KEY_BASE64}
   JWT_PUBLIC_KEY_BASE64: ${JWT_PUBLIC_KEY_BASE64}
   JWT_KID: ${JWT_KID}
+  JWT_PREVIOUS_PUBLIC_KEYS_JSON: ${JWT_PREVIOUS_PUBLIC_KEYS_JSON:-}
   JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
 
   # Platform OAuth (Admin Authentication)
@@ -88,6 +89,14 @@ x-common-app: &common-app
   env_file:
     - .env
   restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
   deploy:
     resources:
       limits:
@@ -109,7 +118,7 @@ services:
   # --------------------------------------------------------------------------
   sso:
     <<: *common-app
-    image: editoredit/sso:v0.1.55  # SQLite is the default
+    image: editoredit/sso:sqlite-v0.8.2  # SQLite is the default
     container_name: sso-sqlite
     profiles: ["", "sqlite"]  # Runs by default (empty profile) or with --profile sqlite
     environment:
@@ -134,7 +143,7 @@ services:
   # --------------------------------------------------------------------------
   sso-postgres:
     <<: *common-app
-    image: editoredit/sso:psql-v0.1.55
+    image: editoredit/sso:psql-v0.8.2
     container_name: sso-postgres
     profiles: ["postgres"]
     environment:
@@ -151,7 +160,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: sso-postgres-db
     profiles: ["postgres"]
     environment:
@@ -176,7 +185,7 @@ services:
   # --------------------------------------------------------------------------
   sso-mysql:
     <<: *common-app
-    image: editoredit/sso:mysql-v0.1.55
+    image: editoredit/sso:mysql-v0.8.2
     container_name: sso-mysql
     profiles: ["mysql"]
     environment:
@@ -193,7 +202,7 @@ services:
         condition: service_healthy
 
   mysql:
-    image: mysql:8.0
+    image: mysql:8.4
     container_name: sso-mysql-db
     profiles: ["mysql"]
     environment:

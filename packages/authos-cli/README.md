@@ -5,6 +5,9 @@
 
 CLI for scaffolding AuthOS integration components into React, Next.js, Vue, and Nuxt projects.
 
+This package is pre-1.0 and Beta. Pin an exact version and review the
+[current AuthOS support matrix](https://github.com/drmhse/AuthOS/blob/main/PROJECT_STATUS.md).
+
 Full documentation: [authos.dev/docs/packages/authos-cli/](https://authos.dev/docs/packages/authos-cli/)
 
 AI agent skills: [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-agent-skills/) and [github.com/drmhse/authos_skill](https://github.com/drmhse/authos_skill)

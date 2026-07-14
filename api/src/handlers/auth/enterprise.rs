@@ -102,6 +102,9 @@ impl From<AppError> for OAuthTokenError {
         match error {
             AppError::Unauthorized(message) => OAuthTokenError::invalid_grant(message),
             AppError::Forbidden(message) => OAuthTokenError::invalid_grant(message),
+            AppError::Jwt(_) | AppError::TokenExpired => {
+                OAuthTokenError::invalid_grant("Invalid or expired token")
+            }
             AppError::BadRequest(message) => OAuthTokenError::invalid_request(message),
             AppError::NotFound(message) => OAuthTokenError::invalid_grant(message),
             other => {
@@ -337,7 +340,9 @@ async fn issue_id_jag(
         ));
     }
 
-    let claims = state.jwt_service.validate_token(subject_token)?;
+    let claims = state
+        .jwt_service
+        .validate_token_for_audience(subject_token, resource)?;
     let token_hash = JwtService::hash_token(subject_token);
     let session = SessionStore::find_valid_by_token_hash(DB::Conn(&state.db), &token_hash).await?;
     if session.is_none() {
@@ -746,7 +751,7 @@ mod tests {
         let access_token = bearer_json["access_token"].as_str().unwrap();
         let access_claims = state
             .jwt_service
-            .validate_token(access_token)
+            .validate_token_for_audience(access_token, resource)
             .expect("validate access token");
         assert_eq!(access_claims.sub, user.id);
         assert_eq!(access_claims.aud.as_deref(), Some(resource));

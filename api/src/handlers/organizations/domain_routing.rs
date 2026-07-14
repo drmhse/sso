@@ -65,6 +65,7 @@ fn to_response(model: verified_domains::Model) -> DomainRouteResponse {
 }
 
 async fn require_integration_manager(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    crate::handlers::organizations::ensure_organization_active(&state.db, org_id).await?;
     if PermissionService::check(
         DB::Conn(&state.db),
         org_id,
@@ -112,12 +113,10 @@ async fn ensure_provider_belongs_to_org(
             .await?
             .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
 
-        if provider.org_id != org_id {
-            if !UpstreamProviderStore::allows_domain_bindings(&provider) {
-                return Err(AppError::NotFound(
-                    "Upstream provider not found".to_string(),
-                ));
-            }
+        if provider.org_id != org_id && !UpstreamProviderStore::allows_domain_bindings(&provider) {
+            return Err(AppError::NotFound(
+                "Upstream provider not found".to_string(),
+            ));
         }
     }
 
@@ -244,7 +243,8 @@ pub async fn verify_domain_route(
         ));
     }
 
-    let updated = VerifiedDomainStore::mark_verified(DB::Conn(&state.db), &domain_id).await?;
+    let updated =
+        VerifiedDomainStore::mark_verified_in_org(DB::Conn(&state.db), &org.id, &domain_id).await?;
     Ok(Json(to_response(updated)))
 }
 
@@ -269,7 +269,9 @@ pub async fn delete_domain_route(
         return Err(AppError::NotFound("Domain route not found".to_string()));
     }
 
-    VerifiedDomainStore::delete(DB::Conn(&state.db), &domain_id).await?;
+    if !VerifiedDomainStore::delete_in_org(DB::Conn(&state.db), &org.id, &domain_id).await? {
+        return Err(AppError::NotFound("Domain route not found".to_string()));
+    }
     Ok(Json(()))
 }
 
@@ -390,6 +392,9 @@ mod tests {
         )
         .await
         .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
         let jwt_service = Arc::new(test_jwt_service(&config));
         let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
         let state = AppState {
@@ -416,6 +421,7 @@ mod tests {
         };
         let auth_user = AuthUser {
             claims: Claims {
+                token_use: crate::auth::jwt::TokenUse::ManagementAccess,
                 sub: owner.id.clone(),
                 email: owner.email.clone(),
                 is_platform_owner: false,
@@ -425,6 +431,7 @@ mod tests {
                 mfa_required: None,
                 mfa_verified: None,
                 saml_state: None,
+                device_code_id: None,
                 act: None,
                 aud: Some(format!("org:{}", org.slug)),
                 iss: Some(state.base_url.clone()),
@@ -638,5 +645,138 @@ mod tests {
             private_error,
             AppError::NotFound(ref message) if message.contains("Upstream provider not found")
         ));
+    }
+
+    #[tokio::test]
+    async fn domain_route_mutations_reject_cross_org_id_and_preserve_target() {
+        let (state, auth_user, org_a_slug) = setup_state_and_owner().await;
+        let org_a = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_a_slug)
+            .await
+            .expect("lookup org A")
+            .expect("org A exists");
+        let owner_b = UserStore::find_or_create_with_options(
+            DB::Conn(&state.db),
+            "domain-owner-b@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner B")
+        .0;
+        let (org_b, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&state.db),
+            "domain-org-b",
+            "Domain Org B",
+            &owner_b.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create org B");
+        let target = VerifiedDomainStore::create(
+            DB::Conn(&state.db),
+            &Uuid::new_v4().to_string(),
+            &org_b.id,
+            "protected.example.com",
+            "protected-token",
+            None,
+            Some(DOMAIN_LOGIN_POLICY_PASSWORD_ALLOWED),
+        )
+        .await
+        .expect("create org B domain");
+
+        assert!(matches!(
+            update_domain_route(
+                State(state.clone()),
+                auth_user.clone(),
+                Path((org_a_slug.clone(), target.id.clone())),
+                Json(UpdateDomainRouteRequest {
+                    upstream_provider_id: None,
+                    login_policy: Some(DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY.to_string()),
+                }),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            delete_domain_route(
+                State(state.clone()),
+                auth_user,
+                Path((org_a_slug, target.id.clone())),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            VerifiedDomainStore::mark_verified_in_org(DB::Conn(&state.db), &org_a.id, &target.id,)
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+
+        let preserved = crate::entities::prelude::VerifiedDomains::find_by_id(&target.id)
+            .one(&state.db)
+            .await
+            .expect("load protected domain")
+            .expect("protected domain remains");
+        assert_eq!(preserved.org_id, org_b.id);
+        assert_eq!(preserved.login_policy, DOMAIN_LOGIN_POLICY_PASSWORD_ALLOWED);
+        assert!(!preserved.verified);
+        assert_eq!(preserved.verification_token, "protected-token");
+    }
+
+    #[tokio::test]
+    async fn domain_route_mutations_reject_suspended_parent_and_preserve_state() {
+        let (state, auth_user, org_slug) = setup_state_and_owner().await;
+        let Json(created) = create_domain_route(
+            State(state.clone()),
+            auth_user.clone(),
+            Path(org_slug.clone()),
+            Json(CreateDomainRouteRequest {
+                domain: "suspended.example.com".to_string(),
+                upstream_provider_id: None,
+                login_policy: Some(DOMAIN_LOGIN_POLICY_PASSWORD_ALLOWED.to_string()),
+            }),
+        )
+        .await
+        .expect("create domain before suspension");
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+            .await
+            .expect("lookup org")
+            .expect("org exists");
+        OrganizationStore::update_status(DB::Conn(&state.db), &org.id, "suspended")
+            .await
+            .expect("suspend org");
+
+        assert!(matches!(
+            update_domain_route(
+                State(state.clone()),
+                auth_user.clone(),
+                Path((org_slug.clone(), created.id.clone())),
+                Json(UpdateDomainRouteRequest {
+                    upstream_provider_id: None,
+                    login_policy: Some(DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY.to_string()),
+                }),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            delete_domain_route(
+                State(state.clone()),
+                auth_user,
+                Path((org_slug, created.id.clone())),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        let preserved = crate::entities::prelude::VerifiedDomains::find_by_id(&created.id)
+            .one(&state.db)
+            .await
+            .expect("load domain")
+            .expect("domain remains");
+        assert_eq!(preserved.login_policy, DOMAIN_LOGIN_POLICY_PASSWORD_ALLOWED);
+        assert_eq!(preserved.org_id, org.id);
     }
 }

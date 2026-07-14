@@ -3,19 +3,23 @@
 //! Implements platform impersonation functionality following RFC 8693 (Token Exchange)
 //! Allows platform owners and organization admins to impersonate users for support purposes.
 
+use crate::auth::jwt::JwtService;
 use crate::entities::{platform_audit_log, users as users_entity};
-use crate::error::AppError;
-use crate::middleware::AuthUser;
+use crate::error::{with_retrying_transaction, AppError};
+use crate::middleware::{AuthUser, ImpersonationContext};
 use crate::state::AppState;
-use crate::store::{memberships::MembershipStore, organizations::OrganizationStore, DB};
+use crate::store::{
+    memberships::MembershipStore, organizations::OrganizationStore, sessions::SessionStore, DB,
+};
 use axum::{
     extract::{Extension, Json, State},
     response::Json as AxumJson,
 };
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Request to impersonate a user
@@ -64,9 +68,11 @@ pub struct UserInfo {
 pub async fn impersonate_user(
     State(state): State<AppState>,
     Extension(auth_user): Extension<AuthUser>,
+    impersonation_context: Option<Extension<ImpersonationContext>>,
     Json(request): Json<ImpersonateRequest>,
 ) -> crate::error::Result<AxumJson<ImpersonateResponse>> {
     let db = &state.db;
+    let reason = validate_impersonation_request(&request.reason, impersonation_context.is_some())?;
 
     // Validate the target user exists and get their details
     let target_user = users_entity::Entity::find_by_id(request.user_id.clone())
@@ -86,25 +92,23 @@ pub async fn impersonate_user(
             ));
         }
 
-        // Check if target user is in the same organization and auth user is an org admin
+        // Check if target user is in the same organization and auth user is an org admin.
         let target_memberships =
             MembershipStore::list_by_user(DB::Conn(db), &target_user.id).await?;
+        let admin_org_ids = MembershipStore::list_by_user(DB::Conn(db), &auth_user.user.id)
+            .await?
+            .into_iter()
+            .filter(|membership| membership.role == "owner" || membership.role == "admin")
+            .map(|membership| membership.org_id)
+            .collect::<HashSet<_>>();
 
         let mut authorized_org = None;
 
         for membership in target_memberships {
-            if let Some(caller_membership) = MembershipStore::find_by_org_and_user(
-                DB::Conn(db),
-                &membership.org_id,
-                &auth_user.user.id,
-            )
-            .await?
-            {
-                if caller_membership.role == "owner" || caller_membership.role == "admin" {
-                    authorized_org =
-                        OrganizationStore::find_by_id(DB::Conn(db), &membership.org_id).await?;
-                    break;
-                }
+            if admin_org_ids.contains(&membership.org_id) {
+                authorized_org =
+                    OrganizationStore::find_by_id(DB::Conn(db), &membership.org_id).await?;
+                break;
             }
         }
 
@@ -138,44 +142,78 @@ pub async fn impersonate_user(
     };
 
     // Create impersonation token with actual context
-    let jwt_service = &state.jwt_service;
+    let jwt_service = state.jwt_service.clone();
     let impersonation_token = jwt_service.create_impersonation_token(
         &target_user.id,
         &target_user.email,
         &auth_user.user.id,
         &auth_user.user.email,
-        Some(&request.reason),
+        Some(reason),
         org_slug.as_deref(),     // Actual org context
         service_slug.as_deref(), // Service context (if available)
         target_user.is_platform_owner,
     )?;
+    let token = impersonation_token.clone();
+    let target_user_id = target_user.id.clone();
+    let actor_user_id = auth_user.user.id.clone();
+    let org_slug_for_session = org_slug.clone();
+    let user_agent = auth_user.user_agent.clone();
+    let ip_address = auth_user.ip_address.clone();
+    let reason_for_audit = reason.to_string();
+    let audit_actor = state.audit_actor.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_impersonation_session",
+        |transaction| {
+            let token = token.clone();
+            let target_user_id = target_user_id.clone();
+            let actor_user_id = actor_user_id.clone();
+            let org_slug = org_slug_for_session.clone();
+            let user_agent = user_agent.clone();
+            let ip_address = ip_address.clone();
+            let reason = reason_for_audit.clone();
+            let audit_actor = audit_actor.clone();
+            let jwt_service = jwt_service.clone();
+            Box::pin(async move {
+                persist_impersonation_session(
+                    transaction.clone(),
+                    &jwt_service,
+                    &token,
+                    &target_user_id,
+                    org_slug.as_deref(),
+                    &user_agent,
+                    &ip_address,
+                )
+                .await?;
 
-    // Create HIGH SEVERITY audit log entry
-    let metadata = json!({
-        "target_user_email": target_user.email,
-        "reason": request.reason,
-        "actor_email": auth_user.user.email,
-        "severity": "HIGH"
-    });
-
-    let audit_log = platform_audit_log::ActiveModel {
-        id: Set(Uuid::new_v4().to_string()),
-        platform_owner_id: Set(auth_user.user.id.clone()),
-        action: Set("user.impersonate".to_string()),
-        target_type: Set("user".to_string()),
-        target_id: Set(target_user.id.clone()),
-        metadata: Set(Some(metadata.to_string())),
-        created_at: Set(Utc::now().naive_utc()),
-    };
-
-    audit_log.insert(db).await?;
+                let metadata = json!({
+                    "reason": reason,
+                    "severity": "HIGH"
+                });
+                let audit_log = platform_audit_log::ActiveModel {
+                    id: Set(Uuid::new_v4().to_string()),
+                    platform_owner_id: Set(actor_user_id),
+                    action: Set("user.impersonate".to_string()),
+                    target_type: Set("user".to_string()),
+                    target_id: Set(target_user_id),
+                    metadata: Set(Some(metadata.to_string())),
+                    created_at: Set(Utc::now().naive_utc()),
+                };
+                audit_actor
+                    .log_platform_with_db(transaction, audit_log)
+                    .await?;
+                Ok(())
+            })
+        },
+    )
+    .await?;
 
     tracing::warn!(
         admin_user_id = %auth_user.user.id,
-        admin_user_email = %auth_user.user.email,
         target_user_id = %target_user.id,
-        target_user_email = %target_user.email,
-        reason = %request.reason,
+        reason_recorded = !request.reason.is_empty(),
         "User impersonation initiated"
     );
 
@@ -215,4 +253,154 @@ pub async fn impersonate_user(
         target_user: target_user_info,
         actor_user: actor_user_info,
     }))
+}
+
+fn validate_impersonation_request(reason: &str, nested: bool) -> crate::error::Result<&str> {
+    // A support session must never mint a fresh impersonation token. Without
+    // this boundary an impersonated platform owner could detach the original
+    // actor context and extend the 15-minute lifetime.
+    if nested {
+        return Err(AppError::Forbidden(
+            "Nested impersonation is not allowed".to_string(),
+        ));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() || reason.chars().count() > 500 {
+        return Err(AppError::BadRequest(
+            "Impersonation reason must be between 1 and 500 characters".to_string(),
+        ));
+    }
+    Ok(reason)
+}
+
+async fn persist_impersonation_session(
+    db: DB<'_>,
+    jwt_service: &JwtService,
+    token: &str,
+    target_user_id: &str,
+    org_slug: Option<&str>,
+    user_agent: &str,
+    ip_address: &str,
+) -> crate::error::Result<crate::entities::sessions::Model> {
+    let claims = jwt_service.validate_impersonation_token(token)?;
+    let expires_at = chrono::DateTime::from_timestamp(claims.exp, 0)
+        .ok_or_else(|| AppError::InternalServerError("Invalid impersonation expiry".to_string()))?
+        .naive_utc();
+
+    // Impersonation is session-backed so logout, explicit session revocation,
+    // target-user security actions, and expiry invalidate it immediately.
+    SessionStore::create(
+        db,
+        target_user_id,
+        &JwtService::hash_token(token),
+        expires_at,
+        None,
+        None,
+        org_slug,
+        None,
+        None,
+        Some(user_agent),
+        Some(ip_address),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    fn jwt_service() -> JwtService {
+        let rsa = openssl::rsa::Rsa::generate(2048).expect("generate RSA key");
+        JwtService::new(
+            &STANDARD.encode(rsa.private_key_to_pem().expect("private PEM")),
+            &STANDARD.encode(rsa.public_key_to_pem().expect("public PEM")),
+            24,
+            "impersonation-test-key",
+            "https://auth.example.com",
+        )
+        .expect("create JWT service")
+    }
+
+    #[test]
+    fn impersonation_request_rejects_nesting_and_requires_a_bounded_reason() {
+        assert!(matches!(
+            validate_impersonation_request("support", true),
+            Err(AppError::Forbidden(message)) if message.contains("Nested")
+        ));
+        assert!(matches!(
+            validate_impersonation_request("   ", false),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_impersonation_request(&"x".repeat(501), false),
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(
+            validate_impersonation_request("  support case  ", false).unwrap(),
+            "support case"
+        );
+    }
+
+    #[tokio::test]
+    async fn impersonation_token_is_session_backed_and_revocable() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let target = crate::store::users::UserStore::create(
+            DB::Conn(&db),
+            "impersonated@example.com",
+            None,
+            false,
+        )
+        .await
+        .expect("create target");
+        let jwt = jwt_service();
+        let token = jwt
+            .create_impersonation_token(
+                &target.id,
+                &target.email,
+                "actor-id",
+                "actor@example.com",
+                Some("support case"),
+                Some("acme"),
+                None,
+                false,
+            )
+            .expect("create impersonation token");
+
+        let session = persist_impersonation_session(
+            DB::Conn(&db),
+            &jwt,
+            &token,
+            &target.id,
+            Some("acme"),
+            "test-agent",
+            "127.0.0.1",
+        )
+        .await
+        .expect("persist impersonation session");
+        assert_eq!(session.user_id, target.id);
+        assert!(session.refresh_token_hash.is_none());
+        let token_hash = JwtService::hash_token(&token);
+        assert!(
+            SessionStore::find_valid_by_token_hash(DB::Conn(&db), &token_hash)
+                .await
+                .expect("find session")
+                .is_some()
+        );
+
+        SessionStore::delete_by_token_hash(DB::Conn(&db), &token_hash)
+            .await
+            .expect("revoke impersonation session");
+        assert!(
+            SessionStore::find_valid_by_token_hash(DB::Conn(&db), &token_hash)
+                .await
+                .expect("find revoked session")
+                .is_none()
+        );
+    }
 }

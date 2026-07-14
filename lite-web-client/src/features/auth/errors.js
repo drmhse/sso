@@ -24,7 +24,7 @@ export function formatResponseErrorPayload(payload, fallback) {
 
     try {
       return formatResponseErrorPayload(JSON.parse(trimmed), fallback);
-    } catch (error) {
+    } catch {
       return trimmed;
     }
   }

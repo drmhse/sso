@@ -108,3 +108,52 @@ impl MagicLinksStore {
         Ok(tokens)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn concurrent_consumption_has_exactly_one_winner() {
+        let path = std::env::temp_dir().join(format!("authos-magic-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let token = MagicLinksStore::create(DB::Conn(&db), "user@example.test", None, "{}")
+            .await
+            .expect("create magic link");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let db = db.clone();
+            let token = token.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                MagicLinksStore::delete(DB::Conn(&db), &token)
+                    .await
+                    .expect("consume token")
+            }));
+        }
+        barrier.wait().await;
+
+        let mut wins = 0;
+        for task in tasks {
+            wins += usize::from(task.await.expect("join consumer"));
+        }
+        assert_eq!(wins, 1);
+        assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &token)
+            .await
+            .expect("reload token")
+            .is_none());
+
+        db.close().await.expect("close sqlite");
+        let _ = std::fs::remove_file(path);
+    }
+}

@@ -8,10 +8,12 @@ mod encryption;
 mod entities;
 mod error;
 mod handlers;
+mod http_security;
 mod jobs;
 mod lite_web;
 mod middleware;
 mod router;
+mod runtime_metadata;
 mod services;
 mod state;
 mod store;
@@ -32,17 +34,14 @@ use crate::jobs::oauth_state_cleanup::OAuthStateCleanupJob;
 use crate::jobs::saml_state_cleanup::SamlStateCleanupJob;
 use crate::jobs::token_refresh::TokenRefreshJob;
 use crate::state::AppState;
-use axum::extract::State;
-use axum::http::{header, HeaderValue};
-use axum::Json;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{extract::State, Json};
 use axum::{
     routing::{get, post},
     Router,
 };
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use openssl::pkey::PKey;
 use sea_orm::DatabaseConnection;
 use serde::Serialize;
@@ -67,15 +66,15 @@ async fn ensure_platform_owner(db: &DatabaseConnection, email: &str) -> anyhow::
             // User exists, ensure they are a platform owner
             if !user.is_platform_owner {
                 UserStore::set_platform_owner(db_conn, &user.id, true).await?;
-                tracing::info!("Platform owner status granted to existing user: {}", email);
+                tracing::info!(user_id = %user.id, "Platform owner status granted to existing user");
             } else {
-                tracing::info!("User is already a platform owner: {}", email);
+                tracing::info!(user_id = %user.id, "User is already a platform owner");
             }
         }
         Ok(None) => {
             // User doesn't exist, create them as a platform owner
-            UserStore::create(db_conn, email, None, true).await?;
-            tracing::info!("Platform owner created: {}", email);
+            let user = UserStore::create(db_conn, email, None, true).await?;
+            tracing::info!(user_id = %user.id, "Platform owner created");
         }
         Err(e) => {
             tracing::error!("Failed to ensure platform owner: {}", e);
@@ -102,112 +101,57 @@ struct JwksResponse {
     keys: Vec<Jwk>,
 }
 
-#[derive(Serialize)]
-struct OidcDiscoveryResponse {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    enterprise_token_endpoint: String,
-    device_authorization_endpoint: String,
-    revocation_endpoint: String,
-    jwks_uri: String,
-    response_types_supported: Vec<String>,
-    grant_types_supported: Vec<String>,
-    authorization_grant_profiles_supported: Vec<String>,
-    identity_chaining_requested_token_types_supported: Vec<String>,
-    subject_types_supported: Vec<String>,
-    id_token_signing_alg_values_supported: Vec<String>,
-    scopes_supported: Vec<String>,
-    token_endpoint_auth_methods_supported: Vec<String>,
-    claims_supported: Vec<String>,
-}
-
 /// Prometheus metrics endpoint
 async fn metrics_handler(
+    headers: HeaderMap,
     prometheus_handle: axum::extract::Extension<Arc<metrics_exporter_prometheus::PrometheusHandle>>,
-) -> String {
-    prometheus_handle.render()
+    metrics_access: axum::extract::Extension<crate::http_security::MetricsAccess>,
+) -> Response {
+    match metrics_access.authorize(headers.get(header::AUTHORIZATION)) {
+        crate::http_security::MetricsAuthorization::Authorized => (
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            prometheus_handle.render(),
+        )
+            .into_response(),
+        crate::http_security::MetricsAuthorization::Unauthorized => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response(),
+        crate::http_security::MetricsAuthorization::Disabled => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
-async fn oidc_discovery_handler(
+fn build_jwks(jwt_service: &JwtService) -> Result<JwksResponse, axum::http::StatusCode> {
+    let keys = jwt_service
+        .verification_public_keys()
+        .into_iter()
+        .map(|(kid, public_key_pem)| {
+            let rsa_key = PKey::public_key_from_pem(public_key_pem)
+                .and_then(|key| key.rsa())
+                .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(Jwk {
+                kty: "RSA".to_string(),
+                alg: "RS256".to_string(),
+                key_use: "sig".to_string(),
+                kid: kid.to_string(),
+                n: URL_SAFE_NO_PAD.encode(rsa_key.n().to_vec()),
+                e: URL_SAFE_NO_PAD.encode(rsa_key.e().to_vec()),
+            })
+        })
+        .collect::<Result<Vec<_>, axum::http::StatusCode>>()?;
+    Ok(JwksResponse { keys })
+}
+
+async fn jwks_handler(
     State(state): State<AppState>,
-) -> Result<Json<OidcDiscoveryResponse>, axum::http::StatusCode> {
-    let base_url = &state.base_url;
-    let discovery = OidcDiscoveryResponse {
-        issuer: base_url.clone(),
-        authorization_endpoint: format!("{}/auth/{{provider}}", base_url),
-        token_endpoint: format!("{}/auth/token", base_url),
-        enterprise_token_endpoint: format!("{}/oauth/token", base_url),
-        device_authorization_endpoint: format!("{}/auth/device/code", base_url),
-        revocation_endpoint: format!("{}/auth/revoke", base_url),
-        jwks_uri: format!("{}/.well-known/jwks.json", base_url),
-        response_types_supported: vec!["code".to_string()],
-        grant_types_supported: vec![
-            "authorization_code".to_string(),
-            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
-            "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
-            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
-        ],
-        authorization_grant_profiles_supported: vec![
-            "urn:ietf:params:oauth:grant-profile:id-jag".to_string()
-        ],
-        identity_chaining_requested_token_types_supported: vec![
-            "urn:ietf:params:oauth:token-type:id-jag".to_string(),
-        ],
-        subject_types_supported: vec!["public".to_string()],
-        id_token_signing_alg_values_supported: vec!["RS256".to_string()],
-        scopes_supported: vec![
-            "openid".to_string(),
-            "profile".to_string(),
-            "email".to_string(),
-        ],
-        token_endpoint_auth_methods_supported: vec![
-            "client_secret_post".to_string(),
-            "client_secret_basic".to_string(),
-        ],
-        claims_supported: vec![
-            "sub".to_string(),
-            "iss".to_string(),
-            "aud".to_string(),
-            "exp".to_string(),
-            "iat".to_string(),
-            "email".to_string(),
-            "name".to_string(),
-        ],
-    };
-
-    Ok(Json(discovery))
-}
-
-async fn jwks_handler() -> Result<Json<JwksResponse>, axum::http::StatusCode> {
-    let public_key_base64 = env::var("JWT_PUBLIC_KEY_BASE64")
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let key_id = env::var("JWT_KID").map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let public_key_pem = STANDARD
-        .decode(&public_key_base64)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let pem_str = String::from_utf8(public_key_pem)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let rsa_key = PKey::public_key_from_pem(pem_str.as_bytes())
-        .and_then(|key| key.rsa())
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let n = URL_SAFE_NO_PAD.encode(rsa_key.n().to_vec());
-    let e = URL_SAFE_NO_PAD.encode(rsa_key.e().to_vec());
-
-    let jwk = Jwk {
-        kty: "RSA".to_string(),
-        alg: "RS256".to_string(),
-        key_use: "sig".to_string(),
-        kid: key_id,
-        n,
-        e,
-    };
-
-    Ok(Json(JwksResponse { keys: vec![jwk] }))
+) -> Result<Json<JwksResponse>, axum::http::StatusCode> {
+    build_jwks(&state.jwt_service).map(Json)
 }
 
 fn webauthn_rp_id(base_url: &str) -> Option<String> {
@@ -243,13 +187,86 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Offline secret verification/rewrap command. It intentionally runs
+    // before JWT material is loaded so this maintenance task cannot be blocked
+    // by unrelated signing-key configuration.
+    if std::env::args().nth(1).as_deref() == Some("rewrap-secrets") {
+        let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+        let options = match crate::services::secret_rewrap::RewrapOptions::parse(&arguments) {
+            Ok(options) => options,
+            Err(crate::services::secret_rewrap::RewrapError::HelpRequested) => {
+                println!(
+                    "rewrap-secrets [--dry-run|--apply] [--batch-size 1-1000] [--max-batches N]"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let config = Config::from_env().map_err(anyhow::Error::msg)?;
+        let encryption = EncryptionService::new()?;
+        let database = crate::db::connect_db(&config).await?;
+        let report = crate::services::secret_rewrap::run(&database, &encryption, &options).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.complete {
+            anyhow::bail!("secret rewrap stopped at the configured batch limit; rerun to continue");
+        }
+        return Ok(());
+    }
+
     // Load configuration
     let config = Config::from_env().expect("Failed to load configuration");
+    let http_security_config = crate::http_security::HttpSecurityConfig::from_env()
+        .expect("Failed to load HTTP security configuration");
+
+    // Validate secret encryption before touching the database. Normal server
+    // operation fails closed when the key is missing or malformed.
+    let encryption = EncryptionService::for_server_startup()?;
+    if encryption.is_some() {
+        tracing::info!("Encryption service initialized");
+    } else {
+        tracing::warn!(
+            "UNENCRYPTED DEVELOPMENT MODE ENABLED via {} - selected secrets may be stored in plaintext; do not use this mode with persistent or production data",
+            crate::encryption::ALLOW_UNENCRYPTED_DEVELOPMENT_ENV
+        );
+    }
+
+    // Validate signing and device-trust key material before database
+    // initialization. A bad secret must not run migrations or otherwise mutate
+    // persistent state before startup fails.
+    let private_key =
+        env::var("JWT_PRIVATE_KEY_BASE64").expect("JWT_PRIVATE_KEY_BASE64 must be set");
+    let public_key = env::var("JWT_PUBLIC_KEY_BASE64").expect("JWT_PUBLIC_KEY_BASE64 must be set");
+    let key_id = env::var("JWT_KID").expect("JWT_KID must be set");
+    let previous_public_keys = JwtService::parse_previous_public_keys_json(
+        env::var(crate::auth::jwt::PREVIOUS_PUBLIC_KEYS_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .expect("Failed to parse previous JWT public-key ring");
+    let jwt_service = Arc::new(
+        JwtService::new_with_previous_keys(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            &key_id,
+            &config.base_url,
+            &previous_public_keys,
+        )
+        .expect("Failed to initialize JWT service"),
+    );
+    let risk_engine = Arc::new(
+        crate::services::risk_engine::RiskEngine::new().expect("Failed to initialize RiskEngine"),
+    );
 
     // Initialize database using SeaORM
+    let database_backend = config
+        .database_url
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .unwrap_or("unknown");
     tracing::info!(
-        "Connecting to database: {} (pool: {}-{} connections)",
-        config.database_url,
+        "Connecting to {} database (pool: {}-{} connections)",
+        database_backend,
         config.db_min_connections,
         config.db_max_connections
     );
@@ -257,6 +274,15 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("Failed to initialize database");
     tracing::info!("Database initialized and migrated successfully");
+
+    // A serving process may run schema migrations, but it must never perform
+    // data-secret migration concurrently with API or worker traffic. Verify
+    // the complete inventory read-only before bootstrap, writer-pool creation,
+    // external connections, background tasks, or router startup.
+    if let Some(encryption) = encryption.as_ref() {
+        crate::services::secret_rewrap::verify_runtime_ready(&db, encryption).await?;
+        tracing::info!("Secret inventory authenticated and runtime-ready");
+    }
 
     // SQLite-only: Initialize writer connection pool (single connection)
     #[cfg(feature = "db_sqlite")]
@@ -275,14 +301,6 @@ async fn main() -> anyhow::Result<()> {
         UserStore::bootstrap_platform_owner(DbEnum::Conn(&db), email, password).await?;
     } else if let Some(email) = config.platform_owner_email.as_ref() {
         ensure_platform_owner(&db, email).await?;
-    }
-
-    // Initialize encryption service (optional)
-    let encryption = EncryptionService::new().ok();
-    if encryption.is_some() {
-        tracing::info!("Encryption service initialized");
-    } else {
-        tracing::warn!("Encryption service not available - tokens will be stored in plaintext");
     }
 
     // Initialize email service (optional)
@@ -362,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
         let processor_db_writer = db_writer.clone();
 
         let processor_email = email_service.clone().map(Arc::new);
+        let processor_encryption = encryption.clone();
         let batch_size = config.job_processor_batch_size;
         tokio::spawn(async move {
             let processor = JobProcessor::new(
@@ -369,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(feature = "db_sqlite")]
                 processor_db_writer,
                 processor_email,
+                processor_encryption,
                 batch_size,
             );
             processor.start().await;
@@ -398,21 +418,6 @@ async fn main() -> anyhow::Result<()> {
     let oauth_client =
         Arc::new(OAuthClient::new(&config).expect("Failed to initialize OAuth client"));
 
-    let private_key =
-        env::var("JWT_PRIVATE_KEY_BASE64").expect("JWT_PRIVATE_KEY_BASE64 must be set");
-    let public_key = env::var("JWT_PUBLIC_KEY_BASE64").expect("JWT_PUBLIC_KEY_BASE64 must be set");
-    let key_id = env::var("JWT_KID").expect("JWT_KID must be set");
-
-    let jwt_service = Arc::new(
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            &key_id,
-            &config.base_url,
-        )
-        .expect("Failed to initialize JWT service"),
-    );
     // Initialize billing provider based on BILLING_PROVIDER env var
     let billing_provider_name =
         std::env::var("BILLING_PROVIDER").unwrap_or_else(|_| "none".to_string());
@@ -468,11 +473,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize centralized event dispatcher
     let event_dispatcher = Arc::new(crate::services::events::EventDispatcher::new(db.clone()));
-
-    // Initialize risk engine for adaptive authentication
-    let risk_engine = Arc::new(
-        crate::services::risk_engine::RiskEngine::new().expect("Failed to initialize RiskEngine"),
-    );
 
     // Check GeoIP database status and warn operator if unavailable
     if std::env::var("GEOIP_DISABLED").unwrap_or_default() != "true" {
@@ -543,7 +543,7 @@ async fn main() -> anyhow::Result<()> {
         .max_capacity(10_000)
         .build();
 
-    // Initialize buffered audit actor
+    // Initialize the durable audit-outbox reconciler.
     // Uses db_writer for SQLite to avoid contention with main db pool
     #[cfg(feature = "db_sqlite")]
     let audit_actor = crate::services::audit_actor::AuditHandle::new(db_writer.clone());
@@ -594,11 +594,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Combine all routes
     let app = Router::new()
-        // OIDC Discovery and JWKS endpoints (require state)
-        .route(
-            "/.well-known/openid-configuration",
-            get(oidc_discovery_handler),
-        )
+        // AuthOS runtime capability metadata and the JWT verification key.
+        // Standards discovery returns 404 until AuthOS implements the
+        // corresponding authorization-server/OIDC provider profiles.
+        .merge(runtime_metadata::routes(&config.base_url))
         .route("/.well-known/jwks.json", get(jwks_handler))
         .merge(public_routes)
         .merge(protected_routes)
@@ -620,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
         // Prometheus metrics endpoint
         .route("/metrics", get(metrics_handler))
         .layer(axum::Extension(Arc::new(prometheus_handle)))
+        .layer(axum::Extension(http_security_config.metrics_access.clone()))
         // Request info extraction (IP and User-Agent) - must be before auth
         .layer(axum::middleware::from_fn(
             crate::middleware::extract_request_info_middleware,
@@ -653,6 +653,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
             30,
         )))
+        // Bound streamed and buffered bodies before handlers allocate unbounded input.
+        .layer(http_security_config.request_body_limit_layer())
         // HTTP request duration metrics - outermost layer to capture full request lifecycle
         // This measures time including CORS handling, auth, and all other middleware
         .layer(axum::middleware::from_fn(
@@ -724,7 +726,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Graceful shutdown signal handler
-/// Waits for SIGTERM or SIGINT, then flushes audit actor before returning
+/// Waits for SIGTERM or SIGINT, then reconciles eligible durable audit rows.
 async fn shutdown_signal(audit_actor: crate::services::audit_actor::AuditHandle) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -752,6 +754,56 @@ async fn shutdown_signal(audit_actor: crate::services::audit_actor::AuditHandle)
         }
     }
 
-    // CRITICAL: Flush all pending audit logs before exiting
+    // Durable rows remain replayable after shutdown; attempt eligible delivery
+    // and report whether retry/backoff rows remain.
     audit_actor.shutdown().await;
+}
+
+#[cfg(test)]
+mod jwks_tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use std::collections::BTreeMap;
+
+    fn key_pair() -> (String, String) {
+        let rsa = openssl::rsa::Rsa::generate(2048).expect("generate RSA key");
+        (
+            STANDARD.encode(rsa.private_key_to_pem().expect("private PEM")),
+            STANDARD.encode(rsa.public_key_to_pem().expect("public PEM")),
+        )
+    }
+
+    #[test]
+    fn jwks_publishes_active_and_previous_verification_keys() {
+        let (_, old_public) = key_pair();
+        let (active_private, active_public) = key_pair();
+        let previous = BTreeMap::from([("old-key".to_string(), old_public)]);
+        let jwt = JwtService::new_with_previous_keys(
+            &active_private,
+            &active_public,
+            24,
+            "active-key",
+            "https://auth.example.com",
+            &previous,
+        )
+        .expect("JWT service with overlap");
+
+        let jwks = build_jwks(&jwt).expect("build JWKS");
+        assert_eq!(
+            jwks.keys
+                .iter()
+                .map(|key| key.kid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active-key", "old-key"]
+        );
+        assert!(jwks
+            .keys
+            .iter()
+            .all(|key| key.kty == "RSA" && key.alg == "RS256" && key.key_use == "sig"));
+        assert_ne!(jwks.keys[0].n, jwks.keys[1].n);
+        assert!(jwks
+            .keys
+            .iter()
+            .all(|key| !key.n.is_empty() && !key.e.is_empty()));
+    }
 }

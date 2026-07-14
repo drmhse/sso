@@ -121,19 +121,17 @@ pub async fn get_organization_status_breakdown(
         ));
     }
 
-    // Use store methods to count by status
-    let pending = OrganizationStore::count_by_status(DB::Conn(&state.db), "pending").await? as i64;
-    let active = OrganizationStore::count_by_status(DB::Conn(&state.db), "active").await? as i64;
-    let suspended =
-        OrganizationStore::count_by_status(DB::Conn(&state.db), "suspended").await? as i64;
-    let rejected =
-        OrganizationStore::count_by_status(DB::Conn(&state.db), "rejected").await? as i64;
+    let status_counts = OrganizationStore::count_by_statuses(
+        DB::Conn(&state.db),
+        &["pending", "active", "suspended", "rejected"],
+    )
+    .await?;
 
     Ok(Json(OrganizationStatusBreakdown {
-        pending,
-        active,
-        suspended,
-        rejected,
+        pending: *status_counts.get("pending").unwrap_or(&0),
+        active: *status_counts.get("active").unwrap_or(&0),
+        suspended: *status_counts.get("suspended").unwrap_or(&0),
+        rejected: *status_counts.get("rejected").unwrap_or(&0),
     }))
 }
 

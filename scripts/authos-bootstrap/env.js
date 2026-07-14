@@ -10,6 +10,7 @@ function buildContainerEnv(config, material) {
     JWT_PRIVATE_KEY_BASE64: material.jwt.privateKeyBase64,
     JWT_PUBLIC_KEY_BASE64: material.jwt.publicKeyBase64,
     JWT_KID: material.jwt.kid,
+    JWT_PREVIOUS_PUBLIC_KEYS_JSON: JSON.stringify(material.jwt.previousPublicKeys || {}),
     JWT_EXPIRATION_HOURS: '24',
     PLATFORM_GITHUB_CLIENT_ID: config.oauth.github.clientId,
     PLATFORM_GITHUB_CLIENT_SECRET: config.oauth.github.clientSecret,
@@ -44,7 +45,7 @@ function buildContainerEnv(config, material) {
     SMTP_FROM_EMAIL: smtp?.fromEmail,
     SMTP_FROM_NAME: smtp?.fromName,
     SERVER_HOST: '0.0.0.0',
-    SERVER_PORT: '80',
+    SERVER_PORT: '3000',
     BASE_URL: config.deployment.baseUrl,
     PLATFORM_BASE_URL: config.deployment.platformBaseUrl,
     FULL_WEB_CLIENT_BASE_URL: config.deployment.fullWebClientBaseUrl,
@@ -53,6 +54,10 @@ function buildContainerEnv(config, material) {
     PLATFORM_OWNER_EMAIL: config.platformOwner.email,
     PLATFORM_OWNER_PASSWORD: material.platformOwnerPassword,
     ENCRYPTION_KEY: material.encryptionKey,
+    ENCRYPTION_KEY_ID: material.encryptionKeyId,
+    ENCRYPTION_PREVIOUS_KEYS: Object.entries(material.encryptionPreviousKeys || {})
+      .map(([keyId, key]) => `${keyId}=${key}`)
+      .join(','),
     DISABLE_RATE_LIMITING: String(config.deployment.disableRateLimiting),
     FAST_HASHING: 'true',
     GEOIP_DISABLED: String(config.deployment.geoipDisabled),

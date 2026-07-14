@@ -18,7 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Serialize)]
 pub struct OrganizationMember {
@@ -76,6 +76,69 @@ pub struct MemberServiceAccessGrant {
     pub access: Option<String>,
 }
 
+async fn transfer_ownership_with_db(
+    db: DB<'_>,
+    audit_actor: &crate::services::audit_actor::AuditHandle,
+    org_id: &str,
+    previous_owner_id: &str,
+    previous_owner_email: &str,
+    new_owner_email: &str,
+) -> Result<(users::Model, memberships::Model)> {
+    let organization = OrganizationStore::find_by_id(db.clone(), org_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let previous_owner_membership =
+        MembershipStore::find_by_org_and_user(db.clone(), org_id, previous_owner_id)
+            .await?
+            .filter(|membership| membership.role == "owner")
+            .ok_or_else(|| AppError::Forbidden("Organization owner access required".to_string()))?;
+    if organization.owner_user_id != previous_owner_id {
+        return Err(AppError::Forbidden(
+            "Organization owner access required".to_string(),
+        ));
+    }
+
+    let (target_membership, new_owner) =
+        MembershipStore::find_unique_member_with_user_by_org_and_email(
+            db.clone(),
+            org_id,
+            new_owner_email,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("User is not a member of this organization".to_string())
+        })?;
+    if new_owner.id == previous_owner_id {
+        return Err(AppError::BadRequest(
+            "New owner must be a different organization member".to_string(),
+        ));
+    }
+
+    OrganizationStore::transfer_ownership_if_current(
+        db.clone(),
+        org_id,
+        previous_owner_id,
+        &new_owner.id,
+    )
+    .await?;
+    let updated_membership =
+        MembershipStore::update_role(db.clone(), &target_membership.id, "owner").await?;
+    MembershipStore::update_role(db.clone(), &previous_owner_membership.id, "admin").await?;
+
+    let event = OrgAuditBuilder::new(org_id, Some(previous_owner_id), "org.ownership_transferred")
+        .target("organization", org_id)
+        .success(true)
+        .details_json(Some(json!({
+            "previous_owner_email": previous_owner_email,
+            "new_owner_email": new_owner.email,
+            "ownership_transferred": true
+        })))
+        .build();
+    audit_actor.log_org_with_db(db, event).await?;
+
+    Ok((new_owner, updated_membership))
+}
+
 async fn validate_org_role(db: DB<'_>, org_id: &str, role: &str) -> Result<()> {
     if role == "owner" || VALID_ORG_ROLES.contains(&role) {
         return Ok(());
@@ -118,9 +181,8 @@ pub async fn list_members(
     // Check if user is member
     crate::middleware::check_org_membership(&state.db, &user.id, &organization.id, &[]).await?;
 
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).clamp(1, 100);
-    let offset = (page - 1) * limit;
+    let (_page, limit, offset) =
+        crate::utils::pagination::signed_page(query.page, query.limit, 50, 100);
 
     // Get members with user details using store layer
     let members = MembershipStore::list_with_users(
@@ -228,137 +290,130 @@ pub async fn update_member_role(
         crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
     }
 
-    // Update role
-    MembershipStore::update_role(DB::Conn(&state.db), &membership.id, &req.role).await?;
-
-    // Sync permissions: revoke old role permission and grant new role permission
-    use crate::entities::permissions::SUBJECT_TYPE_USER;
-    use crate::store::permissions::PermissionsStore;
-
-    // Revoke old role permission
-    PermissionsStore::revoke(
-        DB::Conn(&state.db),
-        "organization",
-        &organization.id,
-        &membership.role,
-        SUBJECT_TYPE_USER,
-        &user_id,
-        None,
-    )
-    .await?;
-
-    let services = ServiceStore::list_by_org(DB::Conn(&state.db), &organization.id).await?;
-    for service in services {
-        for relation in ["viewer", "manager"] {
-            PermissionsStore::revoke(
-                DB::Conn(&state.db),
-                "service",
-                &service.id,
-                relation,
-                SUBJECT_TYPE_USER,
-                &user_id,
-                None,
-            )
-            .await?;
-        }
-    }
-
-    // Grant new role permission
-    use crate::entities::permissions::RelationTuple;
-    PermissionsStore::grant(
-        DB::Conn(&state.db),
-        RelationTuple::user(
-            "organization".to_string(),
-            organization.id.clone(),
-            req.role.clone(),
-            user_id.clone(),
-        ),
-    )
-    .await?;
-
-    // CRITICAL: Invalidate permission cache after role change
-    state.permission_cache.invalidate(&user_id).await;
-
-    // Fetch target user for audit logging
+    // Fetch immutable audit context before the transaction. No success event is
+    // written until every role/permission/ownership mutation has succeeded.
     let target_user = UserStore::find_by_id(DB::Conn(&state.db), &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let org_id = organization.id.clone();
+    let membership_id = membership.id.clone();
+    let old_role = membership.role.clone();
+    let new_role = req.role.clone();
+    let actor_id = user.id.clone();
+    let actor_email = user.email.clone();
+    let target_email = target_user.email.clone();
+    let target_user_id = user_id.clone();
+    let audit_actor = state.audit_actor.clone();
 
-    // Non-blocking audit via actor
-    let old_role = &membership.role;
-    let event = OrgAuditBuilder::new(&organization.id, Some(&user.id), "member.role_changed")
-        .target("user", &user_id)
-        .success(true)
-        .details_json(Some(json!({
-            "old_role": old_role,
-            "new_role": req.role,
-            "target_user_email": target_user.email
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
+    let updated_membership = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "update_member_role",
+        |db| {
+            let org_id = org_id.clone();
+            let membership_id = membership_id.clone();
+            let old_role = old_role.clone();
+            let new_role = new_role.clone();
+            let actor_id = actor_id.clone();
+            let actor_email = actor_email.clone();
+            let target_email = target_email.clone();
+            let target_user_id = target_user_id.clone();
+            let audit_actor = audit_actor.clone();
+            Box::pin(async move {
+                use crate::entities::permissions::{RelationTuple, SUBJECT_TYPE_USER};
 
-    // If setting new owner, update organization and previous owner
-    if req.role == "owner" {
-        let current_user_id = user.id.clone();
-        let org_id = organization.id.clone();
-        let new_owner_id = user_id.clone();
+                let updated_membership =
+                    MembershipStore::update_role(db.clone(), &membership_id, &new_role).await?;
+                PermissionsStore::revoke(
+                    db.clone(),
+                    "organization",
+                    &org_id,
+                    &old_role,
+                    SUBJECT_TYPE_USER,
+                    &target_user_id,
+                    None,
+                )
+                .await?;
 
-        with_retrying_transaction(
-            &state.db,
-            #[cfg(feature = "db_sqlite")]
-            &state.db_writer,
-            "transfer_ownership_via_role_update",
-            |db| {
-                let org_id = org_id.clone();
-                let new_owner_id = new_owner_id.clone();
-                let current_user_id = current_user_id.clone();
-                Box::pin(async move {
-                    // Update organization owner
-                    OrganizationStore::transfer_ownership(db.clone(), &org_id, &new_owner_id)
-                        .await?;
+                let service_ids = ServiceStore::list_by_org(db.clone(), &org_id)
+                    .await?
+                    .into_iter()
+                    .map(|service| service.id)
+                    .collect::<Vec<_>>();
+                PermissionsStore::revoke_direct_service_access_for_user(
+                    db.clone(),
+                    &service_ids,
+                    &target_user_id,
+                )
+                .await?;
+                PermissionsStore::grant(
+                    db.clone(),
+                    RelationTuple::user(
+                        "organization".to_string(),
+                        org_id.clone(),
+                        new_role.clone(),
+                        target_user_id.clone(),
+                    ),
+                )
+                .await?;
 
-                    // Demote previous owner to admin
-                    let prev_owner_membership = MembershipStore::find_by_org_and_user(
+                if new_role == "owner" {
+                    OrganizationStore::transfer_ownership_if_current(
                         db.clone(),
                         &org_id,
-                        &current_user_id,
+                        &actor_id,
+                        &target_user_id,
                     )
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::NotFound("Previous owner membership not found".to_string())
-                    })?;
-                    MembershipStore::update_role(db.clone(), &prev_owner_membership.id, "admin")
-                        .await?;
+                    .await?;
+                    let previous_owner =
+                        MembershipStore::find_by_org_and_user(db.clone(), &org_id, &actor_id)
+                            .await?
+                            .ok_or_else(|| {
+                                AppError::NotFound(
+                                    "Previous owner membership not found".to_string(),
+                                )
+                            })?;
+                    MembershipStore::update_role(db.clone(), &previous_owner.id, "admin").await?;
+                }
 
-                    Ok(())
-                })
-            },
-        )
-        .await?;
+                let role_event =
+                    OrgAuditBuilder::new(&org_id, Some(&actor_id), "member.role_changed")
+                        .target("user", &target_user_id)
+                        .success(true)
+                        .details_json(Some(json!({
+                            "old_role": old_role,
+                            "new_role": new_role,
+                            "target_user_email": target_email.clone()
+                        })))
+                        .build();
+                audit_actor.log_org_with_db(db.clone(), role_event).await?;
 
-        // Invalidate permission cache for previous owner as well
+                if new_role == "owner" {
+                    let ownership_event =
+                        OrgAuditBuilder::new(&org_id, Some(&actor_id), "org.ownership_transferred")
+                            .target("organization", &org_id)
+                            .success(true)
+                            .details_json(Some(json!({
+                                "previous_owner_email": actor_email,
+                                "new_owner_email": target_email,
+                                "ownership_transferred": true
+                            })))
+                            .build();
+                    audit_actor.log_org_with_db(db, ownership_event).await?;
+                }
+
+                Ok(updated_membership)
+            })
+        },
+    )
+    .await?;
+
+    // Invalidate only after the domain mutation and durable audit rows commit.
+    state.permission_cache.invalidate(&user_id).await;
+    if req.role == "owner" {
         state.permission_cache.invalidate(&user.id).await;
-
-        let ownership_event = OrgAuditBuilder::new(
-            &organization.id,
-            Some(&user.id),
-            "org.ownership_transferred",
-        )
-        .target("organization", &organization.id)
-        .success(true)
-        .details_json(Some(json!({
-            "previous_owner_email": user.email,
-            "new_owner_email": target_user.email,
-            "ownership_transferred": true
-        })))
-        .build();
-        state.audit_actor.log_org(ownership_event).await;
     }
-
-    let updated_membership =
-        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &organization.id, &user_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Membership not found".to_string()))?;
 
     Ok(Json(OrganizationMember {
         user: target_user,
@@ -419,37 +474,61 @@ pub async fn remove_member(
         ));
     }
 
-    // Remove membership
-    MembershipStore::delete(DB::Conn(&state.db), &target_membership.id).await?;
+    let org_id = organization.id.clone();
+    let membership_id = target_membership.id.clone();
+    let removed_role = target_membership.role.clone();
+    let removed_by_role = caller_membership.role.clone();
+    let removed_user_email = target_user.email.clone();
+    let actor_id = user.id.clone();
+    let target_user_id = user_id.clone();
+    let audit_actor = state.audit_actor.clone();
 
-    // Revoke all organization permissions for the user
-    use crate::entities::permissions::SUBJECT_TYPE_USER;
-    use crate::store::permissions::PermissionsStore;
-    PermissionsStore::revoke(
-        DB::Conn(&state.db),
-        "organization",
-        &organization.id,
-        &target_membership.role,
-        SUBJECT_TYPE_USER,
-        &user_id,
-        None,
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "remove_member",
+        |db| {
+            let org_id = org_id.clone();
+            let membership_id = membership_id.clone();
+            let removed_role = removed_role.clone();
+            let removed_by_role = removed_by_role.clone();
+            let removed_user_email = removed_user_email.clone();
+            let actor_id = actor_id.clone();
+            let target_user_id = target_user_id.clone();
+            let audit_actor = audit_actor.clone();
+            Box::pin(async move {
+                use crate::entities::permissions::SUBJECT_TYPE_USER;
+
+                MembershipStore::delete(db.clone(), &membership_id).await?;
+                PermissionsStore::revoke(
+                    db.clone(),
+                    "organization",
+                    &org_id,
+                    &removed_role,
+                    SUBJECT_TYPE_USER,
+                    &target_user_id,
+                    None,
+                )
+                .await?;
+
+                let event = OrgAuditBuilder::new(&org_id, Some(&actor_id), "member.removed")
+                    .target("user", &target_user_id)
+                    .success(true)
+                    .details_json(Some(json!({
+                        "removed_user_email": removed_user_email,
+                        "removed_role": removed_role,
+                        "removed_by_role": removed_by_role
+                    })))
+                    .build();
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(())
+            })
+        },
     )
     .await?;
 
-    // CRITICAL: Invalidate permission cache after removing member
     state.permission_cache.invalidate(&user_id).await;
-
-    // Non-blocking audit via actor
-    let event = OrgAuditBuilder::new(&organization.id, Some(&user.id), "member.removed")
-        .target("user", &user_id)
-        .success(true)
-        .details_json(Some(json!({
-            "removed_user_email": target_user.email,
-            "removed_role": target_membership.role,
-            "removed_by_role": caller_membership.role
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(Json(()))
 }
@@ -479,40 +558,26 @@ pub async fn list_member_service_access(
         })?;
 
     let services = ServiceStore::list_by_org(DB::Conn(&state.db), &organization.id).await?;
-    let mut response = Vec::with_capacity(services.len());
+    let service_ids = services
+        .iter()
+        .map(|service| service.id.clone())
+        .collect::<Vec<_>>();
+    let access_by_service = PermissionsStore::list_direct_service_access_for_user(
+        DB::Conn(&state.db),
+        &service_ids,
+        &user_id,
+    )
+    .await?;
 
-    for service in services {
-        let access = if PermissionsStore::check(
-            DB::Conn(&state.db),
-            "service",
-            &service.id,
-            "manager",
-            &user_id,
-        )
-        .await?
-        {
-            Some("manager".to_string())
-        } else if PermissionsStore::check(
-            DB::Conn(&state.db),
-            "service",
-            &service.id,
-            "viewer",
-            &user_id,
-        )
-        .await?
-        {
-            Some("viewer".to_string())
-        } else {
-            None
-        };
-
-        response.push(MemberServiceAccess {
+    let response = services
+        .into_iter()
+        .map(|service| MemberServiceAccess {
+            access: access_by_service.get(&service.id).cloned(),
             service_id: service.id,
             service_slug: service.slug,
             service_name: service.name,
-            access,
-        });
-    }
+        })
+        .collect::<Vec<_>>();
 
     Ok(Json(response))
 }
@@ -555,76 +620,104 @@ pub async fn update_member_service_access(
         requested_grants.insert(grant.service_slug, grant.access);
     }
 
+    let requested_slugs = requested_grants.keys().cloned().collect::<Vec<_>>();
+    let services_by_slug = ServiceStore::find_by_org_and_slugs(
+        DB::Conn(&state.db),
+        &organization.id,
+        &requested_slugs,
+    )
+    .await?
+    .into_iter()
+    .map(|service| (service.slug.clone(), service))
+    .collect::<HashMap<_, _>>();
+
     let mut validated_grants = Vec::with_capacity(requested_grants.len());
     for (service_slug, access) in requested_grants {
-        let service = ServiceStore::find_by_org_and_slug(
-            DB::Conn(&state.db),
-            &organization.id,
-            &service_slug,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Service '{}' not found", service_slug)))?;
-
-        validated_grants.push((service.id, access));
+        let service = services_by_slug
+            .get(&service_slug)
+            .ok_or_else(|| AppError::NotFound(format!("Service '{}' not found", service_slug)))?;
+        validated_grants.push((service.id.clone(), access));
     }
 
-    with_retrying_transaction(
+    let org_id = organization.id.clone();
+    let actor_id = actor.id.clone();
+    let target_user_id = user_id.clone();
+    let audit_actor = state.audit_actor.clone();
+    let response = with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
         &state.db_writer,
         "update_member_service_access",
         |db| {
             let grants = validated_grants.clone();
-            let user_id = user_id.clone();
+            let org_id = org_id.clone();
+            let actor_id = actor_id.clone();
+            let target_user_id = target_user_id.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
-                for (service_id, access) in grants {
-                    for relation in ["viewer", "manager"] {
-                        PermissionsStore::revoke(
-                            db.clone(),
-                            "service",
-                            &service_id,
-                            relation,
-                            crate::entities::permissions::SUBJECT_TYPE_USER,
-                            &user_id,
-                            None,
-                        )
-                        .await?;
-                    }
+                let service_ids = grants
+                    .iter()
+                    .map(|(service_id, _)| service_id.clone())
+                    .collect::<Vec<_>>();
+                PermissionsStore::revoke_direct_service_access_for_user(
+                    db.clone(),
+                    &service_ids,
+                    &target_user_id,
+                )
+                .await?;
 
-                    if let Some(access) = access {
-                        PermissionsStore::grant(
-                            db.clone(),
+                let grant_tuples = grants
+                    .into_iter()
+                    .filter_map(|(service_id, access)| {
+                        access.map(|access| {
                             crate::entities::permissions::RelationTuple::user(
                                 "service",
                                 service_id,
                                 access,
-                                user_id.clone(),
-                            ),
-                        )
-                        .await?;
-                    }
-                }
+                                target_user_id.clone(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                PermissionsStore::grant_many(db.clone(), grant_tuples).await?;
 
-                Ok(())
+                let services = ServiceStore::list_by_org(db.clone(), &org_id).await?;
+                let all_service_ids = services
+                    .iter()
+                    .map(|service| service.id.clone())
+                    .collect::<Vec<_>>();
+                let access_by_service = PermissionsStore::list_direct_service_access_for_user(
+                    db.clone(),
+                    &all_service_ids,
+                    &target_user_id,
+                )
+                .await?;
+                let response = services
+                    .into_iter()
+                    .map(|service| MemberServiceAccess {
+                        access: access_by_service.get(&service.id).cloned(),
+                        service_id: service.id,
+                        service_slug: service.slug,
+                        service_name: service.name,
+                    })
+                    .collect::<Vec<_>>();
+
+                let event =
+                    OrgAuditBuilder::new(&org_id, Some(&actor_id), "member.service_access_updated")
+                        .target("user", &target_user_id)
+                        .success(true)
+                        .details_json(Some(json!({ "target_user_id": target_user_id })))
+                        .build();
+                audit_actor.log_org_with_db(db, event).await?;
+
+                Ok(response)
             })
         },
     )
     .await?;
 
     state.permission_cache.invalidate(&user_id).await;
-
-    let event = OrgAuditBuilder::new(
-        &organization.id,
-        Some(&actor.id),
-        "member.service_access_updated",
-    )
-    .target("user", &user_id)
-    .success(true)
-    .details_json(Some(json!({ "target_user_id": user_id.clone() })))
-    .build();
-    state.audit_actor.log_org(event).await;
-
-    list_member_service_access(State(state), auth_user, Path((org_slug, user_id))).await
+    Ok(Json(response))
 }
 
 /// Transfer ownership to another member (owner only)
@@ -644,52 +737,33 @@ pub async fn transfer_ownership(
     // Check if user is owner
     crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
 
-    // Find new owner by email
-    let new_owner = UserStore::find_by_email(DB::Conn(&state.db), &req.new_owner_email)
-        .await?
-        .ok_or_else(|| AppError::NotFound("User with that email not found".to_string()))?;
-
-    // Check if new owner is a member
-    let membership =
-        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &organization.id, &new_owner.id)
-            .await?
-            .ok_or_else(|| {
-                AppError::NotFound("User is not a member of this organization".to_string())
-            })?;
-
     let org_id = organization.id.clone();
-    let new_owner_id = new_owner.id.clone();
-    let membership_id = membership.id.clone();
     let prev_owner_id = user.id.clone();
+    let previous_owner_email = user.email.clone();
+    let new_owner_email = req.new_owner_email.clone();
+    let audit_actor = state.audit_actor.clone();
 
-    with_retrying_transaction(
+    let (new_owner, updated_membership) = with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
         &state.db_writer,
         "transfer_ownership",
         |db| {
             let org_id = org_id.clone();
-            let new_owner_id = new_owner_id.clone();
-            let membership_id = membership_id.clone();
             let prev_owner_id = prev_owner_id.clone();
+            let previous_owner_email = previous_owner_email.clone();
+            let new_owner_email = new_owner_email.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
-                // Update organization owner
-                OrganizationStore::transfer_ownership(db.clone(), &org_id, &new_owner_id).await?;
-
-                // Update membership roles
-                MembershipStore::update_role(db.clone(), &membership_id, "owner").await?;
-
-                // Demote previous owner to admin
-                let prev_owner_membership =
-                    MembershipStore::find_by_org_and_user(db.clone(), &org_id, &prev_owner_id)
-                        .await?
-                        .ok_or_else(|| {
-                            AppError::NotFound("Previous owner membership not found".to_string())
-                        })?;
-                MembershipStore::update_role(db.clone(), &prev_owner_membership.id, "admin")
-                    .await?;
-
-                Ok(())
+                transfer_ownership_with_db(
+                    db,
+                    &audit_actor,
+                    &org_id,
+                    &prev_owner_id,
+                    &previous_owner_email,
+                    &new_owner_email,
+                )
+                .await
             })
         },
     )
@@ -699,14 +773,303 @@ pub async fn transfer_ownership(
     state.permission_cache.invalidate(&new_owner.id).await;
     state.permission_cache.invalidate(&user.id).await;
 
-    // Fetch updated membership
-    let updated_membership =
-        MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &organization.id, &new_owner.id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Membership not found".to_string()))?;
-
     Ok(Json(OrganizationMember {
         user: new_owner,
         membership: updated_membership,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::audit_actor::AuditHandle;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{Database, TransactionTrait};
+
+    #[cfg(feature = "db_sqlite")]
+    async fn attempt_ownership_transfer(
+        db: &sea_orm::DatabaseConnection,
+        audit_actor: &AuditHandle,
+        org_id: &str,
+        owner_id: &str,
+        owner_email: &str,
+        target_email: &str,
+    ) -> Result<(users::Model, memberships::Model)> {
+        let org_id = org_id.to_string();
+        let owner_id = owner_id.to_string();
+        let owner_email = owner_email.to_string();
+        let target_email = target_email.to_string();
+        let audit_actor = audit_actor.clone();
+        with_retrying_transaction(
+            db,
+            db,
+            "concurrent_ownership_transfer",
+            move |transaction| {
+                let org_id = org_id.clone();
+                let owner_id = owner_id.clone();
+                let owner_email = owner_email.clone();
+                let target_email = target_email.clone();
+                let audit_actor = audit_actor.clone();
+                Box::pin(async move {
+                    transfer_ownership_with_db(
+                        transaction,
+                        &audit_actor,
+                        &org_id,
+                        &owner_id,
+                        &owner_email,
+                        &target_email,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn ownership_transfer_binds_same_email_to_selected_org_member() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let owner = UserStore::find_or_create(DB::Conn(&db), "owner@example.test")
+            .await
+            .expect("create current owner")
+            .0;
+        let (organization, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "selected-org",
+            "Selected Org",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create selected organization");
+
+        let other_owner = UserStore::find_or_create(DB::Conn(&db), "other-owner@example.test")
+            .await
+            .expect("create other owner")
+            .0;
+        let (other_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "other-org",
+            "Other Org",
+            &other_owner.id,
+            None,
+        )
+        .await
+        .expect("create other organization");
+
+        let shared_email = "same-owner@example.test";
+        let platform_decoy = UserStore::find_or_create(DB::Conn(&db), shared_email)
+            .await
+            .expect("create platform decoy")
+            .0;
+        let selected_target =
+            UserStore::create_with_org_id(DB::Conn(&db), shared_email, None, &organization.id)
+                .await
+                .expect("create selected-org target");
+        MembershipStore::create(
+            DB::Conn(&db),
+            &organization.id,
+            &selected_target.id,
+            "member",
+        )
+        .await
+        .expect("create selected-org membership");
+        let other_tenant_decoy =
+            UserStore::create_with_org_id(DB::Conn(&db), shared_email, None, &other_org.id)
+                .await
+                .expect("create other-tenant decoy");
+        let other_membership = MembershipStore::create(
+            DB::Conn(&db),
+            &other_org.id,
+            &other_tenant_decoy.id,
+            "member",
+        )
+        .await
+        .expect("create other-tenant membership");
+
+        let platform_before = platform_decoy.clone();
+        let other_tenant_before = other_tenant_decoy.clone();
+        let other_org_before = other_org.clone();
+        let transaction = db.begin().await.expect("begin transfer");
+        let (new_owner, updated_membership) = transfer_ownership_with_db(
+            DB::Tx(&transaction),
+            &AuditHandle::new(db.clone()),
+            &organization.id,
+            &owner.id,
+            &owner.email,
+            shared_email,
+        )
+        .await
+        .expect("transfer ownership");
+        transaction.commit().await.expect("commit transfer");
+
+        assert_eq!(new_owner.id, selected_target.id);
+        assert_eq!(updated_membership.user_id, selected_target.id);
+        assert_eq!(updated_membership.role, "owner");
+        let selected_org_after = OrganizationStore::find_by_id(DB::Conn(&db), &organization.id)
+            .await
+            .expect("read selected org")
+            .expect("selected org exists");
+        assert_eq!(selected_org_after.owner_user_id, selected_target.id);
+        let previous_owner_membership =
+            MembershipStore::find_by_org_and_user(DB::Conn(&db), &organization.id, &owner.id)
+                .await
+                .expect("read previous owner membership")
+                .expect("previous owner membership exists");
+        assert_eq!(previous_owner_membership.role, "admin");
+
+        assert_eq!(
+            UserStore::find_by_id(DB::Conn(&db), &platform_decoy.id)
+                .await
+                .expect("read platform decoy")
+                .expect("platform decoy exists"),
+            platform_before
+        );
+        assert_eq!(
+            UserStore::find_by_id(DB::Conn(&db), &other_tenant_decoy.id)
+                .await
+                .expect("read other-tenant decoy")
+                .expect("other-tenant decoy exists"),
+            other_tenant_before
+        );
+        assert_eq!(
+            OrganizationStore::find_by_id(DB::Conn(&db), &other_org.id)
+                .await
+                .expect("read other org")
+                .expect("other org exists"),
+            other_org_before
+        );
+        assert_eq!(
+            MembershipStore::find_by_org_and_user(
+                DB::Conn(&db),
+                &other_org.id,
+                &other_tenant_decoy.id,
+            )
+            .await
+            .expect("read other membership")
+            .expect("other membership exists"),
+            other_membership
+        );
+    }
+
+    #[cfg(feature = "db_sqlite")]
+    #[tokio::test]
+    async fn concurrent_ownership_transfers_have_one_winner_and_one_owner_membership() {
+        let path = std::env::temp_dir().join(format!(
+            "authos-ownership-transfer-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::find_or_create(DB::Conn(&db), "race-owner@example.test")
+            .await
+            .expect("create owner")
+            .0;
+        let (organization, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "race-org",
+            "Race Org",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create organization");
+        let first_target = UserStore::create_with_org_id(
+            DB::Conn(&db),
+            "first-target@example.test",
+            None,
+            &organization.id,
+        )
+        .await
+        .expect("create first target");
+        let second_target = UserStore::create_with_org_id(
+            DB::Conn(&db),
+            "second-target@example.test",
+            None,
+            &organization.id,
+        )
+        .await
+        .expect("create second target");
+        MembershipStore::create(DB::Conn(&db), &organization.id, &first_target.id, "member")
+            .await
+            .expect("create first membership");
+        MembershipStore::create(DB::Conn(&db), &organization.id, &second_target.id, "member")
+            .await
+            .expect("create second membership");
+        let audit_actor = AuditHandle::new(db.clone());
+
+        let (first, second) = tokio::join!(
+            attempt_ownership_transfer(
+                &db,
+                &audit_actor,
+                &organization.id,
+                &owner.id,
+                &owner.email,
+                &first_target.email,
+            ),
+            attempt_ownership_transfer(
+                &db,
+                &audit_actor,
+                &organization.id,
+                &owner.id,
+                &owner.email,
+                &second_target.email,
+            )
+        );
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one compare-and-swap transfer must commit"
+        );
+
+        let organization_after = OrganizationStore::find_by_id(DB::Conn(&db), &organization.id)
+            .await
+            .expect("read organization")
+            .expect("organization exists");
+        assert!(
+            organization_after.owner_user_id == first_target.id
+                || organization_after.owner_user_id == second_target.id
+        );
+        let memberships =
+            MembershipStore::list_by_org(DB::Conn(&db), &organization.id, None, 10, 0)
+                .await
+                .expect("list memberships");
+        assert_eq!(
+            memberships
+                .iter()
+                .filter(|membership| membership.role == "owner")
+                .count(),
+            1
+        );
+        assert_eq!(
+            memberships
+                .iter()
+                .find(|membership| membership.user_id == owner.id)
+                .expect("previous owner membership")
+                .role,
+            "admin"
+        );
+        let losing_target_id = if organization_after.owner_user_id == first_target.id {
+            &second_target.id
+        } else {
+            &first_target.id
+        };
+        assert_eq!(
+            memberships
+                .iter()
+                .find(|membership| membership.user_id == *losing_target_id)
+                .expect("losing target membership")
+                .role,
+            "member"
+        );
+
+        db.close().await.expect("close sqlite");
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -42,7 +42,11 @@ impl MigrationTrait for Migration {
                             .text()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(OauthAuthorizationGrants::Scope).text().null())
+                    .col(
+                        ColumnDef::new(OauthAuthorizationGrants::Scope)
+                            .text()
+                            .null(),
+                    )
                     .col(
                         ColumnDef::new(OauthAuthorizationGrants::ExpiresAt)
                             .date_time()

@@ -42,8 +42,10 @@ impl OrganizationBillingCredentialsStore {
     }
 
     /// Upsert billing credentials (insert or update)
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         db: DB<'_>,
+        new_record_id: Option<&str>,
         org_id: &str,
         provider: &str,
         mode: &str,
@@ -55,6 +57,11 @@ impl OrganizationBillingCredentialsStore {
         if let Some(existing) =
             Self::find_by_org_provider_mode(db.clone(), org_id, provider, mode).await?
         {
+            if new_record_id.is_some_and(|expected| expected != existing.id) {
+                return Err(crate::error::AppError::InternalServerError(
+                    "Billing credential changed concurrently; retry the request".to_string(),
+                ));
+            }
             // Update existing
             let mut active_model: organization_billing_credentials::ActiveModel = existing.into();
             active_model.api_key_encrypted = Set(api_key_encrypted);
@@ -69,7 +76,9 @@ impl OrganizationBillingCredentialsStore {
             // Insert new
             let now = chrono::Utc::now().naive_utc();
             let new_creds = organization_billing_credentials::ActiveModel {
-                id: Set(Uuid::new_v4().to_string()),
+                id: Set(new_record_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| Uuid::new_v4().to_string())),
                 org_id: Set(org_id.to_string()),
                 provider: Set(provider.to_string()),
                 mode: Set(mode.to_string()),
@@ -119,23 +128,18 @@ impl OrganizationBillingCredentialsStore {
 
     /// Disable billing credentials (soft delete)
     pub async fn disable(db: DB<'_>, org_id: &str, provider: &str) -> Result<u64> {
-        // Find and update all matching credentials
-        let credentials = OrganizationBillingCredentials::find()
+        let result = OrganizationBillingCredentials::update_many()
+            .set(organization_billing_credentials::ActiveModel {
+                enabled: Set(false),
+                updated_at: Set(chrono::Utc::now().naive_utc()),
+                ..Default::default()
+            })
             .filter(organization_billing_credentials::Column::OrgId.eq(org_id))
             .filter(organization_billing_credentials::Column::Provider.eq(provider))
-            .all(&db)
+            .exec(&db)
             .await?;
 
-        let mut count = 0u64;
-        for cred in credentials {
-            let mut active_model: organization_billing_credentials::ActiveModel = cred.into();
-            active_model.enabled = Set(false);
-            active_model.updated_at = Set(chrono::Utc::now().naive_utc());
-            active_model.update(&db).await?;
-            count += 1;
-        }
-
-        Ok(count)
+        Ok(result.rows_affected)
     }
 }
 
@@ -146,4 +150,172 @@ pub struct BillingCredentialStatus {
     pub provider: String,
     pub mode: String,
     pub enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::organizations::OrganizationStore;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn disable_updates_matching_provider_credentials_in_one_statement() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "billing-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let org =
+            OrganizationStore::create(DB::Conn(&db), "billing-org", "Billing Org", &owner.id, None)
+                .await
+                .expect("create org");
+
+        OrganizationBillingCredentialsStore::upsert(
+            DB::Conn(&db),
+            None,
+            &org.id,
+            "stripe",
+            "test",
+            vec![1],
+            vec![2],
+            "key-1",
+        )
+        .await
+        .expect("insert test stripe credentials");
+        OrganizationBillingCredentialsStore::upsert(
+            DB::Conn(&db),
+            None,
+            &org.id,
+            "stripe",
+            "live",
+            vec![3],
+            vec![4],
+            "key-1",
+        )
+        .await
+        .expect("insert live stripe credentials");
+        OrganizationBillingCredentialsStore::upsert(
+            DB::Conn(&db),
+            None,
+            &org.id,
+            "paddle",
+            "live",
+            vec![5],
+            vec![6],
+            "key-1",
+        )
+        .await
+        .expect("insert paddle credentials");
+
+        let disabled =
+            OrganizationBillingCredentialsStore::disable(DB::Conn(&db), &org.id, "stripe")
+                .await
+                .expect("disable stripe credentials");
+        assert_eq!(disabled, 2);
+
+        let credentials = OrganizationBillingCredentials::find()
+            .filter(organization_billing_credentials::Column::OrgId.eq(&org.id))
+            .all(&db)
+            .await
+            .expect("load credentials");
+        let stripe_enabled = credentials
+            .iter()
+            .filter(|credential| credential.provider == "stripe")
+            .filter(|credential| credential.enabled)
+            .count();
+        let paddle_enabled = credentials
+            .iter()
+            .filter(|credential| credential.provider == "paddle")
+            .filter(|credential| credential.enabled)
+            .count();
+
+        assert_eq!(stripe_enabled, 0);
+        assert_eq!(paddle_enabled, 1);
+    }
+
+    #[tokio::test]
+    async fn billing_credential_mutations_are_org_scoped_and_preserve_other_tenant() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "billing-isolation-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let org_a = OrganizationStore::create(
+            DB::Conn(&db),
+            "billing-isolation-a",
+            "Billing Isolation A",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org A");
+        let org_b = OrganizationStore::create(
+            DB::Conn(&db),
+            "billing-isolation-b",
+            "Billing Isolation B",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org B");
+        let target = OrganizationBillingCredentialsStore::upsert(
+            DB::Conn(&db),
+            None,
+            &org_b.id,
+            "stripe",
+            "live",
+            vec![9, 8, 7],
+            vec![6, 5, 4],
+            "key-b",
+        )
+        .await
+        .expect("insert org B credentials");
+
+        assert_eq!(
+            OrganizationBillingCredentialsStore::disable(DB::Conn(&db), &org_a.id, "stripe")
+                .await
+                .expect("cross-tenant disable is a no-op"),
+            0
+        );
+        assert_eq!(
+            OrganizationBillingCredentialsStore::delete(DB::Conn(&db), &org_a.id, "stripe")
+                .await
+                .expect("cross-tenant delete is a no-op"),
+            0
+        );
+
+        let unchanged = OrganizationBillingCredentials::find_by_id(&target.id)
+            .one(&db)
+            .await
+            .expect("reload target credentials")
+            .expect("other tenant credentials must remain");
+        assert_eq!(unchanged.org_id, org_b.id);
+        assert!(unchanged.enabled);
+        assert_eq!(unchanged.api_key_encrypted, vec![9, 8, 7]);
+        assert_eq!(unchanged.webhook_secret_encrypted, vec![6, 5, 4]);
+        assert_eq!(unchanged.encryption_key_id, "key-b");
+    }
 }

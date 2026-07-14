@@ -1,7 +1,7 @@
 use crate::auth::mfa::MfaService;
 use crate::encryption::EncryptionService;
 use crate::entities::prelude::{TotpBackupCodes, UserDevices, UserTotpSecrets};
-use crate::entities::{totp_backup_codes, user_devices, user_totp_secrets, users};
+use crate::entities::{mfa_audit_log, totp_backup_codes, user_devices, user_totp_secrets, users};
 use crate::error::{with_deadlock_retry, with_retrying_transaction, AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::services::audit_builder::MfaAuditBuilder;
@@ -10,10 +10,6 @@ use crate::state::AppState;
 use crate::store::{
     organizations::OrganizationStore, user_devices::UserDevicesStore, users::UserStore, DB,
 };
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use axum::{
     extract::{Extension, Query, State},
     Json,
@@ -21,7 +17,7 @@ use axum::{
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -264,42 +260,66 @@ pub async fn setup_mfa(
     let encryption_service = EncryptionService::new().map_err(|e| {
         AppError::InternalServerError(format!("Failed to initialize encryption: {}", e))
     })?;
-    let secret_encrypted = encryption_service
-        .encrypt(&secret)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to encrypt secret: {}", e)))?;
-
     let existing_secret = UserTotpSecrets::find()
         .filter(user_totp_secrets::Column::UserId.eq(&auth_user.user.id))
         .one(&state.db)
         .await?;
 
-    if let Some(existing) = existing_secret {
-        let mut existing_active: user_totp_secrets::ActiveModel = existing.into();
-        existing_active.secret_encrypted = Set(secret_encrypted);
-        existing_active.encryption_key_id = Set("default".to_string());
-        existing_active.enabled = Set(false);
-        existing_active.enabled_at = Set(None);
-        existing_active.update(&state.db).await?;
-    } else {
-        let new_secret = user_totp_secrets::ActiveModel {
-            id: Set(Uuid::new_v4().to_string()),
-            user_id: Set(auth_user.user.id.clone()),
-            secret_encrypted: Set(secret_encrypted),
-            encryption_key_id: Set("default".to_string()),
-            enabled: Set(false),
-            ..Default::default()
-        };
-        new_secret.insert(&state.db).await?;
-    }
-
-    // Non-blocking audit via actor
     let event = MfaAuditBuilder::new(&auth_user.user.id, "mfa_setup_initiated")
         .org_id(auth_user.claims.org.as_deref())
         .ip_address(Some(&request_info.ip_address))
         .user_agent(Some(request_info.user_agent.clone()))
         .success(true)
         .build();
-    state.audit_actor.log_mfa(event).await;
+    let transaction = state.db.begin().await?;
+    if let Some(existing) = existing_secret {
+        let secret_encrypted = encryption_service
+            .encrypt_with_context(
+                &secret,
+                crate::encryption::EncryptionContext::new(
+                    "user_totp_secrets",
+                    &existing.id,
+                    "secret_encrypted",
+                ),
+            )
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to encrypt secret: {}", e))
+            })?;
+        let mut existing_active: user_totp_secrets::ActiveModel = existing.into();
+        existing_active.secret_encrypted = Set(secret_encrypted);
+        existing_active.encryption_key_id = Set(encryption_service.key_id().to_string());
+        existing_active.enabled = Set(false);
+        existing_active.enabled_at = Set(None);
+        existing_active.update(&transaction).await?;
+    } else {
+        let secret_id = Uuid::new_v4().to_string();
+        let secret_encrypted = encryption_service
+            .encrypt_with_context(
+                &secret,
+                crate::encryption::EncryptionContext::new(
+                    "user_totp_secrets",
+                    &secret_id,
+                    "secret_encrypted",
+                ),
+            )
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to encrypt secret: {}", e))
+            })?;
+        let new_secret = user_totp_secrets::ActiveModel {
+            id: Set(secret_id),
+            user_id: Set(auth_user.user.id.clone()),
+            secret_encrypted: Set(secret_encrypted),
+            encryption_key_id: Set(encryption_service.key_id().to_string()),
+            enabled: Set(false),
+            ..Default::default()
+        };
+        new_secret.insert(&transaction).await?;
+    }
+    state
+        .audit_actor
+        .log_mfa_with_db(DB::Tx(&transaction), event)
+        .await?;
+    transaction.commit().await?;
 
     Ok(Json(MfaSetupResponse {
         secret,
@@ -338,7 +358,14 @@ pub async fn verify_and_enable_mfa(
         AppError::InternalServerError(format!("Failed to initialize encryption: {}", e))
     })?;
     let secret = encryption_service
-        .decrypt(&totp_secret.secret_encrypted)
+        .decrypt_with_context(
+            &totp_secret.secret_encrypted,
+            crate::encryption::EncryptionContext::new(
+                "user_totp_secrets",
+                &totp_secret.id,
+                "secret_encrypted",
+            ),
+        )
         .map_err(|e| AppError::InternalServerError(format!("Failed to decrypt secret: {}", e)))?;
 
     let mfa_service = MfaService::new();
@@ -355,7 +382,7 @@ pub async fn verify_and_enable_mfa(
             .success(false)
             .details(Some("method:totp,reason:invalid_code"))
             .build();
-        state.audit_actor.log_mfa(event).await;
+        state.audit_actor.log_mfa(event).await?;
 
         return Err(AppError::BadRequest("Invalid TOTP code".to_string()));
     }
@@ -366,13 +393,26 @@ pub async fn verify_and_enable_mfa(
     // Pre-hash all backup codes before the transaction to avoid doing work inside retry loop
     let mut backup_code_hashes: Vec<(String, String)> = Vec::new();
     for code in &backup_codes {
-        let code_hash = mfa_service.hash_backup_code(code).map_err(|e| {
-            AppError::InternalServerError(format!("Failed to hash backup code: {}", e))
-        })?;
+        let code_hash = crate::services::concurrency::hash_password_bounded(code.clone()).await?;
         backup_code_hashes.push((Uuid::new_v4().to_string(), code_hash));
     }
 
-    // Exec transaction with retry
+    let org_id = auth_user.claims.org.as_deref();
+    let mfa_enabled_event = MfaAuditBuilder::new(&auth_user.user.id, "mfa_enabled")
+        .org_id(org_id)
+        .ip_address(Some(&request_info.ip_address))
+        .user_agent(Some(request_info.user_agent.clone()))
+        .success(true)
+        .details(Some("totp"))
+        .build();
+    let backup_event = MfaAuditBuilder::new(&auth_user.user.id, "backup_codes_generated")
+        .org_id(org_id)
+        .ip_address(Some(&request_info.ip_address))
+        .user_agent(Some(request_info.user_agent.clone()))
+        .success(true)
+        .details(Some(&format!("count:{}", backup_codes.len())))
+        .build();
+
     let db = &state.db;
     let helper_user_id = auth_user.user.id.clone();
     let helper_totp_secret_id = totp_secret.id.clone();
@@ -387,6 +427,9 @@ pub async fn verify_and_enable_mfa(
             let user_id = helper_user_id.clone();
             let totp_secret_id = helper_totp_secret_id.clone();
             let backup_hashes = helper_backup_hashes.clone();
+            let mfa_enabled_event = mfa_enabled_event.clone();
+            let backup_event = backup_event.clone();
+            let audit_actor = state.audit_actor.clone();
 
             Box::pin(async move {
                 // Re-fetch the totp_secret inside the transaction to get fresh data
@@ -409,44 +452,30 @@ pub async fn verify_and_enable_mfa(
                     .exec(&db)
                     .await?;
 
-                // Insert new backup codes
-                for (id, code_hash) in backup_hashes {
-                    let new_backup_code = totp_backup_codes::ActiveModel {
+                let new_backup_codes = backup_hashes
+                    .into_iter()
+                    .map(|(id, code_hash)| totp_backup_codes::ActiveModel {
                         id: Set(id),
                         user_id: Set(user_id.clone()),
                         code_hash: Set(code_hash),
                         used: Set(false),
                         ..Default::default()
-                    };
-                    new_backup_code.insert(&db).await?;
-                }
+                    })
+                    .collect::<Vec<_>>();
+                TotpBackupCodes::insert_many(new_backup_codes)
+                    .exec(&db)
+                    .await?;
+
+                audit_actor
+                    .log_mfa_with_db(db.clone(), mfa_enabled_event)
+                    .await?;
+                audit_actor.log_mfa_with_db(db, backup_event).await?;
 
                 Ok(())
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    let org_id = auth_user.claims.org.as_deref();
-    let mfa_enabled_event = MfaAuditBuilder::new(&auth_user.user.id, "mfa_enabled")
-        .org_id(org_id)
-        .ip_address(Some(&request_info.ip_address))
-        .user_agent(Some(request_info.user_agent.clone()))
-        .success(true)
-        .details(Some("totp"))
-        .build();
-    state.audit_actor.log_mfa(mfa_enabled_event).await;
-
-    // Log backup codes generation
-    let backup_event = MfaAuditBuilder::new(&auth_user.user.id, "backup_codes_generated")
-        .org_id(org_id)
-        .ip_address(Some(&request_info.ip_address))
-        .user_agent(Some(request_info.user_agent.clone()))
-        .success(true)
-        .details(Some(&format!("count:{}", backup_codes.len())))
-        .build();
-    state.audit_actor.log_mfa(backup_event).await;
 
     // Publish user.mfa.enabled event for webhooks
     {
@@ -492,6 +521,12 @@ pub async fn disable_mfa(
         .0;
 
     let user_id = auth_user.user.id.clone();
+    let event = MfaAuditBuilder::new(&auth_user.user.id, "mfa_disabled")
+        .org_id(auth_user.claims.org.as_deref())
+        .ip_address(Some(&request_info.ip_address))
+        .user_agent(Some(request_info.user_agent.clone()))
+        .success(true)
+        .build();
 
     // Execute transaction with automatic retry on database contention
     with_retrying_transaction(
@@ -501,6 +536,8 @@ pub async fn disable_mfa(
         "disable_mfa",
         |db| {
             let user_id = user_id.clone();
+            let event = event.clone();
+            let audit_actor = state.audit_actor.clone();
             Box::pin(async move {
                 UserTotpSecrets::delete_many()
                     .filter(user_totp_secrets::Column::UserId.eq(&user_id))
@@ -512,20 +549,13 @@ pub async fn disable_mfa(
                     .exec(&db)
                     .await?;
 
+                audit_actor.log_mfa_with_db(db, event).await?;
+
                 Ok(())
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    let event = MfaAuditBuilder::new(&auth_user.user.id, "mfa_disabled")
-        .org_id(auth_user.claims.org.as_deref())
-        .ip_address(Some(&request_info.ip_address))
-        .user_agent(Some(request_info.user_agent.clone()))
-        .success(true)
-        .build();
-    state.audit_actor.log_mfa(event).await;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -555,13 +585,18 @@ pub async fn regenerate_backup_codes(
     let formatted_codes = MfaService::format_backup_codes(&backup_codes);
 
     let user_id = auth_user.user.id.clone();
+    let event = MfaAuditBuilder::new(&auth_user.user.id, "backup_codes_generated")
+        .org_id(auth_user.claims.org.as_deref())
+        .ip_address(Some(&request_info.ip_address))
+        .user_agent(Some(request_info.user_agent.clone()))
+        .success(true)
+        .details(Some(&format!("count:{}", backup_codes.len())))
+        .build();
 
     // Pre-hash all backup codes before the transaction
     let mut backup_code_hashes: Vec<(String, String)> = Vec::new();
     for code in &backup_codes {
-        let code_hash = mfa_service.hash_backup_code(code).map_err(|e| {
-            AppError::InternalServerError(format!("Failed to hash backup code: {}", e))
-        })?;
+        let code_hash = crate::services::concurrency::hash_password_bounded(code.clone()).await?;
         backup_code_hashes.push((Uuid::new_v4().to_string(), code_hash));
     }
 
@@ -574,22 +609,29 @@ pub async fn regenerate_backup_codes(
         |db| {
             let user_id = user_id.clone();
             let backup_code_hashes = backup_code_hashes.clone();
+            let event = event.clone();
+            let audit_actor = state.audit_actor.clone();
             Box::pin(async move {
                 TotpBackupCodes::delete_many()
                     .filter(totp_backup_codes::Column::UserId.eq(&user_id))
                     .exec(&db)
                     .await?;
 
-                for (id, code_hash) in &backup_code_hashes {
-                    let new_backup_code = totp_backup_codes::ActiveModel {
-                        id: Set(id.clone()),
+                let new_backup_codes = backup_code_hashes
+                    .iter()
+                    .map(|(id, code_hash)| totp_backup_codes::ActiveModel {
+                        id: Set(id.to_string()),
                         user_id: Set(user_id.clone()),
-                        code_hash: Set(code_hash.clone()),
+                        code_hash: Set(code_hash.to_string()),
                         used: Set(false),
                         ..Default::default()
-                    };
-                    new_backup_code.insert(&db).await?;
-                }
+                    })
+                    .collect::<Vec<_>>();
+                TotpBackupCodes::insert_many(new_backup_codes)
+                    .exec(&db)
+                    .await?;
+
+                audit_actor.log_mfa_with_db(db, event).await?;
 
                 Ok(())
             })
@@ -597,23 +639,70 @@ pub async fn regenerate_backup_codes(
     )
     .await?;
 
-    // Non-blocking audit via actor
-    let event = MfaAuditBuilder::new(&auth_user.user.id, "backup_codes_generated")
-        .org_id(auth_user.claims.org.as_deref())
-        .ip_address(Some(&request_info.ip_address))
-        .user_agent(Some(request_info.user_agent.clone()))
-        .success(true)
-        .details(Some(&format!("count:{}", backup_codes.len())))
-        .build();
-    state.audit_actor.log_mfa(event).await;
-
     Ok(Json(BackupCodesResponse {
         backup_codes: formatted_codes,
     }))
 }
 
-/// Helper function to verify a TOTP or backup code
-pub async fn verify_mfa_code(pool: &DatabaseConnection, user_id: &str, code: &str) -> Result<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MfaVerificationMethod {
+    Totp,
+    BackupCode,
+}
+
+async fn claim_backup_code_with_audit(
+    pool: &DatabaseConnection,
+    backup_code_id: &str,
+    backup_audit: (
+        &crate::services::audit_actor::AuditHandle,
+        mfa_audit_log::ActiveModel,
+    ),
+) -> Result<bool> {
+    let transaction = pool.begin().await?;
+    let claimed =
+        claim_backup_code_with_audit_in_db(DB::Tx(&transaction), backup_code_id, backup_audit)
+            .await?;
+    if !claimed {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub(crate) async fn claim_backup_code_with_audit_in_db(
+    db: DB<'_>,
+    backup_code_id: &str,
+    backup_audit: (
+        &crate::services::audit_actor::AuditHandle,
+        mfa_audit_log::ActiveModel,
+    ),
+) -> Result<bool> {
+    let claimed = TotpBackupCodes::update_many()
+        .filter(totp_backup_codes::Column::Id.eq(backup_code_id))
+        .filter(totp_backup_codes::Column::Used.eq(false))
+        .col_expr(totp_backup_codes::Column::Used, true.into())
+        .col_expr(
+            totp_backup_codes::Column::UsedAt,
+            Utc::now().naive_utc().into(),
+        )
+        .exec(&db)
+        .await?;
+    if claimed.rows_affected != 1 {
+        return Ok(false);
+    }
+    backup_audit.0.log_mfa_with_db(db, backup_audit.1).await?;
+    Ok(true)
+}
+
+/// Verify MFA and, for a backup code, atomically claim the one-time code with
+/// its durable audit event. A concurrent replay can affect zero rows and is
+/// therefore rejected instead of reporting a second success.
+pub(crate) async fn verify_mfa_code_candidate(
+    pool: &DatabaseConnection,
+    user_id: &str,
+    code: &str,
+) -> Result<Option<(MfaVerificationMethod, Option<String>)>> {
     let pool_clone = pool.clone();
     let user_id_clone = user_id.to_string();
     let totp_secret = with_deadlock_retry("find_totp_secret", 10, || {
@@ -634,7 +723,14 @@ pub async fn verify_mfa_code(pool: &DatabaseConnection, user_id: &str, code: &st
             AppError::InternalServerError(format!("Failed to initialize encryption: {}", e))
         })?;
         let secret = encryption_service
-            .decrypt(&secret_record.secret_encrypted)
+            .decrypt_with_context(
+                &secret_record.secret_encrypted,
+                crate::encryption::EncryptionContext::new(
+                    "user_totp_secrets",
+                    &secret_record.id,
+                    "secret_encrypted",
+                ),
+            )
             .map_err(|e| {
                 AppError::InternalServerError(format!("Failed to decrypt secret: {}", e))
             })?;
@@ -662,7 +758,7 @@ pub async fn verify_mfa_code(pool: &DatabaseConnection, user_id: &str, code: &st
             .verify_totp(&secret, code, &user.email)
             .unwrap_or(false);
         if totp_valid {
-            return Ok(true);
+            return Ok(Some((MfaVerificationMethod::Totp, None)));
         }
 
         let pool_clone = pool.clone();
@@ -681,32 +777,173 @@ pub async fn verify_mfa_code(pool: &DatabaseConnection, user_id: &str, code: &st
         .await?;
 
         for backup_code in backup_codes {
-            if mfa_service
-                .verify_backup_code(code, &backup_code.code_hash)
-                .map_err(|e| {
-                    AppError::InternalServerError(format!("Failed to verify backup code: {}", e))
-                })?
+            if crate::services::concurrency::verify_password_bounded(
+                code.to_string(),
+                backup_code.code_hash.clone(),
+            )
+            .await?
             {
-                // Clone needed data before moving into async block
-                let backup_code_model: totp_backup_codes::Model = backup_code.clone();
-                let pool_clone = pool.clone();
-
-                with_deadlock_retry("update_backup_code", 10, || {
-                    let p = &pool_clone;
-                    let mut backup_active: totp_backup_codes::ActiveModel =
-                        backup_code_model.clone().into();
-                    backup_active.used = Set(true);
-                    backup_active.used_at = Set(Some(Utc::now().naive_utc()));
-                    async move { backup_active.update(p).await }
-                })
-                .await?;
-
-                return Ok(true);
+                return Ok(Some((
+                    MfaVerificationMethod::BackupCode,
+                    Some(backup_code.id),
+                )));
             }
         }
     }
 
-    Ok(false)
+    Ok(None)
+}
+
+/// Verify MFA and, for privacy/self-service callers, atomically consume a
+/// matching backup code with its audit event.
+pub async fn verify_mfa_code_with_backup_audit(
+    pool: &DatabaseConnection,
+    user_id: &str,
+    code: &str,
+    backup_audit: (
+        &crate::services::audit_actor::AuditHandle,
+        mfa_audit_log::ActiveModel,
+    ),
+) -> Result<Option<MfaVerificationMethod>> {
+    let Some((method, backup_code_id)) = verify_mfa_code_candidate(pool, user_id, code).await?
+    else {
+        return Ok(None);
+    };
+    if let Some(backup_code_id) = backup_code_id {
+        if !claim_backup_code_with_audit(pool, &backup_code_id, backup_audit).await? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(method))
+}
+
+#[cfg(test)]
+mod backup_code_claim_tests {
+    use super::*;
+    use crate::entities::audit_outbox;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{Database, PaginatorTrait, TransactionTrait};
+
+    #[test]
+    fn device_list_extreme_page_and_limit_are_backend_safe() {
+        let query = ListDevicesQuery {
+            page: Some(u64::MAX),
+            limit: Some(u64::MAX),
+            sort_by: None,
+            sort_order: None,
+        };
+        let (page, limit, offset) =
+            crate::utils::pagination::one_based_u64_page(query.page, query.limit, 20, 100);
+        assert_eq!(page, u64::MAX);
+        assert_eq!(limit, 100);
+        assert_eq!(offset, i64::MAX as u64);
+    }
+
+    #[tokio::test]
+    async fn backup_code_claim_is_one_winner_and_audit_coupled() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let user = UserStore::create(DB::Conn(&db), "backup-one-winner@example.test", None, true)
+            .await
+            .unwrap();
+        totp_backup_codes::ActiveModel {
+            id: Set("one-winner-code".to_string()),
+            user_id: Set(user.id.clone()),
+            code_hash: Set("unused-in-claim-test".to_string()),
+            used: Set(false),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let event = MfaAuditBuilder::new(&user.id, "backup_code_used")
+            .success(true)
+            .build();
+
+        assert!(
+            claim_backup_code_with_audit(&db, "one-winner-code", (&audit, event.clone()),)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !claim_backup_code_with_audit(&db, "one-winner-code", (&audit, event),)
+                .await
+                .unwrap()
+        );
+
+        let stored = TotpBackupCodes::find_by_id("one-winner-code")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.used);
+        assert!(stored.used_at.is_some());
+        assert_eq!(audit_outbox::Entity::find().count(&db).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn later_preauth_conflict_rolls_back_backup_code_and_its_success_audit() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let user = UserStore::create(DB::Conn(&db), "backup-retry@example.test", None, true)
+            .await
+            .unwrap();
+        totp_backup_codes::ActiveModel {
+            id: Set("retryable-backup-code".to_string()),
+            user_id: Set(user.id.clone()),
+            code_hash: Set("unused-in-claim-test".to_string()),
+            used: Set(false),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        assert!(
+            crate::store::distributed_locks::DistributedLockStore::try_acquire_lock(
+                DB::Conn(&db),
+                "mfa-preauth:already-consumed",
+                &format!("user:{}", user.id),
+                300,
+            )
+            .await
+            .unwrap()
+        );
+
+        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let transaction = db.begin().await.unwrap();
+        let event = MfaAuditBuilder::new(&user.id, "backup_code_used")
+            .success(true)
+            .build();
+        assert!(claim_backup_code_with_audit_in_db(
+            DB::Tx(&transaction),
+            "retryable-backup-code",
+            (&audit, event),
+        )
+        .await
+        .unwrap());
+        assert!(
+            !crate::store::distributed_locks::DistributedLockStore::try_acquire_lock(
+                DB::Tx(&transaction),
+                "mfa-preauth:already-consumed",
+                &format!("user:{}", user.id),
+                300,
+            )
+            .await
+            .unwrap()
+        );
+        transaction.rollback().await.unwrap();
+
+        assert!(
+            !TotpBackupCodes::find_by_id("retryable-backup-code")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .used
+        );
+        assert_eq!(audit_outbox::Entity::find().count(&db).await.unwrap(), 0);
+    }
 }
 
 // ============================================================================
@@ -764,32 +1001,11 @@ pub async fn change_password(
         )
     })?;
 
-    // Verify current password using spawn_blocking to avoid blocking the async runtime
-    use crate::services::concurrency::ARGON2_SEMAPHORE;
-
-    let password_hash_clone = current_password_hash.clone();
-    let password_input = req.current_password.clone();
-
-    // Acquire semaphore permit to limit concurrent hash operations
-    let _permit = ARGON2_SEMAPHORE.acquire().await.map_err(|_| {
-        AppError::InternalServerError("Password verification unavailable".to_string())
-    })?;
-
-    // Offload to blocking thread pool
-    let is_valid = tokio::task::spawn_blocking(move || {
-        let parsed_hash = match PasswordHash::new(&password_hash_clone) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("Corrupted password hash in database: {}", e);
-                return false;
-            }
-        };
-        Argon2::default()
-            .verify_password(password_input.as_bytes(), &parsed_hash)
-            .is_ok()
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Password verification failed: {}", e)))?;
+    let is_valid = crate::services::concurrency::verify_password_bounded(
+        req.current_password.clone(),
+        current_password_hash.clone(),
+    )
+    .await?;
 
     if !is_valid {
         return Err(AppError::Unauthorized(
@@ -797,13 +1013,8 @@ pub async fn change_password(
         ));
     }
 
-    // Hash new password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let new_password_hash = argon2
-        .hash_password(req.new_password.as_bytes(), &salt)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to hash password: {}", e)))?
-        .to_string();
+    let new_password_hash =
+        crate::services::concurrency::hash_password_bounded(req.new_password.clone()).await?;
 
     // Update password
     UserStore::update_password_hash(DB::Conn(&state.db), &user.id, &new_password_hash).await?;
@@ -855,13 +1066,8 @@ pub async fn set_password(
         ));
     }
 
-    // Hash new password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(req.new_password.as_bytes(), &salt)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to hash password: {}", e)))?
-        .to_string();
+    let password_hash =
+        crate::services::concurrency::hash_password_bounded(req.new_password.clone()).await?;
 
     // Update password
     UserStore::update_password_hash(DB::Conn(&state.db), &user.id, &password_hash).await?;
@@ -951,7 +1157,13 @@ pub async fn update_user(
         validate_email_format(email)?;
 
         // Check if email is already taken by another user
-        if let Some(existing_user) = UserStore::find_by_email(DB::Conn(&state.db), email).await? {
+        if let Some(existing_user) = UserStore::find_by_email_with_context(
+            DB::Conn(&state.db),
+            email,
+            user.org_id.as_deref(),
+        )
+        .await?
+        {
             if existing_user.id != user.id {
                 return Err(AppError::BadRequest("Email is already taken".to_string()));
             }
@@ -959,8 +1171,8 @@ pub async fn update_user(
     }
 
     // Update user with new email if provided
-    let updated_user = if req.email.is_some() {
-        UserStore::update_email(DB::Conn(&state.db), &user.id, req.email.as_ref().unwrap()).await?
+    let updated_user = if let Some(email) = &req.email {
+        UserStore::update_email(DB::Conn(&state.db), &user.id, email).await?
     } else {
         user
     };
@@ -1023,9 +1235,8 @@ pub async fn list_devices(
     Extension(auth_user): Extension<crate::middleware::AuthUser>,
     Query(query): Query<ListDevicesQuery>,
 ) -> Result<Json<ListDevicesResponse>> {
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(20).min(100);
-    let offset = (page - 1) * limit;
+    let (page, limit, offset) =
+        crate::utils::pagination::one_based_u64_page(query.page, query.limit, 20, 100);
 
     let db = DB::Conn(&state.db);
 
@@ -1168,8 +1379,11 @@ pub async fn revoke_device(
             .await?
             .ok_or_else(|| AppError::NotFound("Device not found".to_string()))?;
 
-    // Delete the device
-    UserDevicesStore::delete_by_id(db.clone(), &device_id).await?;
+    // Delete with the owner predicate in the mutation itself so a future
+    // ownership-model change cannot create a check/use gap.
+    if !UserDevicesStore::delete(db.clone(), &device_id, &auth_user.claims.sub).await? {
+        return Err(AppError::NotFound("Device not found".to_string()));
+    }
 
     // Log the revocation
     tracing::info!(
@@ -1201,18 +1415,18 @@ pub async fn revoke_all_devices(
 
     // Delete all devices except possibly the current one
     let devices = UserDevicesStore::find_by_user(db.clone(), &auth_user.claims.sub).await?;
-    let mut revoked_count = 0;
-
-    for device in devices {
-        // Simple heuristic: don't revoke if user agent matches recent device usage
-        let should_keep =
-            device.last_seen_at > Utc::now().naive_utc() && device.name.contains("Current Session");
-
-        if !should_keep {
-            UserDevicesStore::delete_by_id(db.clone(), &device.id).await?;
-            revoked_count += 1;
-        }
-    }
+    let now = Utc::now().naive_utc();
+    let keep_device_ids = devices
+        .iter()
+        .filter(|device| device.last_seen_at > now && device.name.contains("Current Session"))
+        .map(|device| device.id.clone())
+        .collect::<Vec<_>>();
+    let revoked_count = UserDevicesStore::delete_by_user_except_ids(
+        db.clone(),
+        &auth_user.claims.sub,
+        &keep_device_ids,
+    )
+    .await?;
 
     tracing::info!(
         user_id = %auth_user.claims.sub,
@@ -1245,14 +1459,24 @@ pub async fn update_device_name(
             .ok_or_else(|| AppError::NotFound("Device not found".to_string()))?;
 
     // Update device name
-    UserDevicesStore::update_name(db.clone(), &device_id, &req.device_name).await?;
+    if !UserDevicesStore::update_name(
+        db.clone(),
+        &device_id,
+        &auth_user.claims.sub,
+        &req.device_name,
+    )
+    .await?
+    {
+        return Err(AppError::NotFound("Device not found".to_string()));
+    }
 
     // Get updated device
-    let updated_device = UserDevicesStore::find_by_id(db.clone(), &device_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::InternalServerError("Failed to retrieve updated device".to_string())
-        })?;
+    let updated_device =
+        UserDevicesStore::find_by_id_and_user(db.clone(), &device_id, &auth_user.claims.sub)
+            .await?
+            .ok_or_else(|| {
+                AppError::InternalServerError("Failed to retrieve updated device".to_string())
+            })?;
 
     tracing::info!(
         user_id = %auth_user.claims.sub,
@@ -1312,14 +1536,24 @@ pub async fn trust_device(
 
     // Extend device trust expiration (90 days from now)
     let expires_at = (Utc::now() + chrono::Duration::days(90)).naive_utc();
-    UserDevicesStore::update_expires_at(db.clone(), &device_id, &expires_at).await?;
+    if !UserDevicesStore::update_expires_at(
+        db.clone(),
+        &device_id,
+        &auth_user.claims.sub,
+        &expires_at,
+    )
+    .await?
+    {
+        return Err(AppError::NotFound("Device not found".to_string()));
+    }
 
     // Get updated device
-    let updated_device = UserDevicesStore::find_by_id(db.clone(), &device_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::InternalServerError("Failed to retrieve updated device".to_string())
-        })?;
+    let updated_device =
+        UserDevicesStore::find_by_id_and_user(db.clone(), &device_id, &auth_user.claims.sub)
+            .await?
+            .ok_or_else(|| {
+                AppError::InternalServerError("Failed to retrieve updated device".to_string())
+            })?;
 
     tracing::info!(
         user_id = %auth_user.claims.sub,

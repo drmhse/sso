@@ -3,7 +3,8 @@
 services:
   # Test database
   db-test:
-    image: postgres:15-alpine
+    # CI/runtime qualification candidate; this is not a stable support-window promise.
+    image: postgres:16-alpine
     container_name: sso-db-test
     environment:
       POSTGRES_DB: sso_test
@@ -26,14 +27,14 @@ services:
 
   # MySQL Test Database
   db-mysql-test:
-    image: mysql:8.0
+    # CI/runtime qualification candidate; this is not a stable support-window promise.
+    image: mysql:8.4
     container_name: sso-db-mysql-test
     environment:
       MYSQL_DATABASE: sso_test
       MYSQL_USER: sso_test_user
       MYSQL_PASSWORD: sso_test_password
       MYSQL_ROOT_PASSWORD: root_password
-    command: --default-authentication-plugin=mysql_native_password
     ports:
       - "3307:3306"
     healthcheck:

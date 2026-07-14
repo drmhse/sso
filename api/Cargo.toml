@@ -2,13 +2,14 @@
 name = "sso"
 version = "0.1.40"
 edition = "2021"
+license = "AGPL-3.0-only"
 
 [dependencies]
 # Web framework
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "timeout", "set-header"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout", "set-header", "limit"] }
 tower_governor = "0.3"
 include_dir = "0.7"
 mime_guess = "2.0"
@@ -35,7 +36,7 @@ reqwest = { version = "0.13", default-features = false, features = ["form", "jso
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1.0"
+anyhow = "1.0.103"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -98,7 +99,7 @@ metrics-exporter-prometheus = { version = "0.12", default-features = false }
 
 # SAML
 # samael removed
-quick-xml = "0.31"
+quick-xml = "0.41"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 # x509-parser version managed by rcgen/webauthn-rs
 flate2 = "1.0"

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::auth::jwt::JwtService;
-use crate::error::{AppError, Result};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::services::webauthn::WebAuthnService;
 use crate::state::AppState;
@@ -9,8 +9,8 @@ use crate::store::users::UserStore;
 use crate::store::webauthn_challenges::WebAuthnChallengeStore;
 use crate::store::DB;
 use crate::store::{
-    organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
-    user_passkeys::UserPasskeysStore,
+    identities::IdentityStore, memberships::MembershipStore, organizations::OrganizationStore,
+    services::ServiceStore, sessions::SessionStore, user_passkeys::UserPasskeysStore,
 };
 use axum::{
     extract::{Path, State},
@@ -21,6 +21,25 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
+
+const PASSKEY_AUTH_UNAVAILABLE: &str = "Passkey authentication is unavailable";
+
+fn passkey_auth_unavailable() -> AppError {
+    AppError::BadRequest(PASSKEY_AUTH_UNAVAILABLE.to_string())
+}
+
+fn ensure_passkey_login_allowed(action: &crate::services::risk_engine::RiskAction) -> Result<()> {
+    use crate::services::risk_engine::RiskAction;
+    match action {
+        RiskAction::Allow | RiskAction::LogOnly => Ok(()),
+        RiskAction::ChallengeMFA => Err(AppError::Forbidden(
+            "Additional verification required. Please use another login method.".to_string(),
+        )),
+        RiskAction::Block => Err(AppError::Forbidden(
+            "Suspicious login detected. Please contact support.".to_string(),
+        )),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PasskeyRegisterStartRequest {
@@ -325,19 +344,24 @@ pub async fn update_passkey_name(
         ));
     }
 
-    let existing = UserPasskeysStore::find_by_id(DB::Conn(&state.db), &passkey_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Passkey not found".to_string()))?;
-
-    if existing.user_id != auth_user.claims.sub {
+    if !UserPasskeysStore::update_name(
+        DB::Conn(&state.db),
+        &passkey_id,
+        &auth_user.claims.sub,
+        name,
+    )
+    .await?
+    {
         return Err(AppError::NotFound("Passkey not found".to_string()));
     }
 
-    UserPasskeysStore::update_name(DB::Conn(&state.db), &passkey_id, name).await?;
-
-    let passkey = UserPasskeysStore::find_by_id(DB::Conn(&state.db), &passkey_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Passkey not found".to_string()))?;
+    let passkey = UserPasskeysStore::find_by_id_for_user(
+        DB::Conn(&state.db),
+        &passkey_id,
+        &auth_user.claims.sub,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("Passkey not found".to_string()))?;
 
     Ok(Json(UserPasskeyResponse {
         id: passkey.id,
@@ -439,22 +463,25 @@ pub async fn authenticate_start(
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
         crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
-        UserStore::find_by_email_with_context(db.clone(), &req.email, Some(&org.id))
-            .await?
-            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?
+        UserStore::find_by_email_with_context(db.clone(), &req.email, Some(&org.id)).await?
     } else {
-        UserStore::find_by_email(db.clone(), &req.email)
-            .await?
-            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?
+        UserStore::find_by_email_with_context(db.clone(), &req.email, None).await?
     };
 
-    let passkeys = WebAuthnService::load_user_passkeys(db.clone(), &user.id).await?;
+    // Keep missing-user and unenrolled-user paths aligned through the same
+    // passkey-table query. `None` compiles to `user_id IS NULL`, an impossible
+    // typed predicate for the non-null foreign-key column, so no imported row
+    // can collide with a fixed sentinel.
+    let passkeys = WebAuthnService::load_user_passkeys_for_public_auth(
+        db.clone(),
+        user.as_ref().map(|user| user.id.as_str()),
+    )
+    .await?;
 
     if passkeys.is_empty() {
-        return Err(AppError::BadRequest(
-            "No passkeys registered for this user".to_string(),
-        ));
+        return Err(passkey_auth_unavailable());
     }
+    let user = user.ok_or_else(passkey_auth_unavailable)?;
 
     let webauthn = state
         .webauthn_service
@@ -534,20 +561,11 @@ pub async fn authenticate_finish(
 
     let auth_result = webauthn.finish_authentication(&req.credential, &passkey_auth)?;
 
-    let credential_id_value = serde_json::to_value(auth_result.cred_id()).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to serialize credential ID: {}", e))
-    })?;
-
-    let credential_id_str = credential_id_value
-        .as_str()
-        .ok_or_else(|| AppError::InternalServerError("Invalid credential ID format".to_string()))?;
-
-    let new_counter = auth_result.counter();
-
-    WebAuthnService::update_passkey_counter(db.clone(), credential_id_str, new_counter).await?;
+    WebAuthnService::update_passkey_after_authentication(db.clone(), &auth_result).await?;
 
     let user = UserStore::find_by_id(db.clone(), &challenge_record.user_id)
         .await?
+        .filter(|user| user.deleted_at.is_none())
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     // Determine organization context for risk evaluation
@@ -613,66 +631,23 @@ pub async fn authenticate_finish(
     // Log risk assessment
     tracing::info!(
         user_id = %user.id,
-        email = %user.email,
         risk_score = risk_assessment.score,
         risk_action = ?risk_assessment.action,
         risk_factors = ?risk_assessment.factors,
         "Passkey authentication risk assessment"
     );
 
-    // Persist risk assessment to login_events via buffered audit actor (non-blocking)
-    {
-        use crate::entities::login_events;
-        use sea_orm::Set;
-        use uuid::Uuid;
-
-        let risk_factors_json = serde_json::to_string(&risk_assessment.factors).ok();
-
-        let event_model = login_events::ActiveModel {
-            id: Set(Uuid::new_v4().to_string()),
-            user_id: Set(user.id.clone()),
-            service_id: Set(service_id_owned.clone()),
-            provider: Set("passkey".to_string()),
-            ip_address: Set(Some(request_info.ip_address.clone())),
-            user_agent: Set(Some(request_info.user_agent.clone())),
-            risk_score: Set(Some(risk_assessment.score)),
-            risk_factors: Set(risk_factors_json),
-            geo_country: Set(None),
-            geo_city: Set(None),
-            geo_lat: Set(None),
-            geo_long: Set(None),
-            ..Default::default()
-        };
-
-        state.audit_actor.log_login(event_model).await;
-    }
-
-    // Handle risk engine actions
     use crate::services::risk_engine::RiskAction;
-    match risk_assessment.action {
-        RiskAction::Allow | RiskAction::LogOnly => {
-            // Continue with normal flow
-        }
-        RiskAction::ChallengeMFA => {
-            // Passkey auth should be strong enough, but risk engine demands additional verification
-            return Err(AppError::Forbidden(
-                "Additional verification required. Please use another login method.".to_string(),
-            ));
-        }
-        RiskAction::Block => {
-            tracing::warn!(
-                user_id = %user.id,
-                email = %user.email,
-                risk_score = risk_assessment.score,
-                factors = ?risk_assessment.factors,
-                "Passkey authentication blocked by risk engine"
-            );
-
-            return Err(AppError::Forbidden(
-                "Suspicious login detected. Please contact support.".to_string(),
-            ));
-        }
+    if matches!(risk_assessment.action, RiskAction::Block) {
+        tracing::warn!(
+            user_id = %user.id,
+            risk_score = risk_assessment.score,
+            factors = ?risk_assessment.factors,
+            "Passkey authentication blocked by risk engine"
+        );
     }
+    // A blocked/challenged attempt must not create a success event or session.
+    ensure_passkey_login_allowed(&risk_assessment.action)?;
 
     let token = state.jwt_service.create_token(
         &user.id,
@@ -686,61 +661,103 @@ pub async fn authenticate_finish(
             .and_then(|ctx| ctx.service_slug.as_deref()),
     )?;
 
-    let refresh_token = uuid::Uuid::new_v4().to_string();
+    let refresh_token = crate::auth::refresh_tokens::generate();
     let token_hash = JwtService::hash_token(&token);
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
 
-    SessionStore::create(
-        DB::Conn(&state.db),
-        &user.id,
-        &token_hash,
-        expires_at.naive_utc(),
-        Some(&refresh_token),
-        Some(refresh_expires_at.naive_utc()),
-        auth_context
-            .as_ref()
-            .and_then(|ctx| ctx.org_slug.as_deref()),
-        service_id_owned.as_deref(),
-        None,
-        Some(&request_info.user_agent),
-        Some(&request_info.ip_address),
-    )
-    .await?;
-
-    // Generate device trust cookie if risk assessment allows
-    let device_cookie_value = if matches!(risk_assessment.action, RiskAction::Allow) {
+    // Generate device trust material before entering the database transaction.
+    let device_trust = if matches!(risk_assessment.action, RiskAction::Allow) {
         let device_token = state.risk_engine.generate_device_token(&user.id);
-
-        // Store device in database
-        use crate::store::user_devices::UserDevicesStore;
         use sha2::{Digest, Sha256};
-
         let mut hasher = Sha256::new();
         hasher.update(device_token.as_bytes());
-        let token_hash = hex::encode(hasher.finalize());
-
-        let expires_at = (Utc::now() + chrono::Duration::days(90)).naive_utc();
-
-        UserDevicesStore::create(
-            db.clone(),
-            &user.id,
-            &token_hash,
-            "Passkey Authentication Device",
-            Some(request_info.ip_address.clone()),
-            expires_at,
-        )
-        .await?;
-
-        Some(device_token)
+        Some((
+            device_token,
+            hex::encode(hasher.finalize()),
+            (Utc::now() + chrono::Duration::days(90)).naive_utc(),
+        ))
     } else {
         None
     };
+    let risk_factors_json = serde_json::to_string(&risk_assessment.factors).ok();
+    let event_model = crate::entities::login_events::ActiveModel {
+        id: sea_orm::Set(uuid::Uuid::new_v4().to_string()),
+        user_id: sea_orm::Set(user.id.clone()),
+        service_id: sea_orm::Set(service_id_owned.clone()),
+        provider: sea_orm::Set("passkey".to_string()),
+        ip_address: sea_orm::Set(Some(request_info.ip_address.clone())),
+        user_agent: sea_orm::Set(Some(request_info.user_agent.clone())),
+        risk_score: sea_orm::Set(Some(risk_assessment.score)),
+        risk_factors: sea_orm::Set(risk_factors_json),
+        geo_country: sea_orm::Set(None),
+        geo_city: sea_orm::Set(None),
+        geo_lat: sea_orm::Set(None),
+        geo_long: sea_orm::Set(None),
+        ..Default::default()
+    };
+    let session_org_slug = auth_context.as_ref().and_then(|ctx| ctx.org_slug.clone());
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "persist_passkey_login_with_audit",
+        |tx| {
+            let user_id = user.id.clone();
+            let token_hash = token_hash.clone();
+            let refresh_token = refresh_token.clone();
+            let service_id = service_id_owned.clone();
+            let org_slug = session_org_slug.clone();
+            let user_agent = request_info.user_agent.clone();
+            let ip_address = request_info.ip_address.clone();
+            let device_trust = device_trust.clone();
+            let event_model = event_model.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                validate_passkey_login_authority(
+                    tx.clone(),
+                    &user_id,
+                    org_slug.as_deref(),
+                    service_id.as_deref(),
+                )
+                .await?;
+                SessionStore::create(
+                    tx.clone(),
+                    &user_id,
+                    &token_hash,
+                    expires_at.naive_utc(),
+                    Some(&refresh_token),
+                    Some(refresh_expires_at.naive_utc()),
+                    org_slug.as_deref(),
+                    service_id.as_deref(),
+                    None,
+                    Some(&user_agent),
+                    Some(&ip_address),
+                )
+                .await?;
+                if let Some((_, device_token_hash, device_expires_at)) = device_trust {
+                    crate::store::user_devices::UserDevicesStore::create(
+                        tx.clone(),
+                        &user_id,
+                        &device_token_hash,
+                        "Passkey Authentication Device",
+                        Some(ip_address),
+                        device_expires_at,
+                    )
+                    .await?;
+                }
+                audit_actor.log_login_with_db(tx, event_model).await?;
+                Ok(())
+            })
+        },
+    )
+    .await?;
+
+    let device_cookie_value = device_trust.map(|(token, _, _)| token);
 
     tracing::info!(
         user_id = %user.id,
-        email = %user.email,
         "Passkey authentication successful"
     );
 
@@ -777,6 +794,48 @@ pub async fn authenticate_finish(
     }
 }
 
+async fn validate_passkey_login_authority(
+    db: DB<'_>,
+    user_id: &str,
+    org_slug: Option<&str>,
+    service_id: Option<&str>,
+) -> Result<()> {
+    let user = UserStore::find_by_id(db.clone(), user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(passkey_auth_unavailable)?;
+    let Some(org_slug) = org_slug else {
+        if service_id.is_some() {
+            return Err(passkey_auth_unavailable());
+        }
+        return Ok(());
+    };
+    let org = OrganizationStore::find_by_slug(db.clone(), org_slug)
+        .await?
+        .filter(|org| org.status == "active")
+        .ok_or_else(passkey_auth_unavailable)?;
+    if user.is_platform_owner {
+        return Ok(());
+    }
+    if let Some(service_id) = service_id {
+        let has_membership = MembershipStore::find_by_org_and_user(db.clone(), &org.id, user_id)
+            .await?
+            .is_some();
+        let has_service_identity =
+            IdentityStore::exists_for_user_and_service_context(db, user_id, &org.id, service_id)
+                .await?;
+        if !has_membership && !has_service_identity {
+            return Err(passkey_auth_unavailable());
+        }
+    } else if MembershipStore::find_by_org_and_user(db, &org.id, user_id)
+        .await?
+        .is_none()
+    {
+        return Err(passkey_auth_unavailable());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,8 +855,24 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use openssl::rsa::Rsa;
-    use sea_orm::Database;
+    use sea_orm::{ActiveModelTrait, Database, Set};
     use std::sync::Arc;
+
+    #[test]
+    fn risk_gate_rejects_before_passkey_success_persistence() {
+        use crate::services::risk_engine::RiskAction;
+
+        assert!(ensure_passkey_login_allowed(&RiskAction::Allow).is_ok());
+        assert!(ensure_passkey_login_allowed(&RiskAction::LogOnly).is_ok());
+        assert!(matches!(
+            ensure_passkey_login_allowed(&RiskAction::ChallengeMFA),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            ensure_passkey_login_allowed(&RiskAction::Block),
+            Err(AppError::Forbidden(_))
+        ));
+    }
 
     fn test_config() -> Config {
         Config {
@@ -957,10 +1032,149 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn passkey_session_boundary_rechecks_deleted_user_and_service_entitlement() {
+        let state = setup_passkey_state_with_suspended_org().await;
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), "acme")
+            .await
+            .unwrap()
+            .unwrap();
+        OrganizationStore::update_status(DB::Conn(&state.db), &org.id, "active")
+            .await
+            .unwrap();
+        let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, "portal")
+            .await
+            .unwrap()
+            .unwrap();
+        let user = UserStore::create(
+            DB::Conn(&state.db),
+            "passkey-member@example.test",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        MembershipStore::create(DB::Conn(&state.db), &org.id, &user.id, "member")
+            .await
+            .unwrap();
+
+        assert!(validate_passkey_login_authority(
+            DB::Conn(&state.db),
+            &user.id,
+            Some(&org.slug),
+            Some(&service.id),
+        )
+        .await
+        .is_ok());
+        MembershipStore::delete_by_org_and_user(DB::Conn(&state.db), &org.id, &user.id)
+            .await
+            .unwrap();
+        assert!(validate_passkey_login_authority(
+            DB::Conn(&state.db),
+            &user.id,
+            Some(&org.slug),
+            Some(&service.id),
+        )
+        .await
+        .is_err());
+
+        IdentityStore::create(
+            DB::Conn(&state.db),
+            &user.id,
+            "passkey",
+            "credential-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            Some(&service.id),
+        )
+        .await
+        .unwrap();
+        assert!(validate_passkey_login_authority(
+            DB::Conn(&state.db),
+            &user.id,
+            Some(&org.slug),
+            Some(&service.id),
+        )
+        .await
+        .is_ok());
+        IdentityStore::delete_by_user_and_service(DB::Conn(&state.db), &user.id, &service.id)
+            .await
+            .unwrap();
+        assert!(validate_passkey_login_authority(
+            DB::Conn(&state.db),
+            &user.id,
+            Some(&org.slug),
+            Some(&service.id),
+        )
+        .await
+        .is_err());
+
+        let user_id = user.id.clone();
+        let mut deleted_user: crate::entities::users::ActiveModel = user.into();
+        deleted_user.deleted_at = Set(Some(Utc::now().naive_utc()));
+        deleted_user.update(&state.db).await.unwrap();
+        assert!(
+            validate_passkey_login_authority(DB::Conn(&state.db), &user_id, None, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_auth_start_normalizes_absent_and_unenrolled_accounts() {
+        let state = setup_passkey_state_with_suspended_org().await;
+
+        let mut errors = Vec::new();
+        for email in ["absent@example.com", "owner@example.com"] {
+            let result = authenticate_start(
+                State(state.clone()),
+                Json(PasskeyAuthStartRequest {
+                    email: email.to_string(),
+                    org_slug: None,
+                    service_slug: None,
+                    redirect_uri: None,
+                    state: None,
+                }),
+            )
+            .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("passkey start must be unavailable"),
+            };
+
+            assert!(matches!(
+                error,
+                AppError::BadRequest(ref message) if message == PASSKEY_AUTH_UNAVAILABLE
+            ));
+            let response = axum::response::IntoResponse::into_response(error);
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("read bounded error response");
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse error response");
+            assert!(body
+                .as_object_mut()
+                .expect("error response object")
+                .remove("timestamp")
+                .is_some());
+            errors.push((status, headers, body));
+        }
+        assert_eq!(errors[0], errors[1]);
+    }
+
     fn auth_user_for(user: crate::entities::users::Model) -> AuthUser {
         let now = Utc::now();
         AuthUser {
             claims: crate::auth::jwt::Claims {
+                token_use: crate::auth::jwt::TokenUse::ManagementAccess,
                 sub: user.id.clone(),
                 email: user.email.clone(),
                 is_platform_owner: user.is_platform_owner,
@@ -970,6 +1184,7 @@ mod tests {
                 mfa_required: None,
                 mfa_verified: None,
                 saml_state: None,
+                device_code_id: None,
                 act: None,
                 aud: Some("platform".to_string()),
                 iss: Some("http://localhost:3001".to_string()),

@@ -6,6 +6,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
     QuerySelect, Set,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Combined membership and user data for listing members
@@ -20,6 +21,12 @@ pub struct MemberWithUser {
     pub membership_id: String,
     pub membership_role: String,
     pub membership_created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct CountByOrg {
+    org_id: String,
+    count: i64,
 }
 
 pub struct MembershipStore;
@@ -46,6 +53,38 @@ impl MembershipStore {
             .one(&db)
             .await?;
         Ok(result)
+    }
+
+    /// Resolve an email through membership in one exact organization.
+    ///
+    /// Email is tenant-scoped, so looking up a user globally and checking the
+    /// membership afterwards can bind an arbitrary platform or other-tenant
+    /// row. Joining from the selected organization's membership keeps the user
+    /// and membership coupled. More than one matching member is rejected rather
+    /// than selecting whichever row the database happens to return first.
+    pub async fn find_unique_member_with_user_by_org_and_email(
+        db: DB<'_>,
+        org_id: &str,
+        email: &str,
+    ) -> Result<Option<(memberships::Model, users::Model)>> {
+        let matches = Memberships::find()
+            .filter(memberships::Column::OrgId.eq(org_id))
+            .find_also_related(users::Entity)
+            .filter(users::Column::Email.eq(email))
+            .limit(2)
+            .all(&db)
+            .await?;
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [(membership, Some(user))] => Ok(Some((membership.clone(), user.clone()))),
+            [(_, None)] => Err(AppError::InternalServerError(
+                "Organization membership references a missing user".to_string(),
+            )),
+            _ => Err(AppError::BadRequest(
+                "More than one organization member has that email".to_string(),
+            )),
+        }
     }
 
     /// Create a new membership with retry logic for SQLite busy errors
@@ -131,22 +170,39 @@ impl MembershipStore {
 
     /// Delete a membership
     pub async fn delete(db: DB<'_>, membership_id: &str) -> Result<()> {
-        let membership = Self::find_by_id(db.clone(), membership_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Membership not found".to_string()))?;
+        let result = Memberships::delete_many()
+            .filter(memberships::Column::Id.eq(membership_id))
+            .exec(&db)
+            .await?;
 
-        let membership_active: memberships::ActiveModel = membership.into();
-        membership_active.delete(&db).await?;
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound("Membership not found".to_string()));
+        }
 
         Ok(())
     }
 
+    /// Delete memberships by IDs.
+    pub async fn delete_by_ids(db: DB<'_>, membership_ids: &[String]) -> Result<u64> {
+        if membership_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let result = Memberships::delete_many()
+            .filter(memberships::Column::Id.is_in(membership_ids.iter().cloned()))
+            .exec(&db)
+            .await?;
+
+        Ok(result.rows_affected)
+    }
+
     /// Delete membership by org and user
     pub async fn delete_by_org_and_user(db: DB<'_>, org_id: &str, user_id: &str) -> Result<()> {
-        if let Some(membership) = Self::find_by_org_and_user(db.clone(), org_id, user_id).await? {
-            let membership_active: memberships::ActiveModel = membership.into();
-            membership_active.delete(&db).await?;
-        }
+        Memberships::delete_many()
+            .filter(memberships::Column::OrgId.eq(org_id))
+            .filter(memberships::Column::UserId.eq(user_id))
+            .exec(&db)
+            .await?;
 
         Ok(())
     }
@@ -190,6 +246,47 @@ impl MembershipStore {
             .await?;
 
         Ok(memberships)
+    }
+
+    /// List memberships for a user within a bounded set of organizations.
+    pub async fn list_by_user_and_org_ids(
+        db: DB<'_>,
+        user_id: &str,
+        org_ids: &[String],
+    ) -> Result<Vec<memberships::Model>> {
+        if org_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let memberships = Memberships::find()
+            .filter(memberships::Column::UserId.eq(user_id))
+            .filter(memberships::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .all(&db)
+            .await?;
+
+        Ok(memberships)
+    }
+
+    /// Count memberships grouped by organization ID.
+    pub async fn count_by_orgs(db: DB<'_>, org_ids: &[String]) -> Result<HashMap<String, i64>> {
+        if org_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = Memberships::find()
+            .filter(memberships::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .select_only()
+            .column(memberships::Column::OrgId)
+            .column_as(memberships::Column::Id.count(), "count")
+            .group_by(memberships::Column::OrgId)
+            .into_model::<CountByOrg>()
+            .all(&db)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.org_id, row.count))
+            .collect())
     }
 
     /// Check if user is a member of an organization
@@ -283,13 +380,14 @@ impl MembershipStore {
     ) -> Result<Vec<MemberWithUser>> {
         use sea_orm::{JoinType, QueryOrder, QuerySelect, RelationTrait};
 
+        let (limit, offset) = crate::utils::pagination::store_u64(limit, offset, 1000);
         // Get memberships with user data using a simple JOIN
         let mut query = Memberships::find()
             .join(JoinType::InnerJoin, memberships::Relation::Users.def())
             .filter(memberships::Column::OrgId.eq(org_id))
             .order_by_asc(memberships::Column::CreatedAt)
-            .limit(limit as u64)
-            .offset(offset as u64);
+            .limit(limit)
+            .offset(offset);
 
         if let Some(role) = role_filter {
             query = query.filter(memberships::Column::Role.eq(role));
@@ -323,5 +421,28 @@ impl MembershipStore {
             .await?;
 
         Ok(count > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn direct_membership_deletes_preserve_missing_row_semantics() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        assert!(matches!(
+            MembershipStore::delete(DB::Conn(&db), "missing").await,
+            Err(AppError::NotFound(_))
+        ));
+        MembershipStore::delete_by_org_and_user(DB::Conn(&db), "missing-org", "missing-user")
+            .await
+            .expect("missing org/user delete is a noop");
     }
 }

@@ -79,7 +79,7 @@ impl VerifiedDomainStore {
             verification_token: Set(verification_token.to_string()),
             verified: Set(false),
             verified_at: Set(None),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 
@@ -102,7 +102,7 @@ impl VerifiedDomainStore {
 
         let mut domain: verified_domains::ActiveModel = domain.into();
         domain.verified = Set(true);
-        domain.verified_at = Set(Some(now.clone()));
+        domain.verified_at = Set(Some(now));
         domain.updated_at = Set(now);
 
         let result = domain.update(&db).await.map_err(|e| {
@@ -112,19 +112,58 @@ impl VerifiedDomainStore {
         Ok(result)
     }
 
-    /// Delete a domain verification record
-    pub async fn delete(db: DB<'_>, domain_id: &str) -> Result<()> {
-        let domain = VerifiedDomains::find_by_id(domain_id)
+    /// Mark a domain verified only when it belongs to the selected organization.
+    pub async fn mark_verified_in_org(
+        db: DB<'_>,
+        org_id: &str,
+        domain_id: &str,
+    ) -> Result<verified_domains::Model> {
+        let now = chrono::Utc::now().naive_utc();
+        let result = VerifiedDomains::update_many()
+            .filter(verified_domains::Column::Id.eq(domain_id))
+            .filter(verified_domains::Column::OrgId.eq(org_id))
+            .col_expr(
+                verified_domains::Column::Verified,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .col_expr(
+                verified_domains::Column::VerifiedAt,
+                sea_orm::sea_query::Expr::value(Some(now)),
+            )
+            .col_expr(
+                verified_domains::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .exec(&db)
+            .await
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to update domain: {}", e))
+            })?;
+
+        if result.rows_affected != 1 {
+            return Err(AppError::NotFound("Domain not found".to_string()));
+        }
+
+        VerifiedDomains::find()
+            .filter(verified_domains::Column::Id.eq(domain_id))
+            .filter(verified_domains::Column::OrgId.eq(org_id))
             .one(&db)
             .await
             .map_err(|e| AppError::InternalServerError(format!("Database error: {}", e)))?
-            .ok_or_else(|| AppError::NotFound("Domain not found".to_string()))?;
+            .ok_or_else(|| AppError::NotFound("Domain not found".to_string()))
+    }
 
-        let domain: verified_domains::ActiveModel = domain.into();
-        domain.delete(&db).await.map_err(|e| {
-            AppError::InternalServerError(format!("Failed to delete domain: {}", e))
-        })?;
+    /// Delete a domain verification record
+    pub async fn delete_in_org(db: DB<'_>, org_id: &str, domain_id: &str) -> Result<bool> {
+        let result = VerifiedDomains::delete_many()
+            .filter(verified_domains::Column::Id.eq(domain_id))
+            .filter(verified_domains::Column::OrgId.eq(org_id))
+            .exec(&db)
+            .await
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to delete domain: {}", e))
+            })?;
 
-        Ok(())
+        Ok(result.rows_affected == 1)
     }
 }

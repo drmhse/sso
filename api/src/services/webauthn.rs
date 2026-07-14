@@ -207,6 +207,20 @@ impl WebAuthnService {
     pub async fn load_user_passkeys(db: DB<'_>, user_id: &str) -> Result<Vec<Passkey>> {
         let passkey_models = UserPasskeysStore::list_by_user(db, user_id).await?;
 
+        Self::deserialize_passkeys(passkey_models)
+    }
+
+    pub async fn load_user_passkeys_for_public_auth(
+        db: DB<'_>,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Passkey>> {
+        let passkey_models = UserPasskeysStore::list_for_public_auth_lookup(db, user_id).await?;
+        Self::deserialize_passkeys(passkey_models)
+    }
+
+    fn deserialize_passkeys(
+        passkey_models: Vec<crate::entities::user_passkeys::Model>,
+    ) -> Result<Vec<Passkey>> {
         let mut passkeys = Vec::new();
         for model in passkey_models {
             match Self::model_to_passkey(&model) {
@@ -235,18 +249,62 @@ impl WebAuthnService {
         Ok(passkey)
     }
 
-    /// Update passkey counter after successful authentication
-    pub async fn update_passkey_counter(
+    /// Apply the library-validated authentication result to the complete
+    /// serialized credential with optimistic concurrency. The denormalized
+    /// counter and backup flags are updated in the same statement.
+    pub async fn update_passkey_after_authentication(
         db: DB<'_>,
-        credential_id: &str,
-        new_counter: u32,
+        authentication_result: &AuthenticationResult,
     ) -> Result<()> {
-        let passkey = UserPasskeysStore::find_by_credential_id(db.clone(), credential_id)
+        let credential_id_value =
+            serde_json::to_value(authentication_result.cred_id()).map_err(|error| {
+                AppError::InternalServerError(format!("Failed to serialize credential ID: {error}"))
+            })?;
+        let credential_id = credential_id_value.as_str().ok_or_else(|| {
+            AppError::InternalServerError("Invalid credential ID format".to_string())
+        })?;
+
+        for _ in 0..3 {
+            let model = UserPasskeysStore::find_by_credential_id(db.clone(), credential_id)
+                .await?
+                .ok_or_else(|| AppError::NotFound("Passkey not found".to_string()))?;
+            let result_counter = authentication_result.counter() as i64;
+            if model.counter > 0 && result_counter <= model.counter {
+                return Err(AppError::Unauthorized(
+                    "Authenticator counter did not advance".to_string(),
+                ));
+            }
+            let mut passkey = Self::model_to_passkey(&model)?;
+            passkey
+                .update_credential(authentication_result)
+                .ok_or_else(|| {
+                    AppError::Unauthorized(
+                        "Authenticator result does not match the stored passkey".to_string(),
+                    )
+                })?;
+            let updated_public_key = serde_json::to_string(&passkey).map_err(|error| {
+                AppError::InternalServerError(format!(
+                    "Failed to serialize updated passkey: {error}"
+                ))
+            })?;
+
+            if UserPasskeysStore::compare_and_update_after_use(
+                db.clone(),
+                &model.id,
+                &model.public_key,
+                &updated_public_key,
+                result_counter,
+                authentication_result.backup_eligible(),
+                authentication_result.backup_state(),
+            )
             .await?
-            .ok_or_else(|| AppError::NotFound("Passkey not found".to_string()))?;
+            {
+                return Ok(());
+            }
+        }
 
-        UserPasskeysStore::update_after_use(db, &passkey.id, new_counter as i64).await?;
-
-        Ok(())
+        Err(AppError::Unauthorized(
+            "Passkey state changed concurrently; start authentication again".to_string(),
+        ))
     }
 }

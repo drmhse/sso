@@ -1,0 +1,52 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "title": "HTTP request rate",
+      "type": "timeseries",
+      "targets": [{"expr": "authos:http_requests:rate5m", "legendFormat": "requests/s", "refId": "A"}]
+    },
+    {
+      "id": 2,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "title": "HTTP 5xx ratio",
+      "type": "timeseries",
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+      "targets": [{"expr": "authos:http_5xx:ratio5m", "legendFormat": "5xx ratio", "refId": "A"}]
+    },
+    {
+      "id": 3,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "title": "Database pool utilization",
+      "type": "timeseries",
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+      "targets": [{"expr": "authos:db_pool:utilization", "legendFormat": "{{backend}}", "refId": "A"}]
+    },
+    {
+      "id": 4,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "title": "Pending jobs",
+      "type": "timeseries",
+      "targets": [{"expr": "sso_pending_jobs_total", "legendFormat": "{{status}}", "refId": "A"}]
+    },
+    {
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "title": "Authentication attempts",
+      "type": "timeseries",
+      "targets": [{"expr": "sum by (method, result) (rate(sso_auth_attempts_total[5m]))", "legendFormat": "{{method}} {{result}}", "refId": "A"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["authos", "starter"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "AuthOS starter operations",
+  "uid": "authos-starter-operations",
+  "version": 1
+}

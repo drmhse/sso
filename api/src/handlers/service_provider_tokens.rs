@@ -14,8 +14,10 @@ use crate::store::{
 use crate::utils::scopes::{parse_optional_scopes, parse_required_scopes};
 use axum::{extract::State, Json};
 use chrono::{DateTime, Duration, Utc};
+use sea_orm::TransactionTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -228,20 +230,38 @@ async fn action_required(
 }
 
 fn decrypt_token(
-    state: &AppState,
+    encryption: Option<&crate::encryption::EncryptionService>,
+    account_id: &str,
+    encrypted_field: &'static str,
     plaintext: &Option<String>,
     encrypted: &Option<Vec<u8>>,
 ) -> Result<Option<String>> {
-    if let Some(token) = plaintext {
-        return Ok(Some(token.clone()));
+    if let Some(encryption) = encryption {
+        if plaintext.is_some() {
+            return Err(AppError::InternalServerError(
+                "Connected-account token requires migration; run rewrap-secrets --apply"
+                    .to_string(),
+            ));
+        }
+        if let Some(encrypted_token) = encrypted {
+            return encryption
+                .decrypt_with_context(
+                    encrypted_token,
+                    crate::encryption::EncryptionContext::new(
+                        "connected_accounts",
+                        account_id,
+                        encrypted_field,
+                    ),
+                )
+                .map(Some)
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("Failed to decrypt token: {}", e))
+                });
+        }
+        return Ok(None);
     }
-    if let (Some(encryption), Some(encrypted_token)) = (&state.encryption, encrypted) {
-        return encryption
-            .decrypt(encrypted_token)
-            .map(Some)
-            .map_err(|e| AppError::InternalServerError(format!("Failed to decrypt token: {}", e)));
-    }
-    Ok(None)
+
+    Ok(plaintext.clone())
 }
 
 async fn refresh_connected_account(
@@ -251,7 +271,9 @@ async fn refresh_connected_account(
 ) -> Result<connected_accounts::Model> {
     let provider = Provider::from_str(&account.provider)?;
     let refresh_token = decrypt_token(
-        state,
+        state.encryption.as_deref(),
+        &account.id,
+        "refresh_token_encrypted",
         &account.refresh_token,
         &account.refresh_token_encrypted,
     )?
@@ -269,7 +291,14 @@ async fn refresh_connected_account(
             AppError::OAuth("Encryption service unavailable for provider credentials".to_string())
         })?;
         let secret = encryption
-            .decrypt(&creds.client_secret_encrypted)
+            .decrypt_with_context(
+                &creds.client_secret_encrypted,
+                crate::encryption::EncryptionContext::new(
+                    "organization_oauth_credentials",
+                    &creds.id,
+                    "client_secret_encrypted",
+                ),
+            )
             .map_err(|e| AppError::OAuth(format!("Failed to decrypt provider secret: {}", e)))?;
         (creds.client_id, secret)
     } else {
@@ -340,8 +369,9 @@ async fn refresh_connected_account(
         }
     };
 
+    let transaction = state.db.begin().await?;
     let refreshed_account = ConnectedAccountStore::update_tokens(
-        DB::Conn(&state.db),
+        DB::Tx(&transaction),
         &account.id,
         &refreshed.access_token,
         refreshed
@@ -360,7 +390,11 @@ async fn refresh_connected_account(
             "provider": &account.provider,
         })))
         .build();
-    state.audit_actor.log_org(event).await;
+    state
+        .audit_actor
+        .log_org_with_db(DB::Tx(&transaction), event)
+        .await?;
+    transaction.commit().await?;
 
     Ok(refreshed_account)
 }
@@ -374,9 +408,10 @@ pub async fn request_service_provider_token(
     check_provider_token_permission(&principal, &req.provider)?;
 
     let service = principal.service.clone();
-    let has_authenticated = IdentityStore::user_has_authenticated_with_service(
+    let has_authenticated = IdentityStore::user_has_authenticated_with_org_service(
         DB::Conn(&state.db),
         &req.user_id,
+        &service.org_id,
         &service.id,
     )
     .await?;
@@ -422,6 +457,20 @@ pub async fn request_service_provider_token(
         .await?;
         return Ok(Json(response));
     }
+    let account_ids = accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect::<Vec<_>>();
+    let grants_by_account = ServiceProviderGrantStore::list_active_by_accounts(
+        DB::Conn(&state.db),
+        &req.user_id,
+        &service.id,
+        &account_ids,
+    )
+    .await?
+    .into_iter()
+    .map(|grant| (grant.connected_account_id.clone(), grant))
+    .collect::<HashMap<_, _>>();
 
     for account in accounts {
         let account_scopes = parse_scopes(&account.scopes);
@@ -429,14 +478,7 @@ pub async fn request_service_provider_token(
             continue;
         }
 
-        let Some(grant) = ServiceProviderGrantStore::find_active(
-            DB::Conn(&state.db),
-            &req.user_id,
-            &service.id,
-            &account.id,
-        )
-        .await?
-        else {
+        let Some(grant) = grants_by_account.get(&account.id).cloned() else {
             let response = action_required(
                 &state,
                 &service,
@@ -505,14 +547,17 @@ pub async fn request_service_provider_token(
         };
 
         let access_token = decrypt_token(
-            &state,
+            state.encryption.as_deref(),
+            &usable_account.id,
+            "access_token_encrypted",
             &usable_account.access_token,
             &usable_account.access_token_encrypted,
         )?
         .ok_or_else(|| {
             AppError::InternalServerError("Connected account has no token".to_string())
         })?;
-        ServiceProviderGrantStore::mark_used(DB::Conn(&state.db), &grant.id).await?;
+        let transaction = state.db.begin().await?;
+        ServiceProviderGrantStore::mark_used(DB::Tx(&transaction), &grant.id).await?;
         let event = OrgAuditBuilder::new(&service.org_id, None, "provider_token.issued")
             .target("connected_account", &usable_account.id)
             .details_json(Some(json!({
@@ -523,7 +568,11 @@ pub async fn request_service_provider_token(
                 "grant_id": &grant.id,
             })))
             .build();
-        state.audit_actor.log_org(event).await;
+        state
+            .audit_actor
+            .log_org_with_db(DB::Tx(&transaction), event)
+            .await?;
+        transaction.commit().await?;
 
         return Ok(Json(ServiceProviderTokenResponse::Ok {
             access_token,
@@ -556,6 +605,63 @@ pub async fn request_service_provider_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encryption() -> crate::encryption::EncryptionService {
+        crate::encryption::EncryptionService::from_keyring_values("active", &"11".repeat(32), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn configured_encryption_rejects_account_plaintext_and_reads_exact_v2_field() {
+        let encryption = encryption();
+        let plaintext = Some("account-plaintext-canary".to_string());
+        let error = decrypt_token(
+            Some(&encryption),
+            "account-a",
+            "refresh_token_encrypted",
+            &plaintext,
+            &None,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("requires migration"));
+        assert!(!message.contains("account-plaintext-canary"));
+
+        assert_eq!(
+            decrypt_token(
+                None,
+                "account-a",
+                "refresh_token_encrypted",
+                &plaintext,
+                &None,
+            )
+            .unwrap(),
+            plaintext
+        );
+
+        let ciphertext = encryption
+            .encrypt_with_context(
+                "account-v2-canary",
+                crate::encryption::EncryptionContext::new(
+                    "connected_accounts",
+                    "account-a",
+                    "refresh_token_encrypted",
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            decrypt_token(
+                Some(&encryption),
+                "account-a",
+                "refresh_token_encrypted",
+                &None,
+                &Some(ciphertext),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("account-v2-canary")
+        );
+    }
 
     #[test]
     fn parse_scopes_accepts_json_comma_and_space_formats() {

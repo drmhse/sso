@@ -1,44 +1,229 @@
 name: Publish npm packages
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Prepare artifacts or publish artifacts prepared earlier in the caller run
+        required: false
+        default: prepare
+        type: string
+      version:
+        description: Package version used only for a reusable dry run
+        required: false
+        default: 0.0.0-dry-run.0
+        type: string
   workflow_dispatch:
     inputs:
       version:
-        description: Package version to stamp during dry-run/manual publish
+        description: Package version to stamp during the dry run
         required: true
         default: 0.0.0-dry-run.0
         type: string
-      dry_run:
-        description: Run npm publish with --dry-run
-        required: true
-        default: true
-        type: boolean
-  push:
-    tags:
-      - 'v*'
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: npm-publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish public npm workspaces
+  qualify:
+    name: Qualify npm release source
+    if: inputs.mode != 'publish'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: authos_runtime
+          POSTGRES_USER: authos_runtime
+          POSTGRES_PASSWORD: authos_runtime_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U authos_runtime -d authos_runtime"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: authos_runtime
+          MYSQL_USER: authos_runtime
+          MYSQL_PASSWORD: authos_runtime_password
+          MYSQL_ROOT_PASSWORD: authos_runtime_root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pauthos_runtime_root_password --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must be a stable v-prefixed SemVer without prerelease/build metadata: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if [ "$(git cat-file -t "${RELEASE_TAG}")" != "tag" ]; then
+            echo "Release tags must be annotated: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if [ "$(git rev-list -n 1 "${RELEASE_TAG}")" != "${GITHUB_SHA}" ]; then
+            echo "The checked-out commit does not match ${RELEASE_TAG}." >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Release commit must be reachable from origin/main." >&2
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Validate trust and installer metadata
+        run: |
+          npm run check:trust
+          npm run check:licenses
+          npm run check:docs
+          npm run check:bootstrap
+          npm run check:backup
+          npm run check:monitoring
+          npm run check:capacity
+          npm run check:failures
+          npm run check:release-policy
+          npm run check:outbound-http
+          npm run check:redaction
+          npm run check:tenant-isolation
+          npm run check:audit-policy
+          npm run check:pagination-policy
+          bash -n install.sh
+
+      - name: Build SDK dependency
+        run: npm run build:sdk
+
+      - name: Lint workspaces
+        run: npm run lint
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Test workspaces
+        run: npm run test --workspaces --if-present
+
+      - name: Build workspaces
+        run: npm run build
+
+      # A release tag represents the whole AuthOS source tree. Prevent npm
+      # packages from publishing when the API or a shipped database variant is
+      # broken, even if the JavaScript workspaces themselves are green.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --file api/Cargo.lock
+          cargo audit --file api/migration/Cargo.lock
+
+      - name: Qualify Rust API and database variants
+        working-directory: api
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path migration/Cargo.toml --all -- --check
+          cargo clippy --locked --package sso --all-targets --no-deps -- -D warnings
+          cargo clippy --manifest-path migration/Cargo.toml --locked --all-targets --no-deps -- -D warnings
+          cargo test --locked --package sso --all-targets
+          cargo test --manifest-path migration/Cargo.toml --locked --all-targets
+          cargo check --locked --package sso --no-default-features --features db_sqlite --all-targets
+          cargo check --locked --package sso --no-default-features --features db_psql --all-targets
+          cargo check --locked --package sso --no-default-features --features db_mysql --all-targets
+
+      - name: Build PostgreSQL and MySQL runtime qualification candidates
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo build --locked --bin sso_psql --no-default-features --features db_psql
+          cargo build --locked --bin sso_mysql --no-default-features --features db_mysql
+
+      - name: Install logical backup clients
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client default-mysql-client
+
+      - name: Exercise PostgreSQL 16 runtime and logical restore
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          AUTHOS_BACKEND: postgres
+          AUTHOS_BINARY: api/target/debug/sso_psql
+          DATABASE_URL: postgres://authos_runtime:authos_runtime_password@127.0.0.1:5432/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: bash scripts/qualify-logical-backup-restore.sh
+
+      - name: Exercise MySQL 8.4 runtime and logical restore
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          AUTHOS_BACKEND: mysql
+          AUTHOS_BINARY: api/target/debug/sso_mysql
+          DATABASE_URL: mysql://authos_runtime:authos_runtime_password@127.0.0.1:3306/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: bash scripts/qualify-logical-backup-restore.sh
+
+  package:
+    name: Build immutable npm artifacts
+    if: inputs.mode != 'publish'
+    needs: qualify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
       MANUAL_VERSION: ${{ inputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: npm
@@ -92,6 +277,44 @@ jobs:
           }
           NODE
 
+      - name: Require all five registry versions to be absent
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const directories = [
+            'sso-sdk',
+            'packages/authos-node',
+            'packages/authos-react',
+            'packages/authos-vue',
+            'packages/authos-cli',
+          ];
+
+          async function main() {
+            let conflict = false;
+            for (const directory of directories) {
+              const pkg = JSON.parse(fs.readFileSync(`${directory}/package.json`, 'utf8'));
+              const endpoint = `https://registry.npmjs.org/${encodeURIComponent(pkg.name)}/${encodeURIComponent(pkg.version)}`;
+              const response = await fetch(endpoint, { headers: { accept: 'application/json' } });
+              if (response.status === 404) {
+                console.log(`Registry version is available: ${pkg.name}@${pkg.version}`);
+              } else if (response.ok) {
+                console.error(`Registry version already exists and is immutable: ${pkg.name}@${pkg.version}`);
+                conflict = true;
+              } else {
+                throw new Error(`npm registry preflight failed for ${pkg.name}@${pkg.version} (HTTP ${response.status})`);
+              }
+            }
+            if (conflict) process.exitCode = 1;
+          }
+
+          main().catch((error) => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+
       - name: Typecheck SDK
         run: npm run typecheck:sdk
 
@@ -104,36 +327,219 @@ jobs:
       - name: Build packages
         run: npm run build:packages
 
-      - name: Publish changed package versions
+      - name: Pack exact npm publish artifacts
         shell: bash
         run: |
           set -euo pipefail
+          artifact_dir=".artifacts/npm-packages"
+          mkdir -p "${artifact_dir}"
 
-          publish_package() {
+          pack_package() {
             local workspace_dir="$1"
-            local name version publish_args
+            local output_name="$2"
+            local pack_json filename
 
-            name="$(node -p "require('./${workspace_dir}/package.json').name")"
-            version="$(node -p "require('./${workspace_dir}/package.json').version")"
-
-            if npm view "${name}@${version}" version >/dev/null 2>&1; then
-              echo "Skipping ${name}@${version}; already published."
-              return
-            fi
-
-            publish_args=(publish --workspace "${workspace_dir}" --access public)
-            if [[ "${DRY_RUN}" == "true" ]]; then
-              publish_args+=(--dry-run)
-            else
-              publish_args+=(--provenance)
-            fi
-
-            echo "Publishing ${name}@${version} from ${workspace_dir}"
-            npm "${publish_args[@]}"
+            pack_json="$(npm pack --workspace "${workspace_dir}" --pack-destination "${artifact_dir}" --json)"
+            filename="$(node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")); process.stdout.write(value[0].filename)' <<<"${pack_json}")"
+            mv "${artifact_dir}/${filename}" "${artifact_dir}/${output_name}.tgz"
           }
 
-          publish_package sso-sdk
-          publish_package packages/authos-node
-          publish_package packages/authos-react
-          publish_package packages/authos-vue
-          publish_package packages/authos-cli
+          pack_package sso-sdk sso-sdk
+          pack_package packages/authos-node authos-node
+          pack_package packages/authos-react authos-react
+          pack_package packages/authos-vue authos-vue
+          pack_package packages/authos-cli authos-cli
+
+      - name: Generate sso-sdk SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: .artifacts/npm-packages/sso-sdk.tgz
+          format: spdx-json
+          output-file: .artifacts/npm-packages/sso-sdk.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate authos-node SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: .artifacts/npm-packages/authos-node.tgz
+          format: spdx-json
+          output-file: .artifacts/npm-packages/authos-node.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate authos-react SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: .artifacts/npm-packages/authos-react.tgz
+          format: spdx-json
+          output-file: .artifacts/npm-packages/authos-react.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate authos-vue SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: .artifacts/npm-packages/authos-vue.tgz
+          format: spdx-json
+          output-file: .artifacts/npm-packages/authos-vue.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate authos-cli SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: .artifacts/npm-packages/authos-cli.tgz
+          format: spdx-json
+          output-file: .artifacts/npm-packages/authos-cli.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate npm artifact checksums
+        run: |
+          cd .artifacts/npm-packages
+          sha256sum *.tgz *.spdx.json > npm-SHA256SUMS.txt
+
+      - name: Generate and verify durable npm release evidence
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_WORKFLOW_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          evidence_dir=.artifacts/npm-packages
+          python3 scripts/npm-release-evidence.py generate "${evidence_dir}" \
+            --tag "${RELEASE_TAG}" \
+            --commit "${RELEASE_COMMIT}" \
+            --repository "${RELEASE_REPOSITORY}" \
+            --workflow-run "${RELEASE_WORKFLOW_RUN}"
+          (cd "${evidence_dir}" && sha256sum authos-npm-release-manifest.json) \
+            >> "${evidence_dir}/npm-SHA256SUMS.txt"
+          python3 scripts/npm-release-evidence.py verify "${evidence_dir}"
+
+      - name: Upload npm package evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-package-evidence
+          path: .artifacts/npm-packages
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Dry-run exact npm artifacts without registry credentials
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tarball in \
+            .artifacts/npm-packages/sso-sdk.tgz \
+            .artifacts/npm-packages/authos-node.tgz \
+            .artifacts/npm-packages/authos-react.tgz \
+            .artifacts/npm-packages/authos-vue.tgz \
+            .artifacts/npm-packages/authos-cli.tgz
+          do
+            npm publish "${tarball}" --access public --dry-run --ignore-scripts --tag next
+          done
+
+
+  publish:
+    name: Attest and publish prepared npm artifacts
+    if: inputs.mode == 'publish' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Setup Node.js registry client
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      - name: Download prepared npm artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package-evidence
+          path: .artifacts/npm-packages
+
+      - name: Verify downloaded artifact checksums
+        working-directory: .artifacts/npm-packages
+        run: sha256sum --check npm-SHA256SUMS.txt
+
+      - name: Attest npm package artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: |
+            .artifacts/npm-packages/*.tgz
+            .artifacts/npm-packages/*.spdx.json
+            .artifacts/npm-packages/authos-npm-release-manifest.json
+            .artifacts/npm-packages/npm-SHA256SUMS.txt
+
+      - name: Attest sso-sdk SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: .artifacts/npm-packages/sso-sdk.tgz
+          sbom-path: .artifacts/npm-packages/sso-sdk.spdx.json
+
+      - name: Attest authos-node SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: .artifacts/npm-packages/authos-node.tgz
+          sbom-path: .artifacts/npm-packages/authos-node.spdx.json
+
+      - name: Attest authos-react SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: .artifacts/npm-packages/authos-react.tgz
+          sbom-path: .artifacts/npm-packages/authos-react.spdx.json
+
+      - name: Attest authos-vue SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: .artifacts/npm-packages/authos-vue.tgz
+          sbom-path: .artifacts/npm-packages/authos-vue.spdx.json
+
+      - name: Attest authos-cli SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: .artifacts/npm-packages/authos-cli.tgz
+          sbom-path: .artifacts/npm-packages/authos-cli.spdx.json
+
+      - name: Publish all exact npm artifacts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tarball in \
+            .artifacts/npm-packages/sso-sdk.tgz \
+            .artifacts/npm-packages/authos-node.tgz \
+            .artifacts/npm-packages/authos-react.tgz \
+            .artifacts/npm-packages/authos-vue.tgz \
+            .artifacts/npm-packages/authos-cli.tgz
+          do
+            npm publish "${tarball}" --access public --provenance --ignore-scripts
+          done
+
+      - name: Attach durable npm evidence to draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: |
+            .artifacts/npm-packages/sso-sdk.tgz
+            .artifacts/npm-packages/sso-sdk.spdx.json
+            .artifacts/npm-packages/authos-node.tgz
+            .artifacts/npm-packages/authos-node.spdx.json
+            .artifacts/npm-packages/authos-react.tgz
+            .artifacts/npm-packages/authos-react.spdx.json
+            .artifacts/npm-packages/authos-vue.tgz
+            .artifacts/npm-packages/authos-vue.spdx.json
+            .artifacts/npm-packages/authos-cli.tgz
+            .artifacts/npm-packages/authos-cli.spdx.json
+            .artifacts/npm-packages/authos-npm-release-manifest.json
+            .artifacts/npm-packages/npm-SHA256SUMS.txt

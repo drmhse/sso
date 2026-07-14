@@ -180,6 +180,81 @@ async fn fetch_and_cache_user(
     Ok(user)
 }
 
+async fn validate_current_impersonation_authority(
+    db: &DatabaseConnection,
+    actor: &Actor,
+    target: &users::Model,
+    org_slug: Option<&str>,
+) -> Result<()> {
+    use crate::store::{
+        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore, DB,
+    };
+
+    let actor_user = UserStore::find_by_id(DB::Conn(db), &actor.sub)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| {
+            AppError::Unauthorized("Impersonation authorization is no longer valid".to_string())
+        })?;
+    if target.deleted_at.is_some() {
+        return Err(AppError::Unauthorized(
+            "Impersonation authorization is no longer valid".to_string(),
+        ));
+    }
+    if actor_user.is_platform_owner {
+        return Ok(());
+    }
+    if target.is_platform_owner {
+        return Err(AppError::Unauthorized(
+            "Impersonation authorization is no longer valid".to_string(),
+        ));
+    }
+
+    let org_slug = org_slug.ok_or_else(|| {
+        AppError::Unauthorized("Impersonation authorization is no longer valid".to_string())
+    })?;
+    let org = OrganizationStore::find_by_slug(DB::Conn(db), org_slug)
+        .await?
+        .filter(|org| org.status == "active")
+        .ok_or_else(|| {
+            AppError::Unauthorized("Impersonation authorization is no longer valid".to_string())
+        })?;
+    let actor_membership =
+        MembershipStore::find_by_org_and_user(DB::Conn(db), &org.id, &actor_user.id).await?;
+    let target_membership =
+        MembershipStore::find_by_org_and_user(DB::Conn(db), &org.id, &target.id).await?;
+    if !matches!(
+        actor_membership
+            .as_ref()
+            .map(|membership| membership.role.as_str()),
+        Some("owner" | "admin")
+    ) || target_membership.is_none()
+    {
+        return Err(AppError::Unauthorized(
+            "Impersonation authorization is no longer valid".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn fetch_permissions_uncached(db: &DatabaseConnection, user_id: &str) -> Result<Vec<String>> {
+    use crate::store::{permissions::PermissionsStore, DB};
+
+    Ok(
+        PermissionsStore::list_user_permissions(DB::Conn(db), user_id)
+            .await?
+            .into_iter()
+            .map(|permission| {
+                format!(
+                    "{}:{}#{}",
+                    permission.namespace, permission.object_id, permission.relation
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Extract and validate JWT from Authorization header
 pub async fn extract_user_from_jwt(
     State(state): State<crate::state::AppState>,
@@ -203,7 +278,7 @@ pub async fn extract_user_from_jwt(
         })?;
 
     // Validate token
-    let claims = jwt_service.validate_token(token)?;
+    let claims = jwt_service.validate_authos_token(token)?;
     let user_id = claims.sub.clone();
 
     // Extract IP and User-Agent before modifying request
@@ -215,20 +290,29 @@ pub async fn extract_user_from_jwt(
         // This is an impersonation session
         tracing::warn!(
             admin_user_id = %actor.sub,
-            admin_user_email = %actor.email,
             target_user_id = %claims.sub,
-            target_user_email = %claims.email,
-            reason = ?actor.reason,
+            reason_recorded = actor.reason.is_some(),
             "Processing impersonation request"
         );
 
-        // Load the target user from cache or database
-        let user = fetch_and_cache_user(db, user_cache, &claims.sub)
+        let token_hash = JwtService::hash_token(token);
+        let session = SessionStore::find_valid_by_token_hash(DB::Conn(db), &token_hash)
             .await
-            .map_err(|_| AppError::Unauthorized("Target user not found".to_string()))?;
+            .map_err(|_| AppError::Unauthorized("Impersonation session is invalid".to_string()))?
+            .ok_or_else(|| {
+                AppError::Unauthorized("Impersonation session is revoked or expired".to_string())
+            })?;
+
+        // Do not use the user or permission caches for impersonation. Actor
+        // demotion, target privilege changes, and membership removal must take
+        // effect on the next request rather than after a cache TTL.
+        let user = crate::store::users::UserStore::find_by_id(DB::Conn(db), &claims.sub)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("Target user not found".to_string()))?;
+        validate_current_impersonation_authority(db, &actor, &user, claims.org.as_deref()).await?;
 
         // Fetch permissions for impersonated user
-        let permissions = fetch_and_cache_permissions(db, permission_cache, &user_id).await?;
+        let permissions = fetch_permissions_uncached(db, &user_id).await?;
 
         // Store impersonation context
         req.extensions_mut().insert(ImpersonationContext {
@@ -244,13 +328,13 @@ pub async fn extract_user_from_jwt(
             permissions,
             ip_address,
             user_agent,
-            current_session_id: None,
+            current_session_id: Some(session.id),
         });
     } else {
         // Normal authentication flow
         // Check if session is still valid (not revoked)
         let token_hash = JwtService::hash_token(token);
-        let session = SessionStore::find_valid_by_token_hash(DB::Conn(&db), &token_hash).await?;
+        let session = SessionStore::find_valid_by_token_hash(DB::Conn(db), &token_hash).await?;
 
         if session.is_none() {
             return Err(AppError::Unauthorized(
@@ -350,12 +434,13 @@ fn extract_user_agent(req: &Request) -> String {
     req.headers()
         .get("User-Agent")
         .and_then(|header| header.to_str().ok())
-        .unwrap_or_else(|| "unknown")
+        .unwrap_or("unknown")
         .to_string()
 }
 
 /// Middleware to require platform owner role
 pub async fn require_platform_owner(
+    State(state): State<crate::state::AppState>,
     req: Request,
     next: Next,
 ) -> std::result::Result<Response, (StatusCode, String)> {
@@ -364,7 +449,15 @@ pub async fn require_platform_owner(
         .get::<AuthUser>()
         .ok_or((StatusCode::UNAUTHORIZED, "Not authenticated".to_string()))?;
 
-    if !auth_user.user.is_platform_owner {
+    if !has_current_platform_authority(&state.db, &auth_user.user.id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unable to verify platform authority".to_string(),
+            )
+        })?
+    {
         return Err((
             StatusCode::FORBIDDEN,
             "Platform owner access required".to_string(),
@@ -372,6 +465,14 @@ pub async fn require_platform_owner(
     }
 
     Ok(next.run(req).await)
+}
+
+async fn has_current_platform_authority(db: &DatabaseConnection, user_id: &str) -> Result<bool> {
+    use crate::store::{users::UserStore, DB};
+
+    Ok(UserStore::find_by_id(DB::Conn(db), user_id)
+        .await?
+        .is_some_and(|user| user.is_platform_owner && user.deleted_at.is_none()))
 }
 
 /// Helper function to check if user has required role in organization
@@ -666,9 +767,8 @@ pub async fn mfa_rate_limit_middleware(
             .await
         {
             tracing::warn!(
-                "MFA rate limit exceeded for user: {} ({})",
-                auth_user.user.email,
-                auth_user.user.id
+                user_id = %auth_user.user.id,
+                "MFA rate limit exceeded for user"
             );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1033,6 +1133,11 @@ pub async fn extract_api_key(
         .ok_or_else(|| {
             AppError::InternalServerError("Service not found for API key".to_string())
         })?;
+    if !service_organization_is_active(&db, &service.org_id).await? {
+        return Err(AppError::Unauthorized(
+            "API key organization is not active".to_string(),
+        ));
+    }
 
     let permissions: Vec<String> =
         serde_json::from_str(&stored_key.permissions).unwrap_or_default();
@@ -1047,6 +1152,14 @@ pub async fn extract_api_key(
     });
 
     Ok(next.run(req).await)
+}
+
+async fn service_organization_is_active(db: &DatabaseConnection, org_id: &str) -> Result<bool> {
+    use crate::store::{organizations::OrganizationStore, DB};
+
+    Ok(OrganizationStore::find_by_id(DB::Conn(db), org_id)
+        .await?
+        .is_some_and(|organization| organization.status == "active"))
 }
 
 // ============================================================================
@@ -1093,18 +1206,23 @@ pub async fn scim_auth_middleware(
     let token = auth_header.trim_start_matches("Bearer ").trim();
 
     // Verify the token
-    let scim_token = ScimTokenStore::verify(DB::Conn(&db), token)
+    let scim_token = ScimTokenStore::verify_for_active_org(DB::Conn(&db), token)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // Validate X-Organization-ID header if provided
-    if let Some(org_id_header) = request.headers().get("X-Organization-ID") {
-        if let Ok(org_id_str) = org_id_header.to_str() {
-            if org_id_str != scim_token.org_id {
-                // Token belongs to a different organization - unauthorized
-                return Err(StatusCode::FORBIDDEN);
-            }
+    // Validate the optional selector if provided. Multiple values are
+    // ambiguous across proxies/frameworks, so fail closed rather than letting
+    // one layer choose a different value from another.
+    let mut org_id_headers = request.headers().get_all("X-Organization-ID").iter();
+    if let Some(org_id_header) = org_id_headers.next() {
+        if org_id_headers.next().is_some() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let org_id_str = org_id_header.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
+        if org_id_str != scim_token.org_id {
+            // Token belongs to a different organization - unauthorized
+            return Err(StatusCode::FORBIDDEN);
         }
     }
 
@@ -1123,4 +1241,243 @@ pub async fn scim_auth_middleware(
     request.extensions_mut().insert(scim_auth);
 
     Ok(next.run(request).await)
+}
+
+#[cfg(test)]
+mod impersonation_authority_tests {
+    use super::*;
+    use crate::entities::users;
+    use crate::store::{
+        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore, DB,
+    };
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, Set};
+
+    #[tokio::test]
+    async fn org_impersonation_authority_tracks_role_target_scope_and_org_status() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let actor_user = UserStore::create(DB::Conn(&db), "admin@example.com", None, false)
+            .await
+            .expect("create actor");
+        let target = UserStore::create(DB::Conn(&db), "target@example.com", None, false)
+            .await
+            .expect("create target");
+        let (org, actor_membership) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "impersonation-org",
+            "Impersonation Org",
+            &actor_user.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        let target_membership =
+            MembershipStore::create(DB::Conn(&db), &org.id, &target.id, "member")
+                .await
+                .expect("add target");
+        let actor = Actor {
+            sub: actor_user.id.clone(),
+            email: actor_user.email.clone(),
+            reason: Some("support case".to_string()),
+        };
+
+        validate_current_impersonation_authority(&db, &actor, &target, Some("impersonation-org"))
+            .await
+            .expect("admin may impersonate member");
+
+        MembershipStore::update_role(DB::Conn(&db), &actor_membership.id, "member")
+            .await
+            .expect("demote actor");
+        assert!(validate_current_impersonation_authority(
+            &db,
+            &actor,
+            &target,
+            Some("impersonation-org")
+        )
+        .await
+        .is_err());
+
+        MembershipStore::update_role(DB::Conn(&db), &actor_membership.id, "admin")
+            .await
+            .expect("restore actor");
+        MembershipStore::delete(DB::Conn(&db), &target_membership.id)
+            .await
+            .expect("remove target");
+        assert!(validate_current_impersonation_authority(
+            &db,
+            &actor,
+            &target,
+            Some("impersonation-org")
+        )
+        .await
+        .is_err());
+
+        MembershipStore::create(DB::Conn(&db), &org.id, &target.id, "member")
+            .await
+            .expect("restore target");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "suspended")
+            .await
+            .expect("suspend org");
+        assert!(validate_current_impersonation_authority(
+            &db,
+            &actor,
+            &target,
+            Some("impersonation-org")
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn platform_actor_demotion_immediately_removes_global_impersonation_authority() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let actor_user = UserStore::create(DB::Conn(&db), "owner@example.com", None, true)
+            .await
+            .expect("create actor");
+        let target = UserStore::create(DB::Conn(&db), "target2@example.com", None, false)
+            .await
+            .expect("create target");
+        let actor = Actor {
+            sub: actor_user.id.clone(),
+            email: actor_user.email.clone(),
+            reason: Some("support case".to_string()),
+        };
+
+        validate_current_impersonation_authority(&db, &actor, &target, None)
+            .await
+            .expect("platform actor may impersonate globally");
+        UserStore::set_platform_owner(DB::Conn(&db), &actor_user.id, false)
+            .await
+            .expect("demote platform actor");
+        assert!(
+            validate_current_impersonation_authority(&db, &actor, &target, None)
+                .await
+                .is_err()
+        );
+
+        UserStore::set_platform_owner(DB::Conn(&db), &actor_user.id, true)
+            .await
+            .expect("restore platform actor");
+        let mut deleted_actor: users::ActiveModel =
+            UserStore::find_by_id(DB::Conn(&db), &actor_user.id)
+                .await
+                .expect("load actor")
+                .expect("actor remains")
+                .into();
+        deleted_actor.deleted_at = Set(Some(chrono::Utc::now().naive_utc()));
+        deleted_actor.update(&db).await.expect("soft-delete actor");
+        assert!(
+            validate_current_impersonation_authority(&db, &actor, &target, None)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod platform_authority_tests {
+    use super::*;
+    use crate::entities::users;
+    use crate::store::{users::UserStore, DB};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, Set};
+
+    #[tokio::test]
+    async fn platform_authority_uses_current_database_role_not_cached_snapshot() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::create(DB::Conn(&db), "platform-owner@example.com", None, true)
+            .await
+            .expect("create platform owner");
+        let tenant_admin =
+            UserStore::create(DB::Conn(&db), "tenant-admin@example.com", None, false)
+                .await
+                .expect("create tenant admin");
+
+        assert!(has_current_platform_authority(&db, &owner.id)
+            .await
+            .expect("check platform owner"));
+        assert!(!has_current_platform_authority(&db, &tenant_admin.id)
+            .await
+            .expect("check tenant admin"));
+
+        UserStore::set_platform_owner(DB::Conn(&db), &owner.id, false)
+            .await
+            .expect("demote platform owner");
+        assert!(!has_current_platform_authority(&db, &owner.id)
+            .await
+            .expect("check demoted owner"));
+        assert!(!has_current_platform_authority(&db, "missing-user")
+            .await
+            .expect("check missing user"));
+
+        UserStore::set_platform_owner(DB::Conn(&db), &owner.id, true)
+            .await
+            .expect("restore platform role");
+        let mut deleted_owner: users::ActiveModel = UserStore::find_by_id(DB::Conn(&db), &owner.id)
+            .await
+            .expect("load restored owner")
+            .expect("restored owner exists")
+            .into();
+        deleted_owner.deleted_at = Set(Some(chrono::Utc::now().naive_utc()));
+        deleted_owner.update(&db).await.expect("soft-delete owner");
+        assert!(!has_current_platform_authority(&db, &owner.id)
+            .await
+            .expect("check deleted owner"));
+    }
+}
+
+#[cfg(test)]
+mod service_principal_tenant_status_tests {
+    use super::*;
+    use crate::store::{organizations::OrganizationStore, users::UserStore, DB};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn service_principal_authority_follows_current_organization_status() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::create(DB::Conn(&db), "service-owner@example.com", None, false)
+            .await
+            .expect("create owner");
+        let org = OrganizationStore::create(
+            DB::Conn(&db),
+            "service-status-org",
+            "Service Status Org",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org");
+
+        assert!(!service_organization_is_active(&db, &org.id)
+            .await
+            .expect("pending org denied"));
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        assert!(service_organization_is_active(&db, &org.id)
+            .await
+            .expect("active org allowed"));
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "suspended")
+            .await
+            .expect("suspend org");
+        assert!(!service_organization_is_active(&db, &org.id)
+            .await
+            .expect("suspended org denied"));
+    }
 }

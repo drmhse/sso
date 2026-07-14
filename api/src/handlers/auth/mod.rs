@@ -46,7 +46,7 @@ pub use password::{
 };
 
 // MFA handlers
-pub use mfa::verify_mfa_login;
+pub use mfa::{verify_mfa_login, verify_saml_mfa};
 
 // HRD handlers
 pub use hrd::{get_auth_context, lookup_email};

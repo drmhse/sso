@@ -10,6 +10,14 @@ AuthOS uses different licenses for first-party parts of this repository:
 | `packages/authos-node/` | MIT |
 | `packages/authos-react/` | MIT |
 | `packages/authos-vue/` | MIT |
+| `lite-web-client/` | GNU Affero General Public License v3.0 only |
+| `scripts/` and `install.sh` | GNU Affero General Public License v3.0 only |
+| Root documentation and configuration not listed above | No first-party license assigned yet |
+
+Files copied from a licensed source path into a release artifact retain the
+source path's license. In particular, the standalone bundle's
+`authos.config.example.json` is copied from
+`scripts/authos-standalone/authos.config.example.json` and is AGPL-3.0-only.
 
 Vendored third-party code keeps its upstream license notices in place. For example,
 [`api/vendor/sqlx-mysql/`](./api/vendor/sqlx-mysql) includes the original SQLx
@@ -22,3 +30,7 @@ The canonical license texts are available in [`LICENSES/`](./LICENSES):
 - [`LICENSES/MIT.txt`](./LICENSES/MIT.txt)
 
 Package-specific license files are also kept with each publishable package so npm consumers receive the applicable license text.
+
+No license should be inferred for the remaining unassigned root documentation
+and configuration. Assigning those paths to AGPL-3.0-only, MIT, or another
+license requires an explicit maintainer decision.

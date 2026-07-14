@@ -16,6 +16,17 @@ use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 /// * `DB_IDLE_TIMEOUT_SECS` - Idle connection timeout (default: 600)
 /// * `DB_MAX_LIFETIME_SECS` - Maximum connection lifetime (default: 1800)
 pub async fn init_db(config: &Config) -> Result<DatabaseConnection, DbErr> {
+    let db = connect_db(config).await?;
+
+    // Run migrations from our `migration` crate
+    migration::Migrator::up(&db, None).await?;
+
+    Ok(db)
+}
+
+/// Connect without running migrations. Offline inspection/maintenance commands
+/// use this so a dry-run cannot make schema changes as a side effect.
+pub async fn connect_db(config: &Config) -> Result<DatabaseConnection, DbErr> {
     let mut opt = ConnectOptions::new(&config.database_url);
     opt.max_connections(config.db_max_connections)
         .min_connections(config.db_min_connections)
@@ -40,9 +51,6 @@ pub async fn init_db(config: &Config) -> Result<DatabaseConnection, DbErr> {
     });
 
     let db = Database::connect(opt).await?;
-
-    // Run migrations from our `migration` crate
-    migration::Migrator::up(&db, None).await?;
 
     Ok(db)
 }

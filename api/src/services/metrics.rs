@@ -2,16 +2,16 @@
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult,
+    JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
 };
 use uuid::Uuid;
 
 use crate::entities::{
-    mfa_audit_log, mfa_daily_metrics, mfa_failure_patterns, mfa_feature_usage, user_totp_secrets,
-    users,
+    memberships, mfa_audit_log, mfa_daily_metrics, mfa_failure_patterns, mfa_feature_usage,
+    user_totp_secrets, users,
 };
 
 /// MFA metrics aggregation result (matches mfa_daily_metrics entity)
@@ -60,6 +60,18 @@ pub struct MfaFeatureEvent {
     pub details: Option<String>,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct MfaEventCount {
+    event_type: String,
+    count: i64,
+}
+
+#[derive(Debug, Default, FromQueryResult)]
+struct MfaUserCount {
+    total_users: i64,
+    mfa_enabled_users: i64,
+}
+
 /// MFA metrics service for collecting and analyzing MFA usage patterns
 pub struct MfaMetricsService {
     db: DatabaseConnection,
@@ -76,6 +88,7 @@ impl MfaMetricsService {
 
     /// Record a MFA feature usage event
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_feature_usage(
         &self,
         org_id: &str,
@@ -359,6 +372,51 @@ impl MfaMetricsService {
     // MFA Daily Metrics Generation
     // ========================================
 
+    async fn count_users_for_daily_metrics(&self, org_id: Option<&str>) -> Result<MfaUserCount> {
+        let enabled_totp_join_condition = Condition::all()
+            .add(
+                Expr::col((user_totp_secrets::Entity, user_totp_secrets::Column::UserId))
+                    .equals((users::Entity, users::Column::Id)),
+            )
+            .add(user_totp_secrets::Column::Enabled.eq(true));
+
+        let counts = if let Some(oid) = org_id {
+            memberships::Entity::find()
+                .join(JoinType::InnerJoin, memberships::Relation::Users.def())
+                .join_as(
+                    JoinType::LeftJoin,
+                    users::Relation::UserTotpSecrets
+                        .def()
+                        .on_condition(move |_left, _right| enabled_totp_join_condition.clone()),
+                    user_totp_secrets::Entity,
+                )
+                .filter(memberships::Column::OrgId.eq(oid))
+                .select_only()
+                .column_as(memberships::Column::Id.count(), "total_users")
+                .column_as(user_totp_secrets::Column::Id.count(), "mfa_enabled_users")
+                .into_model::<MfaUserCount>()
+                .one(&self.db)
+                .await?
+        } else {
+            users::Entity::find()
+                .join_as(
+                    JoinType::LeftJoin,
+                    users::Relation::UserTotpSecrets
+                        .def()
+                        .on_condition(move |_left, _right| enabled_totp_join_condition.clone()),
+                    user_totp_secrets::Entity,
+                )
+                .select_only()
+                .column_as(users::Column::Id.count(), "total_users")
+                .column_as(user_totp_secrets::Column::Id.count(), "mfa_enabled_users")
+                .into_model::<MfaUserCount>()
+                .one(&self.db)
+                .await?
+        };
+
+        Ok(counts.unwrap_or_default())
+    }
+
     /// Generate daily metrics for the specified date and organization
     /// If org_id is None, generates platform-wide metrics
     pub async fn generate_daily_metrics(
@@ -381,9 +439,15 @@ impl MfaMetricsService {
             audit_query = audit_query.filter(mfa_audit_log::Column::OrgId.eq(oid));
         }
 
-        let events = audit_query.all(&self.db).await?;
+        let event_counts = audit_query
+            .select_only()
+            .column(mfa_audit_log::Column::EventType)
+            .column_as(mfa_audit_log::Column::Id.count(), "count")
+            .group_by(mfa_audit_log::Column::EventType)
+            .into_model::<MfaEventCount>()
+            .all(&self.db)
+            .await?;
 
-        // Count different event types
         let mut new_mfa_setups = 0;
         let mut mfa_disabled = 0;
         let mut totp_verifications_total = 0;
@@ -392,50 +456,28 @@ impl MfaMetricsService {
         let mut backup_codes_generated = 0;
         let mut backup_codes_used = 0;
 
-        for event in events {
+        for event in event_counts {
+            let count = event.count as i32;
             match event.event_type.as_str() {
-                "mfa_enabled" | "mfa_setup_completed" => new_mfa_setups += 1,
-                "mfa_disabled" | "mfa_force_disabled_by_admin" => mfa_disabled += 1,
+                "mfa_enabled" | "mfa_setup_completed" => new_mfa_setups += count,
+                "mfa_disabled" | "mfa_force_disabled_by_admin" => mfa_disabled += count,
                 "mfa_verify_success" => {
-                    totp_verifications_total += 1;
-                    totp_verifications_success += 1;
+                    totp_verifications_total += count;
+                    totp_verifications_success += count;
                 }
                 "mfa_verify_failed" => {
-                    totp_verifications_total += 1;
-                    totp_verifications_failed += 1;
+                    totp_verifications_total += count;
+                    totp_verifications_failed += count;
                 }
-                "backup_codes_generated" => backup_codes_generated += 1,
-                "backup_code_used" => backup_codes_used += 1,
+                "backup_codes_generated" => backup_codes_generated += count,
+                "backup_code_used" => backup_codes_used += count,
                 _ => {}
             }
         }
 
-        // Count total users and MFA-enabled users
-        // Users belong to orgs via memberships, not directly
-        let total_users = if let Some(oid) = org_id {
-            use crate::entities::memberships;
-            memberships::Entity::find()
-                .filter(memberships::Column::OrgId.eq(oid))
-                .count(&self.db)
-                .await? as i32
-        } else {
-            users::Entity::find().count(&self.db).await? as i32
-        };
-
-        // Count users with MFA enabled (have a totp secret that is enabled)
-        // For org-specific, we'd need to join totp_secrets -> users -> memberships
-        // For simplicity, we'll use the event-based count when org-specific
-        let mfa_enabled_users = if org_id.is_some() {
-            // For org-specific, use event-based estimation
-            // In a real system, you'd do a proper join query
-            new_mfa_setups.max(0)
-        } else {
-            // Platform-wide: count all enabled TOTP secrets
-            user_totp_secrets::Entity::find()
-                .filter(user_totp_secrets::Column::Enabled.eq(true))
-                .count(&self.db)
-                .await? as i32
-        };
+        let user_counts = self.count_users_for_daily_metrics(org_id).await?;
+        let total_users = user_counts.total_users as i32;
+        let mfa_enabled_users = user_counts.mfa_enabled_users as i32;
 
         // Upsert the daily metrics
         let metrics_id = Uuid::new_v4().to_string();
@@ -566,5 +608,137 @@ impl MfaMetricsService {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{memberships, organizations, user_totp_secrets, users};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database};
+
+    async fn insert_user(db: &DatabaseConnection, email: &str) -> String {
+        let user_id = Uuid::new_v4().to_string();
+        let now = Utc::now().naive_utc();
+        users::ActiveModel {
+            id: Set(user_id.clone()),
+            email: Set(email.to_string()),
+            org_id: Set(None),
+            is_platform_owner: Set(false),
+            password_hash: Set(None),
+            email_verified_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(None),
+            deleted_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("insert user");
+
+        user_id
+    }
+
+    async fn insert_org(db: &DatabaseConnection, owner_user_id: &str) -> String {
+        let org_id = Uuid::new_v4().to_string();
+        let now = Utc::now().naive_utc();
+        organizations::ActiveModel {
+            id: Set(org_id.clone()),
+            slug: Set(format!("org-{}", &org_id[..8])),
+            name: Set("Test Org".to_string()),
+            owner_user_id: Set(owner_user_id.to_string()),
+            status: Set("active".to_string()),
+            tier_id: Set(None),
+            max_services: Set(None),
+            max_users: Set(None),
+            approved_by: Set(None),
+            approved_at: Set(None),
+            rejected_by: Set(None),
+            rejected_at: Set(None),
+            rejection_reason: Set(None),
+            smtp_host: Set(None),
+            smtp_port: Set(None),
+            smtp_username: Set(None),
+            smtp_password_encrypted: Set(None),
+            smtp_from_email: Set(None),
+            smtp_from_name: Set(None),
+            smtp_encryption_key_id: Set(None),
+            custom_domain: Set(None),
+            domain_verified: Set(false),
+            domain_verification_token: Set(None),
+            brand_logo_url: Set(None),
+            brand_primary_color: Set(None),
+            feature_overrides: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("insert org");
+
+        org_id
+    }
+
+    async fn insert_membership(db: &DatabaseConnection, org_id: &str, user_id: &str) {
+        memberships::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            org_id: Set(org_id.to_string()),
+            user_id: Set(user_id.to_string()),
+            role: Set("member".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("insert membership");
+    }
+
+    async fn insert_totp(db: &DatabaseConnection, user_id: &str, enabled: bool) {
+        user_totp_secrets::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user_id.to_string()),
+            secret_encrypted: Set(vec![1, 2, 3]),
+            encryption_key_id: Set("test-key".to_string()),
+            enabled: Set(enabled),
+            created_at: Set(Utc::now().naive_utc()),
+            enabled_at: Set(enabled.then(|| Utc::now().naive_utc())),
+        }
+        .insert(db)
+        .await
+        .expect("insert totp");
+    }
+
+    #[tokio::test]
+    async fn daily_metrics_counts_total_and_mfa_users_in_one_aggregate_shape() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let user_with_mfa = insert_user(&db, "mfa@example.com").await;
+        let user_without_enabled_mfa = insert_user(&db, "disabled@example.com").await;
+        let outside_user_with_mfa = insert_user(&db, "outside@example.com").await;
+        let org_id = insert_org(&db, &user_with_mfa).await;
+
+        insert_membership(&db, &org_id, &user_with_mfa).await;
+        insert_membership(&db, &org_id, &user_without_enabled_mfa).await;
+        insert_totp(&db, &user_with_mfa, true).await;
+        insert_totp(&db, &user_without_enabled_mfa, false).await;
+        insert_totp(&db, &outside_user_with_mfa, true).await;
+
+        let service = MfaMetricsService::new(db);
+        let date = Utc::now().date_naive();
+        let platform_metrics = service
+            .generate_daily_metrics(None, date)
+            .await
+            .expect("generate platform metrics");
+        let org_metrics = service
+            .generate_daily_metrics(Some(&org_id), date)
+            .await
+            .expect("generate org metrics");
+
+        assert_eq!(platform_metrics.total_users, 3);
+        assert_eq!(platform_metrics.mfa_enabled_users, 2);
+        assert_eq!(org_metrics.total_users, 2);
+        assert_eq!(org_metrics.mfa_enabled_users, 1);
     }
 }

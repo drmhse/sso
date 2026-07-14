@@ -97,7 +97,9 @@ pub async fn get_provider_token(
             // Token expired or expiring soon - refresh it
             let refreshed_identity = refresh_provider_token_with_lock(&state, &identity).await?;
             let access_token = decrypt_token(
-                &state,
+                state.encryption.as_deref(),
+                &refreshed_identity.id,
+                "access_token_encrypted",
                 &refreshed_identity.access_token,
                 &refreshed_identity.access_token_encrypted,
             )?;
@@ -115,7 +117,9 @@ pub async fn get_provider_token(
 
     // 4. Decrypt and return existing token
     let access_token = decrypt_token(
-        &state,
+        state.encryption.as_deref(),
+        &identity.id,
+        "access_token_encrypted",
         &identity.access_token,
         &identity.access_token_encrypted,
     )?;
@@ -168,7 +172,9 @@ async fn refresh_provider_token(
     let provider = Provider::from_str(&identity.provider)?;
 
     let refresh_token = decrypt_token(
-        state,
+        state.encryption.as_deref(),
+        &identity.id,
+        "refresh_token_encrypted",
         &identity.refresh_token,
         &identity.refresh_token_encrypted,
     )?
@@ -202,7 +208,14 @@ async fn refresh_provider_token(
 
         // For now, return the credentials directly since that's what the existing code expects
         let secret = encryption
-            .decrypt(&creds.client_secret_encrypted)
+            .decrypt_with_context(
+                &creds.client_secret_encrypted,
+                crate::encryption::EncryptionContext::new(
+                    "organization_oauth_credentials",
+                    &creds.id,
+                    "client_secret_encrypted",
+                ),
+            )
             .map_err(|e| AppError::OAuth(format!("Failed to decrypt BYOO secret: {}", e)))?;
 
         (creds.client_id, secret)
@@ -287,16 +300,37 @@ async fn refresh_provider_token(
     let expires_at_naive = new_token.expires_at.map(|dt| dt.naive_utc());
 
     if let Some(encryption) = state.encryption.as_ref() {
-        let access_token_encrypted = encryption.encrypt(&new_token.access_token).map_err(|e| {
-            AppError::InternalServerError(format!("Failed to encrypt access token: {}", e))
-        })?;
+        let access_token_encrypted = encryption
+            .encrypt_with_context(
+                &new_token.access_token,
+                crate::encryption::EncryptionContext::new(
+                    "identities",
+                    &identity.id,
+                    "access_token_encrypted",
+                ),
+            )
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to encrypt access token: {}", e))
+            })?;
         let refresh_token_encrypted = new_token
             .refresh_token
             .as_ref()
             .map(|token| {
-                encryption.encrypt(token).map_err(|e| {
-                    AppError::InternalServerError(format!("Failed to encrypt refresh token: {}", e))
-                })
+                encryption
+                    .encrypt_with_context(
+                        token,
+                        crate::encryption::EncryptionContext::new(
+                            "identities",
+                            &identity.id,
+                            "refresh_token_encrypted",
+                        ),
+                    )
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!(
+                            "Failed to encrypt refresh token: {}",
+                            e
+                        ))
+                    })
             })
             .transpose()?;
 
@@ -329,27 +363,40 @@ async fn refresh_provider_token(
 }
 
 fn decrypt_token(
-    state: &AppState,
+    encryption: Option<&crate::encryption::EncryptionService>,
+    identity_id: &str,
+    encrypted_field: &'static str,
     plaintext: &Option<String>,
     encrypted: &Option<Vec<u8>>,
 ) -> Result<Option<String>> {
-    // If plaintext exists, use it (backwards compatibility)
-    if let Some(token) = plaintext {
-        return Ok(Some(token.clone()));
-    }
-
-    // Otherwise, decrypt the encrypted version
-    if let Some(encrypted_token) = encrypted {
-        if let Some(encryption) = &state.encryption {
-            let decrypted = encryption.decrypt(encrypted_token).map_err(|e| {
-                AppError::InternalServerError(format!("Failed to decrypt token: {}", e))
-            })?;
+    if let Some(encryption) = encryption {
+        if plaintext.is_some() {
+            return Err(AppError::InternalServerError(
+                "Provider token requires migration; run rewrap-secrets --apply".to_string(),
+            ));
+        }
+        if let Some(encrypted_token) = encrypted {
+            let decrypted = encryption
+                .decrypt_with_context(
+                    encrypted_token,
+                    crate::encryption::EncryptionContext::new(
+                        "identities",
+                        identity_id,
+                        encrypted_field,
+                    ),
+                )
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("Failed to decrypt token: {}", e))
+                })?;
             return Ok(Some(decrypted));
         }
+        return Ok(None);
     }
 
-    // No token available
-    Ok(None)
+    // Plaintext compatibility is confined to the explicitly unencrypted
+    // development mode. Production startup always supplies encryption and
+    // performs a complete maintenance-readiness scan before routing traffic.
+    Ok(plaintext.clone())
 }
 
 fn parse_scopes(scopes_json: &Option<String>) -> Vec<String> {
@@ -369,4 +416,66 @@ async fn acquire_refresh_lock(
 
 async fn release_refresh_lock(pool: &DatabaseConnection, lock_key: &str) -> Result<()> {
     TokenRefreshLockStore::release_lock(DB::Conn(pool), lock_key).await
+}
+
+#[cfg(test)]
+mod token_storage_tests {
+    use super::*;
+
+    fn encryption() -> crate::encryption::EncryptionService {
+        crate::encryption::EncryptionService::from_keyring_values("active", &"11".repeat(32), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn configured_encryption_rejects_identity_plaintext_and_reads_exact_v2_field() {
+        let encryption = encryption();
+        let plaintext = Some("identity-plaintext-canary".to_string());
+        let error = decrypt_token(
+            Some(&encryption),
+            "identity-a",
+            "access_token_encrypted",
+            &plaintext,
+            &None,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("requires migration"));
+        assert!(!message.contains("identity-plaintext-canary"));
+
+        assert_eq!(
+            decrypt_token(
+                None,
+                "identity-a",
+                "access_token_encrypted",
+                &plaintext,
+                &None,
+            )
+            .unwrap(),
+            plaintext
+        );
+
+        let ciphertext = encryption
+            .encrypt_with_context(
+                "identity-v2-canary",
+                crate::encryption::EncryptionContext::new(
+                    "identities",
+                    "identity-a",
+                    "access_token_encrypted",
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            decrypt_token(
+                Some(&encryption),
+                "identity-a",
+                "access_token_encrypted",
+                &None,
+                &Some(ciphertext),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("identity-v2-canary")
+        );
+    }
 }

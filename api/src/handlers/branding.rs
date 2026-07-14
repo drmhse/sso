@@ -24,30 +24,170 @@ use crate::{
     store::{memberships::MembershipStore, organizations::OrganizationStore, DB},
 };
 
+async fn mark_custom_domain_verified_with_audit(
+    db: DB<'_>,
+    org_id: &str,
+    expected_domain: &str,
+    expected_verification_token: &str,
+    audit_actor: &crate::services::audit_actor::AuditHandle,
+    event: crate::entities::organization_audit_log::ActiveModel,
+) -> Result<(), AppError> {
+    use crate::entities::prelude::Organizations;
+
+    let updated = Organizations::update_many()
+        .set(organizations::ActiveModel {
+            domain_verified: Set(true),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        })
+        .filter(organizations::Column::Id.eq(org_id))
+        .filter(organizations::Column::CustomDomain.eq(expected_domain))
+        .filter(organizations::Column::DomainVerificationToken.eq(expected_verification_token))
+        .filter(organizations::Column::DomainVerified.eq(false))
+        .exec(&db)
+        .await?;
+    if updated.rows_affected != 1 {
+        return Err(AppError::BadRequest(
+            "Domain verification state changed; retry verification".to_string(),
+        ));
+    }
+
+    audit_actor.log_org_with_db(db, event).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replace_custom_domain_with_audit(
+    db: DB<'_>,
+    org_id: &str,
+    expected_domain: Option<&str>,
+    expected_verification_token: Option<&str>,
+    expected_verified: bool,
+    new_domain: &str,
+    new_verification_token: &str,
+    audit_actor: &crate::services::audit_actor::AuditHandle,
+    event: crate::entities::organization_audit_log::ActiveModel,
+) -> Result<(), AppError> {
+    use crate::entities::prelude::Organizations;
+
+    let mut update = Organizations::update_many()
+        .set(organizations::ActiveModel {
+            custom_domain: Set(Some(new_domain.to_string())),
+            domain_verified: Set(false),
+            domain_verification_token: Set(Some(new_verification_token.to_string())),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        })
+        .filter(organizations::Column::Id.eq(org_id))
+        .filter(organizations::Column::DomainVerified.eq(expected_verified));
+    update = match expected_domain {
+        Some(domain) => update.filter(organizations::Column::CustomDomain.eq(domain)),
+        None => update.filter(organizations::Column::CustomDomain.is_null()),
+    };
+    update = match expected_verification_token {
+        Some(token) => update.filter(organizations::Column::DomainVerificationToken.eq(token)),
+        None => update.filter(organizations::Column::DomainVerificationToken.is_null()),
+    };
+
+    let updated = update.exec(&db).await?;
+    if updated.rows_affected != 1 {
+        return Err(AppError::BadRequest(
+            "Domain configuration changed; retry the update".to_string(),
+        ));
+    }
+    audit_actor.log_org_with_db(db, event).await?;
+    Ok(())
+}
+
+async fn clear_custom_domain_with_audit(
+    db: DB<'_>,
+    org_id: &str,
+    expected_domain: Option<&str>,
+    expected_verification_token: Option<&str>,
+    expected_verified: bool,
+    audit_actor: &crate::services::audit_actor::AuditHandle,
+    event: Option<crate::entities::organization_audit_log::ActiveModel>,
+) -> Result<(), AppError> {
+    use crate::entities::prelude::Organizations;
+
+    let mut update = Organizations::update_many()
+        .set(organizations::ActiveModel {
+            custom_domain: Set(None),
+            domain_verified: Set(false),
+            domain_verification_token: Set(None),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        })
+        .filter(organizations::Column::Id.eq(org_id))
+        .filter(organizations::Column::DomainVerified.eq(expected_verified));
+    update = match expected_domain {
+        Some(domain) => update.filter(organizations::Column::CustomDomain.eq(domain)),
+        None => update.filter(organizations::Column::CustomDomain.is_null()),
+    };
+    update = match expected_verification_token {
+        Some(token) => update.filter(organizations::Column::DomainVerificationToken.eq(token)),
+        None => update.filter(organizations::Column::DomainVerificationToken.is_null()),
+    };
+
+    let updated = update.exec(&db).await?;
+    if updated.rows_affected != 1 {
+        return Err(AppError::BadRequest(
+            "Domain configuration changed; retry deletion".to_string(),
+        ));
+    }
+    if let Some(event) = event {
+        audit_actor.log_org_with_db(db, event).await?;
+    }
+    Ok(())
+}
+
 async fn require_settings_manager(
     state: &AppState,
     org_id: &str,
     user_id: &str,
     is_platform_owner: bool,
 ) -> Result<(), AppError> {
-    if is_platform_owner {
+    require_settings_manager_in(DB::Conn(&state.db), org_id, user_id, is_platform_owner).await
+}
+
+async fn require_settings_manager_in(
+    db: DB<'_>,
+    org_id: &str,
+    user_id: &str,
+    is_platform_owner: bool,
+) -> Result<(), AppError> {
+    OrganizationStore::find_by_id(db.clone(), org_id)
+        .await?
+        .filter(|org| org.status == "active")
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // The JWT flag and the request's cached user snapshot are only hints. A
+    // platform-owner demotion must take effect on the next authorization
+    // check, including transaction retries that started before the demotion.
+    if has_live_platform_authority_in(db.clone(), user_id, is_platform_owner).await? {
         return Ok(());
     }
 
-    if PermissionService::check(
-        DB::Conn(&state.db),
-        org_id,
-        user_id,
-        CAP_ORG_SETTINGS_MANAGE,
-    )
-    .await?
-    {
+    if PermissionService::check(db, org_id, user_id, CAP_ORG_SETTINGS_MANAGE).await? {
         return Ok(());
     }
 
     Err(AppError::Forbidden(
         "Insufficient permissions to manage organization settings".to_string(),
     ))
+}
+
+async fn has_live_platform_authority_in(
+    db: DB<'_>,
+    user_id: &str,
+    authority_hint: bool,
+) -> Result<bool, AppError> {
+    if !authority_hint {
+        return Ok(false);
+    }
+    Ok(crate::store::users::UserStore::find_by_id(db, user_id)
+        .await?
+        .is_some_and(|user| user.is_platform_owner && user.deleted_at.is_none()))
 }
 
 // Request/Response Types
@@ -74,13 +214,14 @@ pub async fn set_custom_domain(
     // Verify user has permission
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
+        .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_settings_manager(
         &state,
         &org.id,
         &auth_user.claims.sub,
-        auth_user.claims.is_platform_owner,
+        auth_user.user.is_platform_owner,
     )
     .await?;
 
@@ -114,8 +255,20 @@ pub async fn set_custom_domain(
 
     // Update organization with new domain and verification token
     let org_id = org.id.clone();
+    let expected_domain = org.custom_domain.clone();
+    let expected_verification_token = org.domain_verification_token.clone();
+    let expected_verified = org.domain_verified;
+    let actor_id = auth_user.claims.sub.clone();
+    let actor_is_platform_owner = auth_user.user.is_platform_owner;
     let domain_clone = domain.clone();
     let verification_token_clone = verification_token.clone();
+    use crate::services::audit_builder::OrgAuditBuilder;
+    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "domain.set")
+        .target("organization", &org.id)
+        .success(true)
+        .details_json(Some(serde_json::json!({ "domain": &domain })))
+        .build();
+    let audit_actor = state.audit_actor.clone();
 
     with_retrying_transaction(
         &state.db,
@@ -124,35 +277,44 @@ pub async fn set_custom_domain(
         "set_custom_domain",
         |db| {
             let org_id = org_id.clone();
+            let expected_domain = expected_domain.clone();
+            let expected_verification_token = expected_verification_token.clone();
+            let actor_id = actor_id.clone();
             let domain = domain_clone.clone();
             let verification_token = verification_token_clone.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
-                let org_model = Organizations::find()
-                    .filter(organizations::Column::Id.eq(&org_id))
-                    .one(&db)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-
-                let mut org_active: organizations::ActiveModel = org_model.into();
-                org_active.custom_domain = Set(Some(domain));
-                org_active.domain_verified = Set(false);
-                org_active.domain_verification_token = Set(Some(verification_token));
-                org_active.updated_at = Set(chrono::Utc::now().naive_utc());
-                org_active.update(&db).await?;
-                Ok(())
+                require_settings_manager_in(
+                    db.clone(),
+                    &org_id,
+                    &actor_id,
+                    actor_is_platform_owner,
+                )
+                .await?;
+                TierService::check_feature_access(
+                    db.clone(),
+                    &org_id,
+                    |features| features.allow_custom_domain,
+                    "Custom Domain",
+                )
+                .await?;
+                replace_custom_domain_with_audit(
+                    db,
+                    &org_id,
+                    expected_domain.as_deref(),
+                    expected_verification_token.as_deref(),
+                    expected_verified,
+                    &domain,
+                    &verification_token,
+                    &audit_actor,
+                    event,
+                )
+                .await
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    use crate::services::audit_builder::OrgAuditBuilder;
-    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "domain.set")
-        .target("organization", &org.id)
-        .success(true)
-        .details_json(Some(serde_json::json!({ "domain": domain })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     // Return verification instructions
     let verification_methods = vec![
@@ -189,13 +351,14 @@ pub async fn verify_custom_domain(
     // Verify user has permission
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
+        .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_settings_manager(
         &state,
         &org.id,
         &auth_user.claims.sub,
-        auth_user.claims.is_platform_owner,
+        auth_user.user.is_platform_owner,
     )
     .await?;
 
@@ -227,32 +390,10 @@ pub async fn verify_custom_domain(
     if dns_verified || http_verified {
         // Mark domain as verified
         let org_id = org.id.clone();
-        with_retrying_transaction(
-            &state.db,
-            #[cfg(feature = "db_sqlite")]
-            &state.db_writer,
-            "verify_custom_domain",
-            |db| {
-                let org_id = org_id.clone();
-                Box::pin(async move {
-                    use crate::entities::prelude::Organizations;
-                    let org_model = Organizations::find()
-                        .filter(organizations::Column::Id.eq(&org_id))
-                        .one(&db)
-                        .await?
-                        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-
-                    let mut org_active: organizations::ActiveModel = org_model.into();
-                    org_active.domain_verified = Set(true);
-                    org_active.updated_at = Set(chrono::Utc::now().naive_utc());
-                    org_active.update(&db).await?;
-                    Ok(())
-                })
-            },
-        )
-        .await?;
-
-        // Non-blocking audit via actor
+        let expected_domain = domain.clone();
+        let expected_verification_token = verification_token.clone();
+        let actor_id = auth_user.claims.sub.clone();
+        let actor_is_platform_owner = auth_user.user.is_platform_owner;
         use crate::services::audit_builder::OrgAuditBuilder;
         let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "domain.verified")
             .target("organization", &org.id)
@@ -262,7 +403,40 @@ pub async fn verify_custom_domain(
                 "method": if dns_verified { "DNS" } else { "HTTP" }
             })))
             .build();
-        state.audit_actor.log_org(event).await;
+        let audit_actor = state.audit_actor.clone();
+        with_retrying_transaction(
+            &state.db,
+            #[cfg(feature = "db_sqlite")]
+            &state.db_writer,
+            "verify_custom_domain",
+            |db| {
+                let org_id = org_id.clone();
+                let expected_domain = expected_domain.clone();
+                let expected_verification_token = expected_verification_token.clone();
+                let actor_id = actor_id.clone();
+                let event = event.clone();
+                let audit_actor = audit_actor.clone();
+                Box::pin(async move {
+                    require_settings_manager_in(
+                        db.clone(),
+                        &org_id,
+                        &actor_id,
+                        actor_is_platform_owner,
+                    )
+                    .await?;
+                    mark_custom_domain_verified_with_audit(
+                        db,
+                        &org_id,
+                        &expected_domain,
+                        &expected_verification_token,
+                        &audit_actor,
+                        event,
+                    )
+                    .await
+                })
+            },
+        )
+        .await?;
 
         Ok(Json(DomainVerificationResult {
             verified: true,
@@ -290,9 +464,16 @@ pub async fn get_domain_configuration(
 ) -> Result<Json<DomainConfiguration>, AppError> {
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
+        .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    if !auth_user.claims.is_platform_owner {
+    if !has_live_platform_authority_in(
+        DB::Conn(&state.db),
+        &auth_user.user.id,
+        auth_user.user.is_platform_owner,
+    )
+    .await?
+    {
         let is_member =
             MembershipStore::is_member(DB::Conn(&state.db), &org.id, &auth_user.claims.sub).await?;
 
@@ -316,18 +497,32 @@ pub async fn delete_custom_domain(
 ) -> Result<StatusCode, AppError> {
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
+        .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_settings_manager(
         &state,
         &org.id,
         &auth_user.claims.sub,
-        auth_user.claims.is_platform_owner,
+        auth_user.user.is_platform_owner,
     )
     .await?;
 
     let domain = org.custom_domain.clone();
+    let verification_token = org.domain_verification_token.clone();
+    let domain_verified = org.domain_verified;
+    let actor_id = auth_user.claims.sub.clone();
+    let actor_is_platform_owner = auth_user.user.is_platform_owner;
     let org_id = org.id.clone();
+    let event = domain.as_ref().map(|domain| {
+        use crate::services::audit_builder::OrgAuditBuilder;
+        OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "domain.deleted")
+            .target("organization", &org.id)
+            .success(true)
+            .details_json(Some(serde_json::json!({ "domain": domain })))
+            .build()
+    });
+    let audit_actor = state.audit_actor.clone();
 
     with_retrying_transaction(
         &state.db,
@@ -336,36 +531,33 @@ pub async fn delete_custom_domain(
         "delete_custom_domain",
         |db| {
             let org_id = org_id.clone();
+            let domain = domain.clone();
+            let verification_token = verification_token.clone();
+            let actor_id = actor_id.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
-                use crate::entities::prelude::Organizations;
-                let org_model = Organizations::find()
-                    .filter(organizations::Column::Id.eq(&org_id))
-                    .one(&db)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-
-                let mut org_active: organizations::ActiveModel = org_model.into();
-                org_active.custom_domain = Set(None);
-                org_active.domain_verified = Set(false);
-                org_active.domain_verification_token = Set(None);
-                org_active.updated_at = Set(chrono::Utc::now().naive_utc());
-                org_active.update(&db).await?;
-                Ok(())
+                require_settings_manager_in(
+                    db.clone(),
+                    &org_id,
+                    &actor_id,
+                    actor_is_platform_owner,
+                )
+                .await?;
+                clear_custom_domain_with_audit(
+                    db,
+                    &org_id,
+                    domain.as_deref(),
+                    verification_token.as_deref(),
+                    domain_verified,
+                    &audit_actor,
+                    event,
+                )
+                .await
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    if let Some(domain) = domain {
-        use crate::services::audit_builder::OrgAuditBuilder;
-        let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "domain.deleted")
-            .target("organization", &org.id)
-            .success(true)
-            .details_json(Some(serde_json::json!({ "domain": domain })))
-            .build();
-        state.audit_actor.log_org(event).await;
-    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -380,13 +572,14 @@ pub async fn update_branding(
 ) -> Result<Json<BrandingConfiguration>, AppError> {
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
+        .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_settings_manager(
         &state,
         &org.id,
         &auth_user.claims.sub,
-        auth_user.claims.is_platform_owner,
+        auth_user.user.is_platform_owner,
     )
     .await?;
 
@@ -420,6 +613,18 @@ pub async fn update_branding(
     let org_id = org.id.clone();
     let logo_url = req.logo_url.clone();
     let primary_color = req.primary_color.clone();
+    let actor_id = auth_user.claims.sub.clone();
+    let actor_is_platform_owner = auth_user.user.is_platform_owner;
+    use crate::services::audit_builder::OrgAuditBuilder;
+    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "branding.updated")
+        .target("organization", &org.id)
+        .success(true)
+        .details_json(Some(serde_json::json!({
+            "logo_url": req.logo_url,
+            "primary_color": req.primary_color
+        })))
+        .build();
+    let audit_actor = state.audit_actor.clone();
 
     with_retrying_transaction(
         &state.db,
@@ -430,7 +635,24 @@ pub async fn update_branding(
             let org_id = org_id.clone();
             let logo_url = logo_url.clone();
             let primary_color = primary_color.clone();
+            let actor_id = actor_id.clone();
+            let event = event.clone();
+            let audit_actor = audit_actor.clone();
             Box::pin(async move {
+                require_settings_manager_in(
+                    db.clone(),
+                    &org_id,
+                    &actor_id,
+                    actor_is_platform_owner,
+                )
+                .await?;
+                TierService::check_feature_access(
+                    db.clone(),
+                    &org_id,
+                    |features| features.allow_branding,
+                    "Custom Branding",
+                )
+                .await?;
                 use crate::entities::prelude::Organizations;
                 let org_model = Organizations::find()
                     .filter(organizations::Column::Id.eq(&org_id))
@@ -443,23 +665,12 @@ pub async fn update_branding(
                 org_active.brand_primary_color = Set(primary_color);
                 org_active.updated_at = Set(chrono::Utc::now().naive_utc());
                 org_active.update(&db).await?;
+                audit_actor.log_org_with_db(db, event).await?;
                 Ok(())
             })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor
-    use crate::services::audit_builder::OrgAuditBuilder;
-    let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "branding.updated")
-        .target("organization", &org.id)
-        .success(true)
-        .details_json(Some(serde_json::json!({
-            "logo_url": req.logo_url,
-            "primary_color": req.primary_color
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(Json(BrandingConfiguration {
         logo_url: req.logo_url,
@@ -474,9 +685,16 @@ pub async fn get_branding(
 ) -> Result<Json<BrandingConfiguration>, AppError> {
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
+        .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    if !auth_user.claims.is_platform_owner {
+    if !has_live_platform_authority_in(
+        DB::Conn(&state.db),
+        &auth_user.user.id,
+        auth_user.user.is_platform_owner,
+    )
+    .await?
+    {
         let is_member =
             MembershipStore::is_member(DB::Conn(&state.db), &org.id, &auth_user.claims.sub).await?;
 
@@ -499,10 +717,257 @@ pub async fn get_public_branding(
 ) -> Result<Json<BrandingConfiguration>, AppError> {
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
+        .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     Ok(Json(BrandingConfiguration {
         logo_url: org.brand_logo_url,
         primary_color: org.brand_primary_color,
     }))
+}
+
+#[cfg(test)]
+mod domain_verification_race_tests {
+    use super::*;
+    use crate::entities::audit_outbox;
+    use crate::entities::prelude::Organizations;
+    use crate::services::audit_builder::OrgAuditBuilder;
+    use crate::store::users::UserStore;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{Database, PaginatorTrait, TransactionTrait};
+
+    #[tokio::test]
+    async fn concurrent_domain_replacement_cannot_be_verified_or_audited() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let user = UserStore::create(DB::Conn(&db), "domain-owner@example.test", None, true)
+            .await
+            .unwrap();
+        let org =
+            OrganizationStore::create(DB::Conn(&db), "domain-race", "Domain race", &user.id, None)
+                .await
+                .unwrap();
+
+        Organizations::update_many()
+            .set(organizations::ActiveModel {
+                custom_domain: Set(Some("replacement.example.test".to_string())),
+                domain_verification_token: Set(Some("replacement-token".to_string())),
+                domain_verified: Set(false),
+                ..Default::default()
+            })
+            .filter(organizations::Column::Id.eq(&org.id))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let transaction = db.begin().await.unwrap();
+        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let event = OrgAuditBuilder::new(&org.id, Some(&user.id), "domain.verified")
+            .target("organization", &org.id)
+            .success(true)
+            .build();
+        let error = mark_custom_domain_verified_with_audit(
+            DB::Tx(&transaction),
+            &org.id,
+            "original.example.test",
+            "original-token",
+            &audit,
+            event,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        transaction.rollback().await.unwrap();
+
+        let unchanged = Organizations::find_by_id(&org.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.custom_domain.as_deref(),
+            Some("replacement.example.test")
+        );
+        assert_eq!(
+            unchanged.domain_verification_token.as_deref(),
+            Some("replacement-token")
+        );
+        assert!(!unchanged.domain_verified);
+        assert_eq!(audit_outbox::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_domain_addition_cannot_be_deleted_without_an_audit() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let user = UserStore::create(DB::Conn(&db), "domain-delete@example.test", None, true)
+            .await
+            .unwrap();
+        let org = OrganizationStore::create(
+            DB::Conn(&db),
+            "domain-delete-race",
+            "Domain delete race",
+            &user.id,
+            None,
+        )
+        .await
+        .unwrap();
+
+        Organizations::update_many()
+            .set(organizations::ActiveModel {
+                custom_domain: Set(Some("new.example.test".to_string())),
+                domain_verification_token: Set(Some("new-token".to_string())),
+                domain_verified: Set(false),
+                ..Default::default()
+            })
+            .filter(organizations::Column::Id.eq(&org.id))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let transaction = db.begin().await.unwrap();
+        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let error = clear_custom_domain_with_audit(
+            DB::Tx(&transaction),
+            &org.id,
+            None,
+            None,
+            false,
+            &audit,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        transaction.rollback().await.unwrap();
+
+        let unchanged = Organizations::find_by_id(&org.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.custom_domain.as_deref(), Some("new.example.test"));
+        assert_eq!(
+            unchanged.domain_verification_token.as_deref(),
+            Some("new-token")
+        );
+        assert!(!unchanged.domain_verified);
+        assert_eq!(audit_outbox::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_platform_claim_cannot_read_or_mutate_another_tenant_after_demotion() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let stale_owner = UserStore::create(
+            DB::Conn(&db),
+            "stale-branding-owner@example.test",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let tenant_owner = UserStore::create(
+            DB::Conn(&db),
+            "branding-tenant-owner@example.test",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let org = OrganizationStore::create(
+            DB::Conn(&db),
+            "branding-target",
+            "Branding target",
+            &tenant_owner.id,
+            None,
+        )
+        .await
+        .unwrap();
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .unwrap();
+        Organizations::update_many()
+            .set(organizations::ActiveModel {
+                custom_domain: Set(Some("unchanged.example.test".to_string())),
+                domain_verification_token: Set(Some("unchanged-token".to_string())),
+                domain_verified: Set(false),
+                brand_primary_color: Set(Some("#123456".to_string())),
+                ..Default::default()
+            })
+            .filter(organizations::Column::Id.eq(&org.id))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        // This models an already-issued token and cached request snapshot that
+        // both still say platform owner after the database role is removed.
+        UserStore::set_platform_owner(DB::Conn(&db), &stale_owner.id, false)
+            .await
+            .unwrap();
+        assert!(
+            !has_live_platform_authority_in(DB::Conn(&db), &stale_owner.id, true)
+                .await
+                .unwrap()
+        );
+
+        // Every write/verify/delete transaction enters through this live gate.
+        for operation in ["write", "verify", "delete"] {
+            let transaction = db.begin().await.unwrap();
+            let error =
+                require_settings_manager_in(DB::Tx(&transaction), &org.id, &stale_owner.id, true)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(error, AppError::Forbidden(_)), "{operation}");
+            transaction.rollback().await.unwrap();
+        }
+
+        let unchanged = Organizations::find_by_id(&org.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.custom_domain.as_deref(),
+            Some("unchanged.example.test")
+        );
+        assert_eq!(
+            unchanged.domain_verification_token.as_deref(),
+            Some("unchanged-token")
+        );
+        assert!(!unchanged.domain_verified);
+        assert_eq!(unchanged.brand_primary_color.as_deref(), Some("#123456"));
+        assert_eq!(audit_outbox::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn suspended_tenant_is_rejected_again_at_the_transaction_boundary() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let owner = UserStore::create(
+            DB::Conn(&db),
+            "suspended-branding-owner@example.test",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let org = OrganizationStore::create(
+            DB::Conn(&db),
+            "suspended-branding",
+            "Suspended branding",
+            &owner.id,
+            None,
+        )
+        .await
+        .unwrap();
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "suspended")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            require_settings_manager_in(DB::Conn(&db), &org.id, &owner.id, true).await,
+            Err(AppError::NotFound(_))
+        ));
+    }
 }

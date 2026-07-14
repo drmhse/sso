@@ -20,7 +20,7 @@ use crate::store::{
     organizations::OrganizationStore, platform_audit_log::PlatformAuditLogStore, DB,
 };
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, Set};
+use sea_orm::{ConnectionTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -141,17 +141,16 @@ where
         created_at: Set(now),
     };
 
-    let log_model = new_log.insert(db).await?;
+    crate::services::audit_actor::enqueue_platform_with_connection(db, new_log).await?;
 
-    // Convert to old model format
     Ok(PlatformAuditLog {
-        id: log_model.id,
-        platform_owner_id: log_model.platform_owner_id,
-        action: log_model.action,
-        target_type: log_model.target_type,
-        target_id: log_model.target_id,
-        metadata: log_model.metadata,
-        created_at: chrono::DateTime::from_naive_utc_and_offset(log_model.created_at, Utc),
+        id,
+        platform_owner_id: platform_owner_id.to_string(),
+        action: action.to_string(),
+        target_type: target_type.to_string(),
+        target_id: target_id.to_string(),
+        metadata: metadata_str,
+        created_at: chrono::DateTime::from_naive_utc_and_offset(now, Utc),
     })
 }
 
@@ -172,6 +171,15 @@ pub struct AuditLogQuery {
 pub struct AuditLogResponse {
     pub logs: Vec<PlatformAuditLog>,
     pub total: i64,
+}
+
+fn redact_platform_audit_metadata(metadata: Option<String>) -> Option<String> {
+    metadata.and_then(|metadata| {
+        serde_json::from_str(&metadata)
+            .ok()
+            .map(crate::handlers::organization_audit::redact_audit_metadata)
+            .map(|metadata| metadata.to_string())
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +224,12 @@ pub async fn delete_organization_platform(
                 let org_slug = org_model.slug.clone();
                 let org_name = org_model.name.clone();
 
-                // Create audit log before deletion
+                // Delete organization (database cascades will handle related data)
+                OrganizationStore::delete(db.clone(), &org_id).await?;
+
+                // The platform event does not reference the deleted organization
+                // through a foreign key, so enqueue it after the last fallible
+                // domain operation while preserving the identity in its payload.
                 create_audit_log(
                     &db,
                     &auth_user_id,
@@ -230,9 +243,6 @@ pub async fn delete_organization_platform(
                     })),
                 )
                 .await?;
-
-                // Delete organization (database cascades will handle related data)
-                OrganizationStore::delete(db.clone(), &org_id).await?;
 
                 Ok(())
             })
@@ -259,8 +269,8 @@ pub async fn get_audit_log(
         ));
     }
 
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = query.offset.unwrap_or(0);
+    let (limit, offset) =
+        crate::utils::pagination::signed_limit_offset(query.limit, query.offset, 50, 100);
 
     // Get total count using store
     let total = PlatformAuditLogStore::count_with_filters(
@@ -272,13 +282,14 @@ pub async fn get_audit_log(
     .await? as i64;
 
     // Get logs using store
+    let (limit_u64, offset_u64) = crate::utils::pagination::store_u64(limit, offset, 100);
     let log_models = PlatformAuditLogStore::list_with_filters(
         DB::Conn(&state.db),
         query.action.as_deref(),
         query.target_type.as_deref(),
         query.target_id.as_deref(),
-        limit as u64,
-        offset as u64,
+        limit_u64,
+        offset_u64,
     )
     .await?;
 
@@ -291,12 +302,34 @@ pub async fn get_audit_log(
             action: l.action,
             target_type: l.target_type,
             target_id: l.target_id,
-            metadata: l.metadata,
+            metadata: redact_platform_audit_metadata(l.metadata),
             created_at: chrono::DateTime::from_naive_utc_and_offset(l.created_at, Utc),
         })
         .collect();
 
     Ok(Json(AuditLogResponse { logs, total }))
+}
+
+#[cfg(test)]
+mod audit_redaction_tests {
+    use super::redact_platform_audit_metadata;
+
+    #[test]
+    fn platform_audit_metadata_uses_recursive_credential_redaction() {
+        let redacted = redact_platform_audit_metadata(Some(
+            serde_json::json!({
+                "target_id": "safe-id",
+                "nested": [{"client_secret_value": "secret-canary"}]
+            })
+            .to_string(),
+        ))
+        .expect("valid metadata remains available");
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(parsed["target_id"], "safe-id");
+        assert_eq!(parsed["nested"][0]["client_secret_value"], "[REDACTED]");
+        assert!(!redacted.contains("secret-canary"));
+        assert!(redact_platform_audit_metadata(Some("not-json-secret".to_string())).is_none());
+    }
 }
 
 /// GET /api/platform/analytics/recent-organizations
@@ -312,10 +345,11 @@ pub async fn get_recent_organizations(
         ));
     }
 
-    let limit = query.limit.unwrap_or(10).min(50);
+    let (limit, _) = crate::utils::pagination::signed_limit_offset(query.limit, None, 10, 50);
 
     // Get recent organizations using store
-    let orgs = OrganizationStore::list_recent(DB::Conn(&state.db), limit as u64).await?;
+    let (limit, _) = crate::utils::pagination::store_u64(limit, 0, 50);
+    let orgs = OrganizationStore::list_recent(DB::Conn(&state.db), limit).await?;
 
     let organizations = orgs
         .into_iter()

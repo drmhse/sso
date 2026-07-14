@@ -51,6 +51,7 @@ async function compileBackendBinary({ root, backendName, platform, buildVersion 
     [
       'zigbuild',
       '--release',
+      '--locked',
       '--target',
       target.rustTarget,
       '--no-default-features',

@@ -21,7 +21,7 @@ impl RiskRulesStore {
             impossible_travel_score: Set(50),
             velocity_threshold: Set(10),
             velocity_score: Set(30),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 
@@ -50,6 +50,7 @@ impl RiskRulesStore {
     }
 
     /// Update risk rules
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         db: DB<'_>,
         org_id: &str,
@@ -112,5 +113,68 @@ impl RiskRulesStore {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{organizations::OrganizationStore, users::UserStore};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn risk_rule_update_and_delete_preserve_other_organization() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::create(DB::Conn(&db), "risk-owner@example.test", None, false)
+            .await
+            .expect("create owner");
+        let org_a =
+            OrganizationStore::create(DB::Conn(&db), "risk-org-a", "Risk Org A", &owner.id, None)
+                .await
+                .expect("create org A");
+        let org_b =
+            OrganizationStore::create(DB::Conn(&db), "risk-org-b", "Risk Org B", &owner.id, None)
+                .await
+                .expect("create org B");
+        RiskRulesStore::create_default(DB::Conn(&db), &org_a.id)
+            .await
+            .expect("create org A rules");
+        let rules_b = RiskRulesStore::create_default(DB::Conn(&db), &org_b.id)
+            .await
+            .expect("create org B rules");
+
+        RiskRulesStore::update(
+            DB::Conn(&db),
+            &org_a.id,
+            Some("block".to_string()),
+            Some(10),
+            Some(20),
+            Some(90),
+            Some(90),
+            Some(2),
+            Some(90),
+        )
+        .await
+        .expect("update org A rules");
+        let preserved_b = RiskRulesStore::find_by_org(DB::Conn(&db), &org_b.id)
+            .await
+            .expect("load org B rules")
+            .expect("org B rules remain");
+        assert_eq!(preserved_b.id, rules_b.id);
+        assert_eq!(preserved_b.enforcement_mode, "log_only");
+        assert_eq!(preserved_b.low_threshold, 30);
+        assert_eq!(preserved_b.medium_threshold, 70);
+
+        assert!(RiskRulesStore::delete(DB::Conn(&db), &org_a.id)
+            .await
+            .expect("delete org A rules"));
+        assert!(RiskRulesStore::find_by_org(DB::Conn(&db), &org_b.id)
+            .await
+            .expect("load preserved org B rules")
+            .is_some());
     }
 }

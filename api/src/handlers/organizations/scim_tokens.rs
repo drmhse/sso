@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 async fn require_integration_manager(state: &AppState, org_id: &str, user_id: &str) -> Result<()> {
+    crate::handlers::organizations::ensure_organization_active(&state.db, org_id).await?;
     if PermissionService::check(
         DB::Conn(&state.db),
         org_id,
@@ -26,18 +27,6 @@ async fn require_integration_manager(state: &AppState, org_id: &str, user_id: &s
     Err(AppError::Forbidden(
         "Insufficient permissions to manage integrations".to_string(),
     ))
-}
-
-async fn require_scim_token_in_org(state: &AppState, org_id: &str, token_id: &str) -> Result<()> {
-    let token = ScimTokenStore::find_by_id(DB::Conn(&state.db), token_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("SCIM token not found".to_string()))?;
-
-    if token.org_id != org_id {
-        return Err(AppError::NotFound("SCIM token not found".to_string()));
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,10 +167,9 @@ pub async fn revoke_scim_token(
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_integration_manager(&state, &org.id, &auth_user.user.id).await?;
-    require_scim_token_in_org(&state, &org.id, &token_id).await?;
-
-    // Revoke token
-    ScimTokenStore::revoke(DB::Conn(&state.db), &token_id).await?;
+    if !ScimTokenStore::revoke_in_org(DB::Conn(&state.db), &org.id, &token_id).await? {
+        return Err(AppError::NotFound("SCIM token not found".to_string()));
+    }
 
     Ok(Json(()))
 }
@@ -198,10 +186,9 @@ pub async fn delete_scim_token(
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_integration_manager(&state, &org.id, &auth_user.user.id).await?;
-    require_scim_token_in_org(&state, &org.id, &token_id).await?;
-
-    // Delete token
-    ScimTokenStore::delete(DB::Conn(&state.db), &token_id).await?;
+    if !ScimTokenStore::delete_in_org(DB::Conn(&state.db), &org.id, &token_id).await? {
+        return Err(AppError::NotFound("SCIM token not found".to_string()));
+    }
 
     Ok(Json(()))
 }

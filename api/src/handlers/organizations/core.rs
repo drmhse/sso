@@ -5,7 +5,7 @@ use crate::constants::{
     DEFAULT_MAX_ORGS_PER_USER, DEFAULT_TIER_NAME, MAX_NAME_LENGTH, MAX_SLUG_LENGTH,
     MIN_NAME_LENGTH, MIN_SLUG_LENGTH, RESERVED_SLUGS,
 };
-use crate::entities::{memberships, organization_tiers, organizations, users};
+use crate::entities::{memberships, organization_tiers, organizations, platform_audit_log, users};
 use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{
@@ -22,9 +22,8 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, Set};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateOrganizationRequest {
@@ -52,7 +51,14 @@ async fn require_capability(
     capability: &str,
     message: &str,
 ) -> Result<()> {
-    if user.is_platform_owner
+    let has_live_platform_authority = if user.is_platform_owner {
+        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.id)
+            .await?
+            .is_some_and(|current| current.is_platform_owner && current.deleted_at.is_none())
+    } else {
+        false
+    };
+    if has_live_platform_authority
         || PermissionService::check(DB::Conn(&state.db), org_id, &user.id, capability).await?
     {
         return Ok(());
@@ -68,7 +74,14 @@ async fn require_any_capability(
     capabilities: &[&str],
     message: &str,
 ) -> Result<()> {
-    if user.is_platform_owner
+    let has_live_platform_authority = if user.is_platform_owner {
+        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.id)
+            .await?
+            .is_some_and(|current| current.is_platform_owner && current.deleted_at.is_none())
+    } else {
+        false
+    };
+    if has_live_platform_authority
         || PermissionService::check_any(DB::Conn(&state.db), org_id, &user.id, capabilities).await?
     {
         return Ok(());
@@ -232,7 +245,7 @@ pub async fn create_organization(
         .map_err(|e| AppError::InternalServerError(format!("Failed to create JWT: {}", e)))?;
 
     // Generate refresh token
-    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_token = crate::auth::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&access_token);
@@ -379,7 +392,23 @@ pub async fn delete_organization(
     // Check if user is owner (only owners can delete)
     crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
 
-    // Delete organization
+    let deletion_audit = platform_audit_log::ActiveModel {
+        id: Set(uuid::Uuid::new_v4().to_string()),
+        platform_owner_id: Set(user.id.clone()),
+        action: Set("org.deleted".to_string()),
+        target_type: Set("organization".to_string()),
+        target_id: Set(organization.id.clone()),
+        metadata: Set(Some(
+            serde_json::json!({
+                "org_slug": org_slug,
+                "org_name": organization.name,
+                "deleted_by_org_owner": true,
+            })
+            .to_string(),
+        )),
+        ..Default::default()
+    };
+
     with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
@@ -387,22 +416,16 @@ pub async fn delete_organization(
         "delete_organization",
         |db| {
             let org_id = organization.id.clone();
-            Box::pin(async move { OrganizationStore::delete(db.clone(), &org_id).await })
+            let deletion_audit = deletion_audit.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                OrganizationStore::delete(db.clone(), &org_id).await?;
+                audit_actor.log_platform_with_db(db, deletion_audit).await?;
+                Ok(())
+            })
         },
     )
     .await?;
-
-    // Non-blocking audit via actor (fire and forget since org is already deleted)
-    use crate::services::audit_builder::OrgAuditBuilder;
-    let event = OrgAuditBuilder::new(&organization.id, Some(&user.id), "org.deleted")
-        .target("organization", &organization.id)
-        .success(true)
-        .details_json(Some(serde_json::json!({
-            "org_slug": org_slug,
-            "org_name": organization.name
-        })))
-        .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(Json(()))
 }
@@ -415,31 +438,54 @@ pub async fn list_user_organizations(
 ) -> Result<Json<Vec<OrganizationResponse>>> {
     let user = &auth_user.user;
 
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let offset = (page - 1) * limit;
+    let (_page, limit, offset) =
+        crate::utils::pagination::signed_page(query.page, query.limit, 20, 100);
 
     // Get user's organizations with optional status filter
+    let (limit_u64, offset_u64) = crate::utils::pagination::store_u64(limit, offset, 100);
     let organizations = OrganizationStore::list_by_user_with_status(
         DB::Conn(&state.db),
         &user.id,
         query.status.as_deref(),
-        limit as u64,
-        offset as u64,
+        limit_u64,
+        offset_u64,
     )
     .await?;
 
-    let mut results = Vec::new();
-    for org in organizations {
-        let (membership_count, service_count, tier) =
-            get_organization_stats(&state.db, &org.id).await?;
-        results.push(OrganizationResponse {
-            organization: org,
-            membership_count,
-            service_count,
-            tier,
-        });
-    }
+    let org_ids = organizations
+        .iter()
+        .map(|org| org.id.clone())
+        .collect::<Vec<_>>();
+    let membership_counts = MembershipStore::count_by_orgs(DB::Conn(&state.db), &org_ids).await?;
+    let service_counts = ServiceStore::count_by_orgs(DB::Conn(&state.db), &org_ids).await?;
+    let tier_ids = organizations
+        .iter()
+        .filter_map(|org| org.tier_id.clone())
+        .collect::<Vec<_>>();
+    let tiers = OrganizationTierStore::find_by_ids(DB::Conn(&state.db), &tier_ids)
+        .await?
+        .into_iter()
+        .map(|tier| (tier.id.clone(), tier))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let results = organizations
+        .into_iter()
+        .map(|org| {
+            let membership_count = membership_counts.get(&org.id).copied().unwrap_or(0);
+            let service_count = service_counts.get(&org.id).copied().unwrap_or(0);
+            let tier = org
+                .tier_id
+                .as_ref()
+                .and_then(|tier_id| tiers.get(tier_id).cloned());
+
+            OrganizationResponse {
+                organization: org,
+                membership_count,
+                service_count,
+                tier,
+            }
+        })
+        .collect();
 
     Ok(Json(results))
 }
@@ -507,7 +553,7 @@ pub async fn select_organization(
         .map_err(|e| AppError::InternalServerError(format!("Failed to create JWT: {}", e)))?;
 
     // Generate refresh token
-    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_token = crate::auth::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&access_token);
@@ -553,7 +599,6 @@ pub async fn select_organization(
 
     tracing::info!(
         user_id = %user.id,
-        email = %user.email,
         org_slug = %org_slug,
         "User switched organization context"
     );
@@ -941,6 +986,30 @@ mod tests {
             AppError::Forbidden(ref message) if message.contains("not a member")
         ));
     }
+
+    #[tokio::test]
+    async fn tenant_capability_does_not_trust_stale_platform_owner_snapshot() {
+        let fixture = setup_org_switch_fixture().await;
+        let gamma =
+            OrganizationStore::find_by_slug(DB::Conn(&fixture.state.db), &fixture.gamma_slug)
+                .await
+                .expect("lookup gamma")
+                .expect("gamma exists");
+        let mut stale_user = fixture.auth_user.user.clone();
+        stale_user.is_platform_owner = true;
+
+        assert!(matches!(
+            require_capability(
+                &fixture.state,
+                &gamma.id,
+                &stale_user,
+                CAP_RISK_POLICIES_MANAGE,
+                "denied",
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+    }
 }
 
 pub fn validate_email(email: &str) -> Result<()> {
@@ -995,6 +1064,7 @@ pub async fn get_risk_settings(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let org = ensure_organization_active(&state.db, &org.id).await?;
 
     require_any_capability(
         &state,
@@ -1032,6 +1102,7 @@ pub async fn update_risk_settings(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let org = ensure_organization_active(&state.db, &org.id).await?;
 
     require_capability(
         &state,
@@ -1057,7 +1128,7 @@ pub async fn update_risk_settings(
 
     // Validate thresholds if provided
     if let Some(low) = req.low_threshold {
-        if low < 0 || low > 100 {
+        if !(0..=100).contains(&low) {
             return Err(AppError::BadRequest(
                 "Low threshold must be between 0 and 100".to_string(),
             ));
@@ -1065,7 +1136,7 @@ pub async fn update_risk_settings(
     }
 
     if let Some(medium) = req.medium_threshold {
-        if medium < 0 || medium > 100 {
+        if !(0..=100).contains(&medium) {
             return Err(AppError::BadRequest(
                 "Medium threshold must be between 0 and 100".to_string(),
             ));
@@ -1082,7 +1153,7 @@ pub async fn update_risk_settings(
 
     // Validate scores if provided
     if let Some(score) = req.new_device_score {
-        if score < 0 || score > 100 {
+        if !(0..=100).contains(&score) {
             return Err(AppError::BadRequest(
                 "New device score must be between 0 and 100".to_string(),
             ));
@@ -1090,7 +1161,7 @@ pub async fn update_risk_settings(
     }
 
     if let Some(score) = req.impossible_travel_score {
-        if score < 0 || score > 100 {
+        if !(0..=100).contains(&score) {
             return Err(AppError::BadRequest(
                 "Impossible travel score must be between 0 and 100".to_string(),
             ));
@@ -1098,7 +1169,7 @@ pub async fn update_risk_settings(
     }
 
     if let Some(score) = req.velocity_score {
-        if score < 0 || score > 100 {
+        if !(0..=100).contains(&score) {
             return Err(AppError::BadRequest(
                 "Velocity score must be between 0 and 100".to_string(),
             ));
@@ -1153,6 +1224,7 @@ pub async fn reset_risk_settings(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let org = ensure_organization_active(&state.db, &org.id).await?;
 
     require_capability(
         &state,

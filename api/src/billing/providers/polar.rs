@@ -9,6 +9,7 @@ use crate::billing::models::{
 };
 use crate::billing::traits::BillingProvider;
 use crate::error::{AppError, Result};
+use crate::services::safe_http::{SafeHttpClient, MAX_BILLING_RESPONSE_BYTES};
 use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::http::HeaderMap;
@@ -37,7 +38,7 @@ impl PolarProvider {
         Self {
             api_key,
             webhook_secret,
-            base_url: base_url.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 }
@@ -405,32 +406,100 @@ impl PolarProvider {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        let client = reqwest::Client::new();
         let url = format!("{}{}", self.base_url, path);
+        let mut headers = vec![(
+            "authorization".to_string(),
+            format!("Bearer {}", self.api_key).into_bytes(),
+        )];
+        let body = if let Some(body) = body {
+            headers.push(("content-type".to_string(), b"application/json".to_vec()));
+            serde_json::to_vec(&body)
+                .map_err(|_| AppError::Billing("Polar request encoding failed".to_string()))?
+        } else {
+            Vec::new()
+        };
 
-        let mut request = client.request(method, &url).bearer_auth(&self.api_key);
-
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-
-        let response = request
-            .send()
+        let response = SafeHttpClient::new()
+            .map_err(|_| AppError::Billing("Polar request could not be started".to_string()))?
+            .request_with_owned_headers(method, &url, body, headers)
             .await
-            .map_err(|e| AppError::Billing(format!("Polar API request failed: {}", e)))?;
+            .map_err(|_| AppError::Billing("Polar API request failed".to_string()))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
+        Self::decode_response(response).await
+    }
+
+    async fn decode_response<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T> {
+        let (status, body) =
+            SafeHttpClient::read_body_limited(response, MAX_BILLING_RESPONSE_BYTES)
+                .await
+                .map_err(|_| AppError::Billing("Polar API response was rejected".to_string()))?;
+
+        if !status.is_success() {
             return Err(AppError::Billing(format!(
-                "Polar API error ({}): {}",
-                status, error_text
+                "Polar API request failed with status {}",
+                status.as_u16()
             )));
         }
 
-        response
-            .json()
+        serde_json::from_slice(&body)
+            .map_err(|_| AppError::Billing("Polar API returned an invalid response".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn configured_private_base_url_fails_closed_with_redacted_error() {
+        let api_key = "polar_key_must_not_leak";
+        let base_url = "http://127.0.0.1:9/private-polar-endpoint";
+        let provider = PolarProvider::new_with_base_url(
+            api_key.to_string(),
+            "webhook-secret".to_string(),
+            base_url,
+        );
+
+        let error = provider
+            .api_request::<serde_json::Value>(reqwest::Method::POST, "/v1/checkouts/", None)
             .await
-            .map_err(|e| AppError::Billing(format!("Failed to parse Polar response: {}", e)))
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Polar API request failed"));
+        assert!(!message.contains(api_key));
+        assert!(!message.contains(base_url));
+        assert!(!message.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_rejected_without_exposing_body_details() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let declared_size = MAX_BILLING_RESPONSE_BYTES + 1;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {declared_size}\r\n\r\nsecret-response-body"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+
+        let error = PolarProvider::decode_response::<serde_json::Value>(response)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Polar API response was rejected"));
+        assert!(!message.contains("secret-response-body"));
+        server.await.unwrap();
     }
 }

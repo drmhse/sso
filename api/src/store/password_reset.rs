@@ -42,9 +42,11 @@ impl PasswordResetStore {
 
     /// Mark a password reset token as used
     pub async fn mark_as_used(db: DB<'_>, token_hash: &str) -> Result<bool> {
+        let now = chrono::Utc::now().naive_utc();
         let result = PasswordResetTokens::update_many()
             .filter(password_reset_tokens::Column::TokenHash.eq(token_hash))
             .filter(password_reset_tokens::Column::Used.eq(false))
+            .filter(password_reset_tokens::Column::ExpiresAt.gt(now))
             .col_expr(
                 password_reset_tokens::Column::Used,
                 sea_orm::sea_query::Expr::value(true),
@@ -53,5 +55,55 @@ impl PasswordResetStore {
             .await?;
 
         Ok(result.rows_affected == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::users::UserStore;
+    use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn concurrent_use_has_exactly_one_winner() {
+        let path = std::env::temp_dir().join(format!("authos-reset-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let user = UserStore::create(DB::Conn(&db), "reset-user@example.test", None, false)
+            .await
+            .expect("create user");
+        let expires_at = (Utc::now() + Duration::minutes(5)).naive_utc();
+        PasswordResetStore::create(DB::Conn(&db), &user.id, "reset-hash", &expires_at)
+            .await
+            .expect("create reset token");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                PasswordResetStore::mark_as_used(DB::Conn(&db), "reset-hash")
+                    .await
+                    .expect("consume reset token")
+            }));
+        }
+        barrier.wait().await;
+
+        let mut wins = 0;
+        for task in tasks {
+            wins += usize::from(task.await.expect("join consumer"));
+        }
+        assert_eq!(wins, 1);
+
+        db.close().await.expect("close sqlite");
+        let _ = std::fs::remove_file(path);
     }
 }

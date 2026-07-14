@@ -7,17 +7,19 @@ use crate::entities::siem_configs;
 use crate::error::{AppError, Result};
 use crate::store::DB;
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
 };
-use uuid::Uuid;
 
 pub struct SiemConfigStore;
 
 impl SiemConfigStore {
     /// Create a new SIEM configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: DB<'_>,
+        id: &str,
         org_id: &str,
         name: &str,
         provider_type: &str,
@@ -26,11 +28,10 @@ impl SiemConfigStore {
         auth_header: Option<String>,
         batch_size: Option<i32>,
     ) -> Result<String> {
-        let id = Uuid::new_v4().to_string();
         let now = Utc::now().naive_utc();
 
         let config = siem_configs::ActiveModel {
-            id: Set(id.clone()),
+            id: Set(id.to_string()),
             org_id: Set(org_id.to_string()),
             name: Set(name.to_string()),
             provider: Set(provider_type.to_string()),
@@ -42,7 +43,7 @@ impl SiemConfigStore {
             last_successful_batch_at: Set(None),
             last_processed_log_id: Set(None),
             failure_count: Set(0),
-            created_at: Set(now.clone()),
+            created_at: Set(now),
             updated_at: Set(now),
         };
 
@@ -58,7 +59,7 @@ impl SiemConfigStore {
             "SIEM configuration created"
         );
 
-        Ok(id)
+        Ok(id.to_string())
     }
 
     /// Get SIEM configuration by ID
@@ -105,8 +106,10 @@ impl SiemConfigStore {
     }
 
     /// Update SIEM configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         db: DB<'_>,
+        org_id: &str,
         id: &str,
         name: Option<String>,
         endpoint_url: Option<String>,
@@ -115,22 +118,10 @@ impl SiemConfigStore {
         batch_size: Option<i32>,
         enabled: Option<bool>,
     ) -> Result<()> {
-        let found = match db {
-            DB::Conn(conn) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(conn)
-                    .await?
-            }
-            DB::Tx(tx) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(tx)
-                    .await?
-            }
+        let mut active_model = siem_configs::ActiveModel {
+            updated_at: Set(Utc::now().naive_utc()),
+            ..Default::default()
         };
-
-        let mut active_model: siem_configs::ActiveModel = found
-            .ok_or_else(|| AppError::NotFound("SIEM configuration not found".to_string()))?
-            .into();
 
         if let Some(name) = name {
             active_model.name = Set(name);
@@ -151,12 +142,29 @@ impl SiemConfigStore {
             active_model.enabled = Set(enabled);
         }
 
-        active_model.updated_at = Set(Utc::now().naive_utc());
-
-        match db {
-            DB::Conn(conn) => active_model.update(conn).await?,
-            DB::Tx(tx) => active_model.update(tx).await?,
+        let result = match db {
+            DB::Conn(conn) => {
+                siem_configs::Entity::update_many()
+                    .set(active_model)
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .filter(siem_configs::Column::OrgId.eq(org_id))
+                    .exec(conn)
+                    .await?
+            }
+            DB::Tx(tx) => {
+                siem_configs::Entity::update_many()
+                    .set(active_model)
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .filter(siem_configs::Column::OrgId.eq(org_id))
+                    .exec(tx)
+                    .await?
+            }
         };
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound(
+                "SIEM configuration not found".to_string(),
+            ));
+        }
 
         tracing::info!(
             siem_config_id = %id,
@@ -167,28 +175,28 @@ impl SiemConfigStore {
     }
 
     /// Delete SIEM configuration
-    pub async fn delete(db: DB<'_>, id: &str) -> Result<()> {
-        let found = match db {
+    pub async fn delete(db: DB<'_>, org_id: &str, id: &str) -> Result<()> {
+        let result = match db {
             DB::Conn(conn) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(conn)
+                siem_configs::Entity::delete_many()
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .filter(siem_configs::Column::OrgId.eq(org_id))
+                    .exec(conn)
                     .await?
             }
             DB::Tx(tx) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(tx)
+                siem_configs::Entity::delete_many()
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .filter(siem_configs::Column::OrgId.eq(org_id))
+                    .exec(tx)
                     .await?
             }
         };
-
-        let config =
-            found.ok_or_else(|| AppError::NotFound("SIEM configuration not found".to_string()))?;
-
-        let config: siem_configs::ActiveModel = config.into();
-        match db {
-            DB::Conn(conn) => config.delete(conn).await?,
-            DB::Tx(tx) => config.delete(tx).await?,
-        };
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound(
+                "SIEM configuration not found".to_string(),
+            ));
+        }
 
         tracing::info!(
             siem_config_id = %id,
@@ -204,73 +212,80 @@ impl SiemConfigStore {
         id: &str,
         last_log_id: Option<String>,
     ) -> Result<()> {
-        let found = match db {
+        let now = Utc::now().naive_utc();
+        let active_model = siem_configs::ActiveModel {
+            last_successful_batch_at: Set(Some(now)),
+            last_processed_log_id: Set(last_log_id),
+            failure_count: Set(0),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+
+        let result = match db {
             DB::Conn(conn) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(conn)
+                siem_configs::Entity::update_many()
+                    .set(active_model)
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .exec(conn)
                     .await?
             }
             DB::Tx(tx) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(tx)
+                siem_configs::Entity::update_many()
+                    .set(active_model)
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .exec(tx)
                     .await?
             }
         };
-
-        let mut active_model: siem_configs::ActiveModel = found
-            .ok_or_else(|| AppError::NotFound("SIEM configuration not found".to_string()))?
-            .into();
-
-        let now = Utc::now().naive_utc();
-        active_model.last_successful_batch_at = Set(Some(now.clone()));
-        active_model.last_processed_log_id = Set(last_log_id);
-        active_model.failure_count = Set(0);
-        active_model.updated_at = Set(now);
-
-        match db {
-            DB::Conn(conn) => active_model.update(conn).await?,
-            DB::Tx(tx) => active_model.update(tx).await?,
-        };
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound(
+                "SIEM configuration not found".to_string(),
+            ));
+        }
 
         Ok(())
     }
 
     /// Increment failure count for a SIEM configuration
     pub async fn increment_failure_count(db: DB<'_>, id: &str) -> Result<()> {
-        let found = match db {
+        let result = match db {
             DB::Conn(conn) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(conn)
+                siem_configs::Entity::update_many()
+                    .col_expr(
+                        siem_configs::Column::FailureCount,
+                        Expr::col(siem_configs::Column::FailureCount).add(1),
+                    )
+                    .col_expr(
+                        siem_configs::Column::UpdatedAt,
+                        Expr::value(Utc::now().naive_utc()),
+                    )
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .exec(conn)
                     .await?
             }
             DB::Tx(tx) => {
-                siem_configs::Entity::find_by_id(id.to_string())
-                    .one(tx)
+                siem_configs::Entity::update_many()
+                    .col_expr(
+                        siem_configs::Column::FailureCount,
+                        Expr::col(siem_configs::Column::FailureCount).add(1),
+                    )
+                    .col_expr(
+                        siem_configs::Column::UpdatedAt,
+                        Expr::value(Utc::now().naive_utc()),
+                    )
+                    .filter(siem_configs::Column::Id.eq(id))
+                    .exec(tx)
                     .await?
             }
         };
-
-        let mut active_model: siem_configs::ActiveModel = found
-            .ok_or_else(|| AppError::NotFound("SIEM configuration not found".to_string()))?
-            .into();
-
-        let current_failures = match &active_model.failure_count {
-            sea_orm::ActiveValue::Set(value) => *value,
-            sea_orm::ActiveValue::Unchanged(value) => *value,
-            _ => 0,
-        };
-
-        active_model.failure_count = Set(current_failures + 1);
-        active_model.updated_at = Set(Utc::now().naive_utc());
-
-        match db {
-            DB::Conn(conn) => active_model.update(conn).await?,
-            DB::Tx(tx) => active_model.update(tx).await?,
-        };
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound(
+                "SIEM configuration not found".to_string(),
+            ));
+        }
 
         tracing::warn!(
             siem_config_id = %id,
-            failure_count = current_failures + 1,
             "SIEM configuration failure count incremented"
         );
 
@@ -319,5 +334,224 @@ impl SiemConfigStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{organizations, users};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection};
+    use uuid::Uuid;
+
+    async fn insert_user(db: &DatabaseConnection) -> String {
+        let user_id = Uuid::new_v4().to_string();
+        let now = Utc::now().naive_utc();
+        users::ActiveModel {
+            id: Set(user_id.clone()),
+            email: Set(format!("{}@example.com", user_id)),
+            org_id: Set(None),
+            is_platform_owner: Set(false),
+            password_hash: Set(None),
+            email_verified_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(None),
+            deleted_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("insert user");
+
+        user_id
+    }
+
+    async fn insert_org(db: &DatabaseConnection, owner_user_id: &str) -> String {
+        let org_id = Uuid::new_v4().to_string();
+        let now = Utc::now().naive_utc();
+        organizations::ActiveModel {
+            id: Set(org_id.clone()),
+            slug: Set(format!("org-{}", &org_id[..8])),
+            name: Set("Test Org".to_string()),
+            owner_user_id: Set(owner_user_id.to_string()),
+            status: Set("active".to_string()),
+            tier_id: Set(None),
+            max_services: Set(None),
+            max_users: Set(None),
+            approved_by: Set(None),
+            approved_at: Set(None),
+            rejected_by: Set(None),
+            rejected_at: Set(None),
+            rejection_reason: Set(None),
+            smtp_host: Set(None),
+            smtp_port: Set(None),
+            smtp_username: Set(None),
+            smtp_password_encrypted: Set(None),
+            smtp_from_email: Set(None),
+            smtp_from_name: Set(None),
+            smtp_encryption_key_id: Set(None),
+            custom_domain: Set(None),
+            domain_verified: Set(false),
+            domain_verification_token: Set(None),
+            brand_logo_url: Set(None),
+            brand_primary_color: Set(None),
+            feature_overrides: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("insert org");
+
+        org_id
+    }
+
+    async fn setup_db() -> (DatabaseConnection, String) {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner_id = insert_user(&db).await;
+        let org_id = insert_org(&db, &owner_id).await;
+        (db, org_id)
+    }
+
+    #[tokio::test]
+    async fn siem_config_mutations_are_org_scoped_and_preserve_results() {
+        let (db, org_id) = setup_db().await;
+        let other_owner = insert_user(&db).await;
+        let other_org_id = insert_org(&db, &other_owner).await;
+        let config_id = SiemConfigStore::create(
+            DB::Conn(&db),
+            "siem-config-test",
+            &org_id,
+            "Primary",
+            "custom",
+            "https://siem.example.com",
+            Some("secret".to_string()),
+            None,
+            Some(100),
+        )
+        .await
+        .expect("create siem config");
+
+        assert!(matches!(
+            SiemConfigStore::update(
+                DB::Conn(&db),
+                &other_org_id,
+                &config_id,
+                Some("Cross tenant".to_string()),
+                None,
+                Some(Some("stolen-secret".to_string())),
+                None,
+                None,
+                Some(false),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            SiemConfigStore::delete(DB::Conn(&db), &other_org_id, &config_id).await,
+            Err(AppError::NotFound(_))
+        ));
+        let preserved = SiemConfigStore::get_by_id(DB::Conn(&db), &config_id)
+            .await
+            .expect("load protected config")
+            .expect("config remains");
+        assert_eq!(preserved.org_id, org_id);
+        assert_eq!(preserved.name, "Primary");
+        assert_eq!(preserved.api_key.as_deref(), Some("secret"));
+        assert!(preserved.enabled);
+
+        SiemConfigStore::update(
+            DB::Conn(&db),
+            &org_id,
+            &config_id,
+            Some("Renamed".to_string()),
+            None,
+            Some(Some("new-secret".to_string())),
+            Some(Some("Authorization: Bearer test".to_string())),
+            Some(250),
+            Some(false),
+        )
+        .await
+        .expect("update config");
+        SiemConfigStore::increment_failure_count(DB::Conn(&db), &config_id)
+            .await
+            .expect("increment failure once");
+        SiemConfigStore::increment_failure_count(DB::Conn(&db), &config_id)
+            .await
+            .expect("increment failure twice");
+
+        let updated = SiemConfigStore::get_by_id(DB::Conn(&db), &config_id)
+            .await
+            .expect("load config")
+            .expect("config exists");
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.api_key.as_deref(), Some("new-secret"));
+        assert_eq!(
+            updated.auth_header.as_deref(),
+            Some("Authorization: Bearer test")
+        );
+        assert_eq!(updated.batch_size, "250");
+        assert!(!updated.enabled);
+        assert_eq!(updated.failure_count, 2);
+
+        SiemConfigStore::update_last_successful_batch(
+            DB::Conn(&db),
+            &config_id,
+            Some("log-123".to_string()),
+        )
+        .await
+        .expect("mark successful batch");
+        let reset = SiemConfigStore::get_by_id(DB::Conn(&db), &config_id)
+            .await
+            .expect("load reset config")
+            .expect("config exists after reset");
+        assert_eq!(reset.failure_count, 0);
+        assert_eq!(reset.last_processed_log_id.as_deref(), Some("log-123"));
+        assert!(reset.last_successful_batch_at.is_some());
+
+        SiemConfigStore::delete(DB::Conn(&db), &org_id, &config_id)
+            .await
+            .expect("delete config");
+        assert!(SiemConfigStore::get_by_id(DB::Conn(&db), &config_id)
+            .await
+            .expect("load deleted config")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn siem_config_single_statement_mutations_report_missing_rows() {
+        let (db, org_id) = setup_db().await;
+        let missing_id = Uuid::new_v4().to_string();
+
+        assert!(matches!(
+            SiemConfigStore::update(
+                DB::Conn(&db),
+                &org_id,
+                &missing_id,
+                Some("Missing".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            SiemConfigStore::increment_failure_count(DB::Conn(&db), &missing_id).await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            SiemConfigStore::update_last_successful_batch(DB::Conn(&db), &missing_id, None).await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            SiemConfigStore::delete(DB::Conn(&db), &org_id, &missing_id).await,
+            Err(AppError::NotFound(_))
+        ));
     }
 }

@@ -3,6 +3,7 @@
 pub mod prelude;
 
 pub mod api_keys;
+pub mod audit_outbox;
 pub mod billing_customers;
 pub mod connected_accounts;
 pub mod device_codes;
@@ -36,6 +37,7 @@ pub mod saml_states;
 pub mod scim_tokens;
 pub mod service_provider_grants;
 pub mod services;
+pub mod session_refresh_token_history;
 pub mod sessions;
 pub mod siem_configs;
 pub mod subscriptions;

@@ -104,12 +104,8 @@ pub struct ScimListResponse<T> {
 }
 
 impl<T> ScimListResponse<T> {
-    pub fn new(
-        resources: Vec<T>,
-        total_results: u64,
-        start_index: u64,
-        items_per_page: u64,
-    ) -> Self {
+    pub fn new(resources: Vec<T>, total_results: u64, start_index: u64) -> Self {
+        let items_per_page = resources.len() as u64;
         Self {
             schemas: vec!["urn:ietf:params:scim:api:messages:2.0:ListResponse".to_string()],
             total_results,
@@ -151,6 +147,10 @@ impl ScimError {
 
     pub fn uniqueness(detail: String) -> Self {
         Self::new(409, detail, Some("uniqueness".to_string()))
+    }
+
+    pub fn invalid_filter(detail: String) -> Self {
+        Self::new(400, detail, Some("invalidFilter".to_string()))
     }
 
     pub fn unauthorized(detail: String) -> Self {

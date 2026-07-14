@@ -8,7 +8,9 @@ use axum::{
     extract::{Path, Query},
     Json,
 };
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -60,11 +62,20 @@ pub async fn get_risk_events(
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let org =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     let org_id = org.id;
 
-    // 1. Authorization
-    if !user.is_platform_owner {
+    // 1. Authorization. A token/cache snapshot is insufficient for global authority.
+    let has_live_platform_authority = if user.is_platform_owner {
+        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.id)
+            .await?
+            .is_some_and(|current| current.is_platform_owner && current.deleted_at.is_none())
+    } else {
+        false
+    };
+    if !has_live_platform_authority {
         let can_view = PermissionService::check_any(
             DB::Conn(&state.db),
             &org_id,
@@ -84,21 +95,22 @@ pub async fn get_risk_events(
     use crate::entities::login_events::{Column, Entity as LoginEvents};
     use crate::entities::users::Entity as Users;
 
-    let page = params.page.unwrap_or(0);
-    let limit = params.limit.unwrap_or(50).min(100);
+    let (_page, limit, offset) =
+        crate::utils::pagination::zero_based_u64_page(params.page, params.limit, 50, 100);
     let min_score = params.min_score.unwrap_or(0); // Default to all events with risk data
 
     // Join with Users to get email
     let events = LoginEvents::find()
-        .filter(
-            Condition::all()
-                .add(Column::OrgId.eq(org_id))
-                .add(Column::RiskScore.is_not_null())
-                .add(Column::RiskScore.gte(min_score)),
+        .join(
+            JoinType::LeftJoin,
+            crate::entities::login_events::Relation::Services.def(),
         )
+        .filter(crate::store::login_events::tenant_login_scope(&org_id))
+        .filter(Column::RiskScore.is_not_null())
+        .filter(Column::RiskScore.gte(min_score))
         .find_also_related(Users)
         .order_by_desc(Column::CreatedAt)
-        .offset(page * limit)
+        .offset(offset)
         .limit(limit)
         .all(&state.db)
         .await

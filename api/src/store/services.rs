@@ -3,11 +3,19 @@ use crate::entities::services;
 use crate::error::{AppError, Result};
 use crate::store::DB;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
+    QuerySelect, Set,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub struct ServiceStore;
+
+#[derive(Debug, FromQueryResult)]
+struct CountByOrg {
+    org_id: String,
+    count: i64,
+}
 
 impl ServiceStore {
     /// Find a service by ID
@@ -42,6 +50,24 @@ impl ServiceStore {
         Ok(result)
     }
 
+    /// Find services by slug within an organization.
+    pub async fn find_by_org_and_slugs(
+        db: DB<'_>,
+        org_id: &str,
+        slugs: &[String],
+    ) -> Result<Vec<services::Model>> {
+        if slugs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let result = Services::find()
+            .filter(services::Column::OrgId.eq(org_id))
+            .filter(services::Column::Slug.is_in(slugs.iter().cloned()))
+            .all(&db)
+            .await?;
+        Ok(result)
+    }
+
     /// Find a service by slug within an organization (by slug and org_id)
     /// This is an alias for find_by_org_and_slug for better API clarity
     pub async fn find_by_slug_and_org(
@@ -50,6 +76,28 @@ impl ServiceStore {
         org_id: &str,
     ) -> Result<Option<services::Model>> {
         Self::find_by_org_and_slug(db, org_id, slug).await
+    }
+
+    /// Count services grouped by organization ID.
+    pub async fn count_by_orgs(db: DB<'_>, org_ids: &[String]) -> Result<HashMap<String, i64>> {
+        if org_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = Services::find()
+            .filter(services::Column::OrgId.is_in(org_ids.iter().cloned()))
+            .select_only()
+            .column(services::Column::OrgId)
+            .column_as(services::Column::Id.count(), "count")
+            .group_by(services::Column::OrgId)
+            .into_model::<CountByOrg>()
+            .all(&db)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.org_id, row.count))
+            .collect())
     }
 
     /// Find a service by organization slug and service slug (with JOIN)
@@ -208,6 +256,7 @@ impl ServiceStore {
     }
 
     /// Update SAML configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_saml_config(
         db: DB<'_>,
         service_id: &str,
@@ -289,11 +338,11 @@ impl ServiceStore {
         }
 
         if let Some(lim) = limit {
-            query = query.limit(lim as u64);
+            query = query.limit(crate::utils::pagination::store_u64(lim, 0, 1000).0);
         }
 
         if let Some(off) = offset {
-            query = query.offset(off as u64);
+            query = query.offset(crate::utils::pagination::store_u64(1, off, 1000).1);
         }
 
         let services = query.all(&db).await?;
@@ -431,5 +480,79 @@ impl ServiceStore {
         }
 
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::organizations::OrganizationStore;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    async fn create_test_service(db: &sea_orm::DatabaseConnection, id: &str, org_id: &str) {
+        ServiceStore::create_with_options(
+            DB::Conn(db),
+            id,
+            org_id,
+            id,
+            id,
+            "web",
+            &format!("client-{}", id),
+            "secret-hash",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create service");
+    }
+
+    #[tokio::test]
+    async fn count_by_orgs_groups_services_in_one_query_shape() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let (owner, _) = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner");
+
+        let org_1 = OrganizationStore::create(DB::Conn(&db), "org-1", "Org 1", &owner.id, None)
+            .await
+            .expect("create org 1");
+        let org_2 = OrganizationStore::create(DB::Conn(&db), "org-2", "Org 2", &owner.id, None)
+            .await
+            .expect("create org 2");
+        let org_3 = OrganizationStore::create(DB::Conn(&db), "org-3", "Org 3", &owner.id, None)
+            .await
+            .expect("create org 3");
+
+        create_test_service(&db, "svc-1", &org_1.id).await;
+        create_test_service(&db, "svc-2", &org_1.id).await;
+        create_test_service(&db, "svc-3", &org_2.id).await;
+
+        let counts = ServiceStore::count_by_orgs(
+            DB::Conn(&db),
+            &[org_1.id.clone(), org_2.id.clone(), org_3.id.clone()],
+        )
+        .await
+        .expect("count by orgs");
+
+        assert_eq!(counts.get(&org_1.id), Some(&2));
+        assert_eq!(counts.get(&org_2.id), Some(&1));
+        assert!(!counts.contains_key(&org_3.id));
     }
 }

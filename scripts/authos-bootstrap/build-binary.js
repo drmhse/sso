@@ -114,11 +114,20 @@ async function main() {
     await run('upx', ['--best', '--lzma', bundledBinary], ROOT);
     await run('upx', ['-t', bundledBinary], ROOT);
   }
-  await fs.copyFile(path.join(ROOT, 'authos.config.example.json'), path.join(releaseRoot, 'authos.config.example.json'));
+  await fs.copyFile(
+    path.join(ROOT, 'scripts/authos-standalone/authos.config.example.json'),
+    path.join(releaseRoot, 'authos.config.example.json'),
+  );
+  await fs.copyFile(path.join(ROOT, 'LICENSE'), path.join(releaseRoot, 'LICENSE'));
+  await fs.copyFile(
+    path.join(ROOT, 'LICENSES/AGPL-3.0.txt'),
+    path.join(releaseRoot, 'AGPL-3.0.txt'),
+  );
   await fs.writeFile(
     path.join(releaseRoot, 'install.sh'),
     [
       '#!/usr/bin/env bash',
+      '# SPDX-License-Identifier: AGPL-3.0-only',
       'set -euo pipefail',
       'SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"',
       'exec python3 "${SCRIPT_DIR}/standalone/authos_standalone.py" install --bundle-dir "${SCRIPT_DIR}" "$@"',
@@ -140,18 +149,22 @@ async function main() {
       `Backend: ${args.backend}`,
       `Platform: ${args.platform}`,
       `Rust target: ${target.rustTarget}`,
+      `Corresponding source: https://github.com/drmhse/AuthOS/tree/${buildVersion}`,
       '',
       'Contents:',
       '- authos',
       '- authos.config.example.json',
+      '- LICENSE and AGPL-3.0.txt',
       '- install.sh',
       '- standalone/authos_standalone.py',
       '',
       'Notes:',
       '- The lite web client is embedded in the binary.',
+      '- authos.config.example.json is sourced from the AGPL-licensed standalone scripts.',
       '- Run sudo ./install.sh for the no-Docker Linux install flow.',
       '- The installer manages config.json, systemd, and optional Caddy setup.',
       '- Managed config writes live in /var/lib/authos so the lite admin UI can edit them.',
+      '- The installer, management script, lite web client, and API are licensed AGPL-3.0-only.',
       '',
     ].join('\n'),
     'utf8',

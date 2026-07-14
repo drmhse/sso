@@ -1,5 +1,5 @@
 use crate::auth::sso::{configured_basic_client, ConfiguredBasicClient, Provider};
-use crate::error::{AppError, Result};
+use crate::error::{with_retrying_transaction, AppError, Result};
 use crate::handlers::auth::{
     get_authorization_url_for_client, is_supported_upstream_oauth_type,
     resolve_upstream_oidc_config,
@@ -24,6 +24,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use url::Url;
 
 #[derive(Debug, Serialize)]
@@ -325,7 +326,14 @@ async fn build_upstream_oauth_client(
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("Encryption unavailable".to_string()))?;
     let secret = encryption
-        .decrypt(&provider.client_secret_encrypted)
+        .decrypt_with_context(
+            &provider.client_secret_encrypted,
+            crate::encryption::EncryptionContext::new(
+                "upstream_providers",
+                &provider.id,
+                "client_secret_encrypted",
+            ),
+        )
         .map_err(|e| AppError::InternalServerError(format!("Failed to decrypt secret: {}", e)))?;
 
     configured_basic_client(
@@ -393,26 +401,25 @@ async fn provider_registry(
     Ok(providers)
 }
 
-async fn account_response(
-    state: &AppState,
-    account: crate::entities::connected_accounts::Model,
-    service_id: Option<&str>,
-) -> Result<LinkedAccountResponse> {
-    let grants = if let Some(service_id) = service_id {
-        ServiceProviderGrantStore::find_active(
-            DB::Conn(&state.db),
-            &account.user_id,
-            service_id,
-            &account.id,
-        )
-        .await?
-        .into_iter()
-        .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+fn grant_response(
+    grant: crate::entities::service_provider_grants::Model,
+) -> LinkedAccountGrantResponse {
+    LinkedAccountGrantResponse {
+        id: grant.id,
+        service_id: grant.service_id,
+        scopes: parse_scopes_required(&grant.scopes),
+        granted_at: DateTime::<Utc>::from_naive_utc_and_offset(grant.granted_at, Utc).to_rfc3339(),
+        last_used_at: grant
+            .last_used_at
+            .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
+    }
+}
 
-    Ok(LinkedAccountResponse {
+fn account_response(
+    account: crate::entities::connected_accounts::Model,
+    grants: Vec<crate::entities::service_provider_grants::Model>,
+) -> LinkedAccountResponse {
+    LinkedAccountResponse {
         id: account.id,
         provider: account.provider,
         provider_user_id: account.provider_user_id,
@@ -423,20 +430,39 @@ async fn account_response(
             .expires_at
             .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
         status: account.status,
-        grants: grants
-            .into_iter()
-            .map(|grant| LinkedAccountGrantResponse {
-                id: grant.id,
-                service_id: grant.service_id,
-                scopes: parse_scopes_required(&grant.scopes),
-                granted_at: DateTime::<Utc>::from_naive_utc_and_offset(grant.granted_at, Utc)
-                    .to_rfc3339(),
-                last_used_at: grant
-                    .last_used_at
-                    .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
-            })
-            .collect(),
-    })
+        grants: grants.into_iter().map(grant_response).collect(),
+    }
+}
+
+async fn active_grants_by_account(
+    state: &AppState,
+    user_id: &str,
+    service_id: Option<&str>,
+    accounts: &[crate::entities::connected_accounts::Model],
+) -> Result<HashMap<String, Vec<crate::entities::service_provider_grants::Model>>> {
+    let Some(service_id) = service_id else {
+        return Ok(HashMap::new());
+    };
+    let account_ids = accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect::<Vec<_>>();
+    let grants = ServiceProviderGrantStore::list_active_by_accounts(
+        DB::Conn(&state.db),
+        user_id,
+        service_id,
+        &account_ids,
+    )
+    .await?;
+    let mut by_account: HashMap<String, Vec<crate::entities::service_provider_grants::Model>> =
+        HashMap::new();
+    for grant in grants {
+        by_account
+            .entry(grant.connected_account_id.clone())
+            .or_default()
+            .push(grant);
+    }
+    Ok(by_account)
 }
 
 pub async fn list_linked_accounts(
@@ -447,10 +473,13 @@ pub async fn list_linked_accounts(
     let service_id = service.as_ref().map(|service| service.id.as_str());
     let accounts =
         ConnectedAccountStore::list_by_user(DB::Conn(&state.db), &auth_user.user.id).await?;
+    let mut grants_by_account =
+        active_grants_by_account(&state, &auth_user.user.id, service_id, &accounts).await?;
 
     let mut responses = Vec::with_capacity(accounts.len());
     for account in accounts {
-        responses.push(account_response(&state, account, service_id).await?);
+        let grants = grants_by_account.remove(&account.id).unwrap_or_default();
+        responses.push(account_response(account, grants));
     }
 
     Ok(Json(LinkedAccountsResponse {
@@ -666,29 +695,44 @@ pub async fn grant_linked_account(
         )));
     }
 
-    let grant = ServiceProviderGrantStore::upsert(
-        DB::Conn(&state.db),
-        &auth_user.user.id,
-        &service.id,
-        &account.id,
-        &account.provider,
-        &requested_scopes,
+    let grant = with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "create_linked_account_grant_with_audit",
+        |db| {
+            let user_id = auth_user.user.id.clone();
+            let service_id = service.id.clone();
+            let account_id = account.id.clone();
+            let provider = account.provider.clone();
+            let requested_scopes = requested_scopes.clone();
+            let org_id = service.org_id.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                let grant = ServiceProviderGrantStore::upsert(
+                    db.clone(),
+                    &user_id,
+                    &service_id,
+                    &account_id,
+                    &provider,
+                    &requested_scopes,
+                )
+                .await?;
+                let event = OrgAuditBuilder::new(&org_id, Some(&user_id), "provider_grant.created")
+                    .target("connected_account", &account_id)
+                    .details_json(Some(json!({
+                        "grant_id": &grant.id,
+                        "service_id": &service_id,
+                        "provider": &provider,
+                        "scopes": &requested_scopes,
+                    })))
+                    .build();
+                audit_actor.log_org_with_db(db, event).await?;
+                Ok(grant)
+            })
+        },
     )
     .await?;
-    let event = OrgAuditBuilder::new(
-        &service.org_id,
-        Some(&auth_user.user.id),
-        "provider_grant.created",
-    )
-    .target("connected_account", &account.id)
-    .details_json(Some(json!({
-        "grant_id": &grant.id,
-        "service_id": &service.id,
-        "provider": &account.provider,
-        "scopes": &requested_scopes,
-    })))
-    .build();
-    state.audit_actor.log_org(event).await;
 
     Ok(Json(LinkedAccountGrantResponse {
         id: grant.id,
@@ -712,15 +756,8 @@ pub async fn revoke_linked_account_grant(
     .await?
     .ok_or_else(|| AppError::NotFound("Connected account not found".to_string()))?;
     let service = ServiceStore::find_by_id(DB::Conn(&state.db), &service_id).await?;
-    ServiceProviderGrantStore::revoke(
-        DB::Conn(&state.db),
-        &auth_user.user.id,
-        &service_id,
-        &account_id,
-    )
-    .await?;
-    if let Some(service) = service {
-        let event = OrgAuditBuilder::new(
+    let event = service.map(|service| {
+        OrgAuditBuilder::new(
             &service.org_id,
             Some(&auth_user.user.id),
             "provider_grant.revoked",
@@ -729,9 +766,30 @@ pub async fn revoke_linked_account_grant(
         .details_json(Some(json!({
             "service_id": service_id,
         })))
-        .build();
-        state.audit_actor.log_org(event).await;
-    }
+        .build()
+    });
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "revoke_linked_account_grant_with_audit",
+        |db| {
+            let user_id = auth_user.user.id.clone();
+            let service_id = service_id.clone();
+            let account_id = account_id.clone();
+            let event = event.clone();
+            let audit_actor = state.audit_actor.clone();
+            Box::pin(async move {
+                ServiceProviderGrantStore::revoke(db.clone(), &user_id, &service_id, &account_id)
+                    .await?;
+                if let Some(event) = event {
+                    audit_actor.log_org_with_db(db, event).await?;
+                }
+                Ok(())
+            })
+        },
+    )
+    .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -765,9 +823,12 @@ pub async fn get_provider_token_request(
         &request.provider,
     )
     .await?;
+    let mut grants_by_account =
+        active_grants_by_account(&state, &auth_user.user.id, Some(&service.id), &accounts).await?;
     let mut account_responses = Vec::with_capacity(accounts.len());
     for account in accounts {
-        account_responses.push(account_response(&state, account, Some(&service.id)).await?);
+        let grants = grants_by_account.remove(&account.id).unwrap_or_default();
+        account_responses.push(account_response(account, grants));
     }
 
     Ok(Json(ProviderTokenRequestResponse {
@@ -830,15 +891,8 @@ pub async fn complete_provider_token_request(
             )
         })?;
 
-    ServiceProviderGrantStore::upsert(
-        DB::Conn(&state.db),
-        &auth_user.user.id,
-        &request.service_id,
-        &account.id,
-        &request.provider,
-        &requested_scopes,
-    )
-    .await?;
+    let mut redirect = Url::parse(&request.redirect_uri)
+        .map_err(|_| AppError::BadRequest("Invalid stored redirect_uri".to_string()))?;
     let event = OrgAuditBuilder::new(
         &service.org_id,
         Some(&auth_user.user.id),
@@ -852,12 +906,57 @@ pub async fn complete_provider_token_request(
         "provider_token_request": &request.state,
     })))
     .build();
-    state.audit_actor.log_org(event).await;
-    ProviderTokenRequestStore::complete(DB::Conn(&state.db), &request.state, &auth_user.user.id)
-        .await?;
+    let completed_event = OrgAuditBuilder::new(
+        &service.org_id,
+        Some(&auth_user.user.id),
+        "provider_token_request.completed",
+    )
+    .target("provider_token_request", &request.state)
+    .details_json(Some(json!({
+        "service_id": &request.service_id,
+        "provider": &request.provider,
+        "connected_account_id": &account.id,
+    })))
+    .build();
 
-    let mut redirect = Url::parse(&request.redirect_uri)
-        .map_err(|_| AppError::BadRequest("Invalid stored redirect_uri".to_string()))?;
+    let request_state = request.state.clone();
+    let service_id = request.service_id.clone();
+    let provider = request.provider.clone();
+    let user_id = auth_user.user.id.clone();
+    let account_id = account.id.clone();
+    let audit_actor = state.audit_actor.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "complete_provider_token_request",
+        |db| {
+            let request_state = request_state.clone();
+            let service_id = service_id.clone();
+            let provider = provider.clone();
+            let user_id = user_id.clone();
+            let account_id = account_id.clone();
+            let requested_scopes = requested_scopes.clone();
+            let audit_actor = audit_actor.clone();
+            let event = event.clone();
+            let completed_event = completed_event.clone();
+            Box::pin(async move {
+                ProviderTokenRequestStore::complete_with_grant_and_audits_in_transaction(
+                    db,
+                    &audit_actor,
+                    &request_state,
+                    &user_id,
+                    &service_id,
+                    &account_id,
+                    &provider,
+                    &requested_scopes,
+                    vec![event, completed_event],
+                )
+                .await
+            })
+        },
+    )
+    .await?;
     {
         let mut pairs = redirect.query_pairs_mut();
         pairs
@@ -885,7 +984,7 @@ async fn create_provider_token_request_oauth_state(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
     let requested_scopes = parse_scopes_required(&request.requested_scopes);
-    let allowed_scopes = service_allowed_scopes(&state, &service, &request.provider).await?;
+    let allowed_scopes = service_allowed_scopes(state, &service, &request.provider).await?;
     if !has_all_scopes(&allowed_scopes, &requested_scopes) {
         return Err(AppError::Forbidden(
             "Requested scopes are not allowed for this service".to_string(),
@@ -942,7 +1041,7 @@ async fn create_provider_token_request_oauth_state(
             )
             .await?
             .ok_or_else(|| AppError::NotFound("Upstream provider not found".to_string()))?;
-            let client = build_upstream_oauth_client(&state, &upstream).await?;
+            let client = build_upstream_oauth_client(state, &upstream).await?;
             let (authorization_url, csrf_token, pkce_verifier) =
                 get_authorization_url_for_client(&client, Provider::Oidc, requested_scopes.clone());
             (

@@ -814,6 +814,18 @@ pub struct SamlCertificateInfo {
     pub valid_until: DateTime<Utc>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
+    pub lifecycle_status: String,
+    pub expires_in_seconds: i64,
+    pub published_previous_certificates: Vec<SamlPublishedCertificateInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamlPublishedCertificateInfo {
+    pub public_key: String,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: DateTime<Utc>,
+    pub publish_until: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 // Custom Domains & Branding models

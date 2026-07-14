@@ -239,6 +239,17 @@ export interface SamlCertificate {
   valid_until: string;
   is_active: boolean;
   created_at: string;
+  lifecycle_status: 'healthy' | 'expiring_soon' | 'expired' | 'not_yet_valid';
+  expires_in_seconds: number;
+  published_previous_certificates: SamlPublishedCertificate[];
+}
+
+export interface SamlPublishedCertificate {
+  public_key: string;
+  valid_from: string;
+  valid_until: string;
+  publish_until: string;
+  created_at: string;
 }
 
 /**

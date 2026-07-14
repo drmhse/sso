@@ -1,6 +1,6 @@
 use crate::entities::email_verification_tokens;
 use crate::entities::prelude::EmailVerificationTokens;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::store::DB;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
@@ -41,15 +41,80 @@ impl EmailVerificationStore {
     }
 
     /// Mark an email verification token as used
-    pub async fn mark_as_used(db: DB<'_>, token_hash: &str) -> Result<()> {
-        let token = Self::find_by_token_hash(db.clone(), token_hash)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Token not found".to_string()))?;
+    pub async fn mark_as_used(db: DB<'_>, token_hash: &str) -> Result<bool> {
+        let now = chrono::Utc::now().naive_utc();
+        let result = EmailVerificationTokens::update_many()
+            .filter(email_verification_tokens::Column::TokenHash.eq(token_hash))
+            .filter(email_verification_tokens::Column::Used.eq(false))
+            .filter(email_verification_tokens::Column::ExpiresAt.gt(now))
+            .col_expr(
+                email_verification_tokens::Column::Used,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .exec(&db)
+            .await?;
 
-        let mut token_active: email_verification_tokens::ActiveModel = token.into();
-        token_active.used = Set(true);
-        token_active.update(&db).await?;
+        Ok(result.rows_affected == 1)
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::users::UserStore;
+    use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn concurrent_email_verification_claim_has_exactly_one_winner() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let user = UserStore::create(DB::Conn(&db), "verify@example.com", None, false)
+            .await
+            .expect("create user");
+        EmailVerificationStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "verification-hash",
+            &(Utc::now() + Duration::minutes(5)).naive_utc(),
+        )
+        .await
+        .expect("create verification token");
+
+        let first = EmailVerificationStore::mark_as_used(DB::Conn(&db), "verification-hash");
+        let second = EmailVerificationStore::mark_as_used(DB::Conn(&db), "verification-hash");
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(
+            usize::from(first.expect("first claim")) + usize::from(second.expect("second claim")),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_email_verification_token_cannot_be_claimed() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let user = UserStore::create(DB::Conn(&db), "expired-verify@example.com", None, false)
+            .await
+            .expect("create user");
+        EmailVerificationStore::create(
+            DB::Conn(&db),
+            &user.id,
+            "expired-verification-hash",
+            &(Utc::now() - Duration::seconds(1)).naive_utc(),
+        )
+        .await
+        .expect("create expired verification token");
+
+        assert!(
+            !EmailVerificationStore::mark_as_used(DB::Conn(&db), "expired-verification-hash")
+                .await
+                .expect("claim expired token")
+        );
     }
 }

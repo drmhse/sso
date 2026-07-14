@@ -98,6 +98,9 @@ pub async fn create_invitation(
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let organization =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &organization.id)
+            .await?;
 
     if !PermissionService::check(
         DB::Conn(&state.db),
@@ -156,15 +159,6 @@ pub async fn create_invitation(
     let token_hash = hash_invitation_token(&token); // Hash for storage
     let expires_at = Utc::now() + ChronoDuration::days(INVITATION_EXPIRY_DAYS);
 
-    // Log invitation creation
-    tracing::info!(
-        org_slug = %org_slug,
-        invited_email = %req.email,
-        role = %req.role,
-        inviter_id = %user.id,
-        "Creating organization invitation"
-    );
-
     let new_invitation = organization_invitations::ActiveModel {
         id: Set(invitation_id),
         org_id: Set(organization.id.clone()),
@@ -175,7 +169,6 @@ pub async fn create_invitation(
         token: Set(token_hash),
         expires_at: Set(expires_at.naive_utc()),
         created_at: Set(Utc::now().naive_utc()),
-        ..Default::default()
     };
 
     let invitation = new_invitation.insert(&state.db).await?;
@@ -212,14 +205,14 @@ pub async fn create_invitation(
     {
         tracing::warn!(
             org_slug = %org_slug,
-            invited_email = %req.email,
+            invitation_id = %invitation.id,
             error = %e,
             "Failed to enqueue invitation email, but invitation was created"
         );
     } else {
         tracing::info!(
             org_slug = %org_slug,
-            invited_email = %req.email,
+            invitation_id = %invitation.id,
             "Invitation email enqueued successfully"
         );
     }
@@ -300,6 +293,9 @@ pub async fn accept_invitation_as_admin(
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let organization =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &organization.id)
+            .await?;
 
     if !PermissionService::check(
         DB::Conn(&state.db),
@@ -428,25 +424,62 @@ async fn accept_invitation_internal(
                     }
                 }
 
+                use crate::entities::prelude::Organizations;
+                let org = Organizations::find()
+                    .filter(organizations::Column::Id.eq(&invitation.org_id))
+                    .one(&db)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+                if new_status == "accepted" && org.status != "active" {
+                    return Err(AppError::Forbidden(
+                        "Organization is not active; invitation acceptance is disabled".to_string(),
+                    ));
+                }
+
+                // Claim the pending invitation before any membership/user
+                // side effects. A concurrent consumer or parent-state change
+                // therefore fails without changing tenant state.
+                let active_org_ids = sea_orm::sea_query::Query::select()
+                    .column(organizations::Column::Id)
+                    .from(crate::entities::organizations::Entity)
+                    .and_where(organizations::Column::Status.eq("active"))
+                    .to_owned();
+                let mut claim = OrganizationInvitations::update_many()
+                    .filter(organization_invitations::Column::Id.eq(&invitation.id))
+                    .filter(organization_invitations::Column::Status.eq("pending"))
+                    .set(organization_invitations::ActiveModel {
+                        status: Set(new_status.clone()),
+                        ..Default::default()
+                    });
+                if new_status == "accepted" {
+                    claim = claim.filter(
+                        organization_invitations::Column::OrgId.in_subquery(active_org_ids),
+                    );
+                }
+                let update_result = claim.exec(&db).await?;
+
+                if update_result.rows_affected != 1 {
+                    return Err(AppError::NotFound(
+                        "Invitation not found or already processed".to_string(),
+                    ));
+                }
+
                 // Track user_id for cache invalidation
                 let mut affected_user_id: Option<String> = None;
 
                 if new_status == "accepted" {
                     // Find or create user
-                    let user = find_or_create_user_internal(db.clone(), &invitation.email).await?;
+                    let user = find_or_create_user_internal(
+                        db.clone(),
+                        &invitation.org_id,
+                        &invitation.email,
+                    )
+                    .await?;
                     affected_user_id = Some(user.id.clone());
 
                     // Check team limits
                     let member_count =
                         MembershipStore::count_by_org(db.clone(), &invitation.org_id, None).await?;
-
-                    // Get organization limits
-                    use crate::entities::prelude::Organizations;
-                    let org = Organizations::find()
-                        .filter(organizations::Column::Id.eq(&invitation.org_id))
-                        .one(&db)
-                        .await?
-                        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
                     let tier_limit = if let (Some(max_users), Some(_tier_id)) =
                         (org.max_users, org.tier_id.as_ref())
@@ -491,22 +524,6 @@ async fn accept_invitation_internal(
                     .await?;
                 }
 
-                let update_result = OrganizationInvitations::update_many()
-                    .filter(organization_invitations::Column::Id.eq(&invitation.id))
-                    .filter(organization_invitations::Column::Status.eq("pending"))
-                    .set(organization_invitations::ActiveModel {
-                        status: Set(new_status),
-                        ..Default::default()
-                    })
-                    .exec(&db)
-                    .await?;
-
-                if update_result.rows_affected != 1 {
-                    return Err(AppError::NotFound(
-                        "Invitation not found or already processed".to_string(),
-                    ));
-                }
-
                 Ok(affected_user_id)
             })
         },
@@ -544,6 +561,9 @@ pub async fn cancel_invitation(
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let organization =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &organization.id)
+            .await?;
 
     if !PermissionService::check(
         DB::Conn(&state.db),
@@ -590,6 +610,9 @@ pub async fn list_invitations(
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+    let organization =
+        crate::handlers::organizations::ensure_organization_active(&state.db, &organization.id)
+            .await?;
 
     if !PermissionService::check(
         DB::Conn(&state.db),
@@ -605,9 +628,8 @@ pub async fn list_invitations(
     }
 
     // Extract pagination parameters with defaults
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).clamp(1, 100);
-    let offset = (page - 1) * limit;
+    let (_page, limit, offset) =
+        crate::utils::pagination::signed_page(query.page, query.limit, 50, 100);
 
     // Get invitations for this organization with pagination
     let invitations = InvitationStore::list_org_invitations_with_inviter(
@@ -627,7 +649,6 @@ pub async fn list_invitations(
                     "email": row.email,
                     "role": row.role,
                     "status": row.status,
-                    "token": row.token,
                     "expires_at": DateTime::<Utc>::from_naive_utc_and_offset(row.expires_at, Utc).to_rfc3339(),
                     "created_at": DateTime::<Utc>::from_naive_utc_and_offset(row.created_at, Utc).to_rfc3339()
                 },
@@ -644,11 +665,24 @@ pub async fn list_invitations(
 }
 
 /// Helper function to find or create a user within a transaction (for invitation acceptance)
-async fn find_or_create_user_internal(db: DB<'_>, email: &str) -> Result<users::Model> {
-    // Check if user exists
+async fn find_or_create_user_internal(
+    db: DB<'_>,
+    org_id: &str,
+    email: &str,
+) -> Result<users::Model> {
+    // Reuse a shared identity only when an existing membership proves that it
+    // is already intentionally bound to this exact organization.
+    if let Some((_, user)) =
+        MembershipStore::find_unique_member_with_user_by_org_and_email(db.clone(), org_id, email)
+            .await?
+    {
+        return Ok(user);
+    }
+
     use crate::entities::prelude::Users;
     if let Some(user) = Users::find()
         .filter(users::Column::Email.eq(email))
+        .filter(users::Column::OrgId.eq(org_id))
         .one(&db)
         .await?
     {
@@ -659,12 +693,22 @@ async fn find_or_create_user_internal(db: DB<'_>, email: &str) -> Result<users::
     let new_user = users::ActiveModel {
         id: Set(Uuid::new_v4().to_string()),
         email: Set(email.to_string()),
+        org_id: Set(Some(org_id.to_string())),
         created_at: Set(Utc::now().naive_utc()),
         ..Default::default()
     };
+    use sea_orm::sea_query::OnConflict;
+    Users::insert(new_user)
+        .on_conflict(OnConflict::new().do_nothing().to_owned())
+        .exec_without_returning(&db)
+        .await?;
 
-    let user = new_user.insert(&db).await?;
-    Ok(user)
+    Users::find()
+        .filter(users::Column::Email.eq(email))
+        .filter(users::Column::OrgId.eq(org_id))
+        .one(&db)
+        .await?
+        .ok_or_else(|| AppError::InternalServerError("Failed to create invited user".to_string()))
 }
 
 #[cfg(test)]
@@ -688,7 +732,7 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use openssl::rsa::Rsa;
-    use sea_orm::{Database, DatabaseConnection, EntityTrait};
+    use sea_orm::{Database, DatabaseConnection, EntityTrait, PaginatorTrait};
     use std::sync::Arc;
 
     struct InvitationFixture {
@@ -792,6 +836,9 @@ mod tests {
             OrganizationStore::create_with_owner(DB::Conn(&db), "acme", "Acme", &owner.id, None)
                 .await
                 .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate invitation fixture org");
 
         let jwt_service = Arc::new(test_jwt_service(&config));
         let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
@@ -901,6 +948,53 @@ mod tests {
                 .await
                 .expect("count members");
         assert_eq!(member_count, 2);
+    }
+
+    #[tokio::test]
+    async fn suspended_parent_rejects_invitation_acceptance_without_state_changes() {
+        let fixture = setup_fixture().await;
+        let invite = create_invitation(
+            &fixture.state.db,
+            &fixture.org_id,
+            &fixture.owner_id,
+            "suspended-invitee@example.com",
+            "member",
+            "suspended-token",
+        )
+        .await;
+        OrganizationStore::update_status(DB::Conn(&fixture.state.db), &fixture.org_id, "suspended")
+            .await
+            .expect("suspend organization");
+
+        let error = accept_by_token(
+            &fixture,
+            "suspended-token",
+            Some("suspended-invitee@example.com"),
+        )
+        .await
+        .expect_err("suspended tenant must reject invitation acceptance");
+        assert!(matches!(error, AppError::Forbidden(_)));
+
+        let stored = OrganizationInvitations::find_by_id(invite.id)
+            .one(&fixture.state.db)
+            .await
+            .expect("query invitation")
+            .expect("invitation remains");
+        assert_eq!(stored.status, "pending");
+        assert_eq!(
+            MembershipStore::count_by_org(DB::Conn(&fixture.state.db), &fixture.org_id, None)
+                .await
+                .expect("count unchanged memberships"),
+            1
+        );
+        assert!(UserStore::find_by_email_with_context(
+            DB::Conn(&fixture.state.db),
+            "suspended-invitee@example.com",
+            Some(&fixture.org_id),
+        )
+        .await
+        .expect("query denied invitee")
+        .is_none());
     }
 
     #[tokio::test]
@@ -1043,5 +1137,116 @@ mod tests {
             .expect("query invitation")
             .expect("invitation exists");
         assert_eq!(stored.status, "accepted");
+    }
+
+    #[tokio::test]
+    async fn invitation_acceptance_ignores_platform_and_sibling_same_email_users() {
+        let fixture = setup_fixture().await;
+        let email = "same-email-invitee@example.com";
+        let platform_user = UserStore::find_or_create_with_options(
+            DB::Conn(&fixture.state.db),
+            email,
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create same-email platform user")
+        .0;
+        let sibling_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&fixture.state.db),
+            "sibling-invite-owner@example.com",
+            UserCreationOptions::default(),
+        )
+        .await
+        .expect("create sibling owner")
+        .0;
+        let (sibling_org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&fixture.state.db),
+            "sibling-invite-org",
+            "Sibling Invite Org",
+            &sibling_owner.id,
+            None,
+        )
+        .await
+        .expect("create sibling org");
+        let sibling_user = UserStore::create_with_org_id(
+            DB::Conn(&fixture.state.db),
+            email,
+            None,
+            &sibling_org.id,
+        )
+        .await
+        .expect("create same-email sibling user");
+        create_invitation(
+            &fixture.state.db,
+            &fixture.org_id,
+            &fixture.owner_id,
+            email,
+            "member",
+            "same-email-target-token",
+        )
+        .await;
+
+        let _ = accept_by_token(&fixture, "same-email-target-token", Some(email))
+            .await
+            .expect("accept target-tenant invitation");
+
+        let target_user = UserStore::find_by_email_with_context(
+            DB::Conn(&fixture.state.db),
+            email,
+            Some(&fixture.org_id),
+        )
+        .await
+        .expect("load target user")
+        .expect("target user created");
+        assert_ne!(target_user.id, platform_user.id);
+        assert_ne!(target_user.id, sibling_user.id);
+        assert!(MembershipStore::find_by_org_and_user(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &target_user.id,
+        )
+        .await
+        .expect("load target membership")
+        .is_some());
+        assert!(MembershipStore::find_by_org_and_user(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &platform_user.id,
+        )
+        .await
+        .expect("check platform membership")
+        .is_none());
+        assert!(MembershipStore::find_by_org_and_user(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &sibling_user.id,
+        )
+        .await
+        .expect("check sibling membership")
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_invited_user_resolution_has_one_tenant_identity() {
+        let fixture = setup_fixture().await;
+        let email = "concurrent-invitee@example.com";
+        let first =
+            find_or_create_user_internal(DB::Conn(&fixture.state.db), &fixture.org_id, email);
+        let second =
+            find_or_create_user_internal(DB::Conn(&fixture.state.db), &fixture.org_id, email);
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first concurrent resolution");
+        let second = second.expect("second concurrent resolution");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.org_id.as_deref(), Some(fixture.org_id.as_str()));
+        assert_eq!(
+            crate::entities::prelude::Users::find()
+                .filter(users::Column::Email.eq(email))
+                .filter(users::Column::OrgId.eq(&fixture.org_id))
+                .count(&fixture.state.db)
+                .await
+                .expect("count tenant identities"),
+            1
+        );
     }
 }

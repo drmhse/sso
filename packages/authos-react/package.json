@@ -1,7 +1,7 @@
 {
   "name": "@drmhse/authos-react",
   "version": "0.8.0",
-  "description": "React and Next.js adapter for AuthOS authentication",
+  "description": "Pre-1.0 React and Next.js adapter for AuthOS authentication",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -35,7 +35,7 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts,.tsx",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" tsdown.config.mjs --max-warnings 0",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

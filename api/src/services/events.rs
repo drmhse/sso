@@ -402,9 +402,31 @@ impl EventDispatcher {
         Self { db }
     }
 
+    async fn enqueue_webhook_deliveries(
+        &self,
+        webhooks: &[crate::entities::webhooks::Model],
+        event_type: &str,
+        webhook_payload: &serde_json::Value,
+    ) {
+        use crate::services::job_queue::JobQueueService;
+        use crate::store::DB as DbEnum;
+
+        for webhook in webhooks {
+            if let Err(e) = JobQueueService::enqueue_webhook(
+                DbEnum::Conn(&self.db),
+                &webhook.id,
+                event_type,
+                webhook_payload,
+            )
+            .await
+            {
+                tracing::error!("Failed to enqueue webhook delivery job: {}", e);
+            }
+        }
+    }
+
     /// Publish an event and trigger webhook deliveries
     pub async fn publish(&self, event: Event) -> Result<()> {
-        use crate::services::job_queue::JobQueueService;
         use crate::store::webhooks::WebhookStore;
         use crate::store::DB as DbEnum;
 
@@ -427,24 +449,8 @@ impl EventDispatcher {
             )
             .await?;
 
-            for webhook in webhooks {
-                // Parse events to check if this webhook should receive this event
-                let events: Vec<String> = serde_json::from_str(&webhook.events).unwrap_or_default();
-
-                if events.contains(&event_type_str.to_string()) {
-                    // Enqueue webhook delivery job
-                    if let Err(e) = JobQueueService::enqueue_webhook(
-                        DbEnum::Conn(&self.db),
-                        &webhook.id,
-                        &event_type_str,
-                        &webhook_payload,
-                    )
-                    .await
-                    {
-                        tracing::error!("Failed to enqueue webhook delivery job: {}", e);
-                    }
-                }
-            }
+            self.enqueue_webhook_deliveries(&webhooks, &event_type_str, &webhook_payload)
+                .await;
         }
 
         Ok(())
@@ -452,8 +458,40 @@ impl EventDispatcher {
 
     /// Publish multiple events in batch
     pub async fn publish_batch(&self, events: Vec<Event>) -> Result<()> {
+        use crate::store::webhooks::WebhookStore;
+        use crate::store::DB as DbEnum;
+
+        let mut webhook_cache: HashMap<(String, String), Vec<crate::entities::webhooks::Model>> =
+            HashMap::new();
+
         for event in events {
-            self.publish(event).await?;
+            let event_type_str = event.event_type.as_str();
+            let webhook_payload = event.to_webhook_payload();
+
+            tracing::debug!(
+                "Publishing event: type={}, org_id={:?}",
+                event_type_str,
+                event.org_id
+            );
+
+            if let Some(org_id) = &event.org_id {
+                let cache_key = (org_id.clone(), event_type_str.clone());
+                let webhooks = if let Some(cached) = webhook_cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    let loaded = WebhookStore::find_active_webhooks_for_event(
+                        DbEnum::Conn(&self.db),
+                        org_id,
+                        &event_type_str,
+                    )
+                    .await?;
+                    webhook_cache.insert(cache_key, loaded.clone());
+                    loaded
+                };
+
+                self.enqueue_webhook_deliveries(&webhooks, &event_type_str, &webhook_payload)
+                    .await;
+            }
         }
         Ok(())
     }
