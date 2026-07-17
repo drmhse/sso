@@ -1,10 +1,12 @@
 # Capacity qualification and resource-sizing method
 
-AuthOS does not publish a capacity limit or reference CPU, memory, database, or
-storage size. The repository includes a bounded measurement harness, but its
-presence is not a benchmark result. Operators must measure the exact release,
-topology, database, dataset, and journeys they intend to run before making a
-sizing or service-level claim.
+AuthOS does not publish a supported capacity limit or universal resource size.
+The repository includes a bounded qualification harness and one dated
+[SQLite budget-VM experiment](../../api/benchmarks/sqlite-budget-vm/README.md).
+That experiment is evidence for its pinned build, fixture, topology, and mixed
+workload; it is not a service-level claim. Operators must measure the exact
+release, topology, database, dataset, and journeys they intend to run before
+making a sizing or service-level claim.
 
 ## Repository harness
 
@@ -113,6 +115,7 @@ scenario defaults:
 5. Re-run after release, schema, database, topology, proxy, or material workload
    changes. Publish guidance only with the environment record and raw artifacts.
 
-This method can produce defensible sizing evidence. No such reference result is
-committed today, so the topology matrix continues to state that capacity and
-resource limits are unqualified.
+This method can produce defensible sizing evidence. The committed SQLite
+budget-VM experiment demonstrates the evidence shape and one narrow result.
+Capacity remains unqualified across releases, production hosts, other database
+backends, other journeys, and supported deployment topologies.

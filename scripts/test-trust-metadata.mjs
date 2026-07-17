@@ -50,7 +50,8 @@ function fixture() {
   }
   // README links are checked for existence; symlinks are sufficient for the
   // referenced trees because this fixture mutates only copied trust inputs.
-  for (const directory of ['docs', 'lite-web-client']) {
+  for (const directory of ['docs', 'lite-web-client', 'api/benchmarks']) {
+    fs.mkdirSync(path.dirname(path.join(fixtureRoot, directory)), { recursive: true });
     fs.symlinkSync(path.join(root, directory), path.join(fixtureRoot, directory), 'dir');
   }
   return fixtureRoot;

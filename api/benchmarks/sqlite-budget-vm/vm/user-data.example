@@ -1,0 +1,21 @@
+#cloud-config
+users:
+  - default
+  - name: benchmark
+    gecos: AuthOS benchmark operator
+    groups: [adm, sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - REPLACE_WITH_BENCHMARK_PUBLIC_KEY
+ssh_pwauth: false
+disable_root: true
+package_update: false
+package_upgrade: false
+growpart:
+  mode: auto
+  devices: ['/']
+resize_rootfs: true
+runcmd:
+  - [mkdir, -p, /home/benchmark/authos/data]
+  - [chown, -R, "benchmark:benchmark", /home/benchmark/authos]

@@ -53,6 +53,7 @@ npm install @drmhse/authos-cli
 | Path | Description |
 |------|-------------|
 | [api/](./api) | Rust API and backend binaries. |
+| [api/benchmarks/](./api/benchmarks) | Reproducible API benchmark harnesses and dated evidence. |
 | [lite-web-client/](./lite-web-client) | Embedded setup and end-user journey UI. |
 | [sso-sdk/](./sso-sdk) | Framework-agnostic TypeScript SDK. |
 | [packages/](./packages) | React, Vue, Node, and CLI packages. |
@@ -79,6 +80,7 @@ Project trust and community resources:
 - [Upgrade and rollback](./docs/operations/upgrade-rollback.md)
 - [Cryptographic key rotation](./docs/operations/key-rotation.md)
 - [Monitoring and operational signals](./docs/operations/monitoring.md)
+- [SQLite budget-VM benchmark](./api/benchmarks/sqlite-budget-vm/README.md)
 - [Changelog](./CHANGELOG.md)
 - [Security policy](./SECURITY.md)
 - [Support](./SUPPORT.md)
