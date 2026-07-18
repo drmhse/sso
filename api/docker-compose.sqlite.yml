@@ -53,6 +53,10 @@ x-common-env: &common-env
 
 x-common-app: &common-app
   restart: unless-stopped
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
   deploy:
     resources:
       limits:
@@ -69,7 +73,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: editoredit/sso:sqlite-v0.8.2
+    image: editoredit/sso:sqlite-v0.8.3
     environment:
       <<: *common-env
       DATABASE_URL: ${DATABASE_URL:-sqlite:/app/data/data.db}

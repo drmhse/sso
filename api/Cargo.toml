@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "timeout", "set-header", "limit"] }
 tower_governor = "0.3"
+forwarded-header-value = "0.1"
 include_dir = "0.7"
 mime_guess = "2.0"
 

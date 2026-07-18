@@ -171,7 +171,13 @@ api/benchmarks/sqlite-budget-vm/run-case.sh 4000 60s ramp-4000-3
 api/benchmarks/sqlite-budget-vm/run-case.sh 5000 60s ramp-5000
 api/benchmarks/sqlite-budget-vm/run-case.sh 2000 300s soak-2000-5m
 api/benchmarks/sqlite-budget-vm/run-case.sh 3000 300s soak-3000-5m
+api/benchmarks/sqlite-budget-vm/run-case.sh 2000 30m cleanup-cycle-2000-30m
 ```
+
+The 30-minute case crosses the 15-minute device-code lifetime and multiple
+five-minute cleanup intervals. Record the `device_codes` row count and cleanup
+log entries during that case; a five-minute throughput soak cannot qualify
+expiry cleanup because none of its generated codes have expired.
 
 Run `vmstat -w 1` and process RSS sampling inside the guest, and sample the QEMU
 process from the host, if comparing resource telemetry with the preserved raw

@@ -23,14 +23,13 @@ sudo ./install.sh
 ```
 
 The installer selects the matching SQLite standalone bundle for `linux/amd64`
-or `linux/arm64`, starts AuthOS, and prints a one-time bootstrap link. Releases
-produced by the hardened workflow also verify the bundle checksum; the current
-`v0.8.2` installer predates that automatic verification.
+or `linux/arm64`, verifies its checksum, starts AuthOS, and prints a one-time
+bootstrap link.
 
 To install a specific release:
 
 ```bash
-AUTHOS_VERSION=v0.8.2
+AUTHOS_VERSION=v0.8.3
 curl -fsSL -o install.sh "https://github.com/drmhse/AuthOS/releases/download/${AUTHOS_VERSION}/install.sh"
 chmod +x install.sh
 sudo AUTHOS_RELEASE_TAG="${AUTHOS_VERSION}" ./install.sh

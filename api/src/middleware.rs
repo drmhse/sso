@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::auth::jwt::{Actor, Claims, JwtService};
+use crate::client_ip::TrustedClientIpKeyExtractor;
 use crate::entities::{memberships, organizations, users};
 use crate::error::{AppError, Result};
 use axum::{
@@ -369,64 +370,12 @@ fn extract_ip(req: &Request) -> String {
 }
 
 fn extract_client_ip(req: &Request) -> String {
-    let socket_ip = req
-        .extensions()
-        .get::<std::net::SocketAddr>()
-        .map(|socket_addr| socket_addr.ip());
+    static CLIENT_IP_EXTRACTOR: LazyLock<TrustedClientIpKeyExtractor> =
+        LazyLock::new(TrustedClientIpKeyExtractor::from_env);
 
-    if let Some(remote_ip) = socket_ip {
-        if proxy_headers_are_trusted(&remote_ip) {
-            if let Some(forwarded_ip) = extract_forwarded_ip(req) {
-                return forwarded_ip.to_string();
-            }
-        }
-
-        return remote_ip.to_string();
-    }
-
-    "unknown".to_string()
-}
-
-fn proxy_headers_are_trusted(remote_ip: &IpAddr) -> bool {
-    static TRUST_PROXY_HEADERS: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("TRUST_PROXY_HEADERS")
-            .map(|value| matches!(value.as_str(), "true" | "1" | "yes" | "on"))
-            .unwrap_or(false)
-    });
-
-    static TRUSTED_PROXY_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(|| {
-        std::env::var("TRUSTED_PROXY_IPS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|value| value.trim().parse::<IpAddr>().ok())
-            .collect()
-    });
-
-    *TRUST_PROXY_HEADERS && TRUSTED_PROXY_IPS.iter().any(|trusted| trusted == remote_ip)
-}
-
-fn extract_forwarded_ip(req: &Request) -> Option<IpAddr> {
-    req.headers()
-        .get("X-Forwarded-For")
-        .and_then(|header| header.to_str().ok())
-        .and_then(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .find_map(|candidate| candidate.parse::<IpAddr>().ok())
-        })
-        .or_else(|| {
-            req.headers()
-                .get("X-Real-IP")
-                .and_then(|header| header.to_str().ok())
-                .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        })
-        .or_else(|| {
-            req.headers()
-                .get("CF-Connecting-IP")
-                .and_then(|header| header.to_str().ok())
-                .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        })
+    CLIENT_IP_EXTRACTOR
+        .extract_client_ip(req)
+        .map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
 }
 
 /// Extract User-Agent from request

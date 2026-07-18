@@ -5,8 +5,14 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 ## [Unreleased]
 
+No changes yet.
+
+## 0.8.3 - 2026-07-18
+
 ### Added
 
+- Regression coverage for device-code expiry cleanup and a 30-minute budget-VM
+  qualification case that crosses both code expiry and cleanup intervals.
 - A CI-enforced, explicitly partial tenant-isolation matrix covering every
   current SeaORM entity and route path, with named SQLite evidence and
   categorized critical/high gaps.
@@ -48,6 +54,10 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 ### Changed
 
+- `DISABLE_RATE_LIMITING=true` now removes the route-level governors as its
+  name states, keeping it suitable for isolated tests and benchmarks only.
+- AuthOS Compose deployments now set the API container's open-file limit to
+  65,535, matching the standalone systemd service and benchmark runner.
 - Billing subscription webhooks now bind customer, organization, service,
   plan, and user membership; service-principal identity access binds both
   organization and service; inactive tenant service keys are denied; platform
@@ -71,11 +81,15 @@ project is pre-1.0; breaking changes are called out explicitly when known.
   list retains its established in-memory `limit=0` empty-page behavior.
 - The README now links to the project's maturity and trust documentation.
 - Checked-in operator Compose topologies now align all AuthOS images with
-  `v0.8.2` and the release-qualified PostgreSQL 16/MySQL 8.4 engines; the trust
+  `v0.8.3` and the release-qualified PostgreSQL 16/MySQL 8.4 engines; the trust
   gate rejects stale or unclassified Compose pins.
 
 ### Security
 
+- Rate-limit keys and request auditing now share one trusted-proxy-aware client
+  IP resolver. Forwarding headers are accepted only from an explicitly
+  allowlisted socket peer; direct clients cannot rotate spoofed headers to
+  evade per-IP limits.
 - Branding and custom-domain authorization now rechecks live platform-owner
   authority and active tenant state at request and transaction boundaries;
   OAuth callback/session completion similarly revalidates exact active
@@ -132,7 +146,7 @@ project is pre-1.0; breaking changes are called out explicitly when known.
   PostgreSQL or MySQL credentials.
 - OAuth token response bodies, access-token hashes, and registration email
   addresses are no longer written to application logs.
-- Bootstrap-generated deployments now pin the current `v0.8.2` Docker image
+- Bootstrap-generated deployments now pin the current `v0.8.3` Docker image
   variants instead of the stale `v0.1.51` variants.
 - Access-token validation now requires issuer and audience claims, enforces the
   configured issuer, rejects external-resource tokens at AuthOS management
@@ -241,4 +255,5 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 Earlier pre-1.0 history is available from
 [GitHub Releases](https://github.com/drmhse/AuthOS/releases).
 
-[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/drmhse/AuthOS/compare/v0.8.2...v0.8.3

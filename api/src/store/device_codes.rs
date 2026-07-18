@@ -283,6 +283,60 @@ impl DeviceCodeStore {
 }
 
 #[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn delete_expired_removes_only_codes_past_their_expiry() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let now = chrono::Utc::now().naive_utc();
+
+        let expired = DeviceCodeStore::create(
+            DB::Conn(&db),
+            "expired-device-code",
+            "EXP-0001",
+            "test-client",
+            "test-org",
+            "test-service",
+            &(now - chrono::Duration::minutes(1)),
+        )
+        .await
+        .expect("create expired code");
+        let live = DeviceCodeStore::create(
+            DB::Conn(&db),
+            "live-device-code",
+            "LIVE-001",
+            "test-client",
+            "test-org",
+            "test-service",
+            &(now + chrono::Duration::minutes(15)),
+        )
+        .await
+        .expect("create live code");
+
+        assert_eq!(
+            DeviceCodeStore::delete_expired(DB::Conn(&db))
+                .await
+                .expect("delete expired codes"),
+            1
+        );
+        assert!(DeviceCodeStore::find_by_id(DB::Conn(&db), &expired.id)
+            .await
+            .expect("find expired code")
+            .is_none());
+        assert!(DeviceCodeStore::find_by_id(DB::Conn(&db), &live.id)
+            .await
+            .expect("find live code")
+            .is_some());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::users::UserStore;

@@ -8,6 +8,7 @@
 //! - Service API routes (API key auth)
 //! - SCIM routes (provisioning)
 
+use crate::client_ip::TrustedClientIpKeyExtractor;
 use crate::config::Config;
 use crate::handlers::analytics::*;
 use crate::handlers::api_keys::*;
@@ -53,9 +54,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Router,
 };
-use tower_governor::{
-    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
-};
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 
 /// Build active organization routes (require org to be active, not suspended)
 pub fn active_org_routes(state: &AppState) -> Router<AppState> {
@@ -442,7 +441,7 @@ pub fn analytics_routes(state: &AppState) -> Router<AppState> {
 
 /// Build MFA routes with specialized rate limiting
 pub fn mfa_routes(state: &AppState, config: &Config) -> Router<AppState> {
-    Router::new()
+    let routes = Router::new()
         .route("/api/user/mfa/status", get(get_mfa_status))
         .route("/api/user/mfa/setup", post(setup_mfa))
         .route("/api/user/mfa/verify", post(verify_and_enable_mfa))
@@ -450,21 +449,24 @@ pub fn mfa_routes(state: &AppState, config: &Config) -> Router<AppState> {
         .route(
             "/api/user/mfa/backup-codes/regenerate",
             post(regenerate_backup_codes),
-        )
-        .layer(GovernorLayer {
+        );
+
+    let routes = if config.disable_rate_limiting {
+        routes
+    } else {
+        routes.layer(GovernorLayer {
             config: Box::leak(Box::new(
                 GovernorConfigBuilder::default()
-                    .per_millisecond(if config.disable_rate_limiting { 1 } else { 300 })
-                    .burst_size(if config.disable_rate_limiting {
-                        10000
-                    } else {
-                        5
-                    })
-                    .key_extractor(SmartIpKeyExtractor)
+                    .per_millisecond(300)
+                    .burst_size(5)
+                    .key_extractor(TrustedClientIpKeyExtractor::from_env())
                     .finish()
                     .expect("Failed to build MFA setup rate limiter"),
             )),
         })
+    };
+
+    routes
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
         ))
@@ -476,30 +478,28 @@ pub fn mfa_routes(state: &AppState, config: &Config) -> Router<AppState> {
 
 /// Build MFA verification routes (stricter rate limiting)
 pub fn mfa_verification_routes(config: &Config) -> Router<AppState> {
-    Router::new()
+    let routes = Router::new()
         .route("/api/auth/mfa/verify", post(verify_mfa_login))
-        .route("/saml/mfa/verify", post(verify_saml_mfa))
-        .layer(GovernorLayer {
+        .route("/saml/mfa/verify", post(verify_saml_mfa));
+
+    let routes = if config.disable_rate_limiting {
+        routes
+    } else {
+        routes.layer(GovernorLayer {
             config: Box::leak(Box::new(
                 GovernorConfigBuilder::default()
-                    .per_millisecond(if config.disable_rate_limiting {
-                        1
-                    } else {
-                        1000
-                    })
-                    .burst_size(if config.disable_rate_limiting {
-                        10000
-                    } else {
-                        3
-                    })
-                    .key_extractor(SmartIpKeyExtractor)
+                    .per_millisecond(1000)
+                    .burst_size(3)
+                    .key_extractor(TrustedClientIpKeyExtractor::from_env())
                     .finish()
                     .expect("Failed to build MFA rate limiter"),
             )),
         })
-        .layer(axum_middleware::from_fn(
-            middleware::extract_request_info_middleware,
-        ))
+    };
+
+    routes.layer(axum_middleware::from_fn(
+        middleware::extract_request_info_middleware,
+    ))
 }
 
 /// Build platform admin routes (require JWT + platform owner)
@@ -613,24 +613,7 @@ pub fn platform_routes(state: &AppState) -> Router<AppState> {
 
 /// Build authentication routes with rate limiting
 pub fn auth_routes(config: &Config) -> Router<AppState> {
-    let rate_limiter_config = Box::leak(Box::new(
-        GovernorConfigBuilder::default()
-            .per_millisecond(if config.disable_rate_limiting {
-                1
-            } else {
-                1000
-            })
-            .burst_size(if config.disable_rate_limiting {
-                10000
-            } else {
-                20
-            })
-            .key_extractor(SmartIpKeyExtractor)
-            .finish()
-            .expect("Failed to build auth rate limiter"),
-    ));
-
-    Router::new()
+    let routes = Router::new()
         // SSO routes
         .route("/auth/:provider", get(auth_provider))
         .route("/auth/:provider/callback", get(auth_callback))
@@ -667,38 +650,45 @@ pub fn auth_routes(config: &Config) -> Router<AppState> {
         .route("/api/auth/magic-link/verify", get(verify_magic_link))
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
-        ))
-        .layer(GovernorLayer {
-            config: rate_limiter_config,
+        ));
+
+    if config.disable_rate_limiting {
+        routes
+    } else {
+        routes.layer(GovernorLayer {
+            config: Box::leak(Box::new(
+                GovernorConfigBuilder::default()
+                    .per_millisecond(1000)
+                    .burst_size(20)
+                    .key_extractor(TrustedClientIpKeyExtractor::from_env())
+                    .finish()
+                    .expect("Failed to build auth rate limiter"),
+            )),
         })
+    }
 }
 
 /// Build device flow routes with stricter rate limiting
 pub fn device_routes(config: &Config) -> Router<AppState> {
-    let rate_limiter_config = Box::leak(Box::new(
-        GovernorConfigBuilder::default()
-            .per_millisecond(if config.disable_rate_limiting {
-                1
-            } else {
-                5000
-            })
-            .burst_size(if config.disable_rate_limiting {
-                10000
-            } else {
-                10
-            })
-            .key_extractor(SmartIpKeyExtractor)
-            .finish()
-            .expect("Failed to build device rate limiter"),
-    ));
-
-    Router::new()
+    let routes = Router::new()
         .route("/auth/device/code", post(device_code))
         .route("/auth/device/verify", post(device_verify))
-        .route("/auth/token", post(token_exchange))
-        .layer(GovernorLayer {
-            config: rate_limiter_config,
+        .route("/auth/token", post(token_exchange));
+
+    if config.disable_rate_limiting {
+        routes
+    } else {
+        routes.layer(GovernorLayer {
+            config: Box::leak(Box::new(
+                GovernorConfigBuilder::default()
+                    .per_millisecond(5000)
+                    .burst_size(10)
+                    .key_extractor(TrustedClientIpKeyExtractor::from_env())
+                    .finish()
+                    .expect("Failed to build device rate limiter"),
+            )),
         })
+    }
 }
 
 /// Build service API routes (authenticated via API key)

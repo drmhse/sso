@@ -40,6 +40,7 @@ for (const backend of ['sqlite', 'postgres', 'mysql']) {
     assert.match(output, /      - \/tmp:rw,noexec,nosuid,nodev,size=64m/);
     assert.match(output, /    cap_drop:\n      - ALL/);
     assert.match(output, /      - no-new-privileges:true/);
+    assert.match(output, /    ulimits:\n      nofile:\n        soft: 65535\n        hard: 65535/);
     assert.match(output, /      - authos_geoip_data:\/app\/geoip/);
   });
 }
