@@ -14,6 +14,19 @@ function requireText(document, expected, label) {
 }
 
 requireText(release, 'group: authos-public-release', 'cross-version release serialization');
+requireText(
+  release,
+  `mode: prepare
+    permissions:
+      # This is the permission ceiling for every job in the reusable workflow.
+      # Its prepare/qualification jobs still narrow themselves to contents:read;
+      # only the separately invoked publish mode can use these write scopes.
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write`,
+  'reusable npm workflow permission ceiling',
+);
 
 const stableTagPattern = '^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$';
 requireText(release, stableTagPattern, 'release stable-tag policy');

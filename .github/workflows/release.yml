@@ -624,7 +624,13 @@ jobs:
     with:
       mode: prepare
     permissions:
-      contents: read
+      # This is the permission ceiling for every job in the reusable workflow.
+      # Its prepare/qualification jobs still narrow themselves to contents:read;
+      # only the separately invoked publish mode can use these write scopes.
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
 
   registry_preflight:
     name: Gate every artifact and immutable registry version

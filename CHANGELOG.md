@@ -7,6 +7,14 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.4 - 2026-07-18
+
+### Changed
+
+- The coordinated npm reusable-workflow caller now supplies the permission
+  ceiling required to validate its publication job. Artifact preparation and
+  source qualification remain explicitly read-only inside the called workflow.
+
 ## 0.8.3 - 2026-07-18
 
 ### Added
@@ -255,5 +263,6 @@ No changes yet.
 Earlier pre-1.0 history is available from
 [GitHub Releases](https://github.com/drmhse/AuthOS/releases).
 
-[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/drmhse/AuthOS/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/drmhse/AuthOS/compare/v0.8.2...v0.8.3
