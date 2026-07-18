@@ -32,6 +32,10 @@ const stableTagPattern = '^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$
 requireText(release, stableTagPattern, 'release stable-tag policy');
 requireText(npmPublish, stableTagPattern, 'npm stable-tag policy');
 
+const annotatedTagRefetch = 'refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}';
+requireText(release, annotatedTagRefetch, 'release annotated-tag restoration');
+requireText(npmPublish, annotatedTagRefetch, 'npm annotated-tag restoration');
+
 requireText(release, "requireNewer(candidate, release.tag_name, 'current GitHub latest')", 'GitHub latest monotonicity');
 requireText(release, 'requireNewer(candidate, latest.version, `${name} npm latest`)', 'npm latest monotonicity');
 requireText(release, 'actual_digest', 'Docker digest verification');
