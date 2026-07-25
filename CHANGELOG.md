@@ -7,6 +7,15 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.5 - 2026-07-25
+
+### Changed
+
+- The draft-release job now checks out the exact tagged source before creating
+  release notes and attaching qualified artifacts.
+- npm development dependencies and resolver overrides now select patched
+  versions; the coordinated workspace audit reports no known vulnerabilities.
+
 ## 0.8.4 - 2026-07-18
 
 ### Changed
@@ -263,6 +272,7 @@ No changes yet.
 Earlier pre-1.0 history is available from
 [GitHub Releases](https://github.com/drmhse/AuthOS/releases).
 
-[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/drmhse/AuthOS/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/drmhse/AuthOS/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/drmhse/AuthOS/compare/v0.8.2...v0.8.3
