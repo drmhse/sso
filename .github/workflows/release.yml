@@ -898,6 +898,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # This job intentionally does not check out the repository. Bind gh to
+      # the triggering repository explicitly instead of relying on .git.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Install registry inspection client
         run: |

@@ -42,6 +42,7 @@ requireText(release, 'actual_digest', 'Docker digest verification');
 requireText(release, '"sqlite-latest"', 'SQLite moving-alias verification');
 requireText(release, '"psql-latest"', 'PostgreSQL moving-alias verification');
 requireText(release, '"mysql-latest"', 'MySQL moving-alias verification');
+requireText(release, 'GH_REPO: ${{ github.repository }}', 'checkout-free finalization repository binding');
 requireText(release, 'run: gh release edit "${RELEASE_TAG}" --draft=false --latest', 'draft-only finalization');
 
 requireText(npmPublish, '--provenance --ignore-scripts', 'npm artifact-only publication');
