@@ -101,7 +101,7 @@ metrics-exporter-prometheus = { version = "0.12", default-features = false }
 # SAML
 # samael removed
 quick-xml = "0.41"
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 # x509-parser version managed by rcgen/webauthn-rs
 flate2 = "1.0"
 pkcs1 = "0.7.5"
