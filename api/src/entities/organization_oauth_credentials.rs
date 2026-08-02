@@ -15,8 +15,10 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub client_id: String,
     #[sea_orm(column_type = "Blob")]
+    #[serde(skip_serializing)]
     pub client_secret_encrypted: Vec<u8>,
     #[sea_orm(column_type = "Text")]
+    #[serde(skip_serializing)]
     pub encryption_key_id: String,
     pub created_at: DateTime,
     pub updated_at: DateTime,

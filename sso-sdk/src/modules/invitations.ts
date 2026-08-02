@@ -1,7 +1,8 @@
 import { HttpClient } from '../http';
 import {
-  Invitation,
   InvitationWithOrg,
+  CreateInvitationResponse,
+  OrganizationInvitationListItem,
   CreateInvitationPayload,
   AcceptInvitationPayload,
   DeclineInvitationPayload,
@@ -29,8 +30,11 @@ export class InvitationsModule {
    * });
    * ```
    */
-  public async create(orgSlug: string, payload: CreateInvitationPayload): Promise<Invitation> {
-    const response = await this.http.post<Invitation>(
+  public async create(
+    orgSlug: string,
+    payload: CreateInvitationPayload
+  ): Promise<CreateInvitationResponse> {
+    const response = await this.http.post<CreateInvitationResponse>(
       `/api/organizations/${orgSlug}/invitations`,
       payload
     );
@@ -50,8 +54,8 @@ export class InvitationsModule {
    * invitations.forEach(inv => console.log(inv.invitee_email, inv.status));
    * ```
    */
-  public async listForOrg(orgSlug: string): Promise<Invitation[]> {
-    const response = await this.http.get<Invitation[]>(
+  public async listForOrg(orgSlug: string): Promise<OrganizationInvitationListItem[]> {
+    const response = await this.http.get<OrganizationInvitationListItem[]>(
       `/api/organizations/${orgSlug}/invitations`
     );
     return response.data;

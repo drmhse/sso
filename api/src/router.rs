@@ -371,7 +371,9 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/api/organizations/:org_slug/upstream-providers/:provider_id",
-            delete(delete_upstream_provider),
+            get(get_upstream_provider)
+                .patch(update_upstream_provider)
+                .delete(delete_upstream_provider),
         )
         .route(
             "/api/organizations/:org_slug/domain-routes",

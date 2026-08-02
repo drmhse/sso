@@ -184,14 +184,16 @@ export interface ListDevicesResponse {
   devices: UserDevice[];
   /** Total number of devices */
   total: number;
+  /** Current one-based page */
+  page: number;
+  /** Applied page size */
+  limit: number;
 }
 
 /**
  * Revoke device request
  */
 export interface RevokeDeviceRequest {
-  /** Device ID to revoke */
-  device_id: string;
   /** Optional reason for revocation */
   reason?: string;
 }

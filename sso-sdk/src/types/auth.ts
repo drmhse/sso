@@ -1,5 +1,4 @@
 import { OAuthProvider } from './common';
-import { RiskAssessment } from './risk';
 
 /**
  * Device code request payload
@@ -37,6 +36,7 @@ export interface TokenRequest {
   grant_type: 'urn:ietf:params:oauth:grant-type:device_code';
   device_code: string;
   client_id: string;
+  resource?: string;
 }
 
 /**
@@ -204,10 +204,6 @@ export interface RefreshTokenResponse {
   access_token: string;
   refresh_token: string;
   expires_in: number;
-  /**
-   * Risk assessment details (only present if risk engine is enabled)
-   */
-  risk_assessment?: RiskAssessment;
 }
 
 /**
@@ -272,6 +268,8 @@ export interface LoginRequest {
    * Optional caller state to return to hosted service callbacks.
    */
   state?: string;
+  /** Internal SAML relay state when completing a hosted SAML login. */
+  saml_state?: string;
 }
 
 /**

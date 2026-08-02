@@ -33,7 +33,8 @@ pub use settings::{
     set_org_smtp,
 };
 pub use upstream_providers::{
-    create_upstream_provider, delete_upstream_provider, list_upstream_providers,
+    create_upstream_provider, delete_upstream_provider, get_upstream_provider,
+    list_upstream_providers, update_upstream_provider,
 };
 pub use users::{get_end_user, list_end_users, revoke_end_user_sessions};
 

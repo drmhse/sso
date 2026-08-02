@@ -33,6 +33,7 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "test": "npm run build && node --test test/*.test.mjs",
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"src/**/*.{ts,tsx}\" tsdown.config.mjs --max-warnings 0",
@@ -50,7 +51,13 @@
   "author": "DRM HSE <info@drmhse.com>",
   "license": "MIT",
   "peerDependencies": {
+    "next": ">=14.0.0",
     "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "next": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

@@ -31,6 +31,7 @@ async fn require_integration_manager(state: &AppState, org_id: &str, user_id: &s
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUpstreamProviderRequest {
     pub connection_id: String,
     pub name: String,
@@ -44,6 +45,13 @@ pub struct CreateUpstreamProviderRequest {
     pub discovery_url: Option<String>,
     pub scopes: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateUpstreamProviderRequest {
+    pub name: Option<String>,
     pub enabled: Option<bool>,
 }
 
@@ -163,6 +171,58 @@ pub async fn list_upstream_providers(
     Ok(Json(response))
 }
 
+pub async fn get_upstream_provider(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((org_slug, provider_id)): Path<(String, String)>,
+) -> Result<Json<UpstreamProviderResponse>> {
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    require_integration_manager(&state, &organization.id, &auth_user.user.id).await?;
+
+    let provider = UpstreamProviderStore::find_by_id(DB::Conn(&state.db), &provider_id)
+        .await?
+        .filter(|provider| provider.org_id == organization.id)
+        .ok_or_else(|| AppError::NotFound("Provider not found".to_string()))?;
+
+    Ok(Json(
+        crate::db::models::UpstreamProvider::from(provider).into(),
+    ))
+}
+
+pub async fn update_upstream_provider(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((org_slug, provider_id)): Path<(String, String)>,
+    Json(payload): Json<UpdateUpstreamProviderRequest>,
+) -> Result<Json<UpstreamProviderResponse>> {
+    let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    require_integration_manager(&state, &organization.id, &auth_user.user.id).await?;
+
+    let existing = UpstreamProviderStore::find_by_id(DB::Conn(&state.db), &provider_id)
+        .await?
+        .filter(|provider| provider.org_id == organization.id)
+        .ok_or_else(|| AppError::NotFound("Provider not found".to_string()))?;
+
+    let name = payload.name.as_deref().map(str::trim);
+    if let Some(name) = name {
+        validate_required_text(name, "name", 200)?;
+    }
+
+    let provider =
+        UpstreamProviderStore::update(DB::Conn(&state.db), &existing.id, name, payload.enabled)
+            .await?;
+
+    Ok(Json(
+        crate::db::models::UpstreamProvider::from(provider).into(),
+    ))
+}
+
 pub async fn delete_upstream_provider(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -184,6 +244,18 @@ pub async fn delete_upstream_provider(
 }
 
 async fn validate_upstream_provider_payload(payload: &CreateUpstreamProviderRequest) -> Result<()> {
+    validate_required_text(&payload.connection_id, "connection_id", 128)?;
+    validate_required_text(&payload.name, "name", 200)?;
+    validate_required_text(&payload.client_id, "client_id", 512)?;
+    if payload
+        .scopes
+        .as_ref()
+        .is_some_and(|scopes| scopes.len() > 2048)
+    {
+        return Err(AppError::BadRequest(
+            "scopes must not exceed 2048 bytes".to_string(),
+        ));
+    }
     validate_upstream_client_secret(&payload.provider_type, payload.client_secret.as_deref())?;
     match payload.provider_type.as_str() {
         "oidc" | "oauth2" => {
@@ -224,6 +296,19 @@ async fn validate_upstream_provider_payload(payload: &CreateUpstreamProviderRequ
         validate_provider_url(Some(url), "discovery_url").await?;
     }
 
+    Ok(())
+}
+
+fn validate_required_text(value: &str, field: &str, max_bytes: usize) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(AppError::BadRequest(format!("{} must not be empty", field)));
+    }
+    if value.len() > max_bytes {
+        return Err(AppError::BadRequest(format!(
+            "{} must not exceed {} bytes",
+            field, max_bytes
+        )));
+    }
     Ok(())
 }
 
@@ -273,5 +358,20 @@ mod secret_validation_tests {
         }
         validate_upstream_client_secret("saml", None)
             .expect("SAML uses the documented empty secret sentinel");
+    }
+
+    #[test]
+    fn required_provider_text_is_nonempty_and_bounded() {
+        for value in ["", "   "] {
+            assert!(matches!(
+                validate_required_text(value, "name", 200),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+        validate_required_text("Workforce identity", "name", 200).expect("valid name");
+        assert!(matches!(
+            validate_required_text(&"x".repeat(201), "name", 200),
+            Err(AppError::BadRequest(_))
+        ));
     }
 }

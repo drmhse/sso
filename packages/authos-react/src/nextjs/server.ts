@@ -1,4 +1,4 @@
-import { headers, cookies } from 'next/headers';
+import { headers, cookies } from 'next/headers.js';
 
 /**
  * User information extracted from the request in server components.
@@ -53,7 +53,17 @@ export async function currentUser(): Promise<AuthUser | null> {
 
   const org = headersList.get('x-authos-org') ?? undefined;
   const permissionsHeader = headersList.get('x-authos-permissions');
-  const permissions = permissionsHeader ? JSON.parse(permissionsHeader) : [];
+  let permissions: string[] = [];
+  if (permissionsHeader) {
+    try {
+      const parsed: unknown = JSON.parse(permissionsHeader);
+      if (Array.isArray(parsed) && parsed.every((permission) => typeof permission === 'string')) {
+        permissions = parsed;
+      }
+    } catch {
+      // Treat malformed forwarded metadata as absent instead of crashing rendering.
+    }
+  }
 
   return {
     id: userId,

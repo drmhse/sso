@@ -72,9 +72,28 @@ enum InvitationLookup {
 
 #[derive(Debug, Serialize)]
 pub struct InvitationResponse {
-    pub invitation: organization_invitations::Model,
-    pub inviter: users::Model,
+    pub invitation: SafeInvitationResponse,
+    pub inviter: InvitationInviterResponse,
     pub token: String, // Plaintext token for email links (only returned once)
+}
+
+#[derive(Debug, Serialize)]
+pub struct SafeInvitationResponse {
+    pub id: String,
+    pub org_id: String,
+    pub email: String,
+    pub role: String,
+    pub invited_by: String,
+    pub status: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvitationInviterResponse {
+    pub id: String,
+    pub email: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,8 +237,21 @@ pub async fn create_invitation(
     }
 
     Ok(Json(InvitationResponse {
-        invitation,
-        inviter,
+        invitation: SafeInvitationResponse {
+            id: invitation.id,
+            org_id: invitation.org_id,
+            email: invitation.email,
+            role: invitation.role,
+            invited_by: invitation.invited_by,
+            status: invitation.status,
+            expires_at: DateTime::<Utc>::from_naive_utc_and_offset(invitation.expires_at, Utc),
+            created_at: DateTime::<Utc>::from_naive_utc_and_offset(invitation.created_at, Utc),
+        },
+        inviter: InvitationInviterResponse {
+            id: inviter.id,
+            email: inviter.email,
+            created_at: DateTime::<Utc>::from_naive_utc_and_offset(inviter.created_at, Utc),
+        },
         token, // Return plaintext token for email links
     }))
 }
@@ -734,6 +766,34 @@ mod tests {
     use openssl::rsa::Rsa;
     use sea_orm::{Database, DatabaseConnection, EntityTrait, PaginatorTrait};
     use std::sync::Arc;
+
+    #[test]
+    fn invitation_response_serializes_only_safe_account_fields() {
+        let now = Utc::now();
+        let response = InvitationResponse {
+            invitation: SafeInvitationResponse {
+                id: "inv-1".to_string(),
+                org_id: "org-1".to_string(),
+                email: "invitee@example.com".to_string(),
+                role: "member".to_string(),
+                invited_by: "user-1".to_string(),
+                status: "pending".to_string(),
+                expires_at: now,
+                created_at: now,
+            },
+            inviter: InvitationInviterResponse {
+                id: "user-1".to_string(),
+                email: "owner@example.com".to_string(),
+                created_at: now,
+            },
+            token: "one-time-token".to_string(),
+        };
+
+        let value = serde_json::to_value(response).expect("response should serialize");
+        assert_eq!(value["token"], "one-time-token");
+        assert!(value["inviter"].get("password_hash").is_none());
+        assert!(value["invitation"].get("token").is_none());
+    }
 
     struct InvitationFixture {
         state: AppState,

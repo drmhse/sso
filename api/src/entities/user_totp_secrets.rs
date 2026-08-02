@@ -11,8 +11,10 @@ pub struct Model {
     #[sea_orm(column_type = "Text", unique)]
     pub user_id: String,
     #[sea_orm(column_type = "Blob")]
+    #[serde(skip_serializing)]
     pub secret_encrypted: Vec<u8>,
     #[sea_orm(column_type = "Text")]
+    #[serde(skip_serializing)]
     pub encryption_key_id: String,
     pub enabled: bool,
     pub created_at: DateTime,

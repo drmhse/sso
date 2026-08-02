@@ -28,7 +28,7 @@ export class UpstreamProvidersModule {
    * Get a specific upstream provider.
    *
    * @param orgSlug Organization slug
-   * @param providerId Provider ID or connection_id
+   * @param providerId Provider ID
    * @returns Upstream provider details
    */
   public async get(orgSlug: string, providerId: string): Promise<UpstreamProvider> {
@@ -60,7 +60,7 @@ export class UpstreamProvidersModule {
    * Update an existing upstream provider.
    *
    * @param orgSlug Organization slug
-   * @param providerId Provider ID or connection_id
+   * @param providerId Provider ID
    * @param payload Update payload
    * @returns Updated upstream provider
    */

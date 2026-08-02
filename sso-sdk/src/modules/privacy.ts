@@ -9,7 +9,8 @@ export class PrivacyModule {
 
   /**
    * Export all user data (GDPR Right to Access).
-   * Users can export their own data, or organization owners can export their members' data.
+   * Users can export their own data. Cross-user export requires platform-owner
+   * authority or ownership of every organization the target belongs to.
    *
    * @param userId User ID to export data for
    * @returns Complete user data export including memberships, login events, identities, MFA events, and passkeys
@@ -28,7 +29,9 @@ export class PrivacyModule {
 
   /**
    * Anonymize user data (GDPR Right to be Forgotten).
-   * Requires organization owner permission for all organizations the user is a member of.
+   * Cross-user anonymization requires platform-owner authority or ownership of
+   * every organization the target belongs to. Self-service anonymization
+   * requires a current password or MFA code.
    * Platform owners cannot be anonymized.
    *
    * This operation:

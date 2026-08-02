@@ -18,6 +18,9 @@ AI agent skills: [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-a
 npm install @drmhse/authos-react
 ```
 
+Install `next` as well when using the optional `/nextjs` entry point. The base
+React package does not require Next.js.
+
 ## Quick start
 
 ```tsx

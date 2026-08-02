@@ -44,6 +44,7 @@ export interface MfaEventExport {
   event_type: string;
   timestamp: string;
   success: boolean;
+  details: string | null;
 }
 
 /**

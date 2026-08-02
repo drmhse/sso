@@ -15,9 +15,12 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub url: String,
     #[sea_orm(column_type = "Text")]
+    #[serde(skip_serializing)]
     pub secret: String,
+    #[serde(skip_serializing)]
     pub secret_encrypted: Option<Vec<u8>>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub encryption_key_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub events: String,

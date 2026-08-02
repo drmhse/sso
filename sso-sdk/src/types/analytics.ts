@@ -1,5 +1,5 @@
 export interface LoginTrendPoint {
-  date: string;
+  date: string | null;
   count: number;
 }
 
@@ -10,14 +10,14 @@ export interface LoginsByService {
 }
 
 export interface LoginsByProvider {
-  provider: 'github' | 'google' | 'microsoft';
+  provider: string;
   count: number;
 }
 
 export interface RecentLogin {
   id: string;
   user_id: string;
-  service_id: string;
+  service_id: string | null;
   provider: string;
   created_at: string;
 }

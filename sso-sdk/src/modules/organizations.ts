@@ -36,10 +36,11 @@ import {
   ListSiemConfigsResponse,
   TestConnectionResponse,
   CreateScimTokenRequest,
-  ScimTokenResponse,
+  CreateScimTokenResponse,
   ListScimTokensResponse,
   Invitation,
   CreateInvitationPayload,
+  CreateInvitationResponse,
   RiskEventResponse,
   RiskEventsQuery,
   RoleResponse,
@@ -219,8 +220,8 @@ export class OrganizationsModule {
     createToken: async (
       orgSlug: string,
       payload: CreateScimTokenRequest
-    ): Promise<ScimTokenResponse> => {
-      const response = await this.http.post<ScimTokenResponse>(
+    ): Promise<CreateScimTokenResponse> => {
+      const response = await this.http.post<CreateScimTokenResponse>(
         `/api/organizations/${orgSlug}/scim-tokens`,
         payload
       );
@@ -290,12 +291,12 @@ export class OrganizationsModule {
       payload: CreateInvitationPayload
     ): Promise<Invitation> => {
       // 1. Create invitation
-      const response = await this.http.post<Invitation>(
+      const response = await this.http.post<CreateInvitationResponse>(
         `/api/organizations/${orgSlug}/invitations`,
         payload
       );
 
-      const invitation = response.data;
+      const invitation = response.data.invitation;
 
       // 2. Accept invitation
       await this.http.post(
@@ -382,17 +383,17 @@ export class OrganizationsModule {
      * Requires 'owner' role.
      *
      * @param orgSlug Organization slug
-     * @param payload Transfer payload with new owner ID
+     * @param payload Transfer payload with the new owner's email
      *
      * @example
      * ```typescript
      * await sso.organizations.members.transferOwnership('acme-corp', {
-     *   new_owner_user_id: 'new-owner-id'
+     *   new_owner_email: 'new-owner@example.com'
      * });
      * ```
      */
     transferOwnership: async (orgSlug: string, payload: TransferOwnershipPayload): Promise<void> => {
-      await this.http.post(`/api/organizations/${orgSlug}/members/transfer-ownership`, payload);
+      await this.http.post(`/api/organizations/${orgSlug}/transfer-ownership`, payload);
     },
   };
 
@@ -970,7 +971,7 @@ export class OrganizationsModule {
       configId: string,
       payload: UpdateSiemConfigRequest
     ): Promise<SiemConfigResponse> => {
-      const response = await this.http.patch<SiemConfigResponse>(
+      const response = await this.http.put<SiemConfigResponse>(
         `/api/organizations/${orgSlug}/siem-configs/${configId}`,
         payload
       );

@@ -15,14 +15,19 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub provider_user_id: String,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub access_token: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub refresh_token: Option<String>,
     #[sea_orm(column_type = "Blob", nullable)]
+    #[serde(skip_serializing)]
     pub access_token_encrypted: Option<Vec<u8>>,
     #[sea_orm(column_type = "Blob", nullable)]
+    #[serde(skip_serializing)]
     pub refresh_token_encrypted: Option<Vec<u8>>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub encryption_key_id: Option<String>,
     pub expires_at: Option<DateTime>,
     #[sea_orm(column_type = "Text", nullable)]

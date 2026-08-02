@@ -11,11 +11,14 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub user_id: String,
     #[sea_orm(column_type = "Text", unique)]
+    #[serde(skip_serializing)]
     pub token_hash: String,
     pub expires_at: DateTime,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub refresh_token: Option<String>,
     #[sea_orm(column_type = "Text", nullable, unique)]
+    #[serde(skip_serializing)]
     pub refresh_token_hash: Option<String>,
     pub refresh_token_expires_at: Option<DateTime>,
     #[sea_orm(column_type = "Text", nullable)]

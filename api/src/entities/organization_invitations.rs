@@ -19,6 +19,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub status: String,
     #[sea_orm(column_type = "Text", unique)]
+    #[serde(skip_serializing)]
     pub token: String,
     pub expires_at: DateTime,
     pub created_at: DateTime,

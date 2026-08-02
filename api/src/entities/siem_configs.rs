@@ -17,8 +17,10 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub endpoint_url: String,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub api_key: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub auth_header: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub batch_size: String,

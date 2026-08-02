@@ -24,7 +24,7 @@
     "check:release-policy": "node scripts/check-release-policy.mjs",
     "check:outbound-http": "node scripts/check-outbound-http.mjs",
     "check:tenant-isolation": "node scripts/check-tenant-isolation-matrix.mjs",
-    "check:redaction": "node --test scripts/test-sensitive-logging.mjs && node scripts/check-sensitive-logging.mjs && python3 scripts/test-qualification-secret-transport.py",
+    "check:redaction": "node --test scripts/test-sensitive-logging.mjs && node scripts/check-sensitive-logging.mjs && node scripts/check-entity-secret-serialization.mjs && python3 scripts/test-qualification-secret-transport.py",
     "check:trust": "node --test scripts/test-trust-metadata.mjs && node scripts/check-trust-metadata.mjs",
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",

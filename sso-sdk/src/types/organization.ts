@@ -9,20 +9,19 @@ export interface Organization {
   name: string;
   owner_user_id: string;
   status: OrganizationStatus;
-  tier_id: string;
-  max_services?: number | null;
-  max_users?: number | null;
-  approved_by?: string | null;
-  approved_at?: string | null;
-  rejected_by?: string | null;
-  rejected_at?: string | null;
-  rejection_reason?: string | null;
-  custom_domain?: string | null;
-  domain_verified?: boolean;
-  domain_verification_token?: string | null;
-  brand_logo_url?: string | null;
-  brand_primary_color?: string | null;
-  feature_overrides?: string | Record<string, unknown> | null;
+  tier_id: string | null;
+  max_services: number | null;
+  max_users: number | null;
+  approved_by: string | null;
+  approved_at: string | null;
+  rejected_by: string | null;
+  rejected_at: string | null;
+  rejection_reason: string | null;
+  custom_domain: string | null;
+  domain_verified: boolean;
+  brand_logo_url: string | null;
+  brand_primary_color: string | null;
+  feature_overrides: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -53,6 +52,18 @@ export interface Membership {
   created_at: string;
 }
 
+/** User fields serialized by organization-management responses. */
+export interface OrganizationUser {
+  id: string;
+  email: string;
+  org_id: string | null;
+  is_platform_owner: boolean;
+  email_verified_at: string | null;
+  created_at: string;
+  updated_at: string | null;
+  deleted_at: string | null;
+}
+
 /**
  * Organization response with metadata
  */
@@ -60,17 +71,15 @@ export interface OrganizationResponse {
   organization: Organization;
   membership_count: number;
   service_count: number;
-  tier: OrganizationTier;
+  tier: OrganizationTier | null;
 }
 
 /**
  * Organization member details
  */
 export interface OrganizationMember {
-  user_id: string;
-  email: string;
-  role: MemberRole;
-  joined_at: string;
+  user: OrganizationUser;
+  membership: Membership;
 }
 
 export interface MemberServiceAccess {
@@ -100,12 +109,7 @@ export interface CreateOrganizationPayload {
  */
 export interface CreateOrganizationResponse {
   organization: Organization;
-  owner: {
-    id: string;
-    email: string;
-    is_platform_owner: boolean;
-    created_at: string;
-  };
+  owner: OrganizationUser;
   membership: Membership;
   access_token: string;
   refresh_token: string;
@@ -142,7 +146,7 @@ export interface UpdateMemberRolePayload {
  * Transfer ownership payload
  */
 export interface TransferOwnershipPayload {
-  new_owner_user_id: string;
+  new_owner_email: string;
 }
 
 /**
@@ -223,13 +227,10 @@ export interface AuditLog {
   id: string;
 
   /** Organization ID this audit log belongs to */
-  org_id: string;
+  organization_id: string;
 
   /** User ID who performed the action */
-  actor_user_id: string;
-
-  /** Email of the user who performed the action (optional, joined from users table) */
-  actor_user_email?: string;
+  actor_id: string;
 
   /** Action that was performed (e.g., 'service.created', 'user.invited') */
   action: string;
@@ -249,8 +250,8 @@ export interface AuditLog {
   /** Whether the action was successful */
   success: boolean;
 
-  /** Additional details about the action (JSON string or object) */
-  details?: string;
+  /** Redacted structured event metadata, when present. */
+  metadata?: Record<string, unknown>;
 
   /** Timestamp when the action was recorded */
   created_at: string;
@@ -263,24 +264,6 @@ export interface AuditLog {
     id: string;
     email: string;
   };
-
-  /**
-   * Organization ID (deprecated: use org_id)
-   * @deprecated Use org_id instead for consistency with backend
-   */
-  organization_id?: string;
-
-  /**
-   * Actor ID (deprecated: use actor_user_id) 
-   * @deprecated Use actor_user_id instead for consistency with backend
-   */
-  actor_id?: string;
-
-  /**
-   * Metadata about the action (optional)
-   * Contains additional structured information about what changed
-   */
-  metadata?: Record<string, any> | null;
 }
 
 /**
@@ -524,17 +507,31 @@ export interface UpdateRiskSettingsResponse {
  */
 export interface CreateScimTokenRequest {
   name: string;
+  /** RFC 3339 expiry timestamp. Omit for a non-expiring token. */
+  expires_at?: string;
 }
 
 /**
- * SCIM token response
+ * SCIM token returned by list operations. Secret token material is never included.
  */
 export interface ScimTokenResponse {
   id: string;
   name: string;
-  token?: string; // Only present on creation
-  last_used_at?: string;
+  prefix: string;
+  active: boolean;
   created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+}
+
+/** SCIM token creation response. The plaintext token is returned only once. */
+export interface CreateScimTokenResponse {
+  id: string;
+  name: string;
+  token: string;
+  prefix: string;
+  created_at: string;
+  expires_at: string | null;
 }
 
 /**

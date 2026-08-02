@@ -11,6 +11,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub user_id: String,
     #[sea_orm(column_type = "Text", unique)]
+    #[serde(skip_serializing)]
     pub token_hash: String,
     pub expires_at: DateTime,
     pub used: bool,

@@ -33,6 +33,7 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "test": "npm run build && node --test test/*.test.mjs",
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"src/**/*.ts\" tsdown.config.mjs --max-warnings 0",

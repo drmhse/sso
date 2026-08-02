@@ -18,6 +18,9 @@ AI agent skills: [authos.dev/docs/ai-agent-skills/](https://authos.dev/docs/ai-a
 npm install @drmhse/authos-vue
 ```
 
+Install `nuxt` when using the optional `/nuxt` entry point. The base Vue package
+does not require Nuxt.
+
 ## Quick start
 
 ```ts

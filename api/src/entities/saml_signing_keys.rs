@@ -11,10 +11,12 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub service_id: String,
     #[sea_orm(column_type = "Blob")]
+    #[serde(skip_serializing)]
     pub private_key_encrypted: Vec<u8>,
     #[sea_orm(column_type = "Text")]
     pub public_key: String,
     #[sea_orm(column_type = "Text")]
+    #[serde(skip_serializing)]
     pub encryption_key_id: String,
     pub valid_from: DateTime,
     pub valid_until: DateTime,

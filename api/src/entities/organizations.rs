@@ -29,22 +29,30 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub rejection_reason: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub smtp_host: Option<String>,
+    #[serde(skip_serializing)]
     pub smtp_port: Option<i32>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub smtp_username: Option<String>,
     #[sea_orm(column_type = "Blob", nullable)]
+    #[serde(skip_serializing)]
     pub smtp_password_encrypted: Option<Vec<u8>>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub smtp_from_email: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub smtp_from_name: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub smtp_encryption_key_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable, unique)]
     pub custom_domain: Option<String>,
     pub domain_verified: bool,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub domain_verification_token: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub brand_logo_url: Option<String>,
@@ -155,3 +163,56 @@ impl Related<super::webhooks::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    #[test]
+    fn generic_organization_json_omits_configuration_secrets() {
+        let now = chrono::Utc::now().naive_utc();
+        let organization = Model {
+            id: "org-1".to_string(),
+            slug: "acme".to_string(),
+            name: "Acme".to_string(),
+            owner_user_id: "user-1".to_string(),
+            status: "active".to_string(),
+            tier_id: None,
+            max_services: None,
+            max_users: None,
+            approved_by: None,
+            approved_at: None,
+            rejected_by: None,
+            rejected_at: None,
+            rejection_reason: None,
+            smtp_host: Some("smtp.example.com".to_string()),
+            smtp_port: Some(587),
+            smtp_username: Some("mailer".to_string()),
+            smtp_password_encrypted: Some(vec![1, 2, 3]),
+            smtp_from_email: Some("auth@example.com".to_string()),
+            smtp_from_name: Some("Auth".to_string()),
+            smtp_encryption_key_id: Some("key-1".to_string()),
+            custom_domain: None,
+            domain_verified: false,
+            domain_verification_token: Some("verify-secret".to_string()),
+            brand_logo_url: None,
+            brand_primary_color: None,
+            feature_overrides: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let value = serde_json::to_value(organization).expect("organization should serialize");
+        for field in [
+            "smtp_host",
+            "smtp_port",
+            "smtp_username",
+            "smtp_password_encrypted",
+            "smtp_from_email",
+            "smtp_from_name",
+            "smtp_encryption_key_id",
+            "domain_verification_token",
+        ] {
+            assert!(value.get(field).is_none(), "{field} must not be serialized");
+        }
+    }
+}

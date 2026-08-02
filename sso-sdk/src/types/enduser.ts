@@ -1,4 +1,5 @@
 import { PaginationParams } from './common';
+import type { OrganizationUser } from './organization';
 
 /**
  * End-user subscription details
@@ -25,27 +26,27 @@ export interface EndUserIdentity {
 
 export interface EndUserSession {
   id: string;
-  service_id?: string | null;
-  service_name?: string | null;
-  org_slug?: string | null;
-  ip_address?: string | null;
-  user_agent?: string | null;
+  service_id: string | null;
+  service_name: string | null;
+  org_slug: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
   expires_at: string;
-  refresh_token_expires_at?: string | null;
+  refresh_token_expires_at: string | null;
   created_at: string;
 }
 
 export interface EndUserLoginEvent {
   id: string;
-  service_id?: string | null;
-  service_name?: string | null;
+  service_id: string | null;
+  service_name: string | null;
   provider: string;
-  ip_address?: string | null;
-  user_agent?: string | null;
-  risk_score?: number | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  risk_score: number | null;
   risk_factors: string[];
-  geo_country?: string | null;
-  geo_city?: string | null;
+  geo_country: string | null;
+  geo_city: string | null;
   created_at: string;
 }
 
@@ -53,12 +54,7 @@ export interface EndUserLoginEvent {
  * End-user with subscriptions and identities
  */
 export interface EndUser {
-  user: {
-    id: string;
-    email: string;
-    is_platform_owner: boolean;
-    created_at: string;
-  };
+  user: OrganizationUser;
   subscriptions: EndUserSubscription[];
   identities: EndUserIdentity[];
 }
@@ -77,12 +73,7 @@ export interface EndUserListResponse {
  * End-user detail response with session info
  */
 export interface EndUserDetailResponse {
-  user: {
-    id: string;
-    email: string;
-    is_platform_owner: boolean;
-    created_at: string;
-  };
+  user: OrganizationUser;
   subscriptions: EndUserSubscription[];
   identities: EndUserIdentity[];
   session_count: number;

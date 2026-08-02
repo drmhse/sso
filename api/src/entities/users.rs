@@ -17,6 +17,7 @@ pub struct Model {
     pub org_id: Option<String>,
     pub is_platform_owner: bool,
     #[sea_orm(column_type = "Text", nullable)]
+    #[serde(skip_serializing)]
     pub password_hash: Option<String>,
     pub email_verified_at: Option<DateTime>,
     pub created_at: DateTime,
@@ -173,3 +174,26 @@ impl Related<super::user_totp_secrets::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    #[test]
+    fn password_hash_is_never_serialized() {
+        let now = chrono::Utc::now().naive_utc();
+        let user = Model {
+            id: "user-1".to_string(),
+            email: "user@example.com".to_string(),
+            org_id: None,
+            is_platform_owner: false,
+            password_hash: Some("secret-hash".to_string()),
+            email_verified_at: None,
+            created_at: now,
+            updated_at: None,
+            deleted_at: None,
+        };
+        let value = serde_json::to_value(user).expect("user should serialize");
+        assert!(value.get("password_hash").is_none());
+    }
+}

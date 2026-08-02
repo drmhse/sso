@@ -19,6 +19,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text", unique)]
     pub client_id: String,
     #[sea_orm(column_type = "Text")]
+    #[serde(skip_serializing)]
     pub client_secret_hash: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub github_scopes: Option<String>,

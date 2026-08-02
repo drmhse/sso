@@ -1,5 +1,5 @@
-import type { NextRequest } from 'next/server';
-import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server.js';
+import { NextResponse } from 'next/server.js';
 
 export interface AuthMiddlewareConfig {
   /**

@@ -6,13 +6,30 @@ import { InvitationStatus, MemberRole } from './common';
 export interface Invitation {
   id: string;
   org_id: string;
-  inviter_user_id: string;
-  invitee_email: string;
-  role: MemberRole;
-  token: string;
+  email: string;
+  invited_by: string;
+  role: MemberRole | string;
   status: InvitationStatus;
   expires_at: string;
   created_at: string;
+}
+
+export interface InvitationInviter {
+  id: string;
+  email: string;
+  created_at: string;
+}
+
+export interface CreateInvitationResponse {
+  invitation: Invitation;
+  inviter: InvitationInviter;
+  /** Plaintext invitation token. Returned only at creation. */
+  token: string;
+}
+
+export interface OrganizationInvitationListItem {
+  invitation: Omit<Invitation, 'org_id' | 'invited_by'>;
+  inviter: InvitationInviter;
 }
 
 /**
@@ -40,8 +57,12 @@ export interface DeclineInvitationPayload {
 /**
  * Invitation with organization details
  */
-export interface InvitationWithOrg extends Invitation {
+export interface InvitationWithOrg {
+  id: string;
+  email: string;
+  role: MemberRole | string;
+  expires_at: string;
+  created_at: string;
   organization_name: string;
   organization_slug: string;
-  inviter_email: string;
 }
