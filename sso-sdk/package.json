@@ -46,7 +46,7 @@
   "author": "DRM HSE <info@drmhse.com>",
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^20.11.5",
+    "@types/node": "^26.1.2",
     "tsdown": "^0.22.2",
     "typescript": "^5.3.3"
   },
