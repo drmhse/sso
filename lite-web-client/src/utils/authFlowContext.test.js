@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getAuthFlowContext, hasServiceAuthContext } from '@/utils/authFlowContext';
+import { getAuthFlowContext, getDirectMfaChallenge, hasServiceAuthContext } from '@/utils/authFlowContext';
 
 describe('auth flow context helpers', () => {
   it('detects service-auth query context on hosted entry routes', () => {
@@ -27,5 +27,21 @@ describe('auth flow context helpers', () => {
   it('does not treat platform routes as service-auth context', () => {
     expect(hasServiceAuthContext({ query: {} })).toBe(false);
     expect(hasServiceAuthContext({ query: { org: 'authos', service: 'platform' } })).toBe(false);
+  });
+
+  it('restores a hosted MFA continuation from a token-bearing fragment', () => {
+    expect(getDirectMfaChallenge(
+      {
+        query: {
+          redirect_uri: 'https://admin.servos.dev/auth/callback',
+          state: 'caller-state',
+        },
+      },
+      '#preauth_token=preauth-secret',
+    )).toEqual({
+      preauthToken: 'preauth-secret',
+      redirectUri: 'https://admin.servos.dev/auth/callback',
+      state: 'caller-state',
+    });
   });
 });

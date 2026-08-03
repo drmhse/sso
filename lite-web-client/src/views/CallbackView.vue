@@ -88,6 +88,7 @@ onMounted(async () => {
         redirectPath: postLoginRedirect(route),
         deviceCodeId: deviceId ? String(deviceId) : '',
         supportPath: authRouteWithContext(route, '/support'),
+        state: authContext.state,
       });
       await router.replace('/mfa-challenge');
       return;

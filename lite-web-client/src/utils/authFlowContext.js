@@ -61,3 +61,15 @@ export function appendTokensToRedirectUri(redirectUri, accessToken, refreshToken
   url.hash = hashParams.toString();
   return url.toString();
 }
+
+export function getDirectMfaChallenge(route, locationHash = '') {
+  const fragment = new URLSearchParams(String(locationHash).replace(/^#/, ''));
+  const preauthToken = fragment.get('preauth_token') || firstQueryValue(route?.query?.preauth_token);
+  if (!preauthToken) return null;
+
+  return {
+    preauthToken,
+    redirectUri: firstQueryValue(route?.query?.redirect_uri),
+    state: firstQueryValue(route?.query?.state),
+  };
+}

@@ -2035,9 +2035,12 @@ async fn auth_callback_impl(
                             )?;
 
                         // Redirect with pre-auth token and mfa_required flag
-                        let redirect_url = service_mfa_redirect_uri(
+                        let redirect_url = hosted_service_mfa_redirect_uri(
+                            &state.base_url,
                             redirect_uri,
                             &preauth_token,
+                            oauth_ctx.org_slug.as_deref(),
+                            service_slug.as_deref(),
                             oauth_ctx.client_state.as_deref(),
                         )?;
                         return Ok(Redirect::to(&redirect_url).into_response());
@@ -2085,9 +2088,12 @@ async fn auth_callback_impl(
                 )?;
 
                 // Redirect with pre-auth token and mfa_required flag
-                let redirect_url = service_mfa_redirect_uri(
+                let redirect_url = hosted_service_mfa_redirect_uri(
+                    &state.base_url,
                     redirect_uri,
                     &preauth_token,
+                    oauth_ctx.org_slug.as_deref(),
+                    service_slug.as_deref(),
                     oauth_ctx.client_state.as_deref(),
                 )?;
                 return Ok(Redirect::to(&redirect_url).into_response());
@@ -3034,9 +3040,12 @@ async fn handle_service_flow_via_admin_callback(
                     oauth_state.resource.as_deref(),
                 )?;
 
-                let redirect_url = service_mfa_redirect_uri(
+                let redirect_url = hosted_service_mfa_redirect_uri(
+                    &state.base_url,
                     redirect_uri,
                     &preauth_token,
+                    oauth_state.org_slug.as_deref(),
+                    oauth_state.service_slug.as_deref(),
                     oauth_state.client_state.as_deref(),
                 )?;
                 return Ok(Redirect::to(&redirect_url).into_response());
@@ -3070,9 +3079,12 @@ async fn handle_service_flow_via_admin_callback(
             oauth_state.resource.as_deref(),
         )?;
 
-        let redirect_url = service_mfa_redirect_uri(
+        let redirect_url = hosted_service_mfa_redirect_uri(
+            &state.base_url,
             redirect_uri,
             &preauth_token,
+            oauth_state.org_slug.as_deref(),
+            oauth_state.service_slug.as_deref(),
             oauth_state.client_state.as_deref(),
         )?;
         return Ok(Redirect::to(&redirect_url).into_response());
@@ -3446,16 +3458,38 @@ fn service_token_redirect_uri(
     redirect_uri_with_fragment(redirect_uri, &pairs)
 }
 
-fn service_mfa_redirect_uri(
-    redirect_uri: &str,
+fn hosted_service_mfa_redirect_uri(
+    authos_base_url: &str,
+    service_redirect_uri: &str,
     preauth_token: &str,
+    org_slug: Option<&str>,
+    service_slug: Option<&str>,
     client_state: Option<&str>,
 ) -> Result<String> {
-    let mut pairs = vec![("preauth_token", preauth_token), ("mfa_required", "true")];
-    if let Some(client_state) = client_state {
-        pairs.push(("state", client_state));
+    let mut url = url::Url::parse(authos_base_url)
+        .map_err(|_| AppError::InternalServerError("Invalid AuthOS base URL".to_string()))?;
+    url.set_path("/callback");
+    url.set_query(None);
+    url.set_fragment(None);
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("redirect_uri", service_redirect_uri);
+        if let Some(org_slug) = org_slug {
+            query.append_pair("org", org_slug);
+        }
+        if let Some(service_slug) = service_slug {
+            query.append_pair("service", service_slug);
+        }
+        if let Some(client_state) = client_state {
+            query.append_pair("state", client_state);
+        }
     }
-    redirect_uri_with_fragment(redirect_uri, &pairs)
+    let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+    fragment
+        .append_pair("preauth_token", preauth_token)
+        .append_pair("mfa_required", "true");
+    url.set_fragment(Some(&fragment.finish()));
+    Ok(url.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5079,6 +5113,41 @@ mod tests {
         assert_eq!(
             params.get("device_code_id").map(|value| value.as_ref()),
             Some("device-id")
+        );
+    }
+
+    #[test]
+    fn hosted_service_mfa_redirect_keeps_the_challenge_inside_authos() {
+        let redirect = hosted_service_mfa_redirect_uri(
+            "https://athapi.authos.dev/",
+            "https://admin.servos.dev/auth/callback",
+            "preauth",
+            Some("queuezero"),
+            Some("servos"),
+            Some("caller-state"),
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&redirect).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        let fragment: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(parsed.fragment().unwrap().as_bytes()).collect();
+
+        assert_eq!(parsed.path(), "/callback");
+        assert_eq!(
+            query.get("redirect_uri").map(|value| value.as_ref()),
+            Some("https://admin.servos.dev/auth/callback")
+        );
+        assert_eq!(
+            query.get("state").map(|value| value.as_ref()),
+            Some("caller-state")
+        );
+        assert_eq!(
+            fragment.get("mfa_required").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            fragment.get("preauth_token").map(|value| value.as_ref()),
+            Some("preauth")
         );
     }
 }

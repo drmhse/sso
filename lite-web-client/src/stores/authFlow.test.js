@@ -34,10 +34,12 @@ describe('authFlow store', () => {
     store.setMfaChallenge({
       preauthToken: 'fresh-token',
       redirectPath: '/app/overview',
+      state: 'caller-state',
     });
 
     expect(store.hasMfaChallenge).toBe(true);
     expect(store.mfaChallenge?.preauthToken).toBe('fresh-token');
+    expect(store.mfaChallenge?.state).toBe('caller-state');
     expect(typeof store.mfaChallenge?.createdAt).toBe('number');
   });
 });

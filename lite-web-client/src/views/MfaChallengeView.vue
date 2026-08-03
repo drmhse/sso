@@ -43,7 +43,7 @@ import BaseButton from '@/components/BaseButton.vue';
 import { sso } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth';
 import { useAuthFlowStore } from '@/stores/authFlow';
-import { appendTokensToRedirectUri, firstQueryValue } from '@/utils/authFlowContext';
+import { appendTokensToRedirectUri, authRouteWithContext, firstQueryValue, getDirectMfaChallenge } from '@/utils/authFlowContext';
 import { defaultAuthenticatedRoute } from '@/utils/redirects';
 import { scrubCurrentUrl } from '@/utils/urlSecurity';
 
@@ -68,7 +68,23 @@ const challenge = computed(() => {
 });
 
 onMounted(() => {
-  if (!deviceFlow.value) return;
+  if (!deviceFlow.value) {
+    const directChallenge = getDirectMfaChallenge(route, window.location.hash);
+    if (!authFlowStore.hasMfaChallenge && directChallenge) {
+      authFlowStore.setMfaChallenge({
+        preauthToken: directChallenge.preauthToken,
+        redirectUri: directChallenge.redirectUri,
+        redirectPath: defaultAuthenticatedRoute(),
+        supportPath: authRouteWithContext(route, '/support'),
+        state: directChallenge.state,
+      });
+      scrubCurrentUrl({
+        queryKeys: ['preauth_token'],
+        hashKeys: ['preauth_token'],
+      });
+    }
+    return;
+  }
 
   deviceChallenge.value = {
     preauthToken: firstQueryValue(route.query.preauth_token),
