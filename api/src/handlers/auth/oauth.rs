@@ -2503,9 +2503,11 @@ async fn auth_admin_callback_impl(
                     && dc.service_slug == "admin-cli"
                 {
                     // Platform admin CLI - redirect to platform admin frontend MFA challenge
-                    format!(
-                        "{}/callback#mfa_challenge=true&preauth_token={}&device_code_id={}&user_code={}",
-                        config.platform_dashboard_base_url, preauth_token, dc.id, dc.user_code
+                    platform_device_mfa_redirect_url(
+                        &config.platform_dashboard_base_url,
+                        &preauth_token,
+                        &dc.id,
+                        &dc.user_code,
                     )
                 } else {
                     // Service-level device flow - redirect to service's MFA challenge page
@@ -2727,6 +2729,17 @@ async fn auth_admin_callback_impl(
         )
     };
     Ok(Redirect::to(&redirect_url).into_response())
+}
+
+fn platform_device_mfa_redirect_url(
+    dashboard_base_url: &str,
+    preauth_token: &str,
+    device_code_id: &str,
+    user_code: &str,
+) -> String {
+    format!(
+        "{dashboard_base_url}/callback#mfa_required=true&preauth_token={preauth_token}&device_code_id={device_code_id}&user_code={user_code}"
+    )
 }
 
 /// Handle service flow (end-user login) that came through admin callback
@@ -5039,6 +5052,33 @@ mod tests {
         assert_eq!(
             fragment.get("refresh_token").map(|value| value.as_ref()),
             Some("refresh")
+        );
+    }
+
+    #[test]
+    fn platform_device_mfa_redirect_uses_the_frontend_callback_contract() {
+        let redirect = platform_device_mfa_redirect_url(
+            "https://app.authos.dev",
+            "preauth",
+            "device-id",
+            "ABCD-1234",
+        );
+        let fragment = url::Url::parse(&redirect)
+            .expect("valid callback URL")
+            .fragment()
+            .expect("callback fragment")
+            .to_string();
+        let params: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(fragment.as_bytes()).collect();
+
+        assert_eq!(
+            params.get("mfa_required").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert!(!params.contains_key("mfa_challenge"));
+        assert_eq!(
+            params.get("device_code_id").map(|value| value.as_ref()),
+            Some("device-id")
         );
     }
 }
