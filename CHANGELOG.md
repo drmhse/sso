@@ -7,6 +7,23 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.6 - 2026-08-06
+
+### Fixed
+
+- Service MFA now completes inside the hosted login journey; the MFA challenge
+  view resumes and finalizes the flow correctly.
+- The device-flow MFA callback contract is aligned in the OAuth device
+  endpoint so callback handling matches the SDK contract.
+- SDK response types and secret serialization are hardened: invitation,
+  organization, and upstream-provider models were aligned and the entity-secret
+  serialization checks expanded.
+
+### Changed
+
+- The release finalizer binds `gh` to the triggering repository explicitly
+  instead of relying on local `.git` metadata.
+
 ## 0.8.5 - 2026-07-25
 
 ### Changed
@@ -272,7 +289,8 @@ No changes yet.
 Earlier pre-1.0 history is available from
 [GitHub Releases](https://github.com/drmhse/AuthOS/releases).
 
-[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/drmhse/AuthOS/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/drmhse/AuthOS/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/drmhse/AuthOS/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/drmhse/AuthOS/compare/v0.8.2...v0.8.3
