@@ -69,7 +69,7 @@ function check(fixtureRoot) {
 test('trust gate accepts the aligned release and database pins', () => {
   const fixtureRoot = fixture();
   try {
-    assert.match(check(fixtureRoot), /release v0\.8\.6/);
+    assert.match(check(fixtureRoot), /release v0\.8\.7/);
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -85,7 +85,7 @@ test('trust gate rejects a stale AuthOS Compose pin', () => {
     );
     assert.throws(
       () => check(fixtureRoot),
-      (error) => error?.status === 1 && /does not pin editoredit\/sso:sqlite-v0\.8\.6/.test(error.stderr),
+      (error) => error?.status === 1 && /does not pin editoredit\/sso:sqlite-v0\.8\.7/.test(error.stderr),
     );
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
