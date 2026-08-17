@@ -4066,6 +4066,7 @@ mod tests {
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::config::Config;
     use crate::entities::provider_token_requests;
+    use crate::rsa_keys::GeneratedKey;
     use crate::services::{
         audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
         risk_engine::RiskEngine,
@@ -4079,7 +4080,6 @@ mod tests {
     use chrono::{Duration, Utc};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
-    use openssl::rsa::Rsa;
     use sea_orm::{
         ActiveModelTrait, ConnectionTrait, Database, EntityTrait, PaginatorTrait, QueryFilter,
     };
@@ -4496,13 +4496,13 @@ mod tests {
     }
 
     fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let rsa = GeneratedKey::generate().expect("generate test rsa key");
         let private_key = STANDARD.encode(
-            rsa.private_key_to_pem()
+            rsa.private_key_pem()
                 .expect("encode private key pem for tests"),
         );
         let public_key = STANDARD.encode(
-            rsa.public_key_to_pem()
+            rsa.public_key_pem()
                 .expect("encode public key pem for tests"),
         );
 

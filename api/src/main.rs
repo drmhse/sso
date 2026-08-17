@@ -14,6 +14,7 @@ mod jobs;
 mod lite_web;
 mod middleware;
 mod router;
+mod rsa_keys;
 mod runtime_metadata;
 mod services;
 mod state;
@@ -43,7 +44,6 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use openssl::pkey::PKey;
 use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use std::sync::Arc;
@@ -133,16 +133,15 @@ fn build_jwks(jwt_service: &JwtService) -> Result<JwksResponse, axum::http::Stat
         .verification_public_keys()
         .into_iter()
         .map(|(kid, public_key_pem)| {
-            let rsa_key = PKey::public_key_from_pem(public_key_pem)
-                .and_then(|key| key.rsa())
+            let (modulus, exponent) = crate::rsa_keys::public_key_components(public_key_pem)
                 .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
             Ok(Jwk {
                 kty: "RSA".to_string(),
                 alg: "RS256".to_string(),
                 key_use: "sig".to_string(),
                 kid: kid.to_string(),
-                n: URL_SAFE_NO_PAD.encode(rsa_key.n().to_vec()),
-                e: URL_SAFE_NO_PAD.encode(rsa_key.e().to_vec()),
+                n: URL_SAFE_NO_PAD.encode(modulus),
+                e: URL_SAFE_NO_PAD.encode(exponent),
             })
         })
         .collect::<Result<Vec<_>, axum::http::StatusCode>>()?;
@@ -767,10 +766,10 @@ mod jwks_tests {
     use std::collections::BTreeMap;
 
     fn key_pair() -> (String, String) {
-        let rsa = openssl::rsa::Rsa::generate(2048).expect("generate RSA key");
+        let key = crate::rsa_keys::GeneratedKey::generate().expect("generate RSA key");
         (
-            STANDARD.encode(rsa.private_key_to_pem().expect("private PEM")),
-            STANDARD.encode(rsa.public_key_to_pem().expect("public PEM")),
+            STANDARD.encode(key.private_key_pem().expect("private PEM")),
+            STANDARD.encode(key.public_key_pem().expect("public PEM")),
         )
     }
 

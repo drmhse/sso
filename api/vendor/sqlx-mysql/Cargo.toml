@@ -127,9 +127,13 @@ default-features = false
 [dependencies.once_cell]
 version = "1.9.0"
 
-[dependencies.openssl]
-version = "0.10"
-features = ["vendored"]
+# Pure Rust RSA, replacing the vendored OpenSSL that used to be here. Only the
+# MySQL password-encryption path needed it, and that is one OAEP encryption.
+[dependencies.rsa]
+version = "0.9"
+
+[dependencies.rand]
+version = "0.8"
 
 [dependencies.percent-encoding]
 version = "2.1.0"
