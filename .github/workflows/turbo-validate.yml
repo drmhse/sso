@@ -79,11 +79,17 @@ jobs:
           cargo turbo status
           du -sh ~/.cache/cargo-turbo
 
-      - name: Save the shared dependency store
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Archive and upload the shared dependency store
+        run: tar -C "${HOME}/.cache" --zstd -cf turbo-store.tar.zst cargo-turbo
+
+      - name: Upload the shared dependency store
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          path: ~/.cache/cargo-turbo
-          key: validate-turbo-${{ env.RUST_TARGET }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
+          name: turbo-store
+          path: turbo-store.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
   build:
     name: Build sqlite amd64 (${{ matrix.supplied && 'supplied' || 'from scratch' }})
@@ -122,13 +128,19 @@ jobs:
           tool: cargo-zigbuild
           fallback: none
 
-      - name: Restore the shared dependency store
+      - name: Download the shared dependency store
         if: matrix.supplied
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: ~/.cache/cargo-turbo
-          key: validate-turbo-${{ env.RUST_TARGET }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
-          fail-on-cache-miss: true
+          name: turbo-store
+          path: .artifacts/turbo
+
+      - name: Unpack the shared dependency store
+        if: matrix.supplied
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.cache"
+          tar -C "${HOME}/.cache" --zstd -xf .artifacts/turbo/turbo-store.tar.zst
 
       - name: Install cargo-turbo
         if: matrix.supplied

@@ -22,6 +22,12 @@ No changes yet.
 - Dropping it also makes release builds cacheable. OpenSSL was vendored and
   compiled from C on every checkout, and its static archives bake their own
   build directory into libcrypto.a and libssl.a, so no cache could reuse them.
+  Priming the release dependency set is now noticeably cheaper for the same
+  reason, 413s to 241s.
+- The primed dependency store reaches the build matrix as a run artifact rather
+  than an Actions cache. A cache is scoped to a ref and competes for a
+  repository-wide ten gigabyte budget that is evicted least-recently-used, so a
+  store written by priming could be displaced before the builds asked for it.
 
 ### Security
 

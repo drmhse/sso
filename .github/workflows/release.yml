@@ -312,11 +312,32 @@ jobs:
       - name: Report what was stored
         run: cargo turbo status
 
-      - name: Save the shared dependency store
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Archive the shared dependency store
+        # One tarball rather than the directory itself: the store is tens of
+        # thousands of small files, which artifact upload handles far more slowly
+        # than a single compressed stream.
+        run: tar -C "${HOME}/.cache" --zstd -cf turbo-store.tar.zst cargo-turbo
+
+      - name: Upload the shared dependency store
+        # An artifact rather than a cache, because this hand-off is within one
+        # run. A cache would be the wrong primitive twice over: it is scoped to a
+        # ref, and it competes for a repository-wide ten gigabyte budget that is
+        # evicted least-recently-used. That eviction is not hypothetical. In the
+        # v0.8.8 attempt, priming saved the store at 13:18 and the build jobs
+        # asked for the identical key at 13:40 and were told it did not exist,
+        # because concurrent dependabot runs had meanwhile written eleven
+        # `rust-cache` entries of six hundred megabytes to a gigabyte each and
+        # pushed the repository to 9.81 GB. Every build then compiled all 437
+        # crates itself. An artifact belongs to the run, so nothing else can
+        # displace it, and dropping the cache entry also returns some of that
+        # shared budget to the jobs that still use it.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          path: ~/.cache/cargo-turbo
-          key: authos-turbo-${{ matrix.rust_target }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
+          name: turbo-store-${{ matrix.arch }}
+          path: turbo-store.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
   build:
     name: Build ${{ matrix.backend }} ${{ matrix.arch }}
@@ -399,13 +420,26 @@ jobs:
           tool: cargo-zigbuild
           fallback: none
 
-      - name: Restore the shared dependency store
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Download the shared dependency store
+        # Priming is allowed to fail without stalling a release, so a missing
+        # artifact is not an error: the build simply compiles the dependencies
+        # itself, exactly as it did before any of this existed.
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: ~/.cache/cargo-turbo
-          key: authos-turbo-${{ matrix.rust_target }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
-          restore-keys: |
-            authos-turbo-${{ matrix.rust_target }}-${{ hashFiles('api/Cargo.lock') }}-
+          name: turbo-store-${{ matrix.arch }}
+          path: .artifacts/turbo
+
+      - name: Unpack the shared dependency store
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -f .artifacts/turbo/turbo-store.tar.zst ]; then
+            mkdir -p "${HOME}/.cache"
+            tar -C "${HOME}/.cache" --zstd -xf .artifacts/turbo/turbo-store.tar.zst
+          else
+            echo "No primed store for this architecture; building the dependencies here."
+          fi
 
       - name: Install cargo-turbo
         run: cargo install cargo-turbo --locked --version 0.3.0
