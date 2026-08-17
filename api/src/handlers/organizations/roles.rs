@@ -467,7 +467,7 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
-    use openssl::rsa::Rsa;
+    use crate::rsa_keys::GeneratedKey;
     use sea_orm::Database;
     use std::sync::Arc;
 
@@ -519,13 +519,13 @@ mod tests {
     }
 
     fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = Rsa::generate(2048).expect("generate test rsa key");
+        let rsa = GeneratedKey::generate().expect("generate test rsa key");
         let private_key = STANDARD.encode(
-            rsa.private_key_to_pem()
+            rsa.private_key_pem()
                 .expect("encode private key pem for tests"),
         );
         let public_key = STANDARD.encode(
-            rsa.public_key_to_pem()
+            rsa.public_key_pem()
                 .expect("encode public key pem for tests"),
         );
 

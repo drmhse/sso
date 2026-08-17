@@ -21,10 +21,10 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{Duration, Timelike, Utc};
-use openssl::hash::MessageDigest;
-use openssl::pkey::PKey;
-use openssl::rsa::Rsa;
-use openssl::sign::Signer;
+use rsa::pkcs1v15::SigningKey;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::signature::{SignatureEncoding, Signer};
+use rsa::RsaPrivateKey;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SerialNumber};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -101,12 +101,10 @@ fn generate_saml_key_material(
     valid_from: chrono::DateTime<Utc>,
     valid_until: chrono::DateTime<Utc>,
 ) -> Result<(String, String)> {
-    let rsa_key = Rsa::generate(2048)
+    let generated = crate::rsa_keys::GeneratedKey::generate()
         .map_err(|_| AppError::InternalServerError("Failed to generate SAML key".into()))?;
-    let key_pair_pem = PKey::from_rsa(rsa_key)
-        .and_then(|key| key.private_key_to_pem_pkcs8())
-        .map_err(|_| AppError::InternalServerError("Failed to encode SAML key".into()))?;
-    let private_key_pem = String::from_utf8(key_pair_pem)
+    let private_key_pem = generated
+        .private_key_pkcs8_pem()
         .map_err(|_| AppError::InternalServerError("Failed to encode SAML key".into()))?;
     let key_pair = KeyPair::from_pem(&private_key_pem)
         .map_err(|_| AppError::InternalServerError("Failed to load generated SAML key".into()))?;
@@ -944,13 +942,20 @@ fn sign_xml_element(
     private_key_pem: &str,
     public_cert_pem: &str,
 ) -> Result<String> {
-    let private_key = PKey::private_key_from_pem(private_key_pem.as_bytes()).map_err(|e| {
-        tracing::error!(
-            "Failed to parse private key. PEM preview: {}",
-            &private_key_pem.chars().take(100).collect::<String>()
-        );
-        AppError::InternalServerError(format!("Failed to parse private key: {}", e))
-    })?;
+    // Keys generated here are PKCS#8, and deployments predating that may hold
+    // PKCS#1, so both labels have to parse.
+    let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
+        .or_else(|_| {
+            use rsa::pkcs1::DecodeRsaPrivateKey;
+            RsaPrivateKey::from_pkcs1_pem(private_key_pem)
+        })
+        .map_err(|e| {
+            tracing::error!(
+                "Failed to parse private key. PEM preview: {}",
+                &private_key_pem.chars().take(100).collect::<String>()
+            );
+            AppError::InternalServerError(format!("Failed to parse private key: {}", e))
+        })?;
 
     // Canonicalize the XML element (basic C14N - remove extra whitespace, normalize)
     let canonical_xml = canonicalize_xml(xml_element)?;
@@ -1000,14 +1005,13 @@ fn sign_xml_element(
     // Canonicalize SignedInfo (use version with namespace)
     let canonical_signed_info = canonicalize_xml(&signed_info_for_signing)?;
 
-    let mut signer = Signer::new(MessageDigest::sha256(), &private_key)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to create signer: {}", e)))?;
-    signer
-        .update(canonical_signed_info.as_bytes())
-        .map_err(|e| AppError::InternalServerError(format!("Failed to update signer: {}", e)))?;
-    let signature = signer
-        .sign_to_vec()
-        .map_err(|e| AppError::InternalServerError(format!("Failed to sign XML: {}", e)))?;
+    // RSASSA-PKCS1-v1_5 over SHA-256, which is what the SignatureMethod above
+    // declares and what OpenSSL's `Signer` produced here.
+    let signing_key = SigningKey::<Sha256>::new(private_key);
+    let signature = signing_key
+        .try_sign(canonical_signed_info.as_bytes())
+        .map_err(|e| AppError::InternalServerError(format!("Failed to sign XML: {}", e)))?
+        .to_vec();
 
     let signature_b64 = BASE64.encode(signature);
 
@@ -3379,34 +3383,49 @@ mod tests {
         let (_, second_certificate) =
             generate_saml_key_material("Example Organization".to_string(), valid_from, valid_until)
                 .expect("generate second SAML certificate");
-        let private_key = openssl::pkey::PKey::private_key_from_pem(private_key.as_bytes())
-            .expect("parse private key");
-        let first = openssl::x509::X509::from_pem(first_certificate.as_bytes())
+        use rsa::pkcs8::DecodePrivateKey;
+        use rsa::pkcs8::EncodePublicKey;
+        use x509_cert::der::{DecodePem, Encode};
+
+        let private_key =
+            RsaPrivateKey::from_pkcs8_pem(&private_key).expect("parse private key");
+        let first = x509_cert::Certificate::from_pem(first_certificate.as_bytes())
             .expect("parse first certificate");
-        let second = openssl::x509::X509::from_pem(second_certificate.as_bytes())
+        let second = x509_cert::Certificate::from_pem(second_certificate.as_bytes())
             .expect("parse second certificate");
 
-        assert!(first
-            .public_key()
-            .expect("certificate public key")
-            .public_eq(&private_key));
+        // The certificate carries the public half of the key we generated with it.
+        let certificate_spki = first
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .expect("certificate public key");
+        let expected_spki = rsa::RsaPublicKey::from(&private_key)
+            .to_public_key_der()
+            .expect("public key of generated private key");
+        assert_eq!(certificate_spki, expected_spki.as_bytes());
+
         assert_ne!(
-            first.serial_number().to_bn().unwrap(),
-            second.serial_number().to_bn().unwrap()
+            first.tbs_certificate.serial_number.as_bytes(),
+            second.tbs_certificate.serial_number.as_bytes()
         );
         assert_eq!(
             first
-                .not_before()
-                .compare(&openssl::asn1::Asn1Time::from_unix(valid_from.timestamp()).unwrap())
-                .unwrap(),
-            std::cmp::Ordering::Equal
+                .tbs_certificate
+                .validity
+                .not_before
+                .to_unix_duration()
+                .as_secs(),
+            valid_from.timestamp() as u64
         );
         assert_eq!(
             first
-                .not_after()
-                .compare(&openssl::asn1::Asn1Time::from_unix(valid_until.timestamp()).unwrap())
-                .unwrap(),
-            std::cmp::Ordering::Equal
+                .tbs_certificate
+                .validity
+                .not_after
+                .to_unix_duration()
+                .as_secs(),
+            valid_until.timestamp() as u64
         );
     }
 

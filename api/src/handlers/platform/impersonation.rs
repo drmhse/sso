@@ -313,10 +313,10 @@ mod tests {
     use sea_orm::Database;
 
     fn jwt_service() -> JwtService {
-        let rsa = openssl::rsa::Rsa::generate(2048).expect("generate RSA key");
+        let rsa = crate::rsa_keys::GeneratedKey::generate().expect("generate RSA key");
         JwtService::new(
-            &STANDARD.encode(rsa.private_key_to_pem().expect("private PEM")),
-            &STANDARD.encode(rsa.public_key_to_pem().expect("public PEM")),
+            &STANDARD.encode(rsa.private_key_pem().expect("private PEM")),
+            &STANDARD.encode(rsa.public_key_pem().expect("public PEM")),
             24,
             "impersonation-test-key",
             "https://auth.example.com",

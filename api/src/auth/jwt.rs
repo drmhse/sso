@@ -946,9 +946,9 @@ mod tests {
     }
 
     fn generated_key_pair() -> (String, String) {
-        let rsa = openssl::rsa::Rsa::generate(2048).expect("generate test RSA key");
-        let private_key = rsa.private_key_to_pem().expect("private key PEM");
-        let public_key = rsa.public_key_to_pem().expect("public key PEM");
+        let rsa = crate::rsa_keys::GeneratedKey::generate().expect("generate test RSA key");
+        let private_key = rsa.private_key_pem().expect("private key PEM");
+        let public_key = rsa.public_key_pem().expect("public key PEM");
 
         (STANDARD.encode(private_key), STANDARD.encode(public_key))
     }

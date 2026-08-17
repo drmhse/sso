@@ -2,8 +2,8 @@ use bytes::buf::Chain;
 use bytes::Bytes;
 use digest::{Digest, OutputSizeUser};
 use generic_array::GenericArray;
-use openssl::pkey::{PKey, Public};
-use openssl::rsa::{Padding, Rsa};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::{Oaep, RsaPublicKey};
 use sha1::Sha1;
 use sha2::Sha256;
 
@@ -162,12 +162,13 @@ async fn encrypt_rsa<'s>(
 
     // client sends an RSA encrypted password
     let pkey = parse_rsa_pub_key(rsa_pub_key)?;
-    let mut encrypted = vec![0; pkey.size() as usize];
-    let len = pkey
-        .public_encrypt(&pass, &mut encrypted, Padding::PKCS1_OAEP)
-        .map_err(Error::protocol)?;
-    encrypted.truncate(len);
-    Ok(encrypted)
+
+    // OAEP with SHA-1 for both the digest and the MGF1 mask, which is what
+    // OpenSSL's `Padding::PKCS1_OAEP` defaults to and therefore what the server
+    // on the other end of this exchange expects.
+    let mut rng = rand::thread_rng();
+    pkey.encrypt(&mut rng, Oaep::new::<Sha1>(), &pass)
+        .map_err(Error::protocol)
 }
 
 // XOR(x, y)
@@ -189,14 +190,12 @@ fn to_asciz(s: &str) -> Vec<u8> {
 }
 
 // https://docs.rs/rsa/0.3.0/rsa/struct.RSAPublicKey.html?search=#example-1
-fn parse_rsa_pub_key(key: &[u8]) -> Result<Rsa<Public>, Error> {
+fn parse_rsa_pub_key(key: &[u8]) -> Result<RsaPublicKey, Error> {
     let pem = std::str::from_utf8(key).map_err(Error::protocol)?;
 
     // This takes advantage of the knowledge that we know
     // we are receiving a PKCS#8 RSA Public Key at all
     // times from MySQL
 
-    PKey::public_key_from_pem(pem.as_bytes())
-        .and_then(|key| key.rsa())
-        .map_err(Error::protocol)
+    RsaPublicKey::from_public_key_pem(pem).map_err(Error::protocol)
 }
