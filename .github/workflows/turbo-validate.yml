@@ -8,6 +8,11 @@ name: Validate shared dependency store
 
 on:
   workflow_dispatch:
+  # A dispatch can only be triggered from the default branch, so while this is
+  # being developed the branch itself triggers it.
+  push:
+    branches:
+      - ci/cargo-turbo
 
 permissions:
   contents: read
