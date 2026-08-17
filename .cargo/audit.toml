@@ -1,0 +1,27 @@
+# Advisories accepted for AuthOS, with the reasoning recorded here rather than as
+# a flag repeated across the release, security and npm-publish workflows.
+
+[advisories]
+ignore = [
+  # Marvin Attack: the `rsa` crate's private-key operations are not
+  # constant-time, so timing observable over the network may leak key material.
+  #
+  # Accepted rather than fixed because no fixed version exists: the advisory
+  # records `patched = []`, and the 0.10 line that carries the constant-time
+  # work is still a release candidate. The crate is also not ours alone to
+  # choose. It enters the tree three ways at once, through the API's own RSA
+  # use, the vendored sqlx-mysql, and webauthn-rs 0.6, so removing our own use
+  # would not remove the advisory.
+  #
+  # The exposed path is one: SAML response signing in api/src/handlers/saml.rs,
+  # which signs with a private key on a network-reachable request. The MySQL
+  # sha256_password handshake encrypts with the server's public key and the
+  # JWKS endpoint exports public material, neither of which the attack reaches,
+  # and the API performs no RSA decryption at all.
+  #
+  # OpenSSL, which this replaced, was originally affected by the same attack and
+  # has since mitigated it. The trade accepted here is that timing hardening was
+  # given up in exchange for a dependency that no longer compiles C on every
+  # build and whose artifacts can be cached. Revisit when `rsa` 0.10 is stable.
+  "RUSTSEC-2023-0071",
+]

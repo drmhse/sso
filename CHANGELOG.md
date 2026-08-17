@@ -7,6 +7,35 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.8 - 2026-08-17
+
+### Changed
+
+- The API no longer depends on OpenSSL. RSA key generation, the JWKS modulus
+  and exponent, SAML signing and the vendored sqlx-mysql password path all use
+  RustCrypto now, and webauthn-rs moved to a 0.6 prerelease for the same
+  reason. The encodings OpenSSL emitted are preserved, because existing
+  deployments have that PEM in their databases: PKCS#1 for the private key,
+  PKCS#8 alongside it, and SPKI for the public key. SAML still signs
+  RSASSA-PKCS1-v1_5 over SHA-256, and the MySQL handshake still encrypts with
+  RSA OAEP using SHA-1 for digest and MGF1, which is what the server expects.
+- Dropping it also makes release builds cacheable. OpenSSL was vendored and
+  compiled from C on every checkout, and its static archives bake their own
+  build directory into libcrypto.a and libssl.a, so no cache could reuse them.
+
+### Security
+
+- RUSTSEC-2023-0071 is accepted rather than fixed, and recorded in
+  `.cargo/audit.toml`. The `rsa` crate's private-key operations are not
+  constant-time, so timing observable over the network may leak key material,
+  and no fixed version exists: the advisory records no patched releases and the
+  constant-time work is still a release candidate. The exposed path is SAML
+  response signing; the MySQL handshake encrypts with the server's public key,
+  the JWKS endpoint exports public material, and the API performs no RSA
+  decryption. OpenSSL was originally affected by the same attack and has since
+  mitigated it, so this release trades that hardening for a dependency that no
+  longer compiles C on every build.
+
 ## 0.8.7 - 2026-08-17
 
 ### Changed
