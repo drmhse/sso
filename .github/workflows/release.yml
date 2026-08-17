@@ -321,6 +321,10 @@ jobs:
   build:
     name: Build ${{ matrix.backend }} ${{ matrix.arch }}
     needs: [qualify, prime]
+    # Priming is an optimisation, so a release must not hinge on it. Without this,
+    # a failed prime job would skip the whole matrix and stall the release; with
+    # it, the matrix runs anyway and simply compiles the dependencies itself.
+    if: ${{ !cancelled() && needs.qualify.result == 'success' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

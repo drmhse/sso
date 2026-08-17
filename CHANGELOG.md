@@ -7,6 +7,16 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.7 - 2026-08-17
+
+### Changed
+
+- Release builds compile the dependency set once per architecture instead of
+  once per image. A priming job runs alongside release qualification and hands
+  the third-party dependencies to the build matrix through a shared store, so
+  each of the six image builds starts with them already built. Measured on CI,
+  an image build goes from 556s and 404 crates compiled to 259s and 10.
+
 ## 0.8.6 - 2026-08-06
 
 ### Fixed

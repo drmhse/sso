@@ -81,7 +81,7 @@ test('trust gate rejects a stale AuthOS Compose pin', () => {
     const composePath = path.join(fixtureRoot, 'api/docker-compose.sqlite.yml');
     fs.writeFileSync(
       composePath,
-      fs.readFileSync(composePath, 'utf8').replace('sqlite-v0.8.6', 'sqlite-v0.8.5'),
+      fs.readFileSync(composePath, 'utf8').replace('sqlite-v0.8.7', 'sqlite-v0.8.6'),
     );
     assert.throws(
       () => check(fixtureRoot),
