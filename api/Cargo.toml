@@ -8,7 +8,7 @@ license = "AGPL-3.0-only"
 # Web framework
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "timeout", "set-header", "limit"] }
 tower_governor = "0.3"
 forwarded-header-value = "0.1"
