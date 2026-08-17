@@ -230,9 +230,97 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  prime:
+    name: Prime shared dependencies ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    # Deliberately not `needs: qualify`. GitHub scopes a cache to the ref that
+    # created it, so a tag-triggered release can never read the caches a branch
+    # build left behind: every build job in the matrix reports "No cache found."
+    # and compiles the whole dependency tree from scratch, six times over. This
+    # compiles it once per architecture instead, and it runs alongside
+    # qualification, which takes about nineteen minutes, so it is finished long
+    # before the matrix could have started and costs nothing in wall clock.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+          - arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-zigbuild
+          fallback: none
+
+      - name: Install cargo-turbo
+        run: cargo install cargo-turbo --locked --version 0.3.0
+
+      - name: Reduce the binaries to stubs
+        # Only the third-party dependencies are wanted here, and cargo compiles
+        # every dependency the enabled features declare whether or not the crate
+        # declaring them uses it. Building the real binaries as well would roughly
+        # double this job and push it past qualification's window, and their
+        # artifacts would be discarded anyway: the store never accepts a unit from
+        # a package that lives in this workspace.
+        working-directory: api
+        run: |
+          for stub in src/main.rs src/sso_sqlite.rs src/sso_psql.rs src/sso_mysql.rs; do
+            printf 'fn main() {}\n' > "${stub}"
+          done
+
+      - name: Compile the dependency set for every backend
+        working-directory: api
+        run: |
+          set -euo pipefail
+          while read -r feature binary; do
+            [ -n "${feature}" ] || continue
+            cargo zigbuild --release --locked \
+              --target ${{ matrix.rust_target }} \
+              --no-default-features --features "${feature}" \
+              --bin "${binary}"
+          done <<'BACKENDS'
+          db_sqlite sso_sqlite
+          db_psql sso_psql
+          db_mysql sso_mysql
+          BACKENDS
+
+      - name: Hand the dependencies to the shared store
+        # `--target` makes cargo write into two directories, one for the target and
+        # one for the proc macros and build scripts that run on this machine, so
+        # the flag has to be repeated here for both to be found.
+        working-directory: api
+        run: cargo turbo store zigbuild --release --target ${{ matrix.rust_target }}
+
+      - name: Report what was stored
+        run: cargo turbo status
+
+      - name: Save the shared dependency store
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/cargo-turbo
+          key: authos-turbo-${{ matrix.rust_target }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
+
   build:
     name: Build ${{ matrix.backend }} ${{ matrix.arch }}
-    needs: qualify
+    needs: [qualify, prime]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -306,6 +394,26 @@ jobs:
         with:
           tool: cargo-zigbuild
           fallback: none
+
+      - name: Restore the shared dependency store
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/cargo-turbo
+          key: authos-turbo-${{ matrix.rust_target }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            authos-turbo-${{ matrix.rust_target }}-${{ hashFiles('api/Cargo.lock') }}-
+
+      - name: Install cargo-turbo
+        run: cargo install cargo-turbo --locked --version 0.3.0
+
+      - name: Supply prebuilt dependencies
+        # Placed after the per-job Rust cache on purpose: it declines to touch a
+        # target directory cargo has already built in, so a cache hit still wins
+        # and this only fills a directory that would otherwise be empty. The build
+        # itself stays plain `cargo zigbuild` behind the existing npm script, which
+        # is why this is a step of its own rather than a wrapper around it.
+        working-directory: api
+        run: cargo turbo prepare zigbuild --release --target ${{ matrix.rust_target }}
 
       - name: Install UPX and binutils
         if: matrix.standalone

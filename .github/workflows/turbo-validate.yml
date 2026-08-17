@@ -1,0 +1,159 @@
+name: Validate shared dependency store
+
+# Proves the prime-to-build handoff the release workflow now depends on, without
+# publishing anything. Mirrors one architecture and one backend of the real
+# matrix, and reports what each half cost so the effect is measurable.
+#
+# Run it from the Actions tab when the release workflow's caching changes.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TARGET: x86_64-unknown-linux-musl
+  TURBO_VERSION: 0.3.0
+
+jobs:
+  prime:
+    name: Prime shared dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-zigbuild
+          fallback: none
+
+      - name: Install cargo-turbo
+        run: cargo install cargo-turbo --locked --version ${{ env.TURBO_VERSION }}
+
+      - name: Reduce the binaries to stubs
+        working-directory: api
+        run: |
+          for stub in src/main.rs src/sso_sqlite.rs src/sso_psql.rs src/sso_mysql.rs; do
+            printf 'fn main() {}\n' > "${stub}"
+          done
+
+      - name: Compile the dependency set for every backend
+        working-directory: api
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          while read -r feature binary; do
+            [ -n "${feature}" ] || continue
+            cargo zigbuild --release --locked \
+              --target "${RUST_TARGET}" \
+              --no-default-features --features "${feature}" \
+              --bin "${binary}"
+          done <<'BACKENDS'
+          db_sqlite sso_sqlite
+          db_psql sso_psql
+          db_mysql sso_mysql
+          BACKENDS
+          echo "PRIME: dependency compile took $(( $(date +%s) - start ))s"
+
+      - name: Hand the dependencies to the shared store
+        working-directory: api
+        run: cargo turbo store zigbuild --release --target "${RUST_TARGET}"
+
+      - name: Report what was stored
+        run: |
+          cargo turbo status
+          du -sh ~/.cache/cargo-turbo
+
+      - name: Save the shared dependency store
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/cargo-turbo
+          key: validate-turbo-${{ env.RUST_TARGET }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
+
+  build:
+    name: Build sqlite amd64 (${{ matrix.supplied && 'supplied' || 'from scratch' }})
+    needs: prime
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both halves of the comparison, side by side in one run: one job takes the
+        # primed dependencies and one deliberately does not.
+        supplied: [true, false]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-zigbuild
+          fallback: none
+
+      - name: Restore the shared dependency store
+        if: matrix.supplied
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/cargo-turbo
+          key: validate-turbo-${{ env.RUST_TARGET }}-${{ hashFiles('api/Cargo.lock') }}-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Install cargo-turbo
+        if: matrix.supplied
+        run: cargo install cargo-turbo --locked --version ${{ env.TURBO_VERSION }}
+
+      - name: Supply prebuilt dependencies
+        if: matrix.supplied
+        working-directory: api
+        run: cargo turbo prepare zigbuild --release --target "${RUST_TARGET}"
+
+      - name: Build the real binary
+        working-directory: api
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo zigbuild --release --locked \
+            --target "${RUST_TARGET}" \
+            --no-default-features --features db_sqlite \
+            --bin sso_sqlite 2>&1 | tee /tmp/build.log
+          echo "BUILD: took $(( $(date +%s) - start ))s"
+          echo "BUILD: crates compiled: $(grep -c Compiling /tmp/build.log || true)"
+
+      - name: Check the binary is real
+        working-directory: api
+        run: |
+          test -x "target/${RUST_TARGET}/release/sso_sqlite"
+          ls -l "target/${RUST_TARGET}/release/sso_sqlite"
+          file "target/${RUST_TARGET}/release/sso_sqlite"
