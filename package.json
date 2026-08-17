@@ -60,6 +60,7 @@
       "postcss": "$postcss",
       "sharp": "$sharp"
     },
+    "nanoid": "^3.3.18",
     "shell-quote": "1.8.4",
     "tsup": {
       "esbuild": "0.28.1"
