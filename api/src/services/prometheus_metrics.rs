@@ -392,3 +392,51 @@ pub async fn metrics_updater_task(db: DatabaseConnection) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{users::UserStore, DB};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    #[tokio::test]
+    async fn metric_updates_run_clean_queries_against_live_tables() {
+        let db = db().await;
+        UserStore::create(DB::Conn(&db), "metrics-user@example.test", None, false)
+            .await
+            .expect("create user");
+
+        let service = PrometheusMetricsService::new(db.clone());
+        service.update_active_users().await.expect("active users");
+        service
+            .update_organizations_count()
+            .await
+            .expect("org count");
+        service.update_job_queue_depth().await.expect("queue depth");
+        service.update_db_pool_metrics();
+        service.update_mfa_adoption().await.expect("mfa adoption");
+    }
+
+    #[test]
+    fn labeled_recorders_accept_every_metric_shorthand() {
+        PrometheusMetricsService::record_login_failure("bad_password");
+        PrometheusMetricsService::record_webhook_delivery(0.42);
+        PrometheusMetricsService::record_token_issued();
+        PrometheusMetricsService::record_mfa_challenge();
+        PrometheusMetricsService::record_api_request("/api/user", "GET", 200);
+        PrometheusMetricsService::record_api_error("/api/user", "db");
+        PrometheusMetricsService::record_auth_attempt("password", "success");
+        PrometheusMetricsService::record_siem_delivery(true);
+        PrometheusMetricsService::record_siem_delivery_failure("splunk");
+        PrometheusMetricsService::record_job_processing("send_email", 0.1);
+    }
+}
