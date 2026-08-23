@@ -1430,3 +1430,121 @@ mod service_principal_tenant_status_tests {
             .expect("suspended org denied"));
     }
 }
+
+#[cfg(test)]
+mod rate_limiter_tests {
+    use super::*;
+    use std::net::IpAddr;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn email_rate_limiter_blocks_at_the_cap_and_partitions_by_tenant() {
+        let limiter = EmailRateLimiter::new(3);
+
+        for _ in 0..3 {
+            assert!(
+                !limiter.is_rate_limited_email("user@example.test").await,
+                "under the cap"
+            );
+        }
+        assert!(
+            limiter.is_rate_limited_email("user@example.test").await,
+            "the next attempt over the cap is blocked"
+        );
+
+        // Case-insensitive: the same mailbox in another case shares the bucket.
+        assert!(
+            limiter.is_rate_limited_email("USER@EXAMPLE.TEST").await,
+            "case variants share a bucket"
+        );
+
+        // A different tenant's identical address has its own budget.
+        assert!(
+            !limiter
+                .is_rate_limited_email_with_context("user@example.test", Some("org-1"))
+                .await
+        );
+        // And so does a different address in the same tenant.
+        assert!(
+            !limiter
+                .is_rate_limited_email_with_context("other@example.test", Some("org-1"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn mfa_ip_limiter_blocks_after_the_window_budget() {
+        let limiter = MfaRateLimiter::new(2, Duration::from_secs(60));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+
+        assert!(!limiter.is_rate_limited_ip(ip).await);
+        assert!(!limiter.is_rate_limited_ip(ip).await);
+        assert!(
+            limiter.is_rate_limited_ip(ip).await,
+            "third attempt blocked"
+        );
+
+        let other: IpAddr = "203.0.113.10".parse().unwrap();
+        assert!(
+            !limiter.is_rate_limited_ip(other).await,
+            "other IPs unaffected"
+        );
+    }
+
+    #[tokio::test]
+    async fn mfa_user_limiter_partitions_by_tenant() {
+        let limiter = MfaRateLimiter::new(1, Duration::from_secs(60));
+
+        assert!(!limiter.is_rate_limited_user("user-1").await);
+        assert!(limiter.is_rate_limited_user("user-1").await);
+
+        // Tenant-partitioned key gets its own budget.
+        assert!(
+            !limiter
+                .is_rate_limited_user_with_context("user-1", Some("acme"))
+                .await
+        );
+        assert!(
+            limiter
+                .is_rate_limited_user_with_context("user-1", Some("acme"))
+                .await
+        );
+    }
+
+    #[test]
+    fn email_validation_rejects_the_classic_garbage() {
+        for bad in [
+            "",
+            "no-at-sign",
+            ".starts-with-dot@example.test",
+            "double..dot@example.test",
+        ] {
+            assert!(
+                validate_email_format_static(bad).is_err(),
+                "{bad} must fail"
+            );
+        }
+        // Known gap, pinned deliberately: the leading/trailing dot check runs
+        // against the WHOLE address, so a local part ending in a dot before
+        // the @ slips through (`user.@example.test` is accepted). A future
+        // fix should split at the @ first; flipping this assertion then.
+        assert!(
+            validate_email_format_static("ends-with-dot.@example.test").is_ok(),
+            "documents the whole-string dot check"
+        );
+        assert!(validate_email_format_static("good@example.test").is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_clears_stale_buckets_without_error() {
+        let limiter = EmailRateLimiter::new(1);
+        let _ = limiter.is_rate_limited_email("x@example.test").await;
+        limiter.cleanup().await;
+
+        let mfa = MfaRateLimiter::new(1, Duration::from_secs(60));
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let _ = mfa.is_rate_limited_ip(ip).await;
+        let _ = mfa.is_rate_limited_user("u").await;
+        mfa.cleanup().await;
+    }
+}
