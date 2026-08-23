@@ -321,3 +321,255 @@ mod secret_validation_tests {
         .expect("complete confidential OAuth credentials");
     }
 }
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::middleware::AuthUser;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{
+        memberships::MembershipStore,
+        organizations::OrganizationStore,
+        users::{UserCreationOptions, UserStore},
+        DB,
+    };
+    use axum::extract::Path;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = GeneratedKey::generate().expect("rsa");
+        JwtService::new(
+            &STANDARD.encode(rsa.private_key_pem().expect("pem")),
+            &STANDARD.encode(rsa.public_key_pem().expect("pem")),
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("jwt")
+    }
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        member: AuthUser,
+        org_slug: String,
+    }
+
+    async fn fixture() -> Fixture {
+        // The settings handlers build the encryption service from the
+        // environment; provide a deterministic test key for the duration.
+        unsafe { std::env::set_var("ENCRYPTION_KEY", "11".repeat(32)) };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = Config {
+            database_url: "sqlite::memory:".to_string(),
+            ..test_config_values()
+        };
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "settings-owner@example.test",
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("owner")
+        .0;
+        let member_model =
+            UserStore::create(DB::Conn(&db), "settings-member@example.test", None, false)
+                .await
+                .expect("member");
+
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &owner_model.id,
+            None,
+        )
+        .await
+        .expect("org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate");
+        MembershipStore::create(DB::Conn(&db), &org.id, &member_model.id, "member")
+            .await
+            .expect("membership");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("oauth")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("risk")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = jwt_service
+                .create_token(
+                    &user.id,
+                    &user.email,
+                    user.is_platform_owner,
+                    Some("acme"),
+                    None,
+                )
+                .expect("token");
+            AuthUser {
+                claims: jwt_service.validate_token(&token).expect("claims"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "settings-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        Fixture {
+            state,
+            owner: auth_user_for(&owner_model),
+            member: auth_user_for(&member_model),
+            org_slug: org.slug,
+        }
+    }
+
+    fn test_config_values() -> Config {
+        // Placeholder kept for parity with other fixtures.
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn members_cannot_touch_org_settings() {
+        let f = fixture().await;
+        match get_org_oauth_credentials(
+            State(f.state.clone()),
+            f.member.clone(),
+            Path((f.org_slug.clone(), "github".to_string())),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_credentials_reject_unknown_providers_and_round_trip() {
+        unsafe { std::env::remove_var("ENCRYPTION_KEY") };
+        let f = fixture().await;
+
+        match set_org_oauth_credentials(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "aol".to_string())),
+            Json(SetOAuthCredentialsRequest {
+                client_id: "cid".to_string(),
+                client_secret: "secret".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("Invalid provider")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        let Json(set) = set_org_oauth_credentials(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "github".to_string())),
+            Json(SetOAuthCredentialsRequest {
+                client_id: "cid-123".to_string(),
+                client_secret: "secret-123".to_string(),
+            }),
+        )
+        .await
+        .expect("set credentials");
+        assert_eq!(set.client_id, "cid-123");
+
+        let Json(fetched) = get_org_oauth_credentials(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "github".to_string())),
+        )
+        .await
+        .expect("get credentials");
+        assert_eq!(fetched.client_id, "cid-123");
+        assert!(fetched.has_secret, "a secret is stored but never returned");
+    }
+}
