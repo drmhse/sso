@@ -484,7 +484,7 @@ mod token_storage_tests {
 mod tests {
     use super::*;
     use crate::auth::jwt::JwtService;
-    use crate::auth::sso::{OAuthClient, Provider};
+    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::config::Config;
     use crate::entities::users;
