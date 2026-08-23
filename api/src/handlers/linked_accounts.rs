@@ -1129,7 +1129,6 @@ mod tests {
     use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::config::Config;
-    use crate::entities::users;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
         audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
