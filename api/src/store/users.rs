@@ -987,8 +987,8 @@ mod store_user_tests {
     use crate::entities::users;
     use crate::store::identities::IdentityStore;
     use migration::{Migrator, MigratorTrait};
-    use sea_orm::DatabaseConnection;
     use sea_orm::Database;
+    use sea_orm::DatabaseConnection;
 
     async fn db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:")

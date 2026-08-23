@@ -556,3 +556,125 @@ mod tests {
         assert!(!counts.contains_key(&org_3.id));
     }
 }
+
+#[cfg(test)]
+mod store_service_tests {
+    use super::*;
+    use crate::store::organizations::OrganizationStore;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{Database, DatabaseConnection};
+    use uuid::Uuid;
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    async fn make_service(db: &DatabaseConnection, slug: &str) -> services::Model {
+        let service_id = Uuid::new_v4().to_string();
+        let owner = crate::store::users::UserStore::create(
+            DB::Conn(db),
+            &format!("{slug}-o@example.test"),
+            None,
+            false,
+        )
+        .await
+        .expect("create owner");
+        let (org, _) =
+            OrganizationStore::create_with_owner(DB::Conn(db), slug, slug, &owner.id, None)
+                .await
+                .expect("create org");
+        ServiceStore::create_with_options(
+            DB::Conn(db),
+            &service_id,
+            &org.id,
+            slug,
+            slug,
+            "web",
+            &Uuid::new_v4().to_string(),
+            "hash",
+            None,
+            None,
+            None,
+            Some(r#"["https://app.example.test/cb"]"#),
+            None,
+            None,
+        )
+        .await
+        .expect("create service")
+    }
+
+    #[tokio::test]
+    async fn origin_allowlisting_accepts_registered_and_refuses_unknowns() {
+        let db = db().await;
+        make_service(&db, "origin-portal").await;
+
+        // Origins are compared scheme+host only; paths are irrelevant.
+        assert!(
+            ServiceStore::is_origin_allowed(DB::Conn(&db), "https://app.example.test")
+                .await
+                .unwrap(),
+            "a registered redirect origin must be allowed"
+        );
+        assert!(
+            !ServiceStore::is_origin_allowed(DB::Conn(&db), "https://evil.example.test")
+                .await
+                .unwrap(),
+            "an unregistered origin must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookups_slugs_counts_and_updates_round_trip() {
+        let db = db().await;
+        let service = make_service(&db, "lookup-portal").await;
+
+        // Multi-slug lookup.
+        let found = ServiceStore::find_by_org_and_slugs(
+            DB::Conn(&db),
+            &service.org_id,
+            &["missing".to_string(), service.slug.clone()],
+        )
+        .await
+        .expect("find by slugs");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].slug, service.slug);
+
+        // Slug-pair lookup.
+        let by_pair = ServiceStore::find_by_org_slug_and_service_slug(
+            DB::Conn(&db),
+            "lookup-portal",
+            &service.slug,
+        )
+        .await
+        .expect("find by slug pair")
+        .expect("service found via org+slug");
+        assert_eq!(by_pair.id, service.id);
+
+        // Redirect URI update.
+        let updated = ServiceStore::update_redirect_uris(
+            DB::Conn(&db),
+            &service.id,
+            Some(r#"["https://new.example.test/cb"]"#),
+        )
+        .await
+        .expect("update redirect uris");
+        assert!(updated.redirect_uris.unwrap().contains("new.example.test"));
+
+        assert!(ServiceStore::count_all(DB::Conn(&db)).await.unwrap() >= 1);
+
+        ServiceStore::delete(DB::Conn(&db), &service.id)
+            .await
+            .expect("delete service");
+        match ServiceStore::find_by_id(DB::Conn(&db), &service.id)
+            .await
+            .unwrap()
+        {
+            None => {}
+            Some(_) => panic!("deleted service still present"),
+        }
+    }
+}
