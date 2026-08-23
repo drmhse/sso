@@ -1600,3 +1600,263 @@ pub async fn trust_device(
 fn validate_email_format(email: &str) -> Result<()> {
     crate::middleware::validate_email_format_static(email)
 }
+
+#[cfg(test)]
+mod password_route_tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::middleware::AuthUser;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{users::UserStore, DB};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    struct Fixture {
+        state: AppState,
+        // OAuth-only user (no password hash).
+        oauth_user: AuthUser,
+        // Password user.
+        pw_user: AuthUser,
+        current_password: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new({
+            let rsa = GeneratedKey::generate().expect("rsa");
+            JwtService::new(
+                &STANDARD.encode(rsa.private_key_pem().expect("pem")),
+                &STANDARD.encode(rsa.public_key_pem().expect("pem")),
+                config.jwt_expiration_hours,
+                "test-key",
+                &config.base_url,
+            )
+            .expect("jwt")
+        });
+
+        let oauth_model = UserStore::create(DB::Conn(&db), "oauth-only@example.test", None, false)
+            .await
+            .expect("create oauth user");
+
+        let pw_model = UserStore::create(DB::Conn(&db), "pw-user@example.test", None, false)
+            .await
+            .expect("create pw user");
+        let current_password = "correct-horse-1".to_string();
+        let hashed = crate::services::concurrency::hash_password_bounded(current_password.clone())
+            .await
+            .expect("hash");
+        UserStore::update_password_hash(DB::Conn(&db), &pw_model.id, &hashed)
+            .await
+            .expect("set initial password");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("oauth")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("risk")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("token");
+            AuthUser {
+                claims: jwt_service.validate_token(&token).expect("claims"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "password-test".to_string(),
+                current_session_id: None,
+            }
+        };
+
+        Fixture {
+            state,
+            oauth_user: auth_user_for(&oauth_model),
+            pw_user: auth_user_for(&pw_model),
+            current_password,
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_requests_are_refused() {
+        let f = fixture().await;
+        match get_user(State(f.state.clone()), None).await {
+            Err(AppError::Unauthorized(_)) => {}
+            other => panic!("expected unauthorized, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_password_rejects_weak_and_duplicate_passwords() {
+        let f = fixture().await;
+
+        // Too short.
+        match set_password(
+            State(f.state.clone()),
+            Some(axum::Extension(f.oauth_user.clone())),
+            Json(SetPasswordRequest {
+                new_password: "short".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("8 characters")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Happy path sets the first password.
+        set_password(
+            State(f.state.clone()),
+            Some(axum::Extension(f.oauth_user.clone())),
+            Json(SetPasswordRequest {
+                new_password: "long-enough-1".to_string(),
+            }),
+        )
+        .await
+        .expect("first set");
+
+        // Setting again is refused in favour of change-password.
+        match set_password(
+            State(f.state.clone()),
+            Some(axum::Extension(f.oauth_user.clone())),
+            Json(SetPasswordRequest {
+                new_password: "another-pass-9".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("already set")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn change_password_verifies_the_current_password() {
+        let f = fixture().await;
+
+        // Wrong current password.
+        match change_password(
+            State(f.state.clone()),
+            Some(axum::Extension(f.pw_user.clone())),
+            Json(ChangePasswordRequest {
+                current_password: "wrong-password".to_string(),
+                new_password: "brand-new-pw-1".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::Unauthorized(_)) => {}
+            other => panic!("expected unauthorized, got {other:?}"),
+        }
+
+        // OAuth-only account has nothing to change.
+        match change_password(
+            State(f.state.clone()),
+            Some(axum::Extension(f.oauth_user.clone())),
+            Json(ChangePasswordRequest {
+                current_password: "whatever".to_string(),
+                new_password: "brand-new-pw-1".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("OAuth-only"))
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Correct flow succeeds and accepts the new credential.
+        let Json(response) = change_password(
+            State(f.state.clone()),
+            Some(axum::Extension(f.pw_user.clone())),
+            Json(ChangePasswordRequest {
+                current_password: f.current_password.clone(),
+                new_password: "brand-new-pw-1".to_string(),
+            }),
+        )
+        .await
+        .expect("change password");
+        assert!(response.message.contains("successfully"));
+    }
+}
