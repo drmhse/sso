@@ -438,3 +438,122 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    // Every test here shares one process env (`STRIPE_WEBHOOK_TEST_MODE`) and
+    // cargo runs test functions in parallel, so they are folded into one
+    // serial body rather than racing each other over the variable.
+    #[test]
+    fn webhook_verification_behaves_across_modes_and_attacks() {
+        let provider = provider();
+        let payload = serde_json::json!({
+            "type": "checkout.session.completed",
+            "data": {"object": {"customer": "cus_123", "subscription": "sub_456"}}
+        })
+        .to_string();
+
+        // 1. Missing header.
+        match provider.verify_webhook(&HeaderMap::new(), &Bytes::from("{}")) {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("stripe-signature")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // 2. Expired timestamp outside the tolerance window.
+        let stale = Utc::now().timestamp() - STRIPE_WEBHOOK_TOLERANCE_SECONDS - 10;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "stripe-signature",
+            format!("t={stale},v1=deadbeef").parse().unwrap(),
+        );
+        match provider.verify_webhook(&headers, &Bytes::from("{}")) {
+            Err(AppError::Billing(message)) => assert!(message.contains("tolerance")),
+            other => panic!("expected tolerance failure, got {other:?}"),
+        }
+
+        // 3. Tampered payload under a different secret.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "stripe-signature",
+            signed_header("whsec_test", Utc::now().timestamp(), &payload)
+                .parse()
+                .unwrap(),
+        );
+        let attacker = StripeProvider::new("sk".to_string(), "whsec_evil".to_string());
+        match attacker.verify_webhook(&headers, &Bytes::from(payload.clone())) {
+            Err(AppError::Billing(message)) => assert!(message.contains("invalid signature")),
+            other => panic!("expected invalid signature, got {other:?}"),
+        }
+
+        // 4. Valid signature parses into the right event.
+        let event = provider
+            .verify_webhook(&headers, &Bytes::from(payload.clone()))
+            .expect("verify webhook");
+        match event {
+            BillingEvent::CheckoutCompleted {
+                external_customer_id,
+                external_subscription_id,
+            } => {
+                assert_eq!(external_customer_id.as_deref(), Some("cus_123"));
+                assert_eq!(external_subscription_id.as_deref(), Some("sub_456"));
+            }
+            other => panic!("expected CheckoutCompleted, got {other:?}"),
+        }
+
+        // 5. Unknown event types map to Unhandled.
+        match provider.parse_stripe_event(serde_json::json!({
+            "type": "something.exotic",
+            "data": {"object": {}}
+        })) {
+            BillingEvent::Unhandled { event_type } => assert_eq!(event_type, "something.exotic"),
+            other => panic!("expected Unhandled, got {other:?}"),
+        }
+
+        // 6. Test mode skips verification but still demands the header, and
+        // must clean up after itself for the sibling assertions above.
+        unsafe { std::env::set_var("STRIPE_WEBHOOK_TEST_MODE", "true") };
+        let test_payload = r#"{"type": "invoice.payment_failed", "data": {"object": {"customer": "cus_1", "attempt_count": 2}}}"#;
+        let mut garbage = HeaderMap::new();
+        garbage.insert("stripe-signature", "garbage".parse().unwrap());
+        let event = provider
+            .verify_webhook(&garbage, &Bytes::from(test_payload.to_string()))
+            .expect("test-mode parse");
+        match event {
+            BillingEvent::PaymentFailed { attempt_count, .. } => assert_eq!(attempt_count, 2),
+            other => panic!("expected PaymentFailed, got {other:?}"),
+        }
+        match provider.verify_webhook(&HeaderMap::new(), &Bytes::from(test_payload.to_string())) {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        unsafe { std::env::remove_var("STRIPE_WEBHOOK_TEST_MODE") };
+
+        // Re-run assertion 3 now that the env is clean, proving cleanup.
+        match attacker.verify_webhook(&headers, &Bytes::from(payload)) {
+            Err(AppError::Billing(message)) => assert!(message.contains("invalid signature")),
+            other => panic!("expected invalid signature after cleanup, got {other:?}"),
+        }
+    }
+
+    fn signed_header(secret: &str, timestamp: i64, payload: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{timestamp}.{payload}").as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+        format!("t={timestamp},v1={signature}")
+    }
+
+    fn provider() -> StripeProvider {
+        StripeProvider::new("sk_test_key".to_string(), "whsec_test".to_string())
+    }
+
+    #[test]
+    fn constant_time_comparison_behaves_like_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+}

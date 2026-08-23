@@ -503,3 +503,124 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    const SECRET: &str = "whsec_dGVzdGluZy0xMjM0NTY3ODkwYWJjZGVm";
+
+    fn svix_headers(payload: &str, secret: &str) -> HeaderMap {
+        let timestamp = chrono::Utc::now().timestamp();
+        let id = "msg_test";
+        let signed_content = format!("{id}.{timestamp}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(
+            BASE64
+                .decode(secret.trim_start_matches("whsec_"))
+                .expect("decode test secret")
+                .as_slice(),
+        )
+        .unwrap();
+        mac.update(signed_content.as_bytes());
+        let signature = BASE64.encode(mac.finalize().into_bytes());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("svix-id", id.parse().unwrap());
+        headers.insert("svix-timestamp", timestamp.to_string().parse().unwrap());
+        headers.insert("svix-signature", format!("v1,{signature}").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn missing_headers_are_rejected_individually() {
+        let provider = PolarProvider::new("key".to_string(), SECRET.to_string());
+        let body = Bytes::from(r#"{"type": "subscription.created"}"#);
+
+        for headers in [
+            HeaderMap::new(),
+            {
+                let mut h = HeaderMap::new();
+                h.insert("svix-id", "msg".parse().unwrap());
+                h
+            },
+            {
+                let mut h = HeaderMap::new();
+                h.insert("svix-id", "msg".parse().unwrap());
+                h.insert("svix-timestamp", "123".parse().unwrap());
+                h
+            },
+        ] {
+            match provider.verify_webhook(&headers, &body) {
+                Err(AppError::BadRequest(message)) => assert!(message.contains("svix")),
+                other => panic!("expected BadRequest about missing header, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn stale_timestamps_fail_the_tolerance_window() {
+        let provider = PolarProvider::new("key".to_string(), SECRET.to_string());
+        let payload = r#"{"type": "subscription.created"}"#;
+        let mut headers = svix_headers(payload, SECRET);
+        headers.insert(
+            "svix-timestamp",
+            (chrono::Utc::now().timestamp() - 301)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        match provider.verify_webhook(&headers, &Bytes::from(payload)) {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("tolerance")),
+            other => panic!("expected tolerance failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampered_payloads_fail_verification() {
+        let provider = PolarProvider::new("key".to_string(), SECRET.to_string());
+        let mut headers = svix_headers(r#"{"type":"x"}"#, SECRET);
+        headers.insert("svix-signature", "v1,AAAA".parse().unwrap());
+        match provider.verify_webhook(&headers, &Bytes::from(r#"{"type":"subscription.created"}"#))
+        {
+            Err(AppError::Billing(message)) => assert!(message.contains("verification failed")),
+            other => panic!("expected verification failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_signatures_parse_subscription_events() {
+        let provider = PolarProvider::new("key".to_string(), SECRET.to_string());
+        let payload = serde_json::json!({
+            "type": "subscription.created",
+            "data": {
+                "id": "sub_1",
+                "customer_id": "cus_1",
+                "status": "active",
+                "current_period_end": "2030-01-01T00:00:00Z"
+            }
+        })
+        .to_string();
+
+        let event = provider
+            .verify_webhook(&svix_headers(&payload, SECRET), &Bytes::from(payload))
+            .expect("verify webhook");
+        // Both created and updated map through the same normalizer, which
+        // emits SubscriptionUpdated carrying the status.
+        match event {
+            BillingEvent::SubscriptionUpdated {
+                external_customer_id,
+                status,
+                current_period_end,
+                ..
+            } => {
+                assert_eq!(external_customer_id, "cus_1");
+                assert_eq!(status, SubscriptionStatus::Active);
+                assert_eq!(current_period_end.to_rfc3339(), "2030-01-01T00:00:00+00:00");
+            }
+            other => panic!("expected SubscriptionUpdated, got {other:?}"),
+        }
+    }
+}
