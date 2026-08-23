@@ -206,3 +206,106 @@ impl CleanupResults {
         self.errors > 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{prelude::Users, users};
+    use chrono::Duration;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    /// Soft-deletes a user with a chosen deletion timestamp.
+    async fn soft_delete_at(db: &DatabaseConnection, user_id: &str, when: chrono::DateTime<Utc>) {
+        let user = Users::find_by_id(user_id)
+            .one(db)
+            .await
+            .expect("find user")
+            .expect("user exists");
+        let mut active: users::ActiveModel = user.into();
+        active.deleted_at = Set(Some(when.naive_utc()));
+        active.update(db).await.expect("soft delete");
+    }
+
+    #[tokio::test]
+    async fn run_once_reports_an_empty_queue() {
+        let db = db().await;
+        let job = UserCleanupJob::new(db.clone());
+
+        let results = job.run_once().await.expect("run once");
+        assert_eq!(results.users_found, 0);
+        assert_eq!(results.successfully_deleted, 0);
+        assert!(results.success_rate() == 1.0);
+        assert!(!results.has_errors());
+    }
+
+    #[tokio::test]
+    async fn only_users_soft_deleted_beyond_thirty_days_are_purged() {
+        let db = db().await;
+        let ancient = UserStore::create(DB::Conn(&db), "ancient@example.test", None, false)
+            .await
+            .expect("create ancient");
+        let recent = UserStore::create(DB::Conn(&db), "recent@example.test", None, false)
+            .await
+            .expect("create recent");
+        let live = UserStore::create(DB::Conn(&db), "live@example.test", None, false)
+            .await
+            .expect("create live");
+
+        // Deleted 31 days ago: purged. Deleted 1 day ago: retained.
+        soft_delete_at(&db, &ancient.id, Utc::now() - Duration::days(31)).await;
+        soft_delete_at(&db, &recent.id, Utc::now() - Duration::days(1)).await;
+
+        let job = UserCleanupJob::new(db.clone());
+        let results = job.run_once().await.expect("run once");
+
+        assert_eq!(
+            results.users_found, 1,
+            "only the ancient deletion qualifies"
+        );
+        assert_eq!(results.successfully_deleted, 1);
+        assert!(!results.has_errors());
+
+        assert!(
+            Users::find_by_id(&ancient.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "the GDPR-purged user must be gone entirely"
+        );
+        assert!(Users::find_by_id(&recent.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(Users::find_by_id(&live.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some());
+
+        // A second pass is a no-op.
+        let again = job.run_once().await.expect("second run");
+        assert_eq!(again.users_found, 0);
+    }
+
+    #[tokio::test]
+    async fn success_rate_reflects_partial_failure_arithmetic() {
+        let results = CleanupResults {
+            users_found: 4,
+            successfully_deleted: 3,
+            errors: 1,
+        };
+        assert_eq!(results.success_rate(), 0.75);
+        assert!(results.has_errors());
+    }
+}
