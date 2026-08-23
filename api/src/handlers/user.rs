@@ -1785,7 +1785,7 @@ mod password_route_tests {
         }
 
         // Happy path sets the first password.
-        set_password(
+        let _ = set_password(
             State(f.state.clone()),
             Some(axum::Extension(f.oauth_user.clone())),
             Json(SetPasswordRequest {
