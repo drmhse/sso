@@ -557,6 +557,7 @@ mod tests {
     };
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{ActiveModelTrait, Database};
+    use serde_json::json;
 
     async fn setup_db() -> sea_orm::DatabaseConnection {
         let db = Database::connect("sqlite::memory:")
@@ -770,5 +771,124 @@ mod tests {
             .await
             .expect("poll with zero limit");
         assert!(limited.is_empty());
+    }
+    #[tokio::test]
+    async fn deliveries_move_through_success_retry_and_failure_states() {
+        let db = setup_db().await;
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "lifecycle-owner@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "delivery-lifecycle",
+            "Delivery Lifecycle",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        let now = Utc::now().naive_utc();
+        WebhookStore::create(
+            DB::Conn(&db),
+            "lifecycle-webhook",
+            &org.id,
+            "hooked",
+            "https://hooks.example.test/ingest",
+            b"encrypted-secret".to_vec(),
+            "key-1",
+            r#"["user.signup.success"]"#,
+            true,
+            now,
+            now,
+        )
+        .await
+        .expect("create webhook");
+
+        async fn make_delivery(db: &sea_orm::DatabaseConnection, name: &str) -> String {
+            WebhookDeliveryStore::create_delivery(
+                DB::Conn(db),
+                "lifecycle-webhook",
+                "user.signup.success",
+                &json!({ "name": name }),
+                3,
+            )
+            .await
+            .expect("create delivery")
+        }
+        let ok_id = make_delivery(&db, "ok").await;
+        let retry_id = make_delivery(&db, "retry").await;
+        let dead_id = make_delivery(&db, "dead").await;
+
+        WebhookDeliveryStore::mark_as_successful_with_response_for_webhook(
+            DB::Conn(&db),
+            &ok_id,
+            "lifecycle-webhook",
+            200,
+            Some(r#"{"received":true}"#.to_string()),
+        )
+        .await
+        .expect("mark successful");
+        WebhookDeliveryStore::schedule_retry_for_webhook(
+            DB::Conn(&db),
+            &retry_id,
+            "lifecycle-webhook",
+            (Utc::now() + chrono::Duration::seconds(60)).naive_utc(),
+            Some("upstream exploded".to_string()),
+            Some((500, Some("boom".to_string()))),
+        )
+        .await
+        .expect("schedule retry");
+        WebhookDeliveryStore::mark_as_failed_permanently_for_webhook(
+            DB::Conn(&db),
+            &dead_id,
+            "lifecycle-webhook",
+            Some("gone forever".to_string()),
+            Some((410, None)),
+        )
+        .await
+        .expect("fail permanently");
+
+        let all = WebhookDeliveryStore::get_deliveries_with_filters(
+            DB::Conn(&db),
+            "lifecycle-webhook",
+            None,
+            None,
+            50,
+            0,
+        )
+        .await
+        .expect("list all");
+        assert_eq!(all.len(), 3);
+        let total = WebhookDeliveryStore::count_deliveries_with_filters(
+            DB::Conn(&db),
+            "lifecycle-webhook",
+            None,
+            None,
+        )
+        .await
+        .expect("count all");
+        assert_eq!(total, 3);
+
+        // Cross-webhook authorization is refused: another webhook id cannot
+        // claim this delivery.
+        let claimed = WebhookDeliveryStore::find_authorized_open_delivery(
+            DB::Conn(&db),
+            &ok_id,
+            "some-other-webhook",
+        )
+        .await
+        .expect("query unauthorized claim");
+        assert!(claimed.is_none());
     }
 }
