@@ -119,3 +119,40 @@ pub async fn refresh_google_token(
         expires_at: Some(expires_at),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refreshers run through the SSRF-hardened client, so a loopback or
+    /// private token endpoint is refused before any request leaves.
+    #[tokio::test]
+    async fn loopback_token_endpoints_are_blocked_by_the_ssrf_guard() {
+        for url in [
+            "http://127.0.0.1:8080/token",
+            "http://10.0.0.3/token",
+            "http://[::1]/token",
+        ] {
+            match refresh_google_token("rt", "cid", "csecret", Some(url)).await {
+                Err(message) => {
+                    let text = message.to_string();
+                    assert!(
+                        text.contains("private") || text.contains("forbidden"),
+                        "{url}: {text}"
+                    );
+                }
+                Ok(_) => panic!("{url} must be blocked"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn microsoft_refresh_reports_unreachable_authorities_as_errors() {
+        // The Microsoft authority is hard-coded; the contract under test is
+        // that failures surface as errors rather than panics.
+        match refresh_microsoft_token("rt", "cid", "csecret").await {
+            Err(_) => {}
+            Ok(token) => panic!("unexpected success: {token:?}"),
+        }
+    }
+}

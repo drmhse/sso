@@ -511,13 +511,9 @@ mod tests {
         let plain_model = UserStore::create(DB::Conn(&db), "plain@example.test", None, false)
             .await
             .expect("create plain user");
-        let _ = MembershipStore::create(
-            DB::Conn(&db),
-            "org-placeholder",
-            &plain_model.id,
-            "member",
-        )
-        .await;
+        let _ =
+            MembershipStore::create(DB::Conn(&db), "org-placeholder", &plain_model.id, "member")
+                .await;
 
         let state = AppState {
             db: db.clone(),

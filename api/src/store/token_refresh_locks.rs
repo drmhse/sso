@@ -55,3 +55,77 @@ impl TokenRefreshLockStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn locks_are_exclusive_until_released() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        assert!(
+            TokenRefreshLockStore::acquire_lock(DB::Conn(&db), "user-1", 60)
+                .await
+                .unwrap(),
+            "first acquisition wins"
+        );
+        assert!(
+            !TokenRefreshLockStore::acquire_lock(DB::Conn(&db), "user-1", 60)
+                .await
+                .unwrap(),
+            "a second concurrent acquisition must lose"
+        );
+
+        // A different user is unaffected.
+        assert!(
+            TokenRefreshLockStore::acquire_lock(DB::Conn(&db), "user-2", 60)
+                .await
+                .unwrap()
+        );
+
+        TokenRefreshLockStore::release_lock(DB::Conn(&db), "user-1")
+            .await
+            .expect("release");
+        assert!(
+            TokenRefreshLockStore::acquire_lock(DB::Conn(&db), "user-1", 60)
+                .await
+                .unwrap(),
+            "released locks are re-acquirable"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_locks_are_swept_on_the_next_acquisition() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        // A lock that expired a minute ago.
+        let stale = token_refresh_locks::ActiveModel {
+            user_id: Set("stale-user".to_string()),
+            acquired_at: Set((Utc::now() - Duration::minutes(2)).naive_utc()),
+            expires_at: Set((Utc::now() - Duration::minutes(1)).naive_utc()),
+        };
+        stale.insert(&db).await.expect("seed expired lock");
+
+        assert!(
+            TokenRefreshLockStore::acquire_lock(DB::Conn(&db), "other-user", 60)
+                .await
+                .unwrap(),
+            "acquiring for anyone sweeps the expired lock"
+        );
+        assert!(
+            TokenRefreshLockStore::acquire_lock(DB::Conn(&db), "stale-user", 60)
+                .await
+                .unwrap(),
+            "the swept lock's owner can re-acquire"
+        );
+    }
+}

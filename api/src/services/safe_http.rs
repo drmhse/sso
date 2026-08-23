@@ -502,3 +502,55 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod ssrf_guard_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn ip(v: &str) -> IpAddr {
+        v.parse().unwrap()
+    }
+
+    #[test]
+    fn the_blocklist_covers_every_internal_surface() {
+        for forbidden in [
+            "127.0.0.1",       // loopback
+            "10.1.2.3",        // RFC1918
+            "172.16.0.9",      // RFC1918
+            "192.168.1.1",     // RFC1918
+            "169.254.169.254", // cloud metadata service
+            "224.0.0.5",       // multicast
+            "255.255.255.255", // broadcast
+            "::1",             // IPv6 loopback
+            "fe80::1",         // IPv6 link-local
+        ] {
+            assert!(
+                is_private_or_reserved_ip(&ip(forbidden)),
+                "{forbidden} must be blocked"
+            );
+        }
+        for allowed in ["8.8.8.8", "1.1.1.1", "93.184.216.34"] {
+            assert!(
+                !is_private_or_reserved_ip(&ip(allowed)),
+                "{allowed} must be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_url_validation_refuses_loopback_and_private_targets() {
+        let client = SafeHttpClient::new().expect("build client");
+        for url in [
+            "http://127.0.0.1:8080/token",
+            "http://10.0.0.5/admin",
+            "http://[::1]:9000/",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            match client.validate_external_url(url).await {
+                Err(_) => {}
+                Ok(()) => panic!("{url} must be refused"),
+            }
+        }
+    }
+}
