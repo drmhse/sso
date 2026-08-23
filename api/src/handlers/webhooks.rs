@@ -62,7 +62,7 @@ pub struct WebhookListResponse {
     pub total: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct WebhookDeliveryQuery {
     pub page: Option<i64>,
     pub limit: Option<i64>,
@@ -735,4 +735,558 @@ fn generate_webhook_secret() -> String {
     rng.fill(&mut bytes);
 
     STANDARD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{
+        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore, DB,
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn encryption() -> crate::encryption::EncryptionService {
+        crate::encryption::EncryptionService::from_keyring_values("active", &"11".repeat(32), None)
+            .expect("create encryption service")
+    }
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = GeneratedKey::generate().expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_pem()
+                .expect("encode public key pem for tests"),
+        );
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        member: AuthUser,
+        org_slug: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+
+        let owner_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "webhook-owner@example.test",
+            crate::store::users::UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let member_model =
+            UserStore::create(DB::Conn(&db), "webhook-member@example.test", None, false)
+                .await
+                .expect("create member");
+
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &owner_model.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        MembershipStore::create(DB::Conn(&db), &org.id, &member_model.id, "member")
+            .await
+            .expect("create membership");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: Some(Arc::new(encryption())),
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = jwt_service
+                .create_token(
+                    &user.id,
+                    &user.email,
+                    user.is_platform_owner,
+                    Some(&org.slug),
+                    None,
+                )
+                .expect("create token");
+            let claims = jwt_service.validate_token(&token).expect("validate token");
+            AuthUser {
+                claims,
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "webhook-test".to_string(),
+                current_session_id: None,
+            }
+        };
+
+        Fixture {
+            owner: auth_user_for(&owner_model),
+            member: auth_user_for(&member_model),
+            org_slug: org.slug,
+            state,
+        }
+    }
+
+    fn valid_create(name: &str) -> CreateWebhookRequest {
+        CreateWebhookRequest {
+            name: name.to_string(),
+            url: "https://hooks.example.test/ingest".to_string(),
+            events: vec!["user.signup.success".to_string()],
+        }
+    }
+
+    async fn create_err(f: &Fixture, req: CreateWebhookRequest) -> String {
+        match create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(req),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => message,
+            Err(other) => panic!("expected BadRequest, got {other:?}"),
+            Ok(_) => panic!("expected an error, got a response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_webhook_persists_and_returns_the_signing_secret_once() {
+        let f = fixture().await;
+        let Json(response) = create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("billing")),
+        )
+        .await
+        .expect("create webhook");
+
+        assert_eq!(response.name, "billing");
+        assert_eq!(response.url, "https://hooks.example.test/ingest");
+        assert_eq!(response.events, vec!["user.signup.success"]);
+        assert!(response.is_active);
+        // The signing secret is only ever shown at creation time.
+        assert!(response.secret.as_deref().is_some_and(|s| s.len() >= 32));
+    }
+
+    #[tokio::test]
+    async fn create_webhook_rejects_blank_names() {
+        let f = fixture().await;
+        let message = create_err(&f, valid_create("   ")).await;
+        assert!(message.contains("name"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn create_webhook_rejects_non_http_urls() {
+        let f = fixture().await;
+        let mut req = valid_create("ftp-hook");
+        req.url = "ftp://hooks.example.test".to_string();
+        let message = create_err(&f, req).await;
+        assert!(message.contains("must start with"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn create_webhook_rejects_empty_event_lists() {
+        let f = fixture().await;
+        let mut req = valid_create("no-events");
+        req.events.clear();
+        let message = create_err(&f, req).await;
+        assert!(message.contains("At least one event"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn create_webhook_rejects_unknown_event_types() {
+        let f = fixture().await;
+        let mut req = valid_create("bad-event");
+        req.events = vec!["not.a.real.event".to_string()];
+        let message = create_err(&f, req).await;
+        assert!(message.contains("Invalid event type"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn create_webhook_rejects_duplicate_names() {
+        let f = fixture().await;
+        let _ = create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("dupe")),
+        )
+        .await
+        .expect("first create");
+        let message = create_err(&f, valid_create("dupe")).await;
+        assert!(message.contains("already exists"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn create_webhook_requires_the_encryption_service() {
+        let mut f = fixture().await;
+        f.state.encryption = None;
+        match create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("no-encryption")),
+        )
+        .await
+        {
+            Err(AppError::InternalServerError(_)) => {}
+            other => panic!("expected internal error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_webhook_denies_plain_members() {
+        let f = fixture().await;
+        match create_webhook(
+            State(f.state.clone()),
+            f.member.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("member-made")),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_get_update_and_delete_round_trip() {
+        let f = fixture().await;
+        let Json(first) = create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("one")),
+        )
+        .await
+        .expect("create one");
+
+        let _ = create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("two")),
+        )
+        .await
+        .expect("create two");
+
+        let Json(list) = list_webhooks(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+        )
+        .await
+        .expect("list webhooks");
+        assert_eq!(list.webhooks.len(), 2);
+
+        let Json(fetched) = get_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), first.id.clone())),
+        )
+        .await
+        .expect("get webhook");
+        assert_eq!(fetched.id, first.id);
+        assert!(fetched.secret.is_none(), "secrets stay sealed on read");
+
+        let Json(updated) = update_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), first.id.clone())),
+            Json(UpdateWebhookRequest {
+                name: Some("one-renamed".to_string()),
+                url: Some("https://hooks.example.test/v2".to_string()),
+                events: Some(vec![
+                    "user.login.success".to_string(),
+                    "user.logout".to_string(),
+                ]),
+                is_active: Some(false),
+            }),
+        )
+        .await
+        .expect("update webhook");
+        assert_eq!(updated.name, "one-renamed");
+        assert!(!updated.is_active);
+        assert_eq!(updated.events.len(), 2);
+
+        let _ = delete_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), first.id)),
+        )
+        .await
+        .expect("delete webhook");
+
+        match get_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "missing".to_string())),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+
+        let Json(list) = list_webhooks(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+        )
+        .await
+        .expect("list after delete");
+        assert_eq!(list.webhooks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_webhook_rejects_unknown_ids_and_name_conflicts() {
+        let f = fixture().await;
+        let Json(created) = create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("keep")),
+        )
+        .await
+        .expect("create");
+
+        match update_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "nope".to_string())),
+            Json(UpdateWebhookRequest {
+                name: Some("x".to_string()),
+                url: None,
+                events: None,
+                is_active: None,
+            }),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+
+        let _ = create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("other")),
+        )
+        .await
+        .expect("create other");
+        let conflict = UpdateWebhookRequest {
+            name: Some("other".to_string()),
+            url: None,
+            events: None,
+            is_active: None,
+        };
+        let message = match update_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), created.id.clone())),
+            Json(conflict),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => message,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        assert!(message.contains("already exists"), "{message}");
+
+        match update_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), created.id)),
+            Json(UpdateWebhookRequest {
+                name: None,
+                url: Some("gopher://x".to_string()),
+                events: None,
+                is_active: None,
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("must start with")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliveries_list_and_test_ping_work_together() {
+        let f = fixture().await;
+        let Json(created) = create_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Json(valid_create("pinged")),
+        )
+        .await
+        .expect("create");
+
+        let Json(deliveries) = get_webhook_deliveries(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), created.id.clone())),
+            Query(WebhookDeliveryQuery::default()),
+        )
+        .await
+        .expect("list deliveries");
+        assert!(deliveries.deliveries.is_empty());
+
+        let Json(ping) = test_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), created.id.clone())),
+        )
+        .await
+        .expect("enqueue test ping");
+        assert_eq!(ping["success"], serde_json::json!(true));
+        assert!(ping["delivery_id"].as_str().is_some());
+
+        match test_webhook(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "missing".to_string())),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_types_are_listed_but_members_are_denied() {
+        let f = fixture().await;
+        let Json(types) = get_webhook_event_types(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+        )
+        .await
+        .expect("event types");
+        assert!(!types.is_empty());
+        assert!(types.iter().all(|t| !t.value.is_empty()));
+
+        match get_webhook_event_types(
+            State(f.state.clone()),
+            f.member.clone(),
+            Path(f.org_slug.clone()),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+    }
 }
