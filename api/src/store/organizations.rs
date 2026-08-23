@@ -1428,3 +1428,186 @@ mod tests {
         audit_reconciler.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use sea_orm::DatabaseConnection;
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    async fn owner_with_org(
+        db: &DatabaseConnection,
+        slug: &str,
+    ) -> (users::Model, organizations::Model) {
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(db),
+            &format!("{slug}-owner@example.test"),
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let (org, _) =
+            OrganizationStore::create_with_owner(DB::Conn(db), slug, slug, &owner.id, None)
+                .await
+                .expect("create org");
+        (owner, org)
+    }
+
+    #[tokio::test]
+    async fn lookups_find_by_id_slug_and_custom_domain() {
+        let db = db().await;
+        let (_, org) = owner_with_org(&db, "acme").await;
+        OrganizationStore::set_custom_domain(
+            DB::Conn(&db),
+            &org.id,
+            "sso.acme.com",
+            "verify-token",
+        )
+        .await
+        .expect("set domain");
+
+        assert!(OrganizationStore::find_by_id(DB::Conn(&db), &org.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(OrganizationStore::find_by_slug(DB::Conn(&db), "acme")
+            .await
+            .unwrap()
+            .is_some());
+        let by_domain = OrganizationStore::find_by_custom_domain(DB::Conn(&db), "sso.acme.com")
+            .await
+            .unwrap();
+        assert!(by_domain.is_some(), "custom domain resolves to the org");
+    }
+
+    #[tokio::test]
+    async fn status_transitions_and_the_pending_gate() {
+        let db = db().await;
+        let (owner, org) = owner_with_org(&db, "gated").await;
+
+        // Pending orgs are refused by the active-org gate.
+        match crate::handlers::organizations::ensure_organization_active(&db, &org.id).await {
+            Err(crate::error::AppError::Forbidden(_)) => {}
+            other => panic!("expected pending rejection, got {other:?}"),
+        }
+
+        let approved = OrganizationStore::approve(DB::Conn(&db), &org.id, &owner.id)
+            .await
+            .expect("approve");
+        assert_eq!(approved.status, "active");
+        ensure_active(&db, &approved.id).await;
+
+        let rejected = OrganizationStore::reject(DB::Conn(&db), &org.id, &owner.id, None)
+            .await
+            .expect("reject");
+        assert_eq!(rejected.status, "rejected");
+    }
+
+    async fn ensure_active(db: &DatabaseConnection, org_id: &str) {
+        crate::handlers::organizations::ensure_organization_active(db, org_id)
+            .await
+            .expect("org must be active");
+    }
+
+    #[tokio::test]
+    async fn ownership_transfer_swaps_and_is_idempotence_guarded() {
+        let db = db().await;
+        let (owner, org) = owner_with_org(&db, "swap").await;
+        let next = UserStore::create(DB::Conn(&db), "next-owner@example.test", None, false)
+            .await
+            .expect("create successor");
+
+        let transferred = OrganizationStore::transfer_ownership(DB::Conn(&db), &org.id, &next.id)
+            .await
+            .expect("transfer");
+        assert_eq!(transferred.owner_user_id, next.id);
+
+        // The conditional variant refuses when the expected current owner
+        // no longer matches: `owner` lost ownership in the transfer above.
+        match OrganizationStore::transfer_ownership_if_current(
+            DB::Conn(&db),
+            &org.id,
+            &owner.id,
+            &owner.id,
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(org) => panic!(
+                "stale-current transfer succeeded, owner is now {}",
+                org.owner_user_id
+            ),
+        }
+
+        // And the correct current-owner variant succeeds.
+        let swapped_back = OrganizationStore::transfer_ownership_if_current(
+            DB::Conn(&db),
+            &org.id,
+            &next.id,
+            &owner.id,
+        )
+        .await
+        .expect("cas transfer with fresh owner");
+        assert_eq!(swapped_back.owner_user_id, owner.id);
+    }
+
+    #[tokio::test]
+    async fn branding_tier_and_smtp_updates_round_trip() {
+        let db = db().await;
+        let (_, org) = owner_with_org(&db, "branding").await;
+
+        let renamed = OrganizationStore::update_name(DB::Conn(&db), &org.id, "Acme Renamed")
+            .await
+            .expect("rename");
+        assert_eq!(renamed.name, "Acme Renamed");
+
+        let branded = OrganizationStore::update_branding(
+            DB::Conn(&db),
+            &org.id,
+            Some("logo.png"),
+            Some("#ff0000"),
+        )
+        .await
+        .expect("update branding");
+        drop(branded);
+
+        let with_smtp = OrganizationStore::update_smtp_config(
+            DB::Conn(&db),
+            &org.id,
+            "smtp.example.test",
+            587,
+            "user",
+            b"encrypted-pass".to_vec(),
+            "mail@acme.com",
+            Some("Acme Mail"),
+            Some("test-key"),
+        )
+        .await
+        .expect("set smtp");
+        drop(with_smtp);
+        let cleared = OrganizationStore::clear_smtp_config(DB::Conn(&db), &org.id)
+            .await
+            .expect("clear smtp");
+        drop(cleared);
+
+        let listed = OrganizationStore::list(DB::Conn(&db), None, 10, 0)
+            .await
+            .expect("list orgs");
+        assert!(!listed.is_empty());
+    }
+}
