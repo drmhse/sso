@@ -400,3 +400,398 @@ pub async fn force_disable_user_mfa(
         "message": "MFA has been force-disabled for the user"
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{memberships::MembershipStore, users::UserStore, DB};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = GeneratedKey::generate().expect("generate test rsa key");
+        JwtService::new(
+            &STANDARD.encode(rsa.private_key_pem().expect("private pem")),
+            &STANDARD.encode(rsa.public_key_pem().expect("public pem")),
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create jwt service")
+    }
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        plain_user_model: users::Model,
+        plain: AuthUser,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "platform-owner@example.test",
+            crate::store::users::UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create platform owner")
+        .0;
+        let plain_model = UserStore::create(DB::Conn(&db), "plain@example.test", None, false)
+            .await
+            .expect("create plain user");
+        let _ = MembershipStore::create(
+            DB::Conn(&db),
+            "org-placeholder",
+            &plain_model.id,
+            "member",
+        )
+        .await;
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = jwt_service
+                .create_token(&user.id, &user.email, user.is_platform_owner, None, None)
+                .expect("create token");
+            let claims = jwt_service.validate_token(&token).expect("validate token");
+            AuthUser {
+                claims,
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "platform-user-test".to_string(),
+                current_session_id: None,
+            }
+        };
+
+        Fixture {
+            state,
+            owner: auth_user_for(&owner_model),
+            plain_user_model: plain_model.clone(),
+            plain: auth_user_for(&plain_model),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_owners_are_denied_every_platform_endpoint() {
+        let f = fixture().await;
+        let results = (
+            get_platform_user(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Path(f.plain_user_model.id.clone()),
+            )
+            .await
+            .err(),
+            list_users(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Query(UserListParams {
+                    limit: None,
+                    offset: None,
+                }),
+            )
+            .await
+            .err(),
+            search_users(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Query(UserSearchQuery {
+                    q: "x".to_string(),
+                    limit: None,
+                }),
+            )
+            .await
+            .err(),
+            promote_platform_owner(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Json(PromoteOwnerRequest {
+                    user_id: f.plain_user_model.id.clone(),
+                }),
+            )
+            .await
+            .err(),
+            demote_platform_owner(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Path(f.owner.user.id.clone()),
+            )
+            .await
+            .err(),
+            get_user_mfa_status(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Path(f.plain_user_model.id.clone()),
+            )
+            .await
+            .err(),
+            force_disable_user_mfa(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Path(f.plain_user_model.id.clone()),
+            )
+            .await
+            .err(),
+        );
+        match results {
+            (
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+            ) => {}
+            other => panic!("expected all-forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn owners_can_list_search_and_fetch_users() {
+        let f = fixture().await;
+        let Json(list) = list_users(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Query(UserListParams {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list users");
+        assert!(list.total >= 2);
+        assert!(list.users.iter().any(|u| u.is_platform_owner));
+
+        let Json(found) = search_users(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Query(UserSearchQuery {
+                q: "plain@example.test".to_string(),
+                limit: None,
+            }),
+        )
+        .await
+        .expect("search users");
+        assert!(found.iter().any(|u| u.email == "plain@example.test"));
+
+        let Json(got) = get_platform_user(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.plain_user_model.id.clone()),
+        )
+        .await
+        .expect("get platform user");
+        assert_eq!(got.email, "plain@example.test");
+
+        match get_platform_user(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path("missing".to_string()),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promotion_and_demotion_guard_against_duplicates_self_and_non_owners() {
+        let f = fixture().await;
+
+        // Promoting the already-owner fails.
+        match promote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Json(PromoteOwnerRequest {
+                user_id: f.owner.user.id.clone(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("already a platform owner"))
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Promote the plain user.
+        let Json(promoted) = promote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Json(PromoteOwnerRequest {
+                user_id: f.plain_user_model.id.clone(),
+            }),
+        )
+        .await
+        .expect("promote user");
+        assert!(promoted.is_platform_owner);
+
+        // Promoting again now conflicts.
+        match promote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Json(PromoteOwnerRequest {
+                user_id: f.plain_user_model.id.clone(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected BadRequest on double promote, got {other:?}"),
+        }
+
+        // Demoting yourself is refused.
+        match demote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.owner.user.id.clone()),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("yourself")),
+            other => panic!("expected self-demote refusal, got {other:?}"),
+        }
+
+        // Demoting a non-owner is refused.
+        match demote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path("missing".to_string()),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) | Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected refusal, got {other:?}"),
+        }
+
+        // Demoting the newly promoted owner works.
+        let Json(demoted) = demote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.plain_user_model.id.clone()),
+        )
+        .await
+        .expect("demote user");
+        assert!(!demoted.is_platform_owner);
+    }
+
+    #[tokio::test]
+    async fn mfa_status_reads_and_unknown_users() {
+        let f = fixture().await;
+        let Json(status) = get_user_mfa_status(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.plain_user_model.id.clone()),
+        )
+        .await
+        .expect("mfa status");
+        assert!(!status.enabled, "fresh user has no mfa");
+
+        match get_user_mfa_status(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path("missing".to_string()),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+    }
+}

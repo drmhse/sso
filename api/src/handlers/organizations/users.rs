@@ -513,3 +513,302 @@ pub async fn revoke_end_user_sessions(
         "revoked_count": revoked_count
     })))
 }
+
+#[cfg(test)]
+mod end_user_tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{
+        identities::IdentityStore, memberships::MembershipStore, users::UserStore, DB,
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        member: AuthUser,
+        org_slug: String,
+        end_user_id: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new({
+            let rsa = GeneratedKey::generate().expect("generate test rsa key");
+            JwtService::new(
+                &STANDARD.encode(rsa.private_key_pem().expect("private pem")),
+                &STANDARD.encode(rsa.public_key_pem().expect("public pem")),
+                config.jwt_expiration_hours,
+                "test-key",
+                &config.base_url,
+            )
+            .expect("create jwt service")
+        });
+
+        let owner_model =
+            UserStore::create(DB::Conn(&db), "enduser-owner@example.test", None, false)
+                .await
+                .expect("create owner");
+        let member_model =
+            UserStore::create(DB::Conn(&db), "enduser-member@example.test", None, false)
+                .await
+                .expect("create member");
+
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &owner_model.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        MembershipStore::create(DB::Conn(&db), &org.id, &member_model.id, "member")
+            .await
+            .expect("create membership");
+
+        // An end user: a global user with an identity issued in this org.
+        let end_user = UserStore::create(DB::Conn(&db), "end-user@example.test", None, false)
+            .await
+            .expect("create end user");
+        IdentityStore::create(
+            DB::Conn(&db),
+            &end_user.id,
+            "github",
+            "gh-end-user",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&org.id),
+            None,
+        )
+        .await
+        .expect("seed end user identity");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = jwt_service
+                .create_token(&user.id, &user.email, false, Some(&org.slug), None)
+                .expect("create token");
+            let claims = jwt_service.validate_token(&token).expect("validate token");
+            AuthUser {
+                claims,
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "end-user-test".to_string(),
+                current_session_id: None,
+            }
+        };
+
+        Fixture {
+            state,
+            owner: auth_user_for(&owner_model),
+            member: auth_user_for(&member_model),
+            org_slug: org.slug,
+            end_user_id: end_user.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn members_without_the_viewer_capability_are_denied() {
+        let f = fixture().await;
+        let results = (
+            list_end_users(
+                State(f.state.clone()),
+                f.member.clone(),
+                Path(f.org_slug.clone()),
+                Query(ListEndUsersQuery {
+                    page: None,
+                    limit: None,
+                    service_slug: None,
+                }),
+            )
+            .await
+            .err(),
+            get_end_user(
+                State(f.state.clone()),
+                f.member.clone(),
+                Path((f.org_slug.clone(), f.end_user_id.clone())),
+            )
+            .await
+            .err(),
+            revoke_end_user_sessions(
+                State(f.state.clone()),
+                f.member.clone(),
+                Path((f.org_slug.clone(), f.end_user_id.clone())),
+            )
+            .await
+            .err(),
+        );
+        match results {
+            (
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+            ) => {}
+            other => panic!("expected all-forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn owners_see_seeded_end_users_in_list_and_detail() {
+        let f = fixture().await;
+        let Json(list) = list_end_users(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.org_slug.clone()),
+            Query(ListEndUsersQuery {
+                page: None,
+                limit: None,
+                service_slug: None,
+            }),
+        )
+        .await
+        .expect("list end users");
+        assert!(list.users.iter().any(|u| u.user.id == f.end_user_id));
+
+        let Json(detail) = get_end_user(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), f.end_user_id.clone())),
+        )
+        .await
+        .expect("get end user");
+        assert_eq!(detail.user.id, f.end_user_id);
+
+        match get_end_user(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "not-a-user".to_string())),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_sessions_reports_a_count() {
+        let f = fixture().await;
+        let response = revoke_end_user_sessions(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), f.end_user_id.clone())),
+        )
+        .await
+        .expect("revoke sessions");
+        assert_eq!(
+            response["message"],
+            serde_json::json!("Sessions revoked successfully")
+        );
+        assert!(response["revoked_count"].as_i64().is_some());
+
+        // Unknown end users are refused before any revocation.
+        match revoke_end_user_sessions(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.org_slug.clone(), "missing".to_string())),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+    }
+}
