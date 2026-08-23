@@ -1125,3 +1125,480 @@ pub async fn delete_plan(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::error::AppError;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{
+        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore, DB,
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            managed_state_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    fn test_jwt_service(config: &Config) -> JwtService {
+        let rsa = GeneratedKey::generate().expect("generate test rsa key");
+        let private_key = STANDARD.encode(
+            rsa.private_key_pem()
+                .expect("encode private key pem for tests"),
+        );
+        let public_key = STANDARD.encode(
+            rsa.public_key_pem()
+                .expect("encode public key pem for tests"),
+        );
+        JwtService::new(
+            &private_key,
+            &public_key,
+            config.jwt_expiration_hours,
+            "test-key",
+            &config.base_url,
+        )
+        .expect("create test jwt service")
+    }
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        member: AuthUser,
+        org_slug: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        let oauth_client = Arc::new(OAuthClient::new(&config).expect("create oauth client"));
+
+        let owner_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "service-owner@example.test",
+            crate::store::users::UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let member_model =
+            UserStore::create(DB::Conn(&db), "service-member@example.test", None, false)
+                .await
+                .expect("create member");
+
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &owner_model.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+        MembershipStore::create(DB::Conn(&db), &org.id, &member_model.id, "member")
+            .await
+            .expect("create membership");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client,
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = jwt_service
+                .create_token(&user.id, &user.email, false, Some("acme"), None)
+                .expect("create token");
+            let claims = jwt_service.validate_token(&token).expect("validate token");
+            AuthUser {
+                claims,
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "service-test".to_string(),
+                current_session_id: None,
+            }
+        };
+
+        Fixture {
+            owner: auth_user_for(&owner_model),
+            member: auth_user_for(&member_model),
+            org_slug: org.slug,
+            state,
+        }
+    }
+
+    fn create_request(slug: &str, name: &str) -> CreateServiceRequest {
+        CreateServiceRequest {
+            slug: slug.to_string(),
+            name: name.to_string(),
+            service_type: "web".to_string(),
+            github_scopes: None,
+            microsoft_scopes: None,
+            google_scopes: None,
+            redirect_uris: Some(vec!["https://app.example.test/callback".to_string()]),
+            device_activation_uri: None,
+            resource_uris: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_service_returns_secret_once_and_a_default_free_plan() {
+        let f = fixture().await;
+        let Json(response) = create_service(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Json(create_request("portal", "Portal")),
+        )
+        .await
+        .expect("create service");
+
+        assert_eq!(response.service.slug, "portal");
+        assert!(
+            response.service.client_secret.is_some(),
+            "the client secret is shown exactly once, at creation"
+        );
+        assert!(response.default_plan.is_default);
+        assert_eq!(response.default_plan.price_cents, 0);
+        assert_eq!(response.usage.current_services, 1);
+        assert_eq!(response.usage.max_services, 2);
+    }
+
+    #[tokio::test]
+    async fn create_service_rejects_unknown_types_and_plain_members() {
+        let f = fixture().await;
+        let mut req = create_request("bad-type", "Bad");
+        req.service_type = "satellite".to_string();
+        match create_service(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Json(req),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("Invalid service type"))
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        match create_service(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.member.clone()),
+            Json(create_request("member-svc", "Member")),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn free_tier_caps_services_at_two() {
+        let f = fixture().await;
+        for slug in ["one", "two"] {
+            let _ = create_service(
+                State(f.state.clone()),
+                Path(f.org_slug.clone()),
+                axum::Extension(f.owner.clone()),
+                Json(create_request(slug, slug)),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create {slug} failed: {e:?}"));
+        }
+        match create_service(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Json(create_request("three", "Three")),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("maximum service limit"), "{message}")
+            }
+            other => panic!("expected limit rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_get_update_rotate_delete_round_trip() {
+        let f = fixture().await;
+        let Json(created) = create_service(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Json(create_request("portal", "Portal")),
+        )
+        .await
+        .expect("create");
+
+        // Members lack `services.view`, so the list comes back empty for them.
+        let Json(member_view) = list_organization_services(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.member.clone()),
+            Query(ListServicesQuery {
+                status: None,
+                service_type: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list services as member");
+        assert!(member_view.services.is_empty());
+
+        let Json(list) = list_organization_services(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Query(ListServicesQuery {
+                status: None,
+                service_type: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list services");
+        assert_eq!(list.services.len(), 1);
+        assert_eq!(list.services[0].service.id, created.service.id);
+
+        // Members without `services.view` or a direct grant cannot read it.
+        match get_service(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.member.clone()),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden for member, got {other:?}"),
+        }
+
+        let Json(fetched) = get_service(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.owner.clone()),
+        )
+        .await
+        .expect("get service as owner");
+        assert_eq!(fetched.id, created.service.id);
+
+        let Json(updated) = update_service(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.owner.clone()),
+            Json(UpdateServiceRequest {
+                name: Some("Portal v2".to_string()),
+                service_type: Some("api".to_string()),
+                github_scopes: None,
+                microsoft_scopes: None,
+                google_scopes: None,
+                redirect_uris: None,
+                device_activation_uri: None,
+                resource_uris: None,
+            }),
+        )
+        .await
+        .expect("update service");
+        assert_eq!(updated.name, "Portal v2");
+        assert_eq!(updated.service_type, "api");
+
+        let Json(rotated) = rotate_service_secret(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.owner.clone()),
+        )
+        .await
+        .expect("rotate secret");
+        assert_ne!(
+            rotated.client_secret,
+            created.service.client_secret.clone().unwrap_or_default(),
+            "rotation must issue a new secret"
+        );
+
+        delete_service(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.owner.clone()),
+        )
+        .await
+        .expect("delete service");
+
+        match get_service(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.owner.clone()),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found after delete, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_crud_round_trip_rejects_deleting_the_default_plan() {
+        let f = fixture().await;
+        let _ = create_service(
+            State(f.state.clone()),
+            Path(f.org_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Json(create_request("portal", "Portal")),
+        )
+        .await
+        .expect("create service");
+
+        let Json(plans) = list_service_plans(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.owner.clone()),
+        )
+        .await
+        .expect("list plans");
+        assert_eq!(plans.len(), 1, "the auto-created default free plan");
+        let _default_plan_id = plans[0].plan.id.clone();
+
+        let Json(new_plan) = create_plan(
+            State(f.state.clone()),
+            Path((f.org_slug.clone(), "portal".to_string())),
+            axum::Extension(f.owner.clone()),
+            Json(CreatePlanRequest {
+                name: "Pro".to_string(),
+                description: Some("For bigger teams".to_string()),
+                price_cents: 1999,
+                currency: "usd".to_string(),
+                features: Some(vec!["sso".to_string()]),
+                stripe_price_id: None,
+                is_default: false,
+            }),
+        )
+        .await
+        .expect("create plan");
+        assert_eq!(new_plan.plan.price_cents, 1999);
+
+        let Json(updated) = update_plan(
+            State(f.state.clone()),
+            Path((
+                f.org_slug.clone(),
+                "portal".to_string(),
+                new_plan.plan.id.clone(),
+            )),
+            axum::Extension(f.owner.clone()),
+            Json(UpdatePlanRequest {
+                name: None,
+                description: None,
+                price_cents: Some(2999),
+                currency: None,
+                features: None,
+                stripe_price_id: None,
+                is_default: None,
+            }),
+        )
+        .await
+        .expect("update plan");
+        assert_eq!(updated.plan.price_cents, 2999);
+
+        delete_plan(
+            State(f.state.clone()),
+            Path((
+                f.org_slug.clone(),
+                "portal".to_string(),
+                new_plan.plan.id.clone(),
+            )),
+            axum::Extension(f.owner.clone()),
+        )
+        .await
+        .expect("delete non-default plan");
+    }
+}
