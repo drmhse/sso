@@ -1859,4 +1859,25 @@ mod password_route_tests {
         .expect("change password");
         assert!(response.message.contains("successfully"));
     }
+    #[tokio::test]
+    async fn mfa_status_reports_disabled_for_fresh_users() {
+        let f = fixture().await;
+        let Json(status) = get_mfa_status(
+            State(f.state.clone()),
+            Some(axum::Extension(f.pw_user.clone())),
+        )
+        .await
+        .expect("mfa status");
+        assert!(!status.enabled);
+        assert!(!status.has_backup_codes);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_mfa_status_is_refused() {
+        let f = fixture().await;
+        match get_mfa_status(State(f.state.clone()), None).await {
+            Err(AppError::Unauthorized(_)) => {}
+            other => panic!("expected unauthorized, got {other:?}"),
+        }
+    }
 }
