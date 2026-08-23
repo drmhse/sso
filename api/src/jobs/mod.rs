@@ -24,3 +24,16 @@ pub fn get_cleanup_job_interval(multiplier: u64) -> Duration {
     let base_interval = get_job_interval();
     Duration::from_secs(base_interval.as_secs() * multiplier)
 }
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_intervals_scale_the_base_interval() {
+        let base = get_job_interval();
+        assert_eq!(get_cleanup_job_interval(1), base);
+        assert_eq!(get_cleanup_job_interval(6), base * 6);
+        assert_eq!(get_cleanup_job_interval(60), base * 60);
+    }
+}

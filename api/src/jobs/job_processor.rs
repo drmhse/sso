@@ -563,3 +563,163 @@ impl JobProcessor {
         format!("sha256={:x}", result.into_bytes())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::job_queue::{JobQueueService, JobType};
+    use crate::store::system_jobs::SystemJobStore;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+    use std::time::{Duration, Instant};
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    /// Polls `check` every 100 ms until it holds or the deadline passes.
+    macro_rules! eventually {
+        ($check:expr) => {{
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if $check {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "condition not met within 20s");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }};
+    }
+
+    #[tokio::test]
+    async fn the_processor_drains_a_pending_custom_job_to_completed() {
+        let db = db().await;
+        let _job_id = JobQueueService::enqueue(
+            DB::Conn(&db),
+            JobType::Custom("test-work".to_string()),
+            &serde_json::json!({ "anything": true }),
+            0,
+            1,
+            None,
+        )
+        .await
+        .expect("enqueue custom job");
+
+        // Unknown custom types are gracefully skipped and marked complete.
+        let processor = JobProcessor::new(
+            db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db.clone(),
+            None,
+            None,
+            2,
+        );
+        tokio::spawn(processor.start());
+
+        eventually!({
+            let counts = SystemJobStore::count_by_statuses(DB::Conn(&db), &["completed"])
+                .await
+                .expect("count statuses");
+            counts.get("completed").copied().unwrap_or(0) >= 1
+        });
+
+        let in_flight =
+            SystemJobStore::count_by_statuses(DB::Conn(&db), &["pending", "processing"])
+                .await
+                .expect("count in-flight");
+        assert_eq!(
+            in_flight.values().sum::<i64>(),
+            0,
+            "the queue must be empty after processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn email_jobs_without_a_service_complete_with_a_warning() {
+        let db = db().await;
+        JobQueueService::enqueue(
+            DB::Conn(&db),
+            JobType::SendEmail,
+            &serde_json::json!({
+                "to": "someone@example.test",
+                "subject": "Hello",
+                "body": "World",
+            }),
+            0,
+            3,
+            None,
+        )
+        .await
+        .expect("enqueue email job");
+
+        // No EmailService configured: the job completes without sending.
+        let processor = JobProcessor::new(
+            db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db.clone(),
+            None,
+            None,
+            2,
+        );
+        tokio::spawn(processor.start());
+
+        eventually!({
+            let counts = SystemJobStore::count_by_statuses(DB::Conn(&db), &["completed"])
+                .await
+                .expect("count statuses");
+            counts.get("completed").copied().unwrap_or(0) >= 1
+        });
+    }
+
+    #[tokio::test]
+    async fn webhook_jobs_against_unroutable_hosts_leave_pending() {
+        let db = db().await;
+        JobQueueService::enqueue(
+            DB::Conn(&db),
+            JobType::DeliverWebhook,
+            &serde_json::json!({
+                "webhook_id": "wh-1",
+                "event_type": "webhook.test.ping",
+                "payload": {},
+                "delivery_id": "d-1",
+            }),
+            0,
+            1,
+            None,
+        )
+        .await
+        .expect("enqueue webhook job");
+
+        let processor = JobProcessor::new(
+            db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db.clone(),
+            None,
+            None,
+            2,
+        );
+        tokio::spawn(processor.start());
+
+        // Delivery to an unroutable host cannot succeed; the job must leave
+        // `pending` one way or another (failed permanently, retried into the
+        // future, or completed by graceful handling).
+        eventually!({
+            let pending = SystemJobStore::count_by_statuses(DB::Conn(&db), &["pending"])
+                .await
+                .expect("count pending");
+            let failed = SystemJobStore::count_by_statuses(DB::Conn(&db), &["failed"])
+                .await
+                .expect("count failed");
+            let completed = SystemJobStore::count_by_statuses(DB::Conn(&db), &["completed"])
+                .await
+                .expect("count completed");
+            pending.get("pending").copied().unwrap_or(0) == 0
+                || failed.get("failed").copied().unwrap_or(0) >= 1
+                || completed.get("completed").copied().unwrap_or(0) >= 1
+        });
+    }
+}
