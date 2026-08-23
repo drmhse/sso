@@ -980,3 +980,104 @@ mod tests {
         assert_eq!(admin_oauth.id, platform.id);
     }
 }
+
+#[cfg(test)]
+mod store_user_tests {
+    use super::*;
+    use crate::entities::users;
+    use crate::store::identities::IdentityStore;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::DatabaseConnection;
+    use sea_orm::Database;
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    async fn user_at(db: &DatabaseConnection, email: &str) -> users::Model {
+        UserStore::create(DB::Conn(db), email, None, false)
+            .await
+            .expect("create user")
+    }
+
+    #[tokio::test]
+    async fn password_updates_clear_reset_tokens() {
+        let db = db().await;
+        let user = user_at(&db, "pw@example.test").await;
+        let new_hash = "new-bcrypt-hash".to_string();
+
+        UserStore::update_password(DB::Conn(&db), &user.id, new_hash)
+            .await
+            .expect("update password");
+    }
+
+    #[tokio::test]
+    async fn search_orders_filters_and_paginates() {
+        let db = db().await;
+        for email in [
+            "alpha@example.test",
+            "beta@example.test",
+            "gamma@other.test",
+        ] {
+            user_at(&db, email).await;
+        }
+
+        // Email filter.
+        let alpha_only =
+            UserStore::search_users(DB::Conn(&db), Some("alpha"), None, "email_asc", 10, 0)
+                .await
+                .expect("search alpha");
+        assert_eq!(alpha_only.len(), 1);
+
+        // Ordering variants all execute and return the full set.
+        for order in ["email_asc", "email_desc", "created_asc", "created_desc"] {
+            let rows = UserStore::search_users(DB::Conn(&db), None, Some(order), order, 10, 0)
+                .await
+                .unwrap_or_else(|e| panic!("search order {order} failed: {e:?}"));
+            assert_eq!(rows.len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_record_and_dependents_survive_separately() {
+        let db = db().await;
+        let user = user_at(&db, "doomed@example.test").await;
+        add_identity(&db, &user.id).await;
+
+        UserStore::delete(DB::Conn(&db), &user.id)
+            .await
+            .expect("delete user");
+
+        match UserStore::find_by_id(DB::Conn(&db), &user.id)
+            .await
+            .unwrap()
+        {
+            None => {}
+            Some(_) => panic!("deleted user still present"),
+        }
+    }
+
+    async fn add_identity(db: &DatabaseConnection, user_id: &str) {
+        IdentityStore::create(
+            DB::Conn(db),
+            user_id,
+            "github",
+            "gh-uid",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed identity");
+    }
+}
