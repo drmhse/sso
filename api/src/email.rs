@@ -296,3 +296,75 @@ pub async fn get_email_service_for_org(
     // Only fall back to platform-level SMTP if org has NO SMTP config at all
     Ok(EmailService::from_env().ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn smtp_config(username: String, password: String) -> SmtpConfig {
+        SmtpConfig {
+            host: "smtp.example.test".to_string(),
+            port: 587,
+            username,
+            password,
+            from_email: "auth@example.test".to_string(),
+            from_name: "AuthOS Tests".to_string(),
+        }
+    }
+
+    #[test]
+    fn from_config_builds_authenticated_and_unauthenticated_transports() {
+        // Credentials path.
+        assert!(
+            EmailService::from_config(smtp_config("user".to_string(), "pass".to_string())).is_ok()
+        );
+        // No-auth path (development relays like Mailpit).
+        assert!(EmailService::from_config(smtp_config(String::new(), String::new())).is_ok());
+    }
+
+    #[test]
+    fn from_env_requires_the_mandatory_variables() {
+        // SAFETY: single-threaded test mutating process env for this assertion.
+        unsafe { std::env::remove_var("SMTP_HOST") };
+        assert!(EmailService::from_env().is_err(), "missing SMTP_HOST fails");
+
+        unsafe { std::env::set_var("SMTP_HOST", "smtp.example.test") };
+        unsafe { std::env::set_var("SMTP_PORT", "not-a-number") };
+        assert!(
+            EmailService::from_env().is_err(),
+            "a non-numeric SMTP_PORT fails"
+        );
+
+        unsafe { std::env::set_var("SMTP_PORT", "587") };
+        unsafe { std::env::remove_var("SMTP_FROM_EMAIL") };
+        assert!(
+            EmailService::from_env().is_err(),
+            "missing SMTP_FROM_EMAIL fails"
+        );
+        unsafe { std::env::set_var("SMTP_FROM_EMAIL", "auth@example.test") };
+
+        // With everything set, construction succeeds.
+        assert!(EmailService::from_env().is_ok());
+        unsafe { std::env::remove_var("SMTP_HOST") };
+        unsafe { std::env::remove_var("SMTP_PORT") };
+        unsafe { std::env::remove_var("SMTP_FROM_EMAIL") };
+    }
+
+    #[tokio::test]
+    async fn test_connection_fails_fast_against_an_unroutable_relay() {
+        let service =
+            EmailService::from_config(smtp_config("user".to_string(), "pass".to_string()))
+                .expect("build service");
+        // The configured host does not resolve; connection must error, not hang.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                service.test_connection()
+            )
+            .await
+            .expect("test_connection should not hang")
+            .is_err(),
+            "an unroutable relay must surface a connection error"
+        );
+    }
+}

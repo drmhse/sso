@@ -305,3 +305,203 @@ macro_rules! require_org_member {
         $authz.require_org_member($org_id, $user_id).await?
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::permissions::RelationTuple;
+    use crate::store::{
+        memberships::MembershipStore, organizations::OrganizationStore,
+        permissions::PermissionsStore, users::UserStore,
+    };
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    #[tokio::test]
+    async fn grants_are_visible_to_checks_and_revocations_remove_them() {
+        let db = db().await;
+        let service = AuthorizationService::new(db.clone());
+
+        assert!(
+            !service
+                .check_permission("organization", "org-1", "viewer", "user-1")
+                .await
+                .unwrap(),
+            "nothing granted yet"
+        );
+
+        service
+            .grant_user_permission("organization", "org-1", "viewer", "user-1")
+            .await
+            .expect("grant");
+
+        assert!(service
+            .check_permission("organization", "org-1", "viewer", "user-1")
+            .await
+            .unwrap());
+
+        service
+            .revoke_user_permission("organization", "org-1", "viewer", "user-1")
+            .await
+            .expect("revoke");
+
+        assert!(
+            !service
+                .check_permission("organization", "org-1", "viewer", "user-1")
+                .await
+                .unwrap(),
+            "revocation removes access"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_permission_turns_missing_grants_into_forbidden() {
+        let db = db().await;
+        let service = AuthorizationService::new(db.clone());
+
+        match service
+            .require_permission("organization", "org-2", "manager", "user-2")
+            .await
+        {
+            Err(AppError::Forbidden(message)) => {
+                assert!(message.contains("does not have"), "{message}")
+            }
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+
+        service
+            .grant_user_permission("organization", "org-2", "manager", "user-2")
+            .await
+            .expect("grant");
+        service
+            .require_permission("organization", "org-2", "manager", "user-2")
+            .await
+            .expect("now authorised");
+    }
+
+    #[tokio::test]
+    async fn org_role_helpers_reflect_real_memberships() {
+        let db = db().await;
+        let service = AuthorizationService::new(db.clone());
+
+        let owner = UserStore::create(DB::Conn(&db), "authz-owner@example.test", None, false)
+            .await
+            .expect("create owner");
+        let member = UserStore::create(DB::Conn(&db), "authz-member@example.test", None, false)
+            .await
+            .expect("create member");
+        let outsider = UserStore::create(DB::Conn(&db), "authz-outsider@example.test", None, false)
+            .await
+            .expect("create outsider");
+
+        let (org, _) =
+            OrganizationStore::create_with_owner(DB::Conn(&db), "acme", "Acme", &owner.id, None)
+                .await
+                .expect("create org");
+        MembershipStore::create(DB::Conn(&db), &org.id, &member.id, "member")
+            .await
+            .expect("create membership");
+
+        // Role helpers read the Zanzibar tuples, so seed them the way the
+        // permission layer expects.
+        let tuple = |relation: &str, subject_id: &str| RelationTuple {
+            namespace: "organization".to_string(),
+            object_id: org.id.clone(),
+            relation: relation.to_string(),
+            subject_type: "user".to_string(),
+            subject_id: subject_id.to_string(),
+            subject_relation: None,
+        };
+        PermissionsStore::grant(DB::Conn(&db), tuple("owner", &owner.id))
+            .await
+            .expect("grant owner");
+        PermissionsStore::grant(DB::Conn(&db), tuple("member", &member.id))
+            .await
+            .expect("grant member");
+
+        assert!(service.is_org_owner(&org.id, &owner.id).await.unwrap());
+        // The owner tuple does not imply the member relation in this model;
+        // owners hold it separately.
+        assert!(!service.is_org_member(&org.id, &owner.id).await.unwrap());
+        PermissionsStore::grant(DB::Conn(&db), tuple("member", &owner.id))
+            .await
+            .expect("grant owner membership");
+        assert!(service.is_org_member(&org.id, &owner.id).await.unwrap());
+        assert!(!service.is_org_owner(&org.id, &member.id).await.unwrap());
+        assert!(service.is_org_member(&org.id, &member.id).await.unwrap());
+        assert!(!service.is_org_member(&org.id, &outsider.id).await.unwrap());
+        assert!(!service.is_org_admin(&org.id, &member.id).await.unwrap());
+
+        // The owner-or-admin helper accepts owners.
+        assert!(service
+            .is_org_owner_or_admin(&org.id, &owner.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn group_permissions_expand_to_members_through_usersets() {
+        let db = db().await;
+        let service = AuthorizationService::new(db.clone());
+
+        // A userset grant: everyone holding `member` on `group:g1` gets
+        // `viewer` on `doc:1`.
+        PermissionsStore::grant(
+            DB::Conn(&db),
+            RelationTuple {
+                namespace: "document".to_string(),
+                object_id: "1".to_string(),
+                relation: "viewer".to_string(),
+                subject_type: "group".to_string(),
+                subject_id: "g1".to_string(),
+                subject_relation: Some("member".to_string()),
+            },
+        )
+        .await
+        .expect("grant userset");
+
+        // No direct membership in the group yet.
+        assert!(!service
+            .check_permission("document", "1", "viewer", "user-9")
+            .await
+            .unwrap());
+
+        // Membership in the group expands through the userset.
+        PermissionsStore::grant(
+            DB::Conn(&db),
+            RelationTuple {
+                namespace: "group".to_string(),
+                object_id: "g1".to_string(),
+                relation: "member".to_string(),
+                subject_type: "user".to_string(),
+                subject_id: "user-9".to_string(),
+                subject_relation: None,
+            },
+        )
+        .await
+        .expect("grant group membership");
+
+        assert!(
+            service
+                .check_permission("document", "1", "viewer", "user-9")
+                .await
+                .unwrap(),
+            "userset expansion must reach the indirect member"
+        );
+
+        // Expansion reports the reachable permission.
+        let expanded = service
+            .expand_permission("document", "1", "viewer")
+            .await
+            .unwrap();
+        assert!(!expanded.is_empty());
+    }
+}
