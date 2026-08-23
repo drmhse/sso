@@ -465,3 +465,133 @@ pub async fn oauth_http_client(
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_without_providers() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    #[test]
+    fn provider_strings_round_trip() {
+        for name in ["github", "google", "microsoft", "oidc", "password"] {
+            let parsed = Provider::from_str(name).expect("parse provider");
+            assert_eq!(parsed.as_str(), name);
+        }
+        // Case-insensitive.
+        assert!(matches!(Provider::from_str("GitHub"), Ok(Provider::Github)));
+        assert!(Provider::from_str("aol").is_err());
+    }
+
+    #[test]
+    fn an_unconfigured_client_reports_providers_as_missing() {
+        let client = OAuthClient::new(&config_without_providers()).expect("build empty client");
+        for provider in [Provider::Github, Provider::Google, Provider::Microsoft] {
+            match client.get_authorization_url(provider, None) {
+                Err(AppError::BadRequest(message)) => {
+                    assert!(message.contains("not configured"), "{message}")
+                }
+                other => panic!("expected not-configured for {provider:?}, got {other:?}"),
+            }
+            assert!(client.get_client(provider).is_none());
+        }
+    }
+
+    fn config_with_github() -> Config {
+        let mut config = config_without_providers();
+        config.platform_github_client_id = Some("client-id-123".to_string());
+        config.platform_github_client_secret = Some("client-secret".to_string());
+        config
+    }
+
+    #[test]
+    fn authorization_urls_carry_the_client_id_and_redirect() {
+        let client = OAuthClient::new(&config_with_github()).expect("build github client");
+
+        let (url, csrf) = client
+            .get_authorization_url(Provider::Github, Some("https://app.example.test/cb"))
+            .expect("authorization url");
+        assert!(url.contains("client_id=client-id-123"), "{url}");
+        assert!(
+            url.contains("redirect_uri="),
+            "explicit redirect must be forwarded: {url}"
+        );
+        assert!(!csrf.secret().is_empty());
+
+        // With scopes via the scoped variant.
+        let (scoped_url, _) = client
+            .get_authorization_url_with_scopes(
+                Provider::Github,
+                vec!["user:email".to_string()],
+                None,
+            )
+            .expect("scoped url");
+        assert!(scoped_url.contains("scope="), "{scoped_url}");
+    }
+
+    #[tokio::test]
+    async fn exchange_code_against_an_unconfigured_provider_is_refused_up_front() {
+        let client = OAuthClient::new(&config_without_providers()).expect("build empty client");
+        match client.exchange_code(Provider::Google, "code").await {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("not configured"))
+            }
+            other => panic!("expected not-configured, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pkce_urls_embed_a_challenge() {
+        let client = OAuthClient::new(&config_with_github()).expect("build github client");
+        let (url, _csrf, _verifier) = client
+            .get_authorization_url_with_pkce(Provider::Github, vec!["user:email".to_string()], None)
+            .expect("pkce url");
+        assert!(url.contains("code_challenge="), "{url}");
+        assert!(url.contains("code_challenge_method=S256"), "{url}");
+    }
+}
