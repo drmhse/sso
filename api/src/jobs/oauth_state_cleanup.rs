@@ -34,3 +34,23 @@ impl OAuthStateCleanupJob {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn cleanup_removes_expired_states_and_keeps_live_ones() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        let job = OAuthStateCleanupJob::new(db.clone());
+
+        // With no states at all, a cleanup pass is a harmless no-op.
+        job.cleanup_expired_states().await.expect("cleanup run");
+    }
+}

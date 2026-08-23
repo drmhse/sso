@@ -35,3 +35,22 @@ impl DeviceCodeCleanupJob {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn an_empty_queue_makes_cleanup_a_harmless_no_op() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        DeviceCodeCleanupJob::new(db.clone())
+            .cleanup_expired_device_codes()
+            .await
+            .expect("cleanup run");
+    }
+}

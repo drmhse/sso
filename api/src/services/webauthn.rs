@@ -308,3 +308,38 @@ impl WebAuthnService {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn construction_accepts_valid_relying_party_configuration() {
+        let service =
+            WebAuthnService::new("example.com", "https://example.com", Some("Example SSO"));
+        // The builder validates the rp id/origin pairing; a valid pair builds.
+        assert!(service.is_ok());
+
+        let service = WebAuthnService::new("example.com", "https://example.com", None);
+        assert!(service.is_ok(), "a missing display name is optional");
+    }
+
+    #[test]
+    fn an_origin_that_is_not_a_url_is_refused_at_construction() {
+        let error = WebAuthnService::new("example.com", "not-a-url", None);
+        match error {
+            Err(AppError::InternalServerError(message)) => {
+                assert!(message.contains("Invalid RP origin URL"))
+            }
+            Err(other_error) => panic!("expected internal error, got {other_error:?}"),
+            Ok(_) => panic!("expected construction to fail"),
+        }
+    }
+
+    #[test]
+    fn an_origin_mismatching_the_rp_id_is_refused() {
+        // The origin's host must be derivable from the relying party id.
+        let error = WebAuthnService::new("example.com", "https://other.example.org", None);
+        assert!(error.is_err(), "mismatched rp id/origin must be refused");
+    }
+}
