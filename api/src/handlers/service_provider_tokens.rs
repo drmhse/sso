@@ -681,3 +681,75 @@ mod tests {
         assert_eq!(normalize_provider_key("okta-Prod"), "okta-Prod");
     }
 }
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use crate::middleware::ServicePrincipal;
+
+    fn dummy_service() -> crate::entities::services::Model {
+        crate::entities::services::Model {
+            id: "svc".into(),
+            org_id: "org".into(),
+            slug: "portal".into(),
+            name: "Portal".into(),
+            service_type: "web".into(),
+            client_id: "cid".into(),
+            client_secret_hash: "h".into(),
+            github_scopes: None,
+            microsoft_scopes: None,
+            google_scopes: None,
+            redirect_uris: None,
+            device_activation_uri: None,
+            resource_uris: None,
+            saml_enabled: false,
+            saml_entity_id: None,
+            saml_acs_url: None,
+            saml_slo_url: None,
+            saml_name_id_format: None,
+            saml_attribute_mapping: None,
+            saml_sign_assertions: false,
+            saml_sign_response: false,
+            created_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    fn principal_with(perms: &[&str]) -> ServicePrincipal {
+        ServicePrincipal {
+            api_key_id: "key".to_string(),
+            service_id: "svc".to_string(),
+            service: dummy_service(),
+            permissions: perms.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn provider_keys_are_normalized_to_ascii_lowercase() {
+        assert_eq!(normalize_provider_key("GitHub"), "github");
+        assert_eq!(normalize_provider_key("GOOGLE"), "google");
+        assert_eq!(normalize_provider_key("Microsoft"), "microsoft");
+        assert_eq!(normalize_provider_key("custom-thing"), "custom-thing");
+    }
+
+    #[tokio::test]
+    async fn wildcard_and_specific_permissions_are_accepted_others_refused() {
+        let wildcard = principal_with(&["read:provider_tokens"]);
+        check_provider_token_permission(&wildcard, "github").unwrap();
+        check_provider_token_permission(&wildcard, "google").unwrap();
+
+        let specific = principal_with(&["read:provider_tokens:github"]);
+        check_provider_token_permission(&specific, "github").unwrap();
+        match check_provider_token_permission(&specific, "google") {
+            Err(AppError::Forbidden(message)) => {
+                assert!(message.contains("read:provider_tokens"))
+            }
+            other => panic!("expected forbidden for ungranted provider, got {other:?}"),
+        }
+
+        let none = principal_with(&[]);
+        match check_provider_token_permission(&none, "github") {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+    }
+}
