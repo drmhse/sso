@@ -726,3 +726,521 @@ pub async fn delete_subscription(
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::services;
+    use crate::middleware::ServicePrincipal;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{organizations::OrganizationStore, plans::PlanStore, users::UserStore, DB};
+    use axum::http::StatusCode;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    struct Fixture {
+        state: AppState,
+        principal: ServicePrincipal,
+        other_principal: ServicePrincipal,
+    }
+
+    fn principal_for(service: &services::Model, permissions: &[&str]) -> ServicePrincipal {
+        ServicePrincipal {
+            api_key_id: "test-key".to_string(),
+            service_id: service.id.clone(),
+            service: service.clone(),
+            permissions: permissions.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+
+        let owner = UserStore::create(DB::Conn(&db), "service-api-owner@example.test", None, false)
+            .await
+            .expect("create owner");
+        let (org, _) =
+            OrganizationStore::create_with_owner(DB::Conn(&db), "acme", "Acme", &owner.id, None)
+                .await
+                .expect("create org");
+        OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+            .await
+            .expect("activate org");
+
+        async fn make_service(
+            db: &sea_orm::DatabaseConnection,
+            org_id: &str,
+            slug: &str,
+        ) -> services::Model {
+            ServiceStore::create_with_options(
+                DB::Conn(db),
+                &Uuid::new_v4().to_string(),
+                org_id,
+                slug,
+                slug,
+                "web",
+                &Uuid::new_v4().to_string(),
+                "unused-hash",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create service")
+        }
+        let service = make_service(&db, &org.id, "portal").await;
+        let other_service = make_service(&db, &org.id, "other").await;
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: Arc::new({
+                let rsa = GeneratedKey::generate().expect("generate test rsa key");
+                JwtService::new(
+                    &STANDARD.encode(rsa.private_key_pem().expect("private pem")),
+                    &STANDARD.encode(rsa.public_key_pem().expect("public pem")),
+                    config.jwt_expiration_hours,
+                    "test-key",
+                    &config.base_url,
+                )
+                .expect("create jwt service")
+            }),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        Fixture {
+            principal: principal_for(
+                &service,
+                &[
+                    "read:users",
+                    "write:users",
+                    "delete:users",
+                    "read:subscriptions",
+                    "write:subscriptions",
+                    "delete:subscriptions",
+                    "read:analytics",
+                    "read:service",
+                    "write:service",
+                ],
+            ),
+            other_principal: principal_for(&other_service, &["read:users"]),
+            state,
+        }
+    }
+
+    /// Creates a user through the API itself, which also links the identity.
+    async fn create_linked_user(f: &Fixture, email: &str) -> ServiceApiUser {
+        let (status, Json(user)) = create_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Json(CreateUserRequest {
+                email: email.to_string(),
+            }),
+        )
+        .await
+        .expect("create user");
+        assert_eq!(status, StatusCode::CREATED);
+        user
+    }
+
+    #[tokio::test]
+    async fn missing_permissions_are_rejected_everywhere() {
+        let f = fixture().await;
+        // The other principal only carries read:users.
+        match list_service_subscriptions(
+            State(f.state.clone()),
+            f.other_principal.clone(),
+            Query(ListSubscriptionsQuery {
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(message)) => assert!(message.contains("permission")),
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+        match get_service_analytics(State(f.state.clone()), f.other_principal.clone()).await {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+        match update_service_info(
+            State(f.state.clone()),
+            f.other_principal.clone(),
+            Json(UpdateServiceInfoRequest {
+                name: Some("x".to_string()),
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_is_idempotent_per_service_and_validates_email() {
+        let f = fixture().await;
+        let (status, Json(first)) = create_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Json(CreateUserRequest {
+                email: "new-user@example.test".to_string(),
+            }),
+        )
+        .await
+        .expect("create user");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(first.email, "new-user@example.test");
+
+        // Second creation returns 200 with the same identity.
+        let (status, Json(second)) = create_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Json(CreateUserRequest {
+                email: "new-user@example.test".to_string(),
+            }),
+        )
+        .await
+        .expect("re-create user");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second.id, first.id);
+
+        match create_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Json(CreateUserRequest {
+                email: "not-an-email".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("email")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn users_can_be_listed_fetched_and_unlinked() {
+        let f = fixture().await;
+        let user = create_linked_user(&f, "listed@example.test").await;
+
+        let Json(list) = list_service_users(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Query(ListUsersQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list users");
+        assert_eq!(list.total, 1);
+        assert_eq!(list.users[0].id, user.id);
+
+        let Json(got) = get_service_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path(user.id.clone()),
+        )
+        .await
+        .expect("get user");
+        assert_eq!(got.email, "listed@example.test");
+
+        match get_service_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path("missing".to_string()),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found, got {other:?}"),
+        }
+
+        // Deleting unlinks but does not remove the global user.
+        let status = delete_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path(user.id.clone()),
+        )
+        .await
+        .expect("delete user");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        match get_service_user(State(f.state.clone()), f.principal.clone(), Path(user.id)).await {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found after unlink, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_updates_via_service_keys_are_refused() {
+        let f = fixture().await;
+        let user = create_linked_user(&f, "profile@example.test").await;
+
+        match update_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path(user.id.clone()),
+            Json(UpdateUserRequest {
+                email: Some("new@example.test".to_string()),
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden, got {other:?}"),
+        }
+
+        // An empty payload is a harmless read-shaped update.
+        let Json(same) = update_user(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path(user.id.clone()),
+            Json(UpdateUserRequest { email: None }),
+        )
+        .await
+        .expect("empty update");
+        assert_eq!(same.id, user.id);
+    }
+
+    #[tokio::test]
+    async fn subscription_lifecycle_scoped_to_the_owning_service() {
+        let f = fixture().await;
+        let user = create_linked_user(&f, "subscriber@example.test").await;
+
+        // Create a plan on our service and one on the other service.
+        let now_str = Utc::now().naive_utc();
+        let plan_id = Uuid::new_v4().to_string();
+        PlanStore::create(
+            DB::Conn(&f.state.db),
+            &plan_id,
+            &f.principal.service_id,
+            "Pro",
+            None,
+            1999,
+            "usd",
+            "[]",
+            None,
+            false,
+            now_str,
+        )
+        .await
+        .expect("create own plan");
+        let foreign_plan_id = Uuid::new_v4().to_string();
+        PlanStore::create(
+            DB::Conn(&f.state.db),
+            &foreign_plan_id,
+            &f.other_principal.service_id,
+            "Other Pro",
+            None,
+            999,
+            "usd",
+            "[]",
+            None,
+            false,
+            now_str,
+        )
+        .await
+        .expect("create foreign plan");
+
+        // A plan belonging to another service is refused.
+        match create_subscription(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Json(CreateSubscriptionRequest {
+                user_id: user.id.clone(),
+                plan_id: foreign_plan_id,
+                status: None,
+                current_period_end: None,
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected forbidden for foreign plan, got {other:?}"),
+        }
+
+        let Json(created) = create_subscription(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Json(CreateSubscriptionRequest {
+                user_id: user.id.clone(),
+                plan_id: plan_id.clone(),
+                status: Some("active".to_string()),
+                current_period_end: Some("2030-01-01T00:00:00Z".to_string()),
+            }),
+        )
+        .await
+        .expect("create subscription");
+        assert_eq!(created.plan_name, "Pro");
+
+        let Json(list) = list_service_subscriptions(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Query(ListSubscriptionsQuery {
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list subscriptions");
+        assert_eq!(list.subscriptions.len(), 1);
+
+        let Json(got) = get_user_subscription(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path(user.id.clone()),
+        )
+        .await
+        .expect("get subscription");
+        assert_eq!(got.status, "active");
+
+        let updated = update_subscription(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path(user.id.clone()),
+            Json(UpdateSubscriptionRequest {
+                status: Some("cancelled".to_string()),
+                current_period_end: Some("bad-date".to_string()),
+            }),
+        )
+        .await;
+        match updated {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("Invalid current_period_end"))
+            }
+            other => panic!("expected BadRequest for bad date, got {other:?}"),
+        }
+
+        let status = delete_subscription(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Path(user.id.clone()),
+        )
+        .await
+        .expect("delete subscription");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        match get_user_subscription(State(f.state.clone()), f.principal.clone(), Path(user.id))
+            .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected not found after delete, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn analytics_and_service_info_round_trip() {
+        let f = fixture().await;
+        let _user = create_linked_user(&f, "counted@example.test").await;
+
+        let Json(analytics) = get_service_analytics(State(f.state.clone()), f.principal.clone())
+            .await
+            .expect("analytics");
+        assert_eq!(analytics.total_users, 1);
+        assert_eq!(analytics.total_subscriptions, 0);
+
+        let Json(info) = get_service_info(State(f.state.clone()), f.principal.clone())
+            .await
+            .expect("service info");
+        assert_eq!(info.slug, "portal");
+
+        let Json(updated) = update_service_info(
+            State(f.state.clone()),
+            f.principal.clone(),
+            Json(UpdateServiceInfoRequest {
+                name: Some("Portal Renamed".to_string()),
+            }),
+        )
+        .await
+        .expect("update service info");
+        assert_eq!(updated.name, "Portal Renamed");
+    }
+}

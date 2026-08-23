@@ -444,3 +444,311 @@ pub async fn unlink_identity(
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::middleware::AuthUser;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{identities::IdentityStore, users::UserStore, DB};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    struct Fixture {
+        state: AppState,
+        auth_user: AuthUser,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new({
+            let rsa = GeneratedKey::generate().expect("generate test rsa key");
+            JwtService::new(
+                &STANDARD.encode(rsa.private_key_pem().expect("private pem")),
+                &STANDARD.encode(rsa.public_key_pem().expect("public pem")),
+                config.jwt_expiration_hours,
+                "test-key",
+                &config.base_url,
+            )
+            .expect("create jwt service")
+        });
+
+        let user = UserStore::create(DB::Conn(&db), "identities@example.test", None, false)
+            .await
+            .expect("create user");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user = AuthUser {
+            // Claims are unused by these handlers beyond org/service context.
+            claims: {
+                let token = jwt_service
+                    .create_token(&user.id, &user.email, false, None, None)
+                    .expect("create token");
+                jwt_service.validate_token(&token).expect("validate token")
+            },
+            user,
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "identity-test".to_string(),
+            current_session_id: None,
+        };
+        Fixture { state, auth_user }
+    }
+
+    async fn add_identity(f: &Fixture, provider: &str) {
+        IdentityStore::create(
+            DB::Conn(&f.state.db),
+            &f.auth_user.user.id,
+            provider,
+            &format!("{provider}-uid"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed identity");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_requests_are_rejected() {
+        let f = fixture().await;
+        for result in [
+            list_identities(State(f.state.clone()), None).await.err(),
+            start_link(
+                State(f.state.clone()),
+                Path("github".to_string()),
+                Query(StartLinkQuery { redirect_uri: None }),
+                None,
+            )
+            .await
+            .err(),
+            unlink_identity(State(f.state.clone()), Path("github".to_string()), None)
+                .await
+                .err(),
+        ] {
+            match result {
+                Some(AppError::Unauthorized(_)) => {}
+                other => panic!("expected unauthorized, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_providers_are_rejected_before_anything_else() {
+        let f = fixture().await;
+        let auth = axum::Extension(f.auth_user.clone());
+        match start_link(
+            State(f.state.clone()),
+            Path("myspace".to_string()),
+            Query(StartLinkQuery { redirect_uri: None }),
+            Some(auth.clone()),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("provider")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        match unlink_identity(
+            State(f.state.clone()),
+            Path("myspace".to_string()),
+            Some(auth),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("provider")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_starts_empty_and_reflects_seeded_identities() {
+        let f = fixture().await;
+        let Json(empty) = list_identities(
+            State(f.state.clone()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        .expect("list identities");
+        assert!(empty.is_empty());
+
+        add_identity(&f, "github").await;
+        add_identity(&f, "google").await;
+
+        let Json(list) = list_identities(
+            State(f.state.clone()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        .expect("list identities");
+        let providers: Vec<String> = list.into_iter().map(|i| i.provider).collect();
+        assert!(providers.contains(&"github".to_string()));
+        assert!(providers.contains(&"google".to_string()));
+    }
+
+    #[tokio::test]
+    async fn linking_without_platform_credentials_is_reported_not_crashed() {
+        let f = fixture().await;
+        match start_link(
+            State(f.state.clone()),
+            Path("github".to_string()),
+            Query(StartLinkQuery { redirect_uri: None }),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("not configured"), "{message}")
+            }
+            other => panic!("expected not-configured error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_last_identity_cannot_be_unlinked() {
+        let f = fixture().await;
+        add_identity(&f, "github").await;
+
+        match unlink_identity(
+            State(f.state.clone()),
+            Path("github".to_string()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("last identity"), "{message}")
+            }
+            other => panic!("expected last-identity guard, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unlink_removes_only_the_chosen_provider() {
+        let f = fixture().await;
+        add_identity(&f, "github").await;
+        add_identity(&f, "google").await;
+
+        let status = unlink_identity(
+            State(f.state.clone()),
+            Path("github".to_string()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        .expect("unlink github");
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+
+        let Json(list) = list_identities(
+            State(f.state.clone()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        .expect("list identities");
+        let providers: Vec<String> = list.into_iter().map(|i| i.provider).collect();
+        assert_eq!(providers, vec!["google".to_string()]);
+
+        // The last-identity guard fires before the existence check.
+        match unlink_identity(
+            State(f.state.clone()),
+            Path("microsoft".to_string()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("last identity"), "{message}")
+            }
+            other => panic!("expected last-identity guard, got {other:?}"),
+        }
+    }
+}
