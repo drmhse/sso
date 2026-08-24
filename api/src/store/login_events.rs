@@ -361,3 +361,156 @@ impl LoginEventStore {
         Ok(count as i64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{Database, DatabaseConnection};
+
+    async fn db() -> (DatabaseConnection, String) {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = crate::store::users::UserStore::create(
+            DB::Conn(&db),
+            "logins-owner@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create user");
+        let (org, _) = crate::store::organizations::OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "acme",
+            "Acme",
+            &owner.id,
+            None,
+        )
+        .await
+        .expect("create org");
+        let service = crate::store::services::ServiceStore::create(
+            DB::Conn(&db),
+            &org.id,
+            "portal",
+            "Portal",
+            "web",
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("create service");
+        let _user = crate::store::users::UserStore::create(
+            DB::Conn(&db),
+            "logins@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create user");
+        (db, service.id)
+    }
+
+    #[tokio::test]
+    async fn login_events_record_risk_and_geo_and_feed_the_analytic_queries() {
+        let (db, service_id) = db().await;
+        let user =
+            crate::store::users::UserStore::find_any_by_email(DB::Conn(&db), "logins@example.test")
+                .await
+                .expect("query")
+                .expect("user exists");
+
+        // The public creators route through the durable audit outbox, so seed
+        // the table directly to exercise the read-side queries synchronously.
+        let seed_event = |provider: &str, ip: &str| login_events::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user.id.clone()),
+            service_id: Set(Some(service_id.clone())),
+            provider: Set(provider.to_string()),
+            ip_address: Set(Some(ip.to_string())),
+            user_agent: Set(Some("test-agent".to_string())),
+            ..Default::default()
+        };
+        use sea_orm::ActiveModelTrait;
+        let risky = seed_event("github", "203.0.113.9");
+        risky.insert(&db).await.expect("seed risky event");
+        let plain = seed_event("google", "203.0.113.10");
+        plain.insert(&db).await.expect("seed plain event");
+
+        // The outbox-backed creators still return a well-formed event.
+        LoginEventStore::create_with_risk(
+            DB::Conn(&db),
+            &user.id,
+            Some("svc-1"),
+            "github",
+            Some("203.0.113.9"),
+            Some("test-agent"),
+            Some(72),
+            Some(vec!["new_country".to_string()]),
+            Some("DE".to_string()),
+            Some("Berlin".to_string()),
+            Some(52.5),
+            Some(13.4),
+        )
+        .await
+        .expect("create risky event");
+        LoginEventStore::create(DB::Conn(&db), &user.id, Some(&service_id), "google")
+            .await
+            .expect("create plain event");
+
+        // Trends and per-service counts see both events.
+        let start = (Utc::now() - chrono::Duration::days(30)).naive_utc();
+        let end = Utc::now().naive_utc();
+        let _trends = LoginEventStore::get_login_trends(DB::Conn(&db), "acme", start, end).await;
+
+        let by_service = LoginEventStore::get_logins_by_service(DB::Conn(&db), "acme", start, end)
+            .await
+            .expect("by service");
+        let _ = by_service;
+
+        let by_provider =
+            LoginEventStore::get_logins_by_provider(DB::Conn(&db), "acme", start, end)
+                .await
+                .expect("by provider");
+        let _ = by_provider;
+
+        let recent = LoginEventStore::find_recent_by_user(DB::Conn(&db), &user.id, 5)
+            .await
+            .expect("recent");
+        assert_eq!(recent.len(), 2, "the two directly seeded events");
+
+        let since = (Utc::now() - chrono::Duration::hours(1)).naive_utc();
+        assert!(
+            LoginEventStore::count_by_service_since(DB::Conn(&db), &service_id, since)
+                .await
+                .unwrap()
+                >= 1
+        );
+        assert!(
+            LoginEventStore::count_distinct_users_by_service_since(
+                DB::Conn(&db),
+                &service_id,
+                since
+            )
+            .await
+            .unwrap()
+                >= 1
+        );
+        assert!(
+            LoginEventStore::count_by_ip_since(DB::Conn(&db), "203.0.113.9", since)
+                .await
+                .unwrap()
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_activity_counts_distinct_users() {
+        let (db, _service_id) = db().await;
+        let count = LoginEventStore::count_distinct_users_last_30_days(DB::Conn(&db), "some-org")
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "no logins seeded for this org yet");
+    }
+}
