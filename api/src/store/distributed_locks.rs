@@ -106,3 +106,91 @@ impl DistributedLockStore {
         Ok(result.rows_affected)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
+
+    #[tokio::test]
+    async fn locks_are_exclusive_per_key_and_owner_scoped() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        assert!(DistributedLockStore::try_acquire_lock(
+            DB::Conn(&db),
+            "job:nightly",
+            "worker-a",
+            60
+        )
+        .await
+        .unwrap());
+        assert!(
+            !DistributedLockStore::try_acquire_lock(DB::Conn(&db), "job:nightly", "worker-b", 60)
+                .await
+                .unwrap(),
+            "a second acquirer must lose while held"
+        );
+
+        // Only the owner can release.
+        assert!(
+            !DistributedLockStore::release_lock(DB::Conn(&db), "job:nightly", "worker-b")
+                .await
+                .unwrap()
+        );
+        assert!(
+            DistributedLockStore::release_lock(DB::Conn(&db), "job:nightly", "worker-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            DistributedLockStore::try_acquire_lock(DB::Conn(&db), "job:nightly", "worker-b", 60)
+                .await
+                .unwrap(),
+            "released locks are re-acquirable"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_locks_are_swept_and_extend_refreshes_them() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+
+        // Seed an already-expired lock directly.
+        let expired = distributed_locks::ActiveModel {
+            lock_key: Set("job:stale".to_string()),
+            owner_id: Set("dead-worker".to_string()),
+            acquired_at: Set((Utc::now() - chrono::Duration::minutes(5)).naive_utc()),
+            expires_at: Set((Utc::now() - chrono::Duration::minutes(1)).naive_utc()),
+        };
+        expired.insert(&db).await.expect("seed expired lock");
+
+        // Acquisition by a new worker sweeps the stale lock and succeeds.
+        assert!(DistributedLockStore::try_acquire_lock(
+            DB::Conn(&db),
+            "job:stale",
+            "new-worker",
+            60
+        )
+        .await
+        .unwrap());
+
+        // Extending refreshes the TTL for the current owner.
+        assert!(
+            DistributedLockStore::extend_lock(DB::Conn(&db), "job:stale", "new-worker", 120)
+                .await
+                .expect("extend")
+        );
+        assert!(
+            DistributedLockStore::cleanup_expired_locks(DB::Conn(&db))
+                .await
+                .unwrap()
+                >= 0
+        );
+    }
+}

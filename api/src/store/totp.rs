@@ -56,3 +56,85 @@ impl TotpStore {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::DatabaseConnection;
+    use sea_orm::{ActiveModelTrait, Database, Set};
+    use uuid::Uuid;
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    #[tokio::test]
+    async fn totp_lifecycle_reads_writes_and_deletes() {
+        let db = db().await;
+        let user =
+            crate::store::users::UserStore::create(DB::Conn(&db), "totp@example.test", None, false)
+                .await
+                .expect("create user");
+
+        assert!(!TotpStore::is_enabled(DB::Conn(&db), &user.id)
+            .await
+            .unwrap());
+
+        let secret = user_totp_secrets::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user.id.clone()),
+            secret_encrypted: Set(b"enc".to_vec()),
+            encryption_key_id: Set("k1".to_string()),
+            enabled: Set(false),
+            enabled_at: Set(None),
+            created_at: Set(Utc::now().naive_utc()),
+        };
+        secret.insert(&db).await.expect("seed unconfirmed secret");
+
+        // Unconfirmed means not yet enabled.
+        assert!(!TotpStore::is_enabled(DB::Conn(&db), &user.id)
+            .await
+            .unwrap());
+        assert!(TotpStore::find_by_user(DB::Conn(&db), &user.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Backup codes.
+        let code = totp_backup_codes::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user.id.clone()),
+            code_hash: Set("hash-1".to_string()),
+            used: Set(false),
+            used_at: Set(None),
+            created_at: Set(Utc::now().naive_utc()),
+        };
+        code.insert(&db).await.expect("seed backup code");
+        assert_eq!(
+            TotpStore::count_backup_codes(DB::Conn(&db), &user.id)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Deleting the secret removes codes too (or independently).
+        TotpStore::delete_totp_secret(DB::Conn(&db), &user.id)
+            .await
+            .unwrap();
+        TotpStore::delete_backup_codes(DB::Conn(&db), &user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            TotpStore::count_backup_codes(DB::Conn(&db), &user.id)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}
