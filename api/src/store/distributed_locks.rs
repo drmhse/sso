@@ -186,11 +186,8 @@ mod tests {
                 .await
                 .expect("extend")
         );
-        assert!(
-            DistributedLockStore::cleanup_expired_locks(DB::Conn(&db))
-                .await
-                .unwrap()
-                >= 0
-        );
+        DistributedLockStore::cleanup_expired_locks(DB::Conn(&db))
+            .await
+            .expect("cleanup runs");
     }
 }
