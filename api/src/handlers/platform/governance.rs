@@ -804,3 +804,297 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod governance_tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::config::Config;
+    use crate::entities::users;
+    use crate::middleware::AuthUser;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{
+        memberships::MembershipStore,
+        users::{UserCreationOptions, UserStore},
+        DB,
+    };
+    use axum::extract::Path;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        plain: AuthUser,
+        org_id: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let config = test_config();
+        let jwt_service = Arc::new({
+            let rsa = GeneratedKey::generate().expect("rsa");
+            JwtService::new(
+                &STANDARD.encode(rsa.private_key_pem().expect("pem")),
+                &STANDARD.encode(rsa.public_key_pem().expect("pem")),
+                config.jwt_expiration_hours,
+                "test-key",
+                &config.base_url,
+            )
+            .expect("jwt")
+        });
+
+        let owner_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "governance-owner@example.test",
+            UserCreationOptions {
+                is_platform_owner: true,
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("platform owner")
+        .0;
+        let plain_model =
+            UserStore::create(DB::Conn(&db), "governance-plain@example.test", None, false)
+                .await
+                .expect("plain user");
+
+        // A pending organization awaiting approval.
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "pending-org",
+            "Pending Org",
+            &plain_model.id,
+            None,
+        )
+        .await
+        .expect("create pending org");
+        MembershipStore::create(DB::Conn(&db), &org.id, &plain_model.id, "owner")
+            .await
+            .expect("owner membership");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("oauth")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("risk")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = jwt_service
+                .create_token(&user.id, &user.email, user.is_platform_owner, None, None)
+                .expect("token");
+            AuthUser {
+                claims: jwt_service.validate_token(&token).expect("claims"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "governance-test".to_string(),
+                current_session_id: None,
+            }
+        };
+
+        Fixture {
+            state,
+            owner: auth_user_for(&owner_model),
+            plain: auth_user_for(&plain_model),
+            org_id: org.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn non_owners_are_denied_every_governance_endpoint() {
+        let f = fixture().await;
+        let denials = (
+            list_tiers(State(f.state.clone()), Extension(f.plain.clone()))
+                .await
+                .err(),
+            list_organizations(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Query(ListOrganizationsQuery {
+                    status: None,
+                    tier_id: None,
+                    limit: None,
+                    offset: None,
+                }),
+            )
+            .await
+            .err(),
+            approve_organization(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Path(f.org_id.clone()),
+                Json(ApproveOrganizationRequest { tier_id: None }),
+            )
+            .await
+            .err(),
+            suspend_organization(
+                State(f.state.clone()),
+                Extension(f.plain.clone()),
+                Path(f.org_id.clone()),
+            )
+            .await
+            .err(),
+        );
+        match denials {
+            (
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+                Some(AppError::Forbidden(_)),
+            ) => {}
+            other => panic!("expected all-forbidden, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_full_approval_lifecycle_holds() {
+        let f = fixture().await;
+
+        // Approve assigns a default tier and activates.
+        let Json(approved) = approve_organization(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.org_id.clone()),
+            Json(ApproveOrganizationRequest { tier_id: None }),
+        )
+        .await
+        .expect("approve");
+        assert_eq!(approved.status, "active");
+        assert_eq!(
+            approved.approved_by.as_deref(),
+            Some(f.owner.user.id.as_str())
+        );
+
+        // Suspend and re-activate.
+        let suspended = suspend_organization(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.org_id.clone()),
+        )
+        .await
+        .expect("suspend");
+        assert_eq!(suspended.status, "suspended");
+        let activated = activate_organization(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.org_id.clone()),
+        )
+        .await
+        .expect("activate");
+        assert_eq!(activated.status, "active");
+
+        // Listing reflects the live state with owner details attached.
+        let Json(list) = list_organizations(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Query(ListOrganizationsQuery {
+                status: Some("active".to_string()),
+                tier_id: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("list active orgs");
+        assert!(list
+            .organizations
+            .iter()
+            .any(|o| o.organization.id == f.org_id));
+    }
+
+    #[tokio::test]
+    async fn rejection_records_the_reason() {
+        let f = fixture().await;
+        let Json(rejected) = reject_organization(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Path(f.org_id.clone()),
+            Json(RejectOrganizationRequest {
+                reason: "incomplete signup".to_string(),
+            }),
+        )
+        .await
+        .expect("reject");
+        assert_eq!(rejected.status, "rejected");
+    }
+}
