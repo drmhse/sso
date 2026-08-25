@@ -902,3 +902,257 @@ mod platform_route_boundary_tests {
         assert!(!platform_router[owner_boundary..].contains("\"/api/platform/"));
     }
 }
+
+#[cfg(test)]
+mod router_smoke_tests {
+    use super::*;
+    use crate::auth::jwt::JwtService;
+    use crate::auth::sso::OAuthClient;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::rsa_keys::GeneratedKey;
+    use crate::services::{
+        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
+        risk_engine::RiskEngine,
+    };
+    use crate::state::AppState;
+    use crate::store::{users::UserStore, DB};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use migration::{Migrator, MigratorTrait};
+    use moka::future::Cache;
+    use sea_orm::Database;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn test_config() -> Config {
+        Config {
+            database_url: "sqlite::memory:".to_string(),
+            jwt_expiration_hours: 24,
+            db_max_connections: 5,
+            db_min_connections: 1,
+            db_acquire_timeout_secs: 30,
+            db_idle_timeout_secs: 600,
+            db_max_lifetime_secs: 1800,
+            platform_github_client_id: None,
+            platform_github_client_secret: None,
+            platform_github_redirect_uri: None,
+            platform_google_client_id: None,
+            platform_google_client_secret: None,
+            platform_google_redirect_uri: None,
+            platform_microsoft_client_id: None,
+            platform_microsoft_client_secret: None,
+            platform_microsoft_redirect_uri: None,
+            platform_github_auth_url: None,
+            platform_github_token_url: None,
+            platform_github_user_api_url: None,
+            platform_google_auth_url: None,
+            platform_google_token_url: None,
+            platform_google_user_api_url: None,
+            platform_microsoft_auth_url: None,
+            platform_microsoft_token_url: None,
+            platform_microsoft_user_api_url: None,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_base_url: None,
+            server_host: "127.0.0.1".to_string(),
+            server_port: 3001,
+            base_url: "http://localhost:3001".to_string(),
+            platform_dashboard_base_url: "http://localhost:3001".to_string(),
+            full_web_client_base_url: None,
+            platform_owner_email: None,
+            platform_owner_password: None,
+            managed_config_path: None,
+            managed_state_path: None,
+            managed_status_path: None,
+            managed_request_path: None,
+            disable_rate_limiting: true,
+            job_processor_interval_secs: 10,
+            job_processor_batch_size: 10,
+        }
+    }
+
+    /// Assembles the same route groups main() uses, with the request-info and
+    /// JWT middleware layers in production order.
+    fn build_app(state: AppState, config: &Config) -> axum::Router {
+        Router::new()
+            .merge(public_routes(config))
+            .merge(protected_routes(&state))
+            .with_state(state.clone())
+            // protected_routes carries its own JWT route layer; adding a
+            // global one here would also gate the public routes.
+            .layer(axum::middleware::from_fn(
+                middleware::extract_request_info_middleware,
+            ))
+    }
+
+    #[tokio::test]
+    async fn public_health_is_reachable_without_authentication() {
+        let config = test_config();
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let jwt_service = Arc::new({
+            let rsa = GeneratedKey::generate().expect("rsa");
+            JwtService::new(
+                &STANDARD.encode(rsa.private_key_pem().expect("pem")),
+                &STANDARD.encode(rsa.public_key_pem().expect("pem")),
+                config.jwt_expiration_hours,
+                "test-key",
+                &config.base_url,
+            )
+            .expect("jwt")
+        });
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("oauth")),
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("risk")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config: config.clone(),
+        };
+        let app = build_app(state.clone(), &config);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn protected_routes_demand_a_bearer_token_and_honour_it() {
+        let config = test_config();
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let jwt_service = Arc::new({
+            let rsa = GeneratedKey::generate().expect("rsa");
+            JwtService::new(
+                &STANDARD.encode(rsa.private_key_pem().expect("pem")),
+                &STANDARD.encode(rsa.public_key_pem().expect("pem")),
+                config.jwt_expiration_hours,
+                "test-key",
+                &config.base_url,
+            )
+            .expect("jwt")
+        });
+        let user = UserStore::create(DB::Conn(&db), "smoke@example.test", None, false)
+            .await
+            .expect("create user");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("oauth")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("risk")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config: config.clone(),
+        };
+
+        let app = build_app(state.clone(), &config);
+
+        // No Authorization header at all.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status() == StatusCode::UNAUTHORIZED,
+            "missing token must be refused, got {}",
+            response.status()
+        );
+
+        // A garbage token is refused too.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user")
+                    .header(header::AUTHORIZATION, "Bearer not-a-real-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+
+        // A real token WITH a bound session passes the whole stack: the
+        // middleware checks the token hash against the sessions table, so a
+        // bare JWT is not enough by design.
+        let token = jwt_service
+            .create_token(&user.id, &user.email, false, None, None)
+            .expect("token");
+        crate::store::sessions::SessionStore::create(
+            DB::Conn(&db),
+            &user.id,
+            &JwtService::hash_token(&token),
+            (chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("router-smoke-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("seed session for token");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec()).unwrap().contains(&user.id),
+            "the authenticated identity must be echoed back"
+        );
+    }
+}
