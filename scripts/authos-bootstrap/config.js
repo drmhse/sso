@@ -151,9 +151,9 @@ function resolveOutputPaths(root, config) {
 }
 
 function defaultImage(backend) {
-  if (backend === 'postgres') return 'editoredit/sso:psql-v0.8.8';
-  if (backend === 'mysql') return 'editoredit/sso:mysql-v0.8.8';
-  return 'editoredit/sso:sqlite-v0.8.8';
+  if (backend === 'postgres') return 'editoredit/sso:psql-v0.8.9';
+  if (backend === 'mysql') return 'editoredit/sso:mysql-v0.8.9';
+  return 'editoredit/sso:sqlite-v0.8.9';
 }
 
 function normalizeUrl(value) {

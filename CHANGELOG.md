@@ -7,6 +7,82 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.9 - 2026-09-02
+
+### Changed
+
+- `api/` is a cargo workspace instead of one crate. The root package `sso`
+  keeps the HTTP layer and every lower layer moved to `api/crates/authos-*`:
+  core, entities, crypto, db, audit, store, services, plus a dev-only testkit.
+  Layers may only depend downward and cargo enforces it, because a cycle no
+  longer compiles. Each crate re-exports the layers beneath it under their
+  original module names, so `crate::error` and `crate::store` still resolve and
+  almost no call site changed. Every existing command still works: the root
+  package is also the workspace root, so `cargo run --bin sso_psql
+  --no-default-features --features db_psql` and the `target/release/sso_*`
+  paths the Dockerfile and benchmarks use are unaffected.
+- `api/src/sso_sqlite.rs` was `include!("main.rs")`, so with `db_sqlite` as the
+  default feature every `cargo build` compiled the whole crate twice, once as
+  `sso` and once as `sso_sqlite`, and nothing consumed the bare `sso` binary.
+  `main.rs` became `lib.rs` with `pub async fn run()` and all four binaries are
+  three-line shims. Rebuilding after touching one handler went from 82s to
+  roughly 4s, and one layer can now be tested on its own.
+- Only crates with backend-conditional code carry `db_sqlite`/`db_psql`/
+  `db_mysql`, and they forward to every dependency that also has such code,
+  dev-dependencies included, with every internal dependency declared
+  `default-features = false`. This is load-bearing rather than tidiness:
+  `with_retrying_transaction` takes four arguments under `db_sqlite` and three
+  otherwise, so a mixed-feature graph does not compile.
+- Transaction machinery moved out of `error.rs` into `db/transaction.rs` and
+  the `DB` connection enum out of `store/mod.rs` into `db/connection.rs`, which
+  is what removed the last dependency cycles. `ensure_organization_active` moved
+  from `handlers` into the store. The `auth` module is gone: its primitives
+  (`jwt`, `api_key`, `mfa`, `refresh_tokens`, `sso`) are now `crypto`, and its
+  orchestration (`device_flow`, `token_refresher`) moved up into `services`.
+- The AuthOS CLI provisioning command talks to the API through the SDK instead
+  of its own `fetch` wrapper, so it cannot drift from the published contract.
+- `POST`, `PUT`, `PATCH` and `DELETE` in the SDK HTTP client accept `params`,
+  matching `GET`.
+
+### Added
+
+- `npm run check:layers` fails the build when a module references a higher
+  layer, and `npm run check:test-support` asserts the `test-support` features
+  are absent from every production dependency graph and that the three database
+  backends stay mutually exclusive. Both run in the release gate.
+
+- Platform MFA metrics are real. `GET /api/platform/mfa/metrics` previously
+  returned a fixed message and ignored every parameter, including the `org_id`
+  its own note told callers to pass. It now serves the stored daily rollup,
+  accepts `org_id` (omit it for the platform-wide row) and either a
+  `start_date`/`end_date` range or a trailing `days` window. A background job
+  writes the rollup hourly for the previous day, so the figures exist without
+  anyone calling the generate endpoint by hand, and
+  `/api/platform/mfa/metrics/generate` now also accepts `POST`.
+- The SDK covers the upstream domain routing (Home Realm Discovery) endpoints
+  through `sso.organizations.domainRoutes`, and the platform bootstrap, MFA
+  metrics and suspicious-activity endpoints through `sso.platform.bootstrap`
+  and `sso.platform.mfa`. Every API endpoint that is not a browser redirect or
+  a machine protocol surface (SAML, SCIM) now has an SDK method.
+- `PATCH /api/organizations/:org_slug/roles/:role_id` can clear a role
+  description. The request DTO now distinguishes an absent field from an
+  explicit `null`, which the store layer already supported.
+
+### Changed
+
+- The AuthOS CLI provisioning command talks to the API through the SDK instead
+  of its own `fetch` wrapper, so it cannot drift from the published contract.
+- `POST`, `PUT`, `PATCH` and `DELETE` in the SDK HTTP client accept `params`,
+  matching `GET`.
+
+### Removed
+
+- `state` on the password login request. Login answers with tokens as JSON and
+  has no redirect or emailed link to carry the value back, so the field could
+  never do what it documented. Registration, password reset and verification
+  resend still accept it, because those do continue through a link. Unknown
+  fields are ignored, so clients still sending it are unaffected.
+
 ## 0.8.8 - 2026-08-17
 
 ### Changed
