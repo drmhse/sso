@@ -1,7 +1,9 @@
 use crate::constants::{DEFAULT_MAX_SERVICES, DEFAULT_TIER_NAME, VALID_SERVICE_TYPES};
 use crate::db::models::{Plan, ServiceResponse};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::{organizations, plans};
-use crate::error::{with_retrying_transaction, Result};
+use crate::error::Result;
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::services::permission_service::{
@@ -10,7 +12,7 @@ use crate::services::permission_service::{
 use crate::state::AppState;
 use crate::store::{
     memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
-    plans::PlanStore, services::ServiceStore, subscriptions::SubscriptionStore, DB,
+    plans::PlanStore, services::ServiceStore, subscriptions::SubscriptionStore,
 };
 use crate::utils::client_secret::hash_client_secret;
 use crate::utils::resource_indicators::validate_resource_uri;
@@ -240,23 +242,20 @@ async fn get_service_limits(state: &AppState, org: &organizations::Model) -> Res
         let tier_name = if let Some(tier_id) = &org.tier_id {
             OrganizationTierStore::find_by_id(DB::Conn(&state.db), tier_id)
                 .await?
-                .map(|t| t.name)
-                .unwrap_or_else(|| DEFAULT_TIER_NAME.to_string())
+                .map_or_else(|| DEFAULT_TIER_NAME.to_string(), |t| t.name)
         } else {
             DEFAULT_TIER_NAME.to_string()
         };
 
         OrganizationTierStore::find_by_name(DB::Conn(&state.db), &tier_name)
             .await?
-            .map(|t| t.default_max_services as i64)
-            .unwrap_or(DEFAULT_MAX_SERVICES)
+            .map_or(DEFAULT_MAX_SERVICES, |t| t.default_max_services as i64)
     };
 
     let tier_display = if let Some(tier_id) = &org.tier_id {
         OrganizationTierStore::find_by_id(DB::Conn(&state.db), tier_id)
             .await?
-            .map(|t| t.display_name)
-            .unwrap_or_else(|| "Free Tier".to_string())
+            .map_or_else(|| "Free Tier".to_string(), |t| t.display_name)
     } else {
         "Free Tier".to_string()
     };
@@ -286,9 +285,8 @@ pub async fn create_service(
         )));
     }
 
-    // 1. AUTHENTICATE: Extract user from JWT (handled by middleware)
+    // Authentication already happened in middleware; this is authorization.
 
-    // 2. LOAD & VALIDATE: organization by org_slug and ensure it's active
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound("Organization not found".to_string()))?;
@@ -296,14 +294,12 @@ pub async fn create_service(
     let org =
         crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
-    // 4. AUTHORIZE: user is member with role in ('owner', 'admin')
     if !can_create_service(&state, &auth_user.user.id, &org.id).await? {
         return Err(crate::error::AppError::Forbidden(
             "Insufficient permissions to create services".to_string(),
         ));
     }
 
-    // 5. CHECK LIMIT: current services < max_services
     let current_service_count =
         ServiceStore::count_by_org(DB::Conn(&state.db), &org.id).await? as i64;
 
@@ -316,7 +312,6 @@ pub async fn create_service(
         )));
     }
 
-    // 7. PREPARE transaction data
     let service_id = Uuid::new_v4().to_string();
     let client_id = Uuid::new_v4().to_string();
     let client_secret = Uuid::new_v4().to_string();
@@ -371,7 +366,6 @@ pub async fn create_service(
         .build();
     let audit_actor = state.audit_actor.clone();
 
-    // 8. Execute transaction with automatic retry on database contention
     let (service, default_plan) = with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
@@ -467,7 +461,6 @@ pub async fn create_service(
     )
     .await?;
 
-    // 10. RETURN response matching architecture document
     let usage = ServiceUsageInfo {
         current_services: current_service_count + 1,
         max_services,
@@ -714,7 +707,6 @@ pub async fn update_service(
     Ok(Json(ServiceResponse::from(updated_service)))
 }
 
-// Rotate service client secret
 pub async fn rotate_service_secret(
     State(state): State<AppState>,
     Path((org_slug, service_slug)): Path<(String, String)>,
@@ -784,7 +776,6 @@ pub async fn rotate_service_secret(
     }))
 }
 
-// Delete service
 pub async fn delete_service(
     State(state): State<AppState>,
     Path((org_slug, service_slug)): Path<(String, String)>,
@@ -802,7 +793,7 @@ pub async fn delete_service(
         MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &org.id, &auth_user.user.id)
             .await?;
 
-    if membership.map(|m| m.role != "owner").unwrap_or(true) {
+    if membership.is_none_or(|m| m.role != "owner") {
         return Err(crate::error::AppError::Forbidden(
             "Only organization owners can delete services".to_string(),
         ));
@@ -861,10 +852,10 @@ pub async fn create_plan(
     }
 
     let id = Uuid::new_v4().to_string();
-    let features_json = req
-        .features
-        .map(|f| serde_json::to_string(&f).unwrap())
-        .unwrap_or_else(|| serde_json::to_string::<Vec<String>>(&vec![]).unwrap());
+    let features_json = req.features.map_or_else(
+        || serde_json::to_string::<Vec<String>>(&vec![]).unwrap(),
+        |f| serde_json::to_string(&f).unwrap(),
+    );
     let now = Utc::now().naive_utc();
 
     // Create plan using PlanStore
@@ -915,7 +906,6 @@ pub async fn create_plan(
     }))
 }
 
-// List plans for service
 pub async fn list_service_plans(
     State(state): State<AppState>,
     Path((org_slug, service_slug)): Path<(String, String)>,
@@ -984,7 +974,6 @@ pub async fn list_service_plans(
     Ok(Json(responses))
 }
 
-// Update plan
 pub async fn update_plan(
     State(state): State<AppState>,
     Path((org_slug, service_slug, plan_id)): Path<(String, String, String)>,
@@ -1070,7 +1059,6 @@ pub async fn update_plan(
         ),
     };
 
-    // Get subscription count
     let subscription_count =
         SubscriptionStore::count_active_by_plan(DB::Conn(&state.db), &plan.id).await?;
 
@@ -1080,7 +1068,6 @@ pub async fn update_plan(
     }))
 }
 
-// Delete plan
 pub async fn delete_plan(
     State(state): State<AppState>,
     Path((org_slug, service_slug, plan_id)): Path<(String, String, String)>,
@@ -1129,93 +1116,31 @@ pub async fn delete_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
+
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::sso::OAuthClient;
+
     use crate::entities::users;
     use crate::error::AppError;
-    use crate::rsa_keys::GeneratedKey;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::db::DB;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
     use crate::store::{
-        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore, DB,
+        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore,
     };
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            managed_state_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
+    use crate::test_support::test_jwt_service;
 
     struct Fixture {
         state: AppState,

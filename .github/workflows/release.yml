@@ -103,6 +103,8 @@ jobs:
       - name: Validate trust and installer metadata
         run: |
           npm run check:trust
+          npm run check:layers
+          npm run check:test-support
           npm run check:licenses
           npm run check:docs
           npm run check:bootstrap

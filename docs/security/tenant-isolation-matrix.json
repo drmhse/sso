@@ -5,8 +5,8 @@
   "sources": {
     "inventory": "docs/security/tenant-resource-inventory.md",
     "router": "api/src/router.rs",
-    "main": "api/src/main.rs",
-    "entities": "api/src/entities"
+    "main": "api/src/lib.rs",
+    "entities": "api/crates/authos-entities/src/entities"
   },
   "resources": [
     {

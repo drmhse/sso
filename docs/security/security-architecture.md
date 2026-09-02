@@ -17,14 +17,14 @@ isolation surface.
 The main process is a Rust/Axum HTTP API backed by one SeaORM database
 connection configuration. Build features select SQLite, PostgreSQL, or MySQL.
 The process also starts cleanup, refresh, metrics, event, webhook/email-job, and
-buffered-audit work (`api/src/main.rs`, `api/src/jobs/`, `api/src/services/`).
+buffered-audit work (`api/src/lib.rs`, `api/crates/authos-services/src/jobs/`, `api/crates/authos-services/src/services/`).
 
 The API binds to `SERVER_HOST`/`SERVER_PORT`; `BASE_URL` supplies the public
 issuer/origin. TLS termination, firewalling, database encryption, filesystem
 permissions, container isolation, and reverse-proxy policy are outside the
 Rust process and must be supplied by the deployment. HSTS,
 `X-Content-Type-Options`, and `X-Frame-Options` response headers are set by the
-application, but HSTS is effective only over HTTPS (`api/src/main.rs`).
+application, but HSTS is effective only over HTTPS (`api/src/lib.rs`).
 
 ## Route security domains
 
@@ -36,13 +36,13 @@ application, but HSTS is effective only over HTTPS (`api/src/main.rs`).
 | Service API | `X-Api-Key` resolved to a service principal and permission list | `api/src/middleware.rs` |
 | SCIM API | Hashed bearer token resolved to one active, unexpired organization context | `api/src/middleware.rs` |
 | SAML IdP endpoints | Public request initiation/metadata; protected service configuration and IdP-initiated route | `api/src/router.rs`, `api/src/handlers/saml.rs` |
-| Webhooks from billing providers | Provider-specific verification in webhook handlers; no generic user session | `api/src/main.rs`, `api/src/handlers/webhook.rs` |
-| Health and metrics | Health probes are public; metrics are disabled by default and require a configured bearer token when enabled | `api/src/main.rs`, `api/src/http_security.rs`, `api/src/router.rs` |
+| Webhooks from billing providers | Provider-specific verification in webhook handlers; no generic user session | `api/src/lib.rs`, `api/src/handlers/webhook.rs` |
+| Health and metrics | Health probes are public; metrics are disabled by default and require a configured bearer token when enabled | `api/src/lib.rs`, `api/src/http_security.rs`, `api/src/router.rs` |
 
 All routes receive a 30-second request timeout and a configurable streaming
 request-body bound that defaults to 1 MiB. Dynamic CORS determines which browser
 origins receive credentialed CORS headers; it is not relied on as server-side
-authorization (`api/src/main.rs`, `api/src/http_security.rs`,
+authorization (`api/src/lib.rs`, `api/src/http_security.rs`,
 `api/src/middleware.rs`).
 
 ## Identity, authorization, and tenant context
@@ -53,14 +53,14 @@ An ordinary access token contains `sub`, email, platform-owner flag, `jti`,
 optional organization/service/resource/scope context, `iat`, and `exp`. The JWT
 is signed with RS256. Middleware validates the JWT, hashes the exact token, and
 requires a non-expired session row with that hash before loading the current
-user and permissions from the database (`api/src/auth/jwt.rs`,
-`api/src/middleware.rs`, `api/src/store/sessions.rs`).
+user and permissions from the database (`api/crates/authos-crypto/src/crypto/jwt.rs`,
+`api/src/middleware.rs`, `api/crates/authos-store/src/store/sessions.rs`).
 
 The platform-owner check uses the freshly loaded/cached user model rather than
 only trusting the token's flag. The user cache has a 30-second TTL; permission
 cache has a 60-second TTL. Some authorization changes explicitly invalidate
 caches, but comprehensive invalidation evidence is not yet published
-(`api/src/state.rs`, `api/src/main.rs`).
+(`api/src/state.rs`, `api/src/lib.rs`).
 
 ### Tenant authorization
 
@@ -90,14 +90,14 @@ early byte exit. Middleware checks expiry, loads the bound service, rechecks
 that its organization is currently active, and exposes the stored permission
 list. Service-principal user and provider-token paths require the identity's
 issuing organization and service plus the user's tenant row to match the
-principal (`api/src/auth/api_key.rs`, `api/src/middleware.rs`,
-`api/src/store/identities.rs`).
+principal (`api/crates/authos-crypto/src/crypto/api_key.rs`, `api/src/middleware.rs`,
+`api/crates/authos-store/src/store/identities.rs`).
 
 SCIM tokens are random UUID-derived values stored as SHA-256 hashes with an
 active flag and optional expiry. Middleware binds the request to the token's
 `org_id` and rejects a conflicting `X-Organization-ID`. Handlers use that
 context for user membership and group operations
-(`api/src/store/scim_tokens.rs`, `api/src/handlers/scim/`).
+(`api/crates/authos-store/src/store/scim_tokens.rs`, `api/src/handlers/scim/`).
 
 Hashing is appropriate for high-entropy bearer values only if generation,
 single display, transport, rotation, and database handling are also correct;
@@ -108,7 +108,7 @@ those lifecycle properties still need end-to-end evidence.
 | Material | Current representation | Status |
 | --- | --- | --- |
 | User passwords | Argon2 password-hash string with random salt | Source-evidenced in `api/src/handlers/auth/password.rs`; parameter policy and upgrade strategy unverified. |
-| MFA backup codes | Individual Argon2 hashes | Source-evidenced in `api/src/auth/mfa.rs` and TOTP store paths. |
+| MFA backup codes | Individual Argon2 hashes | Source-evidenced in `api/crates/authos-crypto/src/crypto/mfa.rs` and TOTP store paths. |
 | TOTP secret | AES-256-GCM versioned envelope plus active key ID | Source-evidenced; previous-key reads and database-wide verification/rewrap are locally tested, but all-database and retirement evidence remain gaps. |
 | Access-token session reference | SHA-256 hash of the complete JWT | Source-evidenced; the signed JWT itself remains bearer material at clients. |
 | Refresh token | 256-bit opaque value represented only by a SHA-256 session hash and consumed-ancestor history | Local SQLite storage/replay evidence exists; PostgreSQL/MySQL runtime and multi-replica qualification remain. |
@@ -126,7 +126,7 @@ those lifecycle properties still need end-to-end evidence.
 `EncryptionService` requires an active 32-byte hex key, validates its key ID,
 and accepts an optional read-only previous-key registry. It generates a random
 96-bit nonce and writes an AES-256-GCM envelope containing magic bytes, format
-version, key ID, nonce, and ciphertext (`api/src/encryption/mod.rs`). V2
+version, key ID, nonce, and ciphertext (`api/crates/authos-crypto/src/encryption/mod.rs`). V2
 authenticates the header plus length-delimited physical table, record ID, and
 field context. Legacy `nonce || ciphertext` and V1 values remain readable by
 context-aware callers for staged migration and are rewritten as V2.
@@ -183,7 +183,7 @@ over 1,024 UTF-8 bytes, and shed work that waits more than two seconds for a
 permit. Verified-email, organization status/context, risk, MFA, and session
 creation are applied in the handler flow. Reset tokens expire after an hour,
 are conditionally marked used, and password reset deletes all user sessions
-(`api/src/handlers/auth/password.rs`, `api/src/services/concurrency.rs`).
+(`api/src/handlers/auth/password.rs`, `api/crates/authos-crypto/src/crypto/concurrency.rs`).
 
 Deterministic handler tests cover the normalized response shapes, and the
 bounded timing sampler described in the
@@ -199,7 +199,7 @@ still required.
 TOTP uses six digits, a 30-second step, and a one-step skew window. Backup codes
 are random alphanumeric values stored as Argon2 hashes. MFA login uses a
 five-minute pre-auth JWT and consumes its `jti` under a database-backed
-distributed lock before session creation (`api/src/auth/mfa.rs`,
+distributed lock before session creation (`api/crates/authos-crypto/src/crypto/mfa.rs`,
 `api/src/handlers/auth/mfa.rs`). MFA verification and setup routes have tighter
 IP rate limits.
 
@@ -211,7 +211,7 @@ release guarantees.
 
 Magic-link tokens expire after 15 minutes, are stored hashed, and are deleted
 before authentication continues. Stored context binds service and redirect
-parameters in the reviewed flow (`api/src/store/magic_links.rs`,
+parameters in the reviewed flow (`api/crates/authos-store/src/store/magic_links.rs`,
 `api/src/handlers/auth/magic.rs`).
 
 Passkeys use `webauthn-rs`. Registration requires an authenticated user;
@@ -221,8 +221,8 @@ enabled only for localhost or a domain-backed HTTPS `BASE_URL`, and successful
 authentication applies the library-validated result to the complete serialized
 credential plus its denormalized counter/backup flags using an optimistic
 compare-and-update. A SQLite race proves stale ceremony state cannot overwrite
-the winning credential state (`api/src/main.rs`, `api/src/services/webauthn.rs`,
-`api/src/store/user_passkeys.rs`, `api/src/handlers/auth/passkeys.rs`).
+the winning credential state (`api/src/lib.rs`, `api/crates/authos-services/src/services/webauthn.rs`,
+`api/crates/authos-store/src/store/user_passkeys.rs`, `api/src/handlers/auth/passkeys.rs`).
 
 SQLite also proves one-winner WebAuthn challenge deletion and expiry lookup.
 Cross-origin/RP integration, cloned-authenticator behavior with real devices,
@@ -259,7 +259,7 @@ Every signed JWT profile carries both a distinct JOSE `typ` and signed
 `token_use`. Profile validators fix the algorithm to RS256, require an exact
 active-or-previous verification-ring `kid`, `exp`, `iss`, and `aud`, compare the
 issuer, and enforce profile-specific audience, MFA, scope, and actor invariants
-(`api/src/auth/jwt.rs`). AuthOS authenticated API middleware accepts only
+(`api/crates/authos-crypto/src/crypto/jwt.rs`). AuthOS authenticated API middleware accepts only
 management and impersonation profiles; resource and MFA tokens are rejected.
 OAuth token exchange validates only the external-resource profile with the
 exact requested audience, while MFA completion accepts only the MFA pre-auth
@@ -282,8 +282,8 @@ the consumed hash in the same transaction. The session row is the refresh-token
 family: reuse of any recorded ancestor deletes that row and therefore revokes
 the current access and refresh tokens. A concurrent SQLite regression proves
 one rotation winner followed by family revocation when the losing request is
-recognized as reuse (`api/src/auth/refresh_tokens.rs`,
-`api/src/store/sessions.rs`, `api/src/handlers/auth/session.rs`).
+recognized as reuse (`api/crates/authos-crypto/src/crypto/refresh_tokens.rs`,
+`api/crates/authos-store/src/store/sessions.rs`, `api/src/handlers/auth/session.rs`).
 
 The refresh-token storage migration deliberately clears legacy plaintext
 refresh values instead of attempting a backend-specific online conversion, so
@@ -310,8 +310,8 @@ requested resource/scopes. Callback paths retrieve and delete state before
 upstream token exchange. PKCE is generated for upstream authorization and is
 mandatory for service types treated as public. Service redirects are checked
 against registered redirect URIs in reviewed paths
-(`api/src/handlers/auth/oauth.rs`, `api/src/auth/sso.rs`,
-`api/src/store/oauth_states.rs`).
+(`api/src/handlers/auth/oauth.rs`, `api/crates/authos-crypto/src/crypto/sso.rs`,
+`api/crates/authos-store/src/store/oauth_states.rs`).
 
 AuthOS publishes its active and explicitly retained previous JWT verification
 keys and an AuthOS-specific runtime
@@ -319,7 +319,7 @@ capability document. That document identifies the implemented device-code,
 token-exchange, JWT-bearer, and ID-JAG surfaces and explicitly marks OpenID
 Connect authorization-code and ID-token provider behavior unsupported. The
 standard OpenID Connect and RFC 8414 discovery paths return `404`
-(`api/src/runtime_metadata.rs`, `api/src/main.rs`). AuthOS does not currently
+(`api/crates/authos-core/src/runtime_metadata.rs`, `api/src/lib.rs`). AuthOS does not currently
 expose a standards authorization endpoint or issue ID tokens. There is no
 committed OAuth conformance output. The local key-ring implementation provides
 an overlap mechanism, but no release-candidate cache/rollover drill has yet
@@ -420,7 +420,7 @@ returning success. The channel is only a best-effort wake signal. A startup and
 periodic reconciler scans durable pending rows in bounded batches, inserts the
 target audit record and removes its outbox row in one database transaction,
 and treats an identical target event ID as idempotent replay
-(`api/src/services/audit_actor.rs`). Delivery failures store only a bounded
+(`api/crates/authos-audit/src/audit/actor.rs`). Delivery failures store only a bounded
 error code, retry with bounded attempts/backoff, and become queryable
 `dead_letter` rows. SQLite tests cover closed-channel/restart replay, enqueue
 database failure, all four event kinds, paired domain/outbox rollback, late

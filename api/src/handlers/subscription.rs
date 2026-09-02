@@ -1,8 +1,7 @@
-#![allow(dead_code)]
-
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use crate::store::{memberships::MembershipStore, subscriptions::SubscriptionStore, DB};
+use crate::store::{memberships::MembershipStore, subscriptions::SubscriptionStore};
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
@@ -57,13 +56,13 @@ pub async fn get_subscription(
             plan: result.plan_name,
             features,
             status: result.status,
-            current_period_end: result.current_period_end.to_string(),
+            current_period_end: result.current_period_end,
         }))
     } else {
         // No active subscription, return free plan
         use crate::constants::DEFAULT_TIER_NAME;
         Ok(Json(SubscriptionResponse {
-            service: service_slug.to_string(),
+            service: service_slug.clone(),
             plan: DEFAULT_TIER_NAME.to_string(),
             features: vec![],
             status: "active".to_string(),
@@ -72,9 +71,7 @@ pub async fn get_subscription(
     }
 }
 
-// ============================================================================
 // STRIPE CHECKOUT
-// ============================================================================
 
 use crate::store::{organizations::OrganizationStore, plans::PlanStore, services::ServiceStore};
 use axum::extract::Path;
@@ -104,7 +101,6 @@ pub async fn create_checkout(
         .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
         .0;
 
-    // 1. Verify user is member of the organization
     let membership = MembershipStore::find_by_org_slug_and_user(
         DB::Conn(&state.db),
         &org_slug,
@@ -118,7 +114,6 @@ pub async fn create_checkout(
         ));
     }
 
-    // 2. Find the organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -126,13 +121,11 @@ pub async fn create_checkout(
         crate::handlers::organizations::ensure_organization_active(&state.db, &organization.id)
             .await?;
 
-    // 3. Find the service
     let service =
         ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &organization.id, &service_slug)
             .await?
             .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
-    // 4. Find the plan and verify it has a Stripe price ID
     let plan = PlanStore::find_by_id_and_service(DB::Conn(&state.db), &req.plan_id, &service.id)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
@@ -144,14 +137,12 @@ pub async fn create_checkout(
         )
     })?;
 
-    // 5. Get or create billing customer for the organization
     use crate::handlers::organizations::create_billing_customer;
 
     let org_id = organization.id.clone();
     let org_name = organization.name.clone();
     let billing_customer = create_billing_customer(&state, &org_id, &org_name).await?;
 
-    // 6. Create checkout session with metadata
     use crate::billing::CreateCheckoutRequest as BillingCheckoutRequest;
 
     let mut metadata = std::collections::HashMap::new();

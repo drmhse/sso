@@ -19,3 +19,4 @@ export * from './siem';
 export * from './risk';
 export * from './roles';
 export * from './upstream-provider';
+export * from './domain-route';

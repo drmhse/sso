@@ -31,8 +31,9 @@ The repository already contains substantial implementation work:
 - A Rust/Axum API with SQLite, PostgreSQL, and MySQL feature variants.
 - Standalone Linux bundles, multi-architecture Docker image builds, and published TypeScript packages.
 - OAuth/OIDC, SAML, SCIM, passkey, MFA, organization, role, invitation, webhook, and audit-related code paths.
-- 105 first-party Rust test functions under `api/src` and 13 JavaScript test
-  files (37 JavaScript test cases). Vendored dependency tests are excluded.
+- 509 first-party Rust test functions across the `api/` workspace crates
+  (`cargo test --workspace` executes 522 cases) and 13 JavaScript test files
+  (37 JavaScript test cases). Vendored dependency tests are excluded.
 - Tag-triggered release workflows for Linux `amd64` and `arm64`, three database image variants, checksums for standalone bundles, and npm provenance.
 - Database test-environment scripts and migration history.
 

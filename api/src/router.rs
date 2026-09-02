@@ -402,7 +402,6 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
             "/api/organizations/:org_slug/branding",
             patch(update_branding).get(get_branding),
         )
-        // Merge active org routes
         .merge(active_org_routes(state))
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
@@ -597,8 +596,10 @@ pub fn platform_routes(state: &AppState) -> Router<AppState> {
             get(get_suspicious_activity),
         )
         .route(
+            // POST is the correct verb for a rollup rebuild; GET stays for the
+            // existing contract.
             "/api/platform/mfa/metrics/generate",
-            get(generate_daily_metrics),
+            post(generate_daily_metrics).get(generate_daily_metrics),
         )
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
@@ -906,16 +907,17 @@ mod platform_route_boundary_tests {
 #[cfg(test)]
 mod router_smoke_tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
+    use crate::audit::actor::AuditHandle;
     use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::jwt::JwtService;
+    use crate::crypto::sso::OAuthClient;
+    use crate::db::DB;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::{users::UserStore, DB};
+    use crate::store::users::UserStore;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -925,52 +927,7 @@ mod router_smoke_tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
     /// Assembles the same route groups main() uses, with the request-info and
     /// JWT middleware layers in production order.

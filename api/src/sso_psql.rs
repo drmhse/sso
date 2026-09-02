@@ -1,1 +1,3 @@
-include!("main.rs");
+fn main() -> anyhow::Result<()> {
+    sso::run()
+}

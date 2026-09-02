@@ -1,13 +1,15 @@
-use crate::auth::jwt::JwtService;
-use crate::auth::sso::Provider;
 use crate::constants::DEVICE_CODE_EXPIRE_MINUTES;
+use crate::crypto::jwt::JwtService;
+use crate::crypto::sso::Provider;
 use crate::db::models::User;
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::store::{
     device_codes::DeviceCodeStore, identities::IdentityStore, memberships::MembershipStore,
     organizations::OrganizationStore, services::ServiceStore, sessions::SessionStore,
-    subscriptions::SubscriptionStore, DB,
+    subscriptions::SubscriptionStore,
 };
 use axum::{extract::State, Json};
 use chrono::Utc;
@@ -22,10 +24,9 @@ fn unavailable_user_code() -> AppError {
 }
 
 // Re-export common types for use in other modules
-pub use crate::auth::device_flow::DeviceFlowService;
 pub use crate::error::Json400;
+pub use crate::services::device_flow::DeviceFlowService;
 
-// Device Code Request
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeRequest {
     pub client_id: String,
@@ -33,7 +34,6 @@ pub struct DeviceCodeRequest {
     pub service: String,
 }
 
-// Device Code Response
 #[derive(Debug, Serialize)]
 pub struct DeviceCodeResponse {
     pub device_code: String,
@@ -43,13 +43,11 @@ pub struct DeviceCodeResponse {
     pub interval: i64,
 }
 
-// Device Verify Request
 #[derive(Debug, Deserialize)]
 pub struct DeviceVerifyRequest {
     pub user_code: String,
 }
 
-// Device Verify Response
 #[derive(Debug, Serialize)]
 pub struct DeviceVerifyResponse {
     pub org_slug: String,
@@ -57,7 +55,6 @@ pub struct DeviceVerifyResponse {
     pub available_providers: Vec<String>,
 }
 
-// Token Request
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
     pub client_id: String,
@@ -66,7 +63,6 @@ pub struct TokenRequest {
     pub resource: Option<String>,
 }
 
-// Token Response
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -119,8 +115,7 @@ pub async fn device_code(
     }
 
     // Get config for platform device activation URI
-    let config = crate::config::Config::from_env()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
     // Check if this is a platform-level device flow or service-level
     let verification_uri = if req.org == "platform"
@@ -141,7 +136,6 @@ pub async fn device_code(
         .map(crate::db::models::Service::from)
         .ok_or_else(|| AppError::BadRequest("Invalid client credentials".to_string()))?;
 
-        // Use service's device_activation_uri if set
         service.device_activation_uri.ok_or_else(|| {
             AppError::BadRequest(
                 "Device activation URI not configured for this service".to_string(),
@@ -149,10 +143,10 @@ pub async fn device_code(
         })?
     };
 
-    // --- Perform CPU-bound work here, in the parallel handler ---
+    // Perform CPU-bound work here, in the parallel handler
     let device_code = DeviceFlowService::generate_device_code();
     let user_code = DeviceFlowService::generate_user_code();
-    // --- End CPU-bound work ---
+    // End CPU-bound work
 
     // Create device code directly in the database
     let expires_at =
@@ -327,8 +321,7 @@ pub async fn token_exchange(
         .and_then(|provider| Provider::from_str(&provider).ok());
     let login_provider_key = login_provider
         .as_ref()
-        .map(Provider::as_str)
-        .unwrap_or("device")
+        .map_or("device", Provider::as_str)
         .to_string();
 
     // Check if this is a platform-level device flow
@@ -347,8 +340,7 @@ pub async fn token_exchange(
             None,
         )?;
 
-        // Generate refresh token
-        let refresh_token = crate::auth::refresh_tokens::generate();
+        let refresh_token = crate::crypto::refresh_tokens::generate();
 
         // Store session with refresh token
         let token_hash = JwtService::hash_token(&token);
@@ -420,8 +412,7 @@ pub async fn token_exchange(
         requested_resource.as_deref(),
     )?;
 
-    // Generate refresh token
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&token);
@@ -613,13 +604,12 @@ async fn validate_live_device_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
-    use crate::rsa_keys::GeneratedKey;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::{
         organizations::OrganizationStore,
@@ -627,79 +617,15 @@ mod tests {
         users::{UserCreationOptions, UserStore},
     };
     use axum::extract::State;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait};
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
-
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
+    use crate::test_support::test_jwt_service;
 
     async fn setup_state() -> AppState {
         let db = Database::connect("sqlite::memory:")

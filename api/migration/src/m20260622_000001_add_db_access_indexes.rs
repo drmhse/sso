@@ -848,7 +848,7 @@ where
     for column in columns {
         index.col(*column);
     }
-    manager.create_index(index.to_owned()).await
+    manager.create_index(index.clone()).await
 }
 
 #[derive(DeriveIden, Copy, Clone)]

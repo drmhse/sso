@@ -1,3 +1,4 @@
+import { SsoClient, SsoApiError, MemoryStorage } from '@drmhse/sso-sdk';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import pc from 'picocolors';
@@ -32,13 +33,6 @@ interface ServiceResponse {
   client_id: string;
   github_scopes?: string[] | null;
   redirect_uris?: string[] | null;
-}
-
-interface ApiKeyResponse {
-  id: string;
-  name: string;
-  prefix: string;
-  permissions: string[];
 }
 
 interface ProvisionReport {
@@ -133,9 +127,13 @@ export async function provisionActCommand(
     return;
   }
 
-  if (!adminToken) {
+  const sso = createAdminClient(baseUrl);
+
+  if (adminToken) {
+    await sso.setSession({ access_token: adminToken });
+  } else {
     try {
-      adminToken = await loginPlatformOwner(baseUrl, ownerEmail, ownerPassword);
+      await loginPlatformOwner(sso, ownerEmail, ownerPassword);
     } catch (error) {
       renderReport(
         {
@@ -158,10 +156,9 @@ export async function provisionActCommand(
     }
   }
 
-  const client = new AuthOsAdminClient(baseUrl, adminToken);
-  const organizationStatus = await ensureOrganization(client, orgSlug, orgName);
+  const organizationStatus = await ensureOrganization(sso, orgSlug, orgName);
   const desiredRedirectUris = unique([webRedirectUri, nativeRedirectUri]);
-  const existingService = await findService(client, orgSlug, serviceSlug);
+  const existingService = await findService(sso, orgSlug, serviceSlug);
   let serviceStatus: ProvisionReport['serviceStatus'] = 'unchanged';
   let service: ServiceResponse;
 
@@ -175,50 +172,36 @@ export async function provisionActCommand(
       !sameStringSet(existingScopes, githubScopes);
 
     if (needsUpdate) {
-      service = await client.request<ServiceResponse>(
-        `/api/organizations/${encodeURIComponent(orgSlug)}/services/${encodeURIComponent(
-          serviceSlug,
-        )}`,
-        {
-          method: 'PATCH',
-          body: {
-            name: serviceName,
-            service_type: 'mobile',
-            github_scopes: githubScopes,
-            redirect_uris: desiredRedirectUris,
-          },
-        },
-      );
+      service = (await sso.services.update(orgSlug, serviceSlug, {
+        name: serviceName,
+        service_type: 'mobile',
+        github_scopes: githubScopes,
+        redirect_uris: desiredRedirectUris,
+      })) as unknown as ServiceResponse;
       serviceStatus = 'updated';
     } else {
       service = existingService;
     }
   } else {
-    const response = await client.request<{ service: ServiceResponse }>(
-      `/api/organizations/${encodeURIComponent(orgSlug)}/services`,
-      {
-        method: 'POST',
-        body: {
-          slug: serviceSlug,
-          name: serviceName,
-          service_type: 'mobile',
-          github_scopes: githubScopes,
-          redirect_uris: desiredRedirectUris,
-        },
-      },
-    );
-    service = response.service;
+    const response = await sso.services.create(orgSlug, {
+      slug: serviceSlug,
+      name: serviceName,
+      service_type: 'mobile',
+      github_scopes: githubScopes,
+      redirect_uris: desiredRedirectUris,
+    });
+    service = response.service as unknown as ServiceResponse;
     serviceStatus = 'created';
   }
 
   const previousRedirectUris = existingService?.redirect_uris ?? [];
   const providerCredentials = await provisionGitHubCredentials(
-    client,
+    sso,
     orgSlug,
     options.githubClientId ?? process.env.AUTHOS_GITHUB_CLIENT_ID,
     options.githubClientSecret ?? process.env.AUTHOS_GITHUB_CLIENT_SECRET,
   );
-  const apiKey = await provisionApiKey(client, orgSlug, serviceSlug, {
+  const apiKey = await provisionApiKey(sso, orgSlug, serviceSlug, {
     name: apiKeyName,
     forceNew: options.forceNewApiKey === true,
     writePath: options.writeApiKey,
@@ -261,125 +244,76 @@ export async function provisionActCommand(
   }
 }
 
-class AuthOsAdminClient {
-  constructor(private readonly baseUrl: string, private readonly token: string) {}
-
-  async request<T>(
-    path: string,
-    init: { method?: string; body?: unknown } = {},
-  ): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method: init.method ?? 'GET',
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        accept: 'application/json',
-        ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      body: init.body === undefined ? undefined : JSON.stringify(init.body),
-    });
-    if (!response.ok) {
-      const message = await response.text();
-      throw new AuthOsHttpError(init.method ?? 'GET', path, response.status, message);
-    }
-    return (await response.json()) as T;
-  }
+/**
+ * Build an SDK client for admin provisioning. Every API call in this command
+ * goes through the SDK so the CLI cannot drift from the published contract.
+ */
+function createAdminClient(baseUrl: string): SsoClient {
+  return new SsoClient({ baseURL: baseUrl, storage: new MemoryStorage() });
 }
 
-class AuthOsHttpError extends Error {
-  constructor(
-    readonly method: string,
-    readonly path: string,
-    readonly status: number,
-    readonly responseText: string,
-  ) {
-    super(`AuthOS ${method} ${path} failed (${status}): ${responseText}`);
-  }
+function isNotFound(error: unknown): boolean {
+  return error instanceof SsoApiError && error.statusCode === 404;
 }
+
 
 async function loginPlatformOwner(
-  baseUrl: string,
+  sso: SsoClient,
   email: string,
   password: string,
-): Promise<string> {
-  const response = await fetch(`${baseUrl}/api/auth/login`, {
-    method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!response.ok) {
-    throw new Error(`${response.status}: ${await response.text()}`);
-  }
-  const data = (await response.json()) as {
-    access_token?: string;
-    refresh_token?: string;
-  };
-  if (!data.access_token) {
-    throw new Error('AuthOS login did not return an access token');
-  }
-  if (!data.refresh_token) {
+): Promise<void> {
+  const tokens = await sso.auth.login({ email, password });
+  if (!tokens.refresh_token) {
     throw new Error('Platform owner login requires MFA or was risk-challenged');
   }
-  return data.access_token;
 }
 
 async function ensureOrganization(
-  client: AuthOsAdminClient,
+  sso: SsoClient,
   orgSlug: string,
   orgName: string,
 ): Promise<ProvisionReport['organizationStatus']> {
   try {
-    await client.request(`/api/organizations/${encodeURIComponent(orgSlug)}`);
+    await sso.organizations.get(orgSlug);
     return 'unchanged';
   } catch (error) {
-    if (!(error instanceof AuthOsHttpError) || error.status !== 404) {
+    if (!isNotFound(error)) {
       throw error;
     }
   }
 
-  await client.request('/api/organizations', {
-    method: 'POST',
-    body: { slug: orgSlug, name: orgName },
-  });
+  await sso.organizations.create({ slug: orgSlug, name: orgName });
   return 'created';
 }
 
 async function findService(
-  client: AuthOsAdminClient,
+  sso: SsoClient,
   orgSlug: string,
   serviceSlug: string,
 ): Promise<ServiceResponse | null> {
-  const response = await client.request<{ services: ServiceResponse[] }>(
-    `/api/organizations/${encodeURIComponent(orgSlug)}/services`,
+  const response = await sso.services.list(orgSlug);
+  const match = response.services.find(
+    (candidate) => candidate.service.slug === serviceSlug,
   );
-  return (
-    response.services.find((candidate) => candidate.slug === serviceSlug) ?? null
-  );
+  return (match?.service as unknown as ServiceResponse | undefined) ?? null;
 }
 
 async function provisionGitHubCredentials(
-  client: AuthOsAdminClient,
+  sso: SsoClient,
   orgSlug: string,
   clientId?: string,
   clientSecret?: string,
 ): Promise<ProvisionReport['providerCredentials']['github']> {
   if (clientId && clientSecret) {
-    await client.request(
-      `/api/organizations/${encodeURIComponent(orgSlug)}/oauth-credentials/github`,
-      {
-        method: 'POST',
-        body: { client_id: clientId, client_secret: clientSecret },
-      },
-    );
+    await sso.organizations.oauthCredentials.set(orgSlug, 'github', {
+      client_id: clientId,
+      client_secret: clientSecret,
+    });
     return 'configured';
   }
 
   try {
-    await client.request(
-      `/api/organizations/${encodeURIComponent(orgSlug)}/oauth-credentials/github`,
-    );
+    await sso.organizations.oauthCredentials.get(orgSlug, 'github');
     return 'unchanged';
   } catch {
     return 'missing';
@@ -387,7 +321,7 @@ async function provisionGitHubCredentials(
 }
 
 async function provisionApiKey(
-  client: AuthOsAdminClient,
+  sso: SsoClient,
   orgSlug: string,
   serviceSlug: string,
   options: {
@@ -397,11 +331,7 @@ async function provisionApiKey(
     blockers: string[];
   },
 ): Promise<ProvisionReport['apiKey']> {
-  const response = await client.request<{ api_keys: ApiKeyResponse[] }>(
-    `/api/organizations/${encodeURIComponent(orgSlug)}/services/${encodeURIComponent(
-      serviceSlug,
-    )}/api-keys`,
-  );
+  const response = await sso.services.apiKeys.list(orgSlug, serviceSlug);
   const existing = response.api_keys.find((key) => key.name === options.name);
   if (existing && !options.forceNew) {
     return {
@@ -417,18 +347,10 @@ async function provisionApiKey(
     return { name: options.name, status: 'skipped' };
   }
 
-  const created = await client.request<ApiKeyResponse & { key: string }>(
-    `/api/organizations/${encodeURIComponent(orgSlug)}/services/${encodeURIComponent(
-      serviceSlug,
-    )}/api-keys`,
-    {
-      method: 'POST',
-      body: {
-        name: options.name,
-        permissions: ['read:provider_tokens:github'],
-      },
-    },
-  );
+  const created = await sso.services.apiKeys.create(orgSlug, serviceSlug, {
+    name: options.name,
+    permissions: ['read:provider_tokens:github'],
+  });
   await mkdir(dirname(options.writePath), { recursive: true });
   await writeFile(options.writePath, `${created.key}\n`, { mode: 0o600 });
   return {

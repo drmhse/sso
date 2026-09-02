@@ -1,12 +1,12 @@
 use crate::constants::VALID_ORG_ROLES;
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::services::permission_service::{PermissionService, CAP_ORG_ROLES_MANAGE};
 use crate::state::AppState;
-use crate::store::{
-    organization_roles::OrganizationRoleStore, organizations::OrganizationStore, DB,
-};
+use crate::store::{organization_roles::OrganizationRoleStore, organizations::OrganizationStore};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -35,7 +35,7 @@ impl From<crate::entities::organization_roles::Model> for RoleResponse {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                     .collect()
             })
             .unwrap_or_default();
@@ -64,8 +64,20 @@ pub struct CreateRoleRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateRoleRequest {
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// Absent leaves the description alone, `null` clears it, a string sets it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub description: Option<Option<String>>,
     pub permissions: Option<Vec<String>>,
+}
+
+/// Distinguishes an absent JSON field from an explicit `null`, which a plain
+/// `Option<T>` collapses into the same value.
+fn double_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
 }
 
 /// GET /api/organizations/:org_slug/roles
@@ -75,16 +87,12 @@ pub async fn list_roles(
     Path(org_slug): Path<String>,
     auth_user: axum::Extension<AuthUser>,
 ) -> Result<Json<Vec<RoleResponse>>> {
-    // 1. Resolve Org
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // 2. Check Permission
-    // Even 'members' might want to see roles (to know what roles exist), but managing them requires permission.
-    // For listing, we can allow anyone who can manage roles OR just verify basic membership.
-    // Let's rely on CAP_ORG_ROLES_MANAGE for now to be safe, or just membership if we want transparency.
-    // Given the UI shows roles in settings, typically admins see this.
+    // Deliberately strict: listing needs the manage capability, not just
+    // membership, so the role layout is not readable by every member.
     if !PermissionService::check(
         DB::Conn(&state.db),
         &org.id,
@@ -93,17 +101,13 @@ pub async fn list_roles(
     )
     .await?
     {
-        // Fallback: If they are just listing, maybe we allow it?
-        // But for "Roles Editor", it's an admin feature.
         return Err(AppError::Forbidden(
             "Insufficient permissions to view roles".to_string(),
         ));
     }
 
-    // 3. Fetch Custom Roles
     let custom_roles = OrganizationRoleStore::find_by_org(DB::Conn(&state.db), &org.id).await?;
 
-    // 4. Combine with Default Roles
     let mut all_roles = Vec::new();
 
     // Add default roles
@@ -317,23 +321,7 @@ pub async fn update_role(
 
     let permissions_json = req.permissions.map(|p| serde_json::to_value(p).unwrap());
 
-    // Wrap description in Option<Option<String>> accurately
-    // The store expects Option<Option<String>> for nullable update
-    // UpdateRoleRequest has description: Option<String>.
-    // If field is missing (None), we don't update.
-    // If field is present (Some(val)), we update.
-    // BUT we need to support setting to NULL?
-    // For simplicity, let's assume if they send Some(string), we set it.
-    // If they want to clear it, they might send empty string or we need a specific nullable DTO.
-    // Given the simplified struct, let's treat Some(desc) as "set to desc".
-    // Wait, the Store update signature: `description: Option<Option<String>>`
-    // usage: None -> no change. Some(None) -> set to null. Some(Some("foo")) -> set to "foo".
-    // Our request DTO has `description: Option<String>`.
-    // It cannot distinguish "missing" from "null" unless we use a specific deserializer or skip_serializing_if logic.
-    // For now, let's map `Some(d)` to `Some(Some(d))` and ignore clearing. (MVP limitation).
-    // Or better, assume we don't clear descriptions often.
-
-    let description_update = req.description.map(Some);
+    let description_update = req.description.clone();
 
     let org_id = org.id.clone();
     let actor_id = auth_user.user.id.clone();
@@ -448,13 +436,12 @@ pub async fn delete_role(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwt::{Claims, JwtService};
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
-    use crate::rsa_keys::GeneratedKey;
+    use crate::crypto::jwt::Claims;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
     use crate::services::{
-        audit_actor::AuditHandle,
         events::EventDispatcher,
         metrics::MfaMetricsService,
         permission_service::{CAP_AUDIT_LOGS_VIEW, CAP_SERVICES_MANAGE},
@@ -465,79 +452,15 @@ mod tests {
         users::{UserCreationOptions, UserStore},
     };
     use axum::Extension;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
-
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
+    use crate::test_support::test_jwt_service;
 
     async fn setup_state_owner_org() -> (AppState, AuthUser, String, String) {
         let db = Database::connect("sqlite::memory:")
@@ -586,7 +509,7 @@ mod tests {
         };
         let auth_user = AuthUser {
             claims: Claims {
-                token_use: crate::auth::jwt::TokenUse::ManagementAccess,
+                token_use: crate::crypto::jwt::TokenUse::ManagementAccess,
                 sub: owner.id.clone(),
                 email: owner.email.clone(),
                 is_platform_owner: false,
@@ -715,5 +638,27 @@ mod tests {
         )
         .await
         .expect("check any ungranted capability"));
+    }
+
+    #[test]
+    fn role_description_update_separates_absent_from_null() {
+        let absent: UpdateRoleRequest =
+            serde_json::from_str(r#"{"name":"Support"}"#).expect("absent description");
+        assert_eq!(
+            absent.description, None,
+            "absent must not change the column"
+        );
+
+        let cleared: UpdateRoleRequest =
+            serde_json::from_str(r#"{"description":null}"#).expect("null description");
+        assert_eq!(
+            cleared.description,
+            Some(None),
+            "explicit null must clear the column"
+        );
+
+        let set: UpdateRoleRequest =
+            serde_json::from_str(r#"{"description":"Handles tickets"}"#).expect("set description");
+        assert_eq!(set.description, Some(Some("Handles tickets".to_string())));
     }
 }

@@ -128,19 +128,9 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
-        // Reverting this is destructive and complex (merging split users).
-        // For now, we will just set org_id back to NULL for all users that were not platform owners?
-        // But we can't easily distinguishing them from newly created scoped users.
-        // Downgrade is "best effort": Update all users to NULL org_id?
-        // No, that destroys the scoping we just added.
-        // Let's leave down() empty or minimal, as reverting semantic data changes is ambiguous.
-        // Or strictly: UPDATE users SET org_id = NULL.
-        // But then we have duplicate emails (from the split).
-        // So we can't revert without violating uniqueness constraint on (email) if we drop org_id.
-
-        // Since m20260103 adds the column, reverting THIS migration (m20260104) implies we still have the column but revert the DATA changes.
-        // We cannot merge split users automatically.
-        // We will just return Ok(()), effectively making this a one-way data migration.
+        // One-way by design. This migration split shared accounts into
+        // per-organization users; nulling org_id again would reintroduce
+        // duplicate emails, and the split users cannot be merged automatically.
         Ok(())
     }
 }

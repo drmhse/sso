@@ -264,10 +264,6 @@ export interface LoginRequest {
    * against the service before tokens are returned to the hosted UI.
    */
   redirect_uri?: string;
-  /**
-   * Optional caller state to return to hosted service callbacks.
-   */
-  state?: string;
   /** Internal SAML relay state when completing a hosted SAML login. */
   saml_state?: string;
 }

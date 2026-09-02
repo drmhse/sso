@@ -18,6 +18,10 @@ export interface CreateRoleRequest {
 
 export interface UpdateRoleRequest {
   name?: string;
-  description?: string;
+  /**
+   * Omit to leave the description unchanged, `null` to clear it, or a string to
+   * set it. `undefined` and `null` mean different things here.
+   */
+  description?: string | null;
   permissions?: string[];
 }

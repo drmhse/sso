@@ -1,9 +1,9 @@
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{
     PermissionService, CAP_RISK_EVENTS_VIEW, CAP_RISK_POLICIES_MANAGE,
 };
-use crate::store::DB;
 use axum::{
     extract::{Path, Query},
     Json,
@@ -67,7 +67,7 @@ pub async fn get_risk_events(
 
     let org_id = org.id;
 
-    // 1. Authorization. A token/cache snapshot is insufficient for global authority.
+    // Authorization. A token/cache snapshot is insufficient for global authority.
     let has_live_platform_authority = if user.is_platform_owner {
         crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.id)
             .await?
@@ -91,7 +91,6 @@ pub async fn get_risk_events(
         }
     }
 
-    // 2. Query Risk Events
     use crate::entities::login_events::{Column, Entity as LoginEvents};
     use crate::entities::users::Entity as Users;
 
@@ -118,7 +117,6 @@ pub async fn get_risk_events(
             AppError::InternalServerError(format!("Failed to fetch risk events: {}", e))
         })?;
 
-    // 3. Map to Response
     let response: Vec<RiskEventResponse> = events
         .into_iter()
         .map(|(event, user)| {

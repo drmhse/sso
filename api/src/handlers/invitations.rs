@@ -1,8 +1,10 @@
 use crate::constants::{
     DEFAULT_MAX_USERS, INVITATION_EXPIRY_DAYS, VALID_INVITATION_ROLES, VALID_ORG_ROLES,
 };
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::{organization_invitations, organizations, users};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{
     PermissionService, CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE,
@@ -11,7 +13,7 @@ use crate::state::AppState;
 use crate::store::{
     invitations::InvitationStore, memberships::MembershipStore,
     organization_roles::OrganizationRoleStore, organization_tiers::OrganizationTierStore,
-    organizations::OrganizationStore, users::UserStore, DB,
+    organizations::OrganizationStore, users::UserStore,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -113,7 +115,6 @@ pub async fn create_invitation(
 ) -> Result<Json<InvitationResponse>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -500,7 +501,6 @@ async fn accept_invitation_internal(
                 let mut affected_user_id: Option<String> = None;
 
                 if new_status == "accepted" {
-                    // Find or create user
                     let user = find_or_create_user_internal(
                         db.clone(),
                         &invitation.org_id,
@@ -589,7 +589,6 @@ pub async fn cancel_invitation(
 ) -> Result<Json<()>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -638,7 +637,6 @@ pub async fn list_invitations(
 ) -> Result<Json<Vec<serde_json::Value>>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -746,25 +744,24 @@ async fn find_or_create_user_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
+
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::sso::OAuthClient;
+
     use crate::entities::prelude::OrganizationInvitations;
-    use crate::rsa_keys::GeneratedKey;
+
+    use crate::audit::actor::AuditHandle;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::{
         memberships::MembershipStore,
         organizations::OrganizationStore,
         users::{UserCreationOptions, UserStore},
     };
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use migration::{Migrator, MigratorTrait};
+
     use moka::future::Cache;
-    use sea_orm::{Database, DatabaseConnection, EntityTrait, PaginatorTrait};
+    use sea_orm::{DatabaseConnection, EntityTrait, PaginatorTrait};
     use std::sync::Arc;
 
     #[test]
@@ -801,81 +798,11 @@ mod tests {
         owner_id: String,
     }
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
+    use crate::test_support::test_jwt_service;
 
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
-
-    async fn setup_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        Migrator::up(&db, None).await.expect("run migrations");
-        db
-    }
+    use crate::test_support::setup_db;
 
     async fn setup_fixture() -> InvitationFixture {
         let db = setup_db().await;

@@ -1,0 +1,58 @@
+[package]
+name = "authos-services"
+version = "0.1.40"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "chrono", "migrate", "sqlite", "postgres", "mysql"] }
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
+migration = { path = "../../migration", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0.103"
+thiserror = "1.0"
+tracing = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8.6"
+hmac = "0.12"
+async-trait = "0.1"
+base64 = "0.22"
+subtle = "2.5"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname"] }
+webauthn-rs = { version = "0.6.1-dev", default-features = false, features = ["danger-allow-state-serialisation"] }
+hickory-resolver = "0.26"
+url = "2.5"
+maxminddb = "0.27"
+strum = { version = "0.25", features = ["derive"] }
+metrics = "0.21"
+metrics-exporter-prometheus = { version = "0.12", default-features = false }
+flate2 = "1.0"
+tar = "0.4.46"
+authos-core = { path = "../authos-core", default-features = false }
+authos-entities = { path = "../authos-entities", default-features = false }
+authos-crypto = { path = "../authos-crypto", default-features = false }
+authos-db = { path = "../authos-db", default-features = false }
+authos-audit = { path = "../authos-audit", default-features = false }
+authos-store = { path = "../authos-store", default-features = false }
+
+[features]
+# Only crates with backend-conditional code carry these; they forward to every
+# dependency that also has such code, dev-dependencies included, so a build can
+# never mix backends (the transaction helpers differ in arity per backend).
+default = ["db_sqlite"]
+db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite", "authos-db/db_sqlite", "authos-store/db_sqlite", "authos-testkit/db_sqlite"]
+db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres", "authos-db/db_psql", "authos-store/db_psql", "authos-testkit/db_psql"]
+db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql", "authos-db/db_mysql", "authos-store/db_mysql", "authos-testkit/db_mysql"]
+# Test-only shortcuts. Reachable only through dev-dependencies.
+test-support = []
+
+[dev-dependencies]
+authos-testkit = { path = "../authos-testkit", default-features = false }
+authos-crypto = { path = "../authos-crypto", features = ["test-support"], default-features = false }

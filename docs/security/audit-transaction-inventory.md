@@ -41,9 +41,9 @@ same transaction; four events describe a rejected attempt or conflict without a
 paired domain mutation and use the standalone durable enqueue.
 There are zero unclassified calls.
 
-Across the complete current production tree, the structural checker finds 54
+Across the complete current production tree, the structural checker finds 53
 physical `AuditHandle` call expressions: 50 use a caller-supplied transaction
-and four are the allowlisted standalone result/rejection events below. The
+and three are the allowlisted standalone result/rejection events below. The
 earlier 35+4 figures describe the original remaining-inventory baseline, not
 the whole tree. Two OAuth completion routes intentionally share one coupled
 session/audit helper, so route-flow counts need not equal physical call-expression
@@ -85,14 +85,17 @@ stale success event. Domain and branding mutations also recheck current
 management authority (and the applicable tier entitlement) inside that same
 transaction.
 
-The four intentionally standalone durable events are:
+The three intentionally standalone durable events are:
 
 | Path | Classification |
 | --- | --- |
 | `handlers/user.rs` | rejected TOTP enable verification |
 | `handlers/auth/mfa.rs` | rejected MFA verification result |
-| `handlers/auth/utils.rs` | shared result-only login helper |
 | `handlers/auth/oauth.rs` | rejected provider-account conflict |
+
+`handlers/auth/utils.rs` previously held a fourth: a shared result-only login
+helper that nothing called. It was removed with the file, taking the count from
+four to three.
 
 Standalone does not mean best-effort: `AuditHandle::log_*` returns only after
 the outbox row is durable. It merely means there is no domain mutation whose
@@ -120,7 +123,7 @@ The structural checks remain useful because line numbers move:
 ```bash
 rg -n '\.log_(org|login|mfa|platform)\(' api/src --glob '*.rs'
 rg -n 'audit_log.*\.insert|new_event\.insert' \
-  api/src/services/audit.rs api/src/handlers/platform/mod.rs api/src/store/login_events.rs
+  api/crates/authos-services/src/services/audit.rs api/src/handlers/platform/mod.rs api/crates/authos-store/src/store/login_events.rs
 npm run check:audit-policy
 ```
 

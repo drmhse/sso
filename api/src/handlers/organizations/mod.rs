@@ -39,6 +39,6 @@ pub use upstream_providers::{
 pub use users::{get_end_user, list_end_users, revoke_end_user_sessions};
 
 // Re-export helper functions that are used in other modules
-pub use core::ensure_organization_active;
+pub use crate::store::organizations::ensure_organization_active;
 
 pub mod roles;

@@ -2,13 +2,15 @@
 //!
 //! Endpoints for managing SIEM (Security Information and Event Management) integrations.
 
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::services::permission_service::{PermissionService, CAP_INTEGRATIONS_MANAGE};
 use crate::services::tier_enforcement::TierService;
 use crate::state::AppState;
-use crate::store::{organizations::OrganizationStore, siem_configs::SiemConfigStore, DB};
+use crate::store::{organizations::OrganizationStore, siem_configs::SiemConfigStore};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -154,8 +156,9 @@ fn siem_auth_headers(
                 decode_siem_secret(require_encryption()?, stored, config_id, "auth_header")?;
             let (name, value) = header
                 .split_once(':')
-                .map(|(name, value)| (name.trim(), value.trim()))
-                .unwrap_or(("Authorization", header.trim()));
+                .map_or(("Authorization", header.trim()), |(name, value)| {
+                    (name.trim(), value.trim())
+                });
             if name.is_empty() || value.is_empty() {
                 return Err(AppError::BadRequest(
                     "Custom SIEM authentication header is malformed".to_string(),
@@ -674,7 +677,7 @@ pub async fn test_siem_connection(
         AppError::InternalServerError(format!("Failed to serialize test payload: {}", e))
     })?;
 
-    let safe_client = crate::services::safe_http::SafeHttpClient::new()?;
+    let safe_client = crate::crypto::safe_http::SafeHttpClient::new()?;
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     headers.extend(auth_headers);
 
@@ -684,7 +687,7 @@ pub async fn test_siem_connection(
 
     match response {
         Ok(response) => {
-            match crate::services::safe_http::SafeHttpClient::read_body_limited(response, 8 * 1024)
+            match crate::crypto::safe_http::SafeHttpClient::read_body_limited(response, 8 * 1024)
                 .await
             {
                 Ok((status, _)) if status.is_success() => Ok(Json(TestConnectionResponse {
@@ -775,7 +778,7 @@ mod secret_tests {
                 "Datadog",
                 Some(&encryption),
                 "config-a",
-                Some(api_key.clone()),
+                Some(api_key),
                 Some("corrupt-unused-auth-header".to_string()),
             )
             .unwrap(),

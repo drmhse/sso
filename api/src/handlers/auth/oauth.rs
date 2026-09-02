@@ -1,10 +1,12 @@
-use crate::auth::jwt::JwtService;
-use crate::auth::sso::{
+use crate::constants::OAUTH_STATE_EXPIRE_MINUTES;
+use crate::crypto::jwt::JwtService;
+use crate::crypto::sso::{
     configured_basic_client, oauth_http_client, ConfiguredBasicClient, Provider,
 };
-use crate::constants::OAUTH_STATE_EXPIRE_MINUTES;
 use crate::db::models::{DeviceCode, Service, User};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
@@ -12,7 +14,7 @@ use crate::store::{
     identities::IdentityStore, memberships::MembershipStore, oauth_states::OAuthStateStore,
     organizations::OrganizationStore, provider_token_requests::ProviderTokenRequestStore,
     service_provider_grants::ServiceProviderGrantStore, services::ServiceStore,
-    sessions::SessionStore, upstream_providers::UpstreamProviderStore, DB,
+    sessions::SessionStore, upstream_providers::UpstreamProviderStore,
 };
 use crate::utils::resource_indicators::validate_requested_resource;
 use crate::utils::scopes::{normalize_scope_list, parse_optional_scopes, parse_required_scopes};
@@ -47,8 +49,8 @@ async fn upsert_connected_account_from_oauth(
     state: &AppState,
     user_id: &str,
     provider_key: &str,
-    user_info: &crate::auth::sso::UserInfo,
-    token_details: &crate::auth::sso::TokenDetails,
+    user_info: &crate::crypto::sso::UserInfo,
+    token_details: &crate::crypto::sso::TokenDetails,
     scopes: &[String],
 ) -> Result<crate::entities::connected_accounts::Model> {
     ConnectedAccountStore::upsert_from_oauth_details(
@@ -547,7 +549,7 @@ async fn transfer_orphan_provider_duplicate(
 
                 Identities::update_many()
                     .set(identities::ActiveModel {
-                        user_id: Set(target_user_id.to_string()),
+                        user_id: Set(target_user_id.clone()),
                         ..Default::default()
                     })
                     .filter(identities::Column::UserId.eq(duplicate_user_id.clone()))
@@ -558,7 +560,7 @@ async fn transfer_orphan_provider_duplicate(
 
                 ConnectedAccounts::update_many()
                     .set(connected_accounts::ActiveModel {
-                        user_id: Set(target_user_id.to_string()),
+                        user_id: Set(target_user_id.clone()),
                         updated_at: Set(chrono::Utc::now().naive_utc()),
                         ..Default::default()
                     })
@@ -738,7 +740,7 @@ pub(crate) async fn resolve_upstream_oidc_config(
             )
         })?;
 
-        let discovery_doc = crate::services::safe_http::SafeHttpClient::new()?
+        let discovery_doc = crate::crypto::safe_http::SafeHttpClient::new()?
             .get(discovery_url)
             .await
             .map_err(|e| {
@@ -771,7 +773,7 @@ pub(crate) async fn resolve_upstream_oidc_config(
         }
     }
 
-    let safe_client = crate::services::safe_http::SafeHttpClient::new()?;
+    let safe_client = crate::crypto::safe_http::SafeHttpClient::new()?;
     for (field, url) in [
         ("authorization_url", authorization_url.as_deref()),
         ("token_url", token_url.as_deref()),
@@ -808,7 +810,6 @@ pub struct AuthRequest {
     pub connection_id: Option<String>,
 }
 
-// Admin Auth Request
 #[derive(Debug, Deserialize)]
 pub struct AdminAuthRequest {
     pub org_slug: Option<String>,
@@ -970,17 +971,16 @@ pub async fn auth_provider(
                 format!("{}/auth/oidc/callback", state.base_url),
             )?;
 
-            let upstream_scopes: Vec<String> = provider_model
-                .scopes
-                .as_ref()
-                .map(|s| parse_upstream_scopes(s))
-                .unwrap_or_else(|| {
+            let upstream_scopes: Vec<String> = provider_model.scopes.as_ref().map_or_else(
+                || {
                     vec![
                         "openid".to_string(),
                         "email".to_string(),
                         "profile".to_string(),
                     ]
-                });
+                },
+                |s| parse_upstream_scopes(s),
+            );
 
             let (url, csrf, verifier) =
                 get_authorization_url_for_client(&client, Provider::Oidc, upstream_scopes);
@@ -1013,10 +1013,9 @@ pub async fn auth_provider(
                 .await?;
             get_authorization_url_for_client(&custom_client, provider, scopes.clone())
         } else {
-            // Fall back to platform's default OAuth credentials
-            // Use ADMIN callback URL because that's what's registered with providers
-            // (GitHub/Microsoft only allow 1 callback per app)
-            // The admin callback will detect service context via service_id and route appropriately
+            // Uses the ADMIN callback URL: GitHub and Microsoft allow only one
+            // registered callback per app, so that route detects service context
+            // from service_id and re-routes.
             let callback_url = format!("{}/auth/admin/{}/callback", state.base_url, provider_str);
 
             state.oauth_client.get_authorization_url_with_pkce(
@@ -1113,7 +1112,6 @@ pub async fn auth_saml_callback(
     Extension(_request_info): Extension<RequestInfo>,
     axum::extract::Form(payload): axum::extract::Form<SamlCallbackPayload>,
 ) -> Result<Response> {
-    // 1. Get OAuth state from RelayState
     let state_param = payload.relay_state.as_ref().ok_or_else(|| {
         AppError::BadRequest("Missing RelayState (state) in SAML callback".to_string())
     })?;
@@ -1122,13 +1120,12 @@ pub async fn auth_saml_callback(
         .await?
         .ok_or_else(|| AppError::BadRequest("Invalid or expired state parameter".to_string()))?;
 
-    // 2. Atomically consume state. A concurrent callback that loaded the same
+    // Atomically consume state. A concurrent callback that loaded the same
     // row must lose here and cannot continue processing the assertion.
     OAuthStateStore::delete(DB::Conn(&state.db), state_param)
         .await
         .map_err(|_| AppError::BadRequest("Invalid or expired state parameter".to_string()))?;
 
-    // 3. Get provider info
     let conn_id = oauth_state.upstream_connection_id.as_ref().ok_or_else(|| {
         AppError::InternalServerError("Missing connection context in state".to_string())
     })?;
@@ -1144,56 +1141,20 @@ pub async fn auth_saml_callback(
 
     let provider = resolve_upstream_provider_for_org(&state, &organization.id, conn_id).await?;
 
-    // 4. Process SAML Response
     let provider_model_struct: crate::db::models::UpstreamProvider = provider.into();
-    let saml_user = super::upstream_saml::process_saml_response(
+    let _saml_user = super::upstream_saml::process_saml_response(
         &state,
         &payload.saml_response,
         &provider_model_struct,
     )
     .await?;
 
-    // 5. Create or update user/identity
-    // Construct token details similar to OAuth
-    let _token_details = crate::auth::sso::TokenDetails {
-        access_token: "saml_upstream".to_string(), // Placeholder
-        refresh_token: None,
-        expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
-        scopes: vec!["openid".to_string(), "email".to_string()],
-    };
-
-    let _issuing_org_id = Some(organization.id);
-    let _issuing_service_id = oauth_state.service_id;
-
-    // Use reqwest to fetch user info - already have it from SAML assertion
-    let _user_info = crate::auth::sso::UserInfo {
-        provider_user_id: saml_user
-            .provider_user_id
-            .unwrap_or_else(|| saml_user.email.clone()),
-        email: saml_user.email,
-        name: None,
-    };
-
-    // Redirect to frontend callback URL
-    let redirect_uri = oauth_state
-        .redirect_uri
-        .clone()
-        .ok_or_else(|| AppError::BadRequest("Missing redirect_uri in OAuth state".to_string()))?;
-
-    // ISSUANCE LOGIC - Simplified for SAML proof
-    // In a real implementation, we would create/update user and identity here
-    // For now, let's assume we redirect with success
-
-    // We need to actually handle the login to make the test pass
-    // For now, let's return a redirect to the app
-    let redirect_url = service_token_redirect_uri(
-        &redirect_uri,
-        "SAML_MOCK_TOKEN",
-        "SAML_MOCK_REFRESH",
-        oauth_state.client_state.as_deref(),
-    )?;
-
-    Ok(Redirect::to(&redirect_url).into_response())
+    // Unreachable: process_saml_response fails closed until upstream assertion
+    // signature verification exists. Session issuance stays absent rather than
+    // stubbed so no relying party can mistake a placeholder for a real login.
+    Err(AppError::ServiceUnavailable(
+        "Upstream SAML login is not available".to_string(),
+    ))
 }
 
 /// SSO: Handle OAuth callback
@@ -1256,8 +1217,7 @@ async fn auth_callback_impl(
     let provider = Provider::from_str(&provider_str)?;
 
     // Load config (needed for user info fetching later)
-    let config = crate::config::Config::from_env()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
     // OAuth callbacks are never accepted without the state issued at the start
     // of the flow. Preserve the optional wrapper below for the existing flow
@@ -1464,7 +1424,6 @@ async fn auth_callback_impl(
         (details, None, None)
     };
 
-    // Get user info
     let user_info = if provider == Provider::Oidc {
         // Handle OIDC user info fetching (requires fetching provider model again)
         let oauth_ctx = oauth_state.as_ref().ok_or_else(|| {
@@ -1492,7 +1451,7 @@ async fn auth_callback_impl(
         let oidc_config = resolve_upstream_oidc_config(&provider_model).await?;
         let userinfo_url = oidc_config.userinfo_url;
 
-        let resp = crate::services::safe_http::SafeHttpClient::new()?
+        let resp = crate::crypto::safe_http::SafeHttpClient::new()?
             .get_with_owned_headers(
                 &userinfo_url,
                 vec![(
@@ -1523,7 +1482,7 @@ async fn auth_callback_impl(
             AppError::InternalServerError(format!("Failed to parse user info: {}", e))
         })?;
 
-        crate::auth::sso::UserInfo {
+        crate::crypto::sso::UserInfo {
             provider_user_id: info.sub,
             email: info.email.ok_or_else(|| {
                 AppError::BadRequest("Email not provided by OIDC provider".to_string())
@@ -2110,7 +2069,6 @@ async fn auth_callback_impl(
                 .await?;
             }
 
-            // Create JWT
             let jwt = state.jwt_service.create_token_with_resource(
                 &user.id,
                 &user.email,
@@ -2120,8 +2078,7 @@ async fn auth_callback_impl(
                 oauth_ctx.resource.as_deref(),
             )?;
 
-            // Generate refresh token
-            let refresh_token = crate::auth::refresh_tokens::generate();
+            let refresh_token = crate::crypto::refresh_tokens::generate();
 
             // Store session with refresh token
             let token_hash = JwtService::hash_token(&jwt);
@@ -2209,8 +2166,7 @@ pub async fn auth_admin_provider(
     let provider = Provider::from_str(&provider_str)?;
 
     // Build admin OAuth client dynamically using PLATFORM_* credentials
-    let config = crate::config::Config::from_env()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
     let admin_oauth_client = create_admin_oauth_client(&config, provider)?;
 
@@ -2264,8 +2220,7 @@ pub async fn auth_admin_callback(
     Query(callback): Query<CallbackQuery>,
 ) -> Result<Response> {
     // Load config early so we can use it for error redirects
-    let config = crate::config::Config::from_env()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
     // Wrap the main logic to catch errors and redirect to frontend with error info
     match auth_admin_callback_impl(state, request_info, provider_str, callback).await {
@@ -2305,8 +2260,7 @@ async fn auth_admin_callback_impl(
     callback: CallbackQuery,
 ) -> Result<Response> {
     let provider = Provider::from_str(&provider_str)?;
-    let config = crate::config::Config::from_env()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
     // Get OAuth state and verify it's an admin flow
     let oauth_state = if let Some(ref state_param) = callback.state {
@@ -2567,7 +2521,7 @@ async fn auth_admin_callback_impl(
                     &dc.service_slug,
                 )
                 .await?
-                .map(|s| s.into());
+                .map(std::convert::Into::into);
 
                 let base_activation_uri: String = service
                     .and_then(|s| s.device_activation_uri)
@@ -2601,8 +2555,7 @@ async fn auth_admin_callback_impl(
     let mfa_enabled = is_mfa_enabled(&state.db, &user.id).await?;
 
     // Load config for redirect URL
-    let config = crate::config::Config::from_env()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
     if mfa_enabled {
         // User has MFA enabled - create pre-auth token instead of full session
@@ -2673,8 +2626,7 @@ async fn auth_admin_callback_impl(
         }
     };
 
-    // Generate refresh token
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&jwt);
@@ -2763,8 +2715,7 @@ async fn handle_service_flow_via_admin_callback(
     // OAuth state was already validated and deleted by the caller
 
     // Load config
-    let config = crate::config::Config::from_env()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
     // Get service BEFORE token exchange to check PKCE requirement
     let service_id = oauth_state.service_id.as_ref().ok_or_else(|| {
@@ -2806,7 +2757,6 @@ async fn handle_service_flow_via_admin_callback(
     let token_details =
         exchange_admin_code(&admin_oauth_client, provider, &callback_code, pkce_verifier).await?;
 
-    // Get user info from provider
     let user_info = get_provider_user_info(provider, &token_details.access_token, &config).await?;
     let requested_scopes = parse_stored_scopes(&oauth_state.requested_scopes);
     let effective_scopes = normalized_granted_scopes(
@@ -3101,8 +3051,7 @@ async fn handle_service_flow_via_admin_callback(
         oauth_state.resource.as_deref(),
     )?;
 
-    // Generate refresh token
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&jwt);
@@ -3320,7 +3269,7 @@ async fn exchange_admin_code(
     _provider: Provider,
     code: &str,
     pkce_verifier: Option<&str>,
-) -> Result<crate::auth::sso::TokenDetails> {
+) -> Result<crate::crypto::sso::TokenDetails> {
     use oauth2::{AuthorizationCode, TokenResponse};
 
     let mut token_request = client.exchange_code(AuthorizationCode::new(code.to_string()));
@@ -3344,7 +3293,7 @@ async fn exchange_admin_code(
         .map(|scopes| scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         .unwrap_or_default();
 
-    Ok(crate::auth::sso::TokenDetails {
+    Ok(crate::crypto::sso::TokenDetails {
         access_token: token.access_token().secret().clone(),
         refresh_token: token.refresh_token().map(|rt| rt.secret().clone()),
         expires_at,
@@ -3357,7 +3306,7 @@ async fn exchange_custom_code(
     _provider: Provider,
     code: &str,
     pkce_verifier: Option<&str>,
-) -> Result<crate::auth::sso::TokenDetails> {
+) -> Result<crate::crypto::sso::TokenDetails> {
     use oauth2::{AuthorizationCode, TokenResponse};
 
     let mut token_request = client.exchange_code(AuthorizationCode::new(code.to_string()));
@@ -3381,7 +3330,7 @@ async fn exchange_custom_code(
         .map(|scopes| scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         .unwrap_or_default();
 
-    Ok(crate::auth::sso::TokenDetails {
+    Ok(crate::crypto::sso::TokenDetails {
         access_token: token.access_token().secret().clone(),
         refresh_token: token.refresh_token().map(|rt| rt.secret().clone()),
         expires_at,
@@ -3656,12 +3605,12 @@ async fn get_provider_user_info(
     provider: Provider,
     access_token: &str,
     config: &crate::config::Config,
-) -> Result<crate::auth::sso::UserInfo> {
+) -> Result<crate::crypto::sso::UserInfo> {
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
 
     async fn fetch_json<T: DeserializeOwned>(
-        client: &crate::services::safe_http::SafeHttpClient,
+        client: &crate::crypto::safe_http::SafeHttpClient,
         url: &str,
         access_token: &str,
         include_user_agent: bool,
@@ -3675,9 +3624,9 @@ async fn get_provider_user_info(
         }
 
         let response = client.get_with_owned_headers(url, headers).await?;
-        let (status, body) = crate::services::safe_http::SafeHttpClient::read_body_limited(
+        let (status, body) = crate::crypto::safe_http::SafeHttpClient::read_body_limited(
             response,
-            crate::services::safe_http::MAX_OAUTH_RESPONSE_BYTES,
+            crate::crypto::safe_http::MAX_OAUTH_RESPONSE_BYTES,
         )
         .await?;
         if !status.is_success() {
@@ -3690,7 +3639,7 @@ async fn get_provider_user_info(
             .map_err(|_| AppError::OAuth("OAuth provider returned invalid user info".to_string()))
     }
 
-    let client = crate::services::safe_http::SafeHttpClient::new()?;
+    let client = crate::crypto::safe_http::SafeHttpClient::new()?;
 
     match provider {
         Provider::Github => {
@@ -3734,7 +3683,7 @@ async fn get_provider_user_info(
                     .ok_or_else(|| AppError::OAuth("No verified email found".to_string()))?
             };
 
-            Ok(crate::auth::sso::UserInfo {
+            Ok(crate::crypto::sso::UserInfo {
                 provider_user_id: user.id.to_string(),
                 email,
                 name: user.name,
@@ -3760,7 +3709,7 @@ async fn get_provider_user_info(
 
             require_google_verified_email(user.verified_email)?;
 
-            Ok(crate::auth::sso::UserInfo {
+            Ok(crate::crypto::sso::UserInfo {
                 provider_user_id: user.id,
                 email: user.email,
                 name: user.name,
@@ -3789,7 +3738,7 @@ async fn get_provider_user_info(
                 AppError::OAuth("Microsoft user profile did not include an email".to_string())
             })?;
 
-            Ok(crate::auth::sso::UserInfo {
+            Ok(crate::crypto::sso::UserInfo {
                 provider_user_id: user.id,
                 email,
                 name: user.name,
@@ -4062,21 +4011,21 @@ async fn is_mfa_enabled(pool: &DatabaseConnection, user_id: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::config::Config;
+    use crate::crypto::sso::OAuthClient;
     use crate::entities::provider_token_requests;
-    use crate::rsa_keys::GeneratedKey;
+
+    use crate::audit::actor::AuditHandle;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::{
         users::{UserCreationOptions, UserStore},
         verified_domains::VerifiedDomainStore,
     };
     use axum::http::header::LOCATION;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use chrono::{Duration, Utc};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
@@ -4450,71 +4399,15 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
             platform_github_client_id: Some("github-client".to_string()),
             platform_github_client_secret: Some("github-secret".to_string()),
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
             platform_github_auth_url: Some("https://idp.example.com/github/authorize".to_string()),
             platform_github_token_url: Some("https://idp.example.com/github/token".to_string()),
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
+            ..crate::test_support::test_config()
         }
     }
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
-
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
+    use crate::test_support::test_jwt_service;
 
     async fn setup_oauth_state() -> AppState {
         let db = Database::connect("sqlite::memory:")
@@ -5028,19 +4921,21 @@ mod tests {
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
 
         assert_eq!(
-            params.get("existing").map(|value| value.as_ref()),
+            params.get("existing").map(std::convert::AsRef::as_ref),
             Some("1")
         );
         assert_eq!(
-            params.get("provider_grant").map(|value| value.as_ref()),
+            params
+                .get("provider_grant")
+                .map(std::convert::AsRef::as_ref),
             Some("success")
         );
         assert_eq!(
-            params.get("provider").map(|value| value.as_ref()),
+            params.get("provider").map(std::convert::AsRef::as_ref),
             Some("microsoft")
         );
         assert_eq!(
-            params.get("state").map(|value| value.as_ref()),
+            params.get("state").map(std::convert::AsRef::as_ref),
             Some("client-state")
         );
     }
@@ -5076,15 +4971,19 @@ mod tests {
             Some("https://athapi.authos.dev/callback")
         );
         assert_eq!(
-            query.get("redirect").map(|value| value.as_ref()),
+            query.get("redirect").map(std::convert::AsRef::as_ref),
             Some("/app/account-security?org=queuezero&service=flux")
         );
         assert_eq!(
-            fragment.get("access_token").map(|value| value.as_ref()),
+            fragment
+                .get("access_token")
+                .map(std::convert::AsRef::as_ref),
             Some("access")
         );
         assert_eq!(
-            fragment.get("refresh_token").map(|value| value.as_ref()),
+            fragment
+                .get("refresh_token")
+                .map(std::convert::AsRef::as_ref),
             Some("refresh")
         );
     }
@@ -5106,12 +5005,14 @@ mod tests {
             url::form_urlencoded::parse(fragment.as_bytes()).collect();
 
         assert_eq!(
-            params.get("mfa_required").map(|value| value.as_ref()),
+            params.get("mfa_required").map(std::convert::AsRef::as_ref),
             Some("true")
         );
         assert!(!params.contains_key("mfa_challenge"));
         assert_eq!(
-            params.get("device_code_id").map(|value| value.as_ref()),
+            params
+                .get("device_code_id")
+                .map(std::convert::AsRef::as_ref),
             Some("device-id")
         );
     }
@@ -5134,19 +5035,23 @@ mod tests {
 
         assert_eq!(parsed.path(), "/callback");
         assert_eq!(
-            query.get("redirect_uri").map(|value| value.as_ref()),
+            query.get("redirect_uri").map(std::convert::AsRef::as_ref),
             Some("https://admin.servos.dev/auth/callback")
         );
         assert_eq!(
-            query.get("state").map(|value| value.as_ref()),
+            query.get("state").map(std::convert::AsRef::as_ref),
             Some("caller-state")
         );
         assert_eq!(
-            fragment.get("mfa_required").map(|value| value.as_ref()),
+            fragment
+                .get("mfa_required")
+                .map(std::convert::AsRef::as_ref),
             Some("true")
         );
         assert_eq!(
-            fragment.get("preauth_token").map(|value| value.as_ref()),
+            fragment
+                .get("preauth_token")
+                .map(std::convert::AsRef::as_ref),
             Some("preauth")
         );
     }

@@ -32,6 +32,7 @@
   "author": "DRM HSE <info@drmhse.com>",
   "license": "MIT",
   "dependencies": {
+    "@drmhse/sso-sdk": "0.8.0",
     "commander": "^12.1.0",
     "picocolors": "^1.1.1",
     "prompts": "^2.4.2"

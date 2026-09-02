@@ -1,11 +1,12 @@
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::{memberships, organizations, permissions::SUBJECT_TYPE_USER, prelude::*};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::ScimAuth;
 use crate::services::scim_filter::{ScimFilterParser, ScimOperator};
 use crate::state::AppState;
 use crate::store::{
     memberships::MembershipStore, organizations::OrganizationStore, permissions::PermissionsStore,
-    DB,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -45,7 +46,7 @@ async fn org_to_scim_group(
     let members: Vec<ScimGroupMember> = memberships
         .into_iter()
         .map(|m| {
-            let user_id = m.user_id.clone();
+            let user_id = m.user_id;
             ScimGroupMember {
                 value: user_id.clone(),
                 ref_url: Some(format!("{}/scim/v2/Users/{}", base_url, user_id)),
@@ -307,12 +308,11 @@ pub async fn update_group(
 
     let org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
-    // Note: Organization name updates would need to be implemented in OrganizationStore
-    // For now, we'll skip this as it's not a critical SCIM feature
+    // Group displayName maps to the organization name, which SCIM cannot rename
+    // here: the store has no rename path and tenants are keyed by slug.
 
     // Update members if provided
     if let Some(members) = req.members {
-        // Get current members
         let current_members =
             MembershipStore::list_by_org(DB::Conn(&state.db), &org.id, None, 1000, 0).await?;
         let current_user_ids = current_members
@@ -564,7 +564,8 @@ pub async fn delete_group(
     Extension(scim_auth): Extension<ScimAuth>,
     Path(group_id): Path<String>,
 ) -> Result<StatusCode> {
-    // For now, return an error as we don't want SCIM to delete organizations
+    // A SCIM group is an organization, so deleting one through SCIM would
+    // delete a tenant. Always refused; the org is loaded only to authorize.
     let _org = current_scim_org_by_group_id(&state, &scim_auth, &group_id).await?;
 
     Err(AppError::Forbidden(

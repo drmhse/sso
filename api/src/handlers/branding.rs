@@ -7,6 +7,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::db::{transaction::with_retrying_transaction, DB};
 use crate::services::domain_verification::{
     normalize_verifiable_domain, verify_dns_txt_record, verify_http_file,
 };
@@ -18,10 +19,10 @@ use crate::{
         DomainVerificationResponse, DomainVerificationResult,
     },
     entities::organizations,
-    error::{with_retrying_transaction, AppError},
+    error::AppError,
     middleware::AuthUser,
     state::AppState,
-    store::{memberships::MembershipStore, organizations::OrganizationStore, DB},
+    store::{memberships::MembershipStore, organizations::OrganizationStore},
 };
 
 async fn mark_custom_domain_verified_with_audit(
@@ -29,7 +30,7 @@ async fn mark_custom_domain_verified_with_audit(
     org_id: &str,
     expected_domain: &str,
     expected_verification_token: &str,
-    audit_actor: &crate::services::audit_actor::AuditHandle,
+    audit_actor: &crate::audit::actor::AuditHandle,
     event: crate::entities::organization_audit_log::ActiveModel,
 ) -> Result<(), AppError> {
     use crate::entities::prelude::Organizations;
@@ -65,7 +66,7 @@ async fn replace_custom_domain_with_audit(
     expected_verified: bool,
     new_domain: &str,
     new_verification_token: &str,
-    audit_actor: &crate::services::audit_actor::AuditHandle,
+    audit_actor: &crate::audit::actor::AuditHandle,
     event: crate::entities::organization_audit_log::ActiveModel,
 ) -> Result<(), AppError> {
     use crate::entities::prelude::Organizations;
@@ -105,7 +106,7 @@ async fn clear_custom_domain_with_audit(
     expected_domain: Option<&str>,
     expected_verification_token: Option<&str>,
     expected_verified: bool,
-    audit_actor: &crate::services::audit_actor::AuditHandle,
+    audit_actor: &crate::audit::actor::AuditHandle,
     event: Option<crate::entities::organization_audit_log::ActiveModel>,
 ) -> Result<(), AppError> {
     use crate::entities::prelude::Organizations;
@@ -761,7 +762,7 @@ mod domain_verification_race_tests {
             .unwrap();
 
         let transaction = db.begin().await.unwrap();
-        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let audit = crate::audit::actor::AuditHandle::without_worker(db.clone());
         let event = OrgAuditBuilder::new(&org.id, Some(&user.id), "domain.verified")
             .target("organization", &org.id)
             .success(true)
@@ -826,7 +827,7 @@ mod domain_verification_race_tests {
             .unwrap();
 
         let transaction = db.begin().await.unwrap();
-        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let audit = crate::audit::actor::AuditHandle::without_worker(db.clone());
         let error = clear_custom_domain_with_audit(
             DB::Tx(&transaction),
             &org.id,

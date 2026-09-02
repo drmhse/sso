@@ -234,11 +234,12 @@ export class HttpClient {
   public async post<T = any>(
     path: string,
     data?: any,
-    config?: { headers?: Record<string, string> }
+    config?: { params?: Record<string, any>; headers?: Record<string, string> }
   ): Promise<HttpResponse<T>> {
     return this.request<T>(path, {
       method: 'POST',
       body: data,
+      params: config?.params,
       headers: config?.headers,
     });
   }
@@ -273,11 +274,12 @@ export class HttpClient {
   public async put<T = any>(
     path: string,
     data?: any,
-    config?: { headers?: Record<string, string> }
+    config?: { params?: Record<string, any>; headers?: Record<string, string> }
   ): Promise<HttpResponse<T>> {
     return this.request<T>(path, {
       method: 'PUT',
       body: data,
+      params: config?.params,
       headers: config?.headers,
     });
   }
@@ -288,11 +290,12 @@ export class HttpClient {
   public async patch<T = any>(
     path: string,
     data?: any,
-    config?: { headers?: Record<string, string> }
+    config?: { params?: Record<string, any>; headers?: Record<string, string> }
   ): Promise<HttpResponse<T>> {
     return this.request<T>(path, {
       method: 'PATCH',
       body: data,
+      params: config?.params,
       headers: config?.headers,
     });
   }
@@ -303,17 +306,19 @@ export class HttpClient {
   public async delete<T = any>(
     path: string,
     data?: any,
-    config?: { headers?: Record<string, string> }
+    config?: { params?: Record<string, any>; headers?: Record<string, string> }
   ): Promise<HttpResponse<T>> {
-    const requestConfig =
-      data && typeof data === 'object' && 'headers' in data && !config
-        ? data
-        : config;
+    // Callers may pass a config as the second argument instead of a body, so
+    // treat an object carrying only config keys as the config.
+    const looksLikeConfig =
+      data && typeof data === 'object' && ('headers' in data || 'params' in data);
+    const requestConfig = looksLikeConfig && !config ? data : config;
     const body = requestConfig === data ? undefined : data;
 
     return this.request<T>(path, {
       method: 'DELETE',
       body,
+      params: requestConfig?.params,
       headers: requestConfig?.headers,
     });
   }

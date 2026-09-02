@@ -1,11 +1,12 @@
 //! Billing handlers for organization billing management
 
+use crate::db::DB;
 use crate::entities::billing_customers;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{PermissionService, CAP_BILLING_MANAGE};
 use crate::state::AppState;
-use crate::store::{memberships::MembershipStore, organizations::OrganizationStore, DB};
+use crate::store::{memberships::MembershipStore, organizations::OrganizationStore};
 use axum::{
     extract::{Path, State},
     Extension, Json,
@@ -35,7 +36,6 @@ pub async fn create_portal_session(
     Path(org_slug): Path<String>,
     Json(req): Json<BillingPortalRequest>,
 ) -> Result<Json<BillingPortalResponse>> {
-    // 1. Verify membership and get org
     MembershipStore::find_by_org_slug_and_user(
         DB::Conn(&state.db),
         &org_slug,
@@ -44,12 +44,10 @@ pub async fn create_portal_session(
     .await?
     .ok_or_else(|| AppError::Forbidden("You are not a member of this organization".to_string()))?;
 
-    // 2. Get organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // 3. Verify billing capability
     if !PermissionService::check(
         DB::Conn(&state.db),
         &org.id,
@@ -63,7 +61,6 @@ pub async fn create_portal_session(
         ));
     }
 
-    // 4. Get billing customer for this organization
     let provider_type = state.billing_provider.provider_type();
     if provider_type == crate::billing::BillingProviderType::Disabled {
         return Err(AppError::ServiceUnavailable(
@@ -85,7 +82,6 @@ pub async fn create_portal_session(
         }
     };
 
-    // 5. Create billing portal session using the provider
     let result = state
         .billing_provider
         .create_portal_session(&billing_customer.external_customer_id, &req.return_url)
@@ -194,7 +190,7 @@ pub async fn create_billing_customer(
         .await?;
 
     // Store in database
-    use crate::error::with_retrying_transaction;
+    use crate::db::transaction::with_retrying_transaction;
 
     let org_id = org_id.to_string();
     let provider_str = provider_type.to_string();

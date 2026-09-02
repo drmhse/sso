@@ -205,7 +205,7 @@ async fn handle_subscription_event(
     current_period_end: chrono::DateTime<chrono::Utc>,
     metadata: std::collections::HashMap<String, String>,
 ) -> Result<()> {
-    use crate::error::with_retrying_transaction;
+    use crate::db::transaction::with_retrying_transaction;
 
     // Extract metadata (we pass user_id, service_id, plan_id through metadata)
     let Some(user_id) = metadata.get("user_id") else {
@@ -409,7 +409,6 @@ async fn find_subscriptions_by_customer(
     provider: BillingProviderType,
     external_customer_id: &str,
 ) -> Result<Vec<subscriptions::Model>> {
-    // Find the organization by billing customer ID
     let billing_customer = billing_customers::Entity::find()
         .filter(billing_customers::Column::Provider.eq(provider.to_string()))
         .filter(billing_customers::Column::ExternalCustomerId.eq(external_customer_id))
@@ -464,7 +463,7 @@ async fn update_customer_subscription_status(
         return Ok(());
     }
 
-    use crate::error::with_retrying_transaction;
+    use crate::db::transaction::with_retrying_transaction;
     use sea_orm::Set;
 
     let status = status.to_string();
@@ -512,10 +511,11 @@ async fn update_customer_subscription_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DB;
     use crate::entities::billing_customers;
     use crate::store::{
         organizations::OrganizationStore, plans::PlanStore, services::ServiceStore,
-        users::UserStore, DB,
+        users::UserStore,
     };
     use chrono::{Duration, Utc};
     use migration::{Migrator, MigratorTrait};

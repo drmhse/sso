@@ -3,8 +3,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { rustSourceRoots } from './lib/rust-sources.mjs';
+
 const root = path.resolve(import.meta.dirname, '..');
-const sourceRoot = path.join(root, 'api', 'src');
+// Every workspace crate, not just the top one.
+const sourceRoots = rustSourceRoots(root);
 const inventoryPath = path.join(root, 'docs', 'security', 'outbound-http-inventory.json');
 const rawClientPattern = /reqwest::(?:Client::new|Client::builder|get)\s*\(/;
 
@@ -16,7 +19,7 @@ function rustFiles(directory) {
   });
 }
 
-const discovered = rustFiles(sourceRoot)
+const discovered = sourceRoots.flatMap((dir) => rustFiles(dir))
   .filter((file) => rawClientPattern.test(fs.readFileSync(file, 'utf8')))
   .map((file) => path.relative(root, file).split(path.sep).join('/'))
   .sort();

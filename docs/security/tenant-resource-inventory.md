@@ -197,7 +197,7 @@ They are evidence for only the cases named here, not completion of the matrix:
 ## Inventory maintenance
 
 CI compares SeaORM entity tables and route paths from both `api/src/router.rs`
-and `api/src/main.rs` against `tenant-isolation-matrix.json`, verifies every
+and `api/src/lib.rs` against `tenant-isolation-matrix.json`, verifies every
 entity appears in this prose inventory, and rejects stale named SQLite evidence.
 The current gate is structural: method-level handlers, actor cases, selector
 combinations, background jobs, caches, external exports, and PostgreSQL/MySQL

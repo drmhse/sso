@@ -267,6 +267,196 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "authos-audit"
+version = "0.1.40"
+dependencies = [
+ "anyhow",
+ "authos-core",
+ "authos-crypto",
+ "authos-db",
+ "authos-entities",
+ "authos-store",
+ "authos-testkit",
+ "chrono",
+ "migration",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "authos-core"
+version = "0.1.40"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "forwarded-header-value",
+ "http",
+ "jsonwebtoken",
+ "oauth2",
+ "rand 0.8.6",
+ "rsa",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "subtle",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tower_governor",
+ "tracing",
+]
+
+[[package]]
+name = "authos-crypto"
+version = "0.1.40"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "authos-core",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "jsonwebtoken",
+ "num_cpus",
+ "oauth2",
+ "qrcode",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "totp-rs",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "authos-db"
+version = "0.1.40"
+dependencies = [
+ "authos-core",
+ "authos-entities",
+ "authos-testkit",
+ "chrono",
+ "migration",
+ "rand 0.8.6",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "authos-entities"
+version = "0.1.40"
+dependencies = [
+ "authos-core",
+ "chrono",
+ "sea-orm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "authos-services"
+version = "0.1.40"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "authos-audit",
+ "authos-core",
+ "authos-crypto",
+ "authos-db",
+ "authos-entities",
+ "authos-store",
+ "authos-testkit",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "flate2",
+ "hex",
+ "hickory-resolver",
+ "hmac 0.12.1",
+ "lettre",
+ "maxminddb",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "migration",
+ "rand 0.8.6",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "strum 0.25.0",
+ "subtle",
+ "tar",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "webauthn-rs",
+]
+
+[[package]]
+name = "authos-store"
+version = "0.1.40"
+dependencies = [
+ "authos-audit",
+ "authos-core",
+ "authos-crypto",
+ "authos-db",
+ "authos-entities",
+ "authos-services",
+ "authos-testkit",
+ "chrono",
+ "hex",
+ "migration",
+ "rand 0.8.6",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "authos-testkit"
+version = "0.1.40"
+dependencies = [
+ "authos-core",
+ "authos-crypto",
+ "authos-entities",
+ "base64 0.22.1",
+ "chrono",
+ "migration",
+ "sea-orm",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1424,12 +1614,6 @@ dependencies = [
  "version_check",
  "zeroize",
 ]
-
-[[package]]
-name = "geoutils"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36d244a08113319b5ebcabad2b8b7925732d15eec46d7e7ac3c11734f3b7a6ad"
 
 [[package]]
 name = "getrandom"
@@ -4395,37 +4579,30 @@ dependencies = [
 name = "sso"
 version = "0.1.40"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "argon2",
- "async-trait",
+ "authos-audit",
+ "authos-core",
+ "authos-crypto",
+ "authos-db",
+ "authos-entities",
+ "authos-services",
+ "authos-store",
+ "authos-testkit",
  "axum",
  "base64 0.22.1",
  "chrono",
- "const-oid",
  "dotenvy",
  "flate2",
- "forwarded-header-value",
- "futures",
- "geoutils",
  "hex",
- "hickory-resolver",
- "hmac 0.12.1",
  "http",
  "include_dir",
- "jsonwebtoken",
- "lettre",
- "maxminddb",
  "metrics",
  "metrics-exporter-prometheus",
  "migration",
  "mime_guess",
  "moka",
- "num_cpus",
  "oauth2",
- "pkcs1",
- "pkcs8",
- "qrcode",
  "quick-xml",
  "rand 0.8.6",
  "rcgen",
@@ -4437,13 +4614,9 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
- "strum 0.25.0",
  "subtle",
- "tar",
- "thiserror 1.0.69",
  "time",
  "tokio",
- "totp-rs",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tower_governor",

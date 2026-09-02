@@ -1,0 +1,30 @@
+[package]
+name = "authos-db"
+version = "0.1.40"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "chrono", "migrate", "sqlite", "postgres", "mysql"] }
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
+migration = { path = "../../migration", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+rand = "0.8.6"
+authos-core = { path = "../authos-core", default-features = false }
+authos-entities = { path = "../authos-entities", default-features = false }
+
+[features]
+# Only crates with backend-conditional code carry these; they forward to every
+# dependency that also has such code, dev-dependencies included, so a build can
+# never mix backends (the transaction helpers differ in arity per backend).
+default = ["db_sqlite"]
+db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite", "migration/db_sqlite"]
+db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres", "migration/db_psql"]
+db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql", "migration/db_mysql"]
+
+[dev-dependencies]
+authos-testkit = { path = "../authos-testkit", default-features = false }

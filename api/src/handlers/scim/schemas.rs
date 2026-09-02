@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use axum::{
     async_trait,
     extract::{FromRequest, Request},
@@ -153,10 +151,6 @@ impl ScimError {
         Self::new(400, detail, Some("invalidFilter".to_string()))
     }
 
-    pub fn unauthorized(detail: String) -> Self {
-        Self::new(401, detail, None)
-    }
-
     pub fn invalid_syntax(detail: String) -> Self {
         Self::new(422, detail, Some("invalidSyntax".to_string()))
     }
@@ -214,6 +208,7 @@ where
 /// SCIM User creation/update request
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct ScimUserRequest {
     #[serde(default)]
     pub schemas: Vec<String>,
@@ -235,6 +230,7 @@ pub struct ScimUserRequest {
 /// SCIM Group creation/update request
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct ScimGroupRequest {
     #[serde(default)]
     pub schemas: Vec<String>,
@@ -269,7 +265,10 @@ pub struct ScimPatchRequest {
 // SCIM Schema URNs
 pub const SCIM_USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 pub const SCIM_GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
+// Asserted against in the SCIM response tests; RFC 7644 fixes these URNs.
+#[allow(dead_code)]
 pub const SCIM_LIST_RESPONSE_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
+#[allow(dead_code)]
 pub const SCIM_ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
 pub const SCIM_PATCH_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
 

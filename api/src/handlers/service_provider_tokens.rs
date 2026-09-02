@@ -1,15 +1,16 @@
-use crate::auth::{sso::Provider, token_refresher};
+use crate::crypto::sso::Provider;
+use crate::db::DB;
 use crate::entities::connected_accounts;
 use crate::error::{AppError, Result};
 use crate::middleware::ServicePrincipal;
 use crate::services::audit_builder::OrgAuditBuilder;
+use crate::services::token_refresher;
 use crate::state::AppState;
 use crate::store::{
     connected_accounts::ConnectedAccountStore, identities::IdentityStore,
     organization_oauth_credentials::OrganizationOAuthCredentialsStore,
     provider_token_requests::ProviderTokenRequestStore,
     service_provider_grants::ServiceProviderGrantStore, upstream_providers::UpstreamProviderStore,
-    DB,
 };
 use crate::utils::scopes::{parse_optional_scopes, parse_required_scopes};
 use axum::{extract::State, Json};
@@ -719,7 +720,7 @@ mod permission_tests {
             api_key_id: "key".to_string(),
             service_id: "svc".to_string(),
             service: dummy_service(),
-            permissions: perms.iter().map(|p| p.to_string()).collect(),
+            permissions: perms.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 

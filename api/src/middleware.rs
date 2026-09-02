@@ -1,7 +1,5 @@
-#![allow(dead_code)]
-
-use crate::auth::jwt::{Actor, Claims, JwtService};
 use crate::client_ip::TrustedClientIpKeyExtractor;
+use crate::crypto::jwt::{Actor, Claims, JwtService};
 use crate::entities::{memberships, organizations, users};
 use crate::error::{AppError, Result};
 use axum::{
@@ -20,9 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-// ============================================================================
 // Security Audit Item 2: Regex DoS Prevention
-// ============================================================================
 
 use std::sync::LazyLock;
 
@@ -63,8 +59,10 @@ pub struct AuthUser {
     pub current_session_id: Option<String>,
 }
 
-/// Extension type for storing impersonation context
+/// Marks a request as already impersonating; handlers read only its presence,
+/// to refuse nesting a second impersonation inside the first.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ImpersonationContext {
     /// The admin user who is performing the impersonation
     pub actor: Actor,
@@ -96,14 +94,13 @@ async fn fetch_and_cache_permissions(
     cache: &Cache<String, Vec<String>>,
     user_id: &str,
 ) -> Result<Vec<String>> {
-    use crate::store::{permissions::PermissionsStore, DB};
+    use crate::db::DB;
+    use crate::store::permissions::PermissionsStore;
 
-    // 1. Try cache first (O(1) lookup)
     if let Some(cached_perms) = cache.get(user_id).await {
         return Ok(cached_perms);
     }
 
-    // 2. Cache miss: Fetch from database
     let perms_models = PermissionsStore::list_user_permissions(DB::Conn(db), user_id).await?;
 
     let perms_strings: Vec<String> = perms_models
@@ -111,45 +108,9 @@ async fn fetch_and_cache_permissions(
         .map(|p| format!("{}:{}#{}", p.namespace, p.object_id, p.relation))
         .collect();
 
-    // 3. Store in cache for future requests
     cache
         .insert(user_id.to_string(), perms_strings.clone())
         .await;
-
-    Ok(perms_strings)
-}
-
-/// Security Audit Item 8: Fetch permissions with tenant context
-/// Uses compound cache key 'org_id:user_id' to prevent cross-tenant cache pollution
-pub async fn fetch_and_cache_permissions_with_context(
-    db: &DatabaseConnection,
-    cache: &Cache<String, Vec<String>>,
-    user_id: &str,
-    org_id: Option<&str>,
-) -> Result<Vec<String>> {
-    use crate::store::{permissions::PermissionsStore, DB};
-
-    // Create compound key for tenant-scoped cache
-    let cache_key = match org_id {
-        Some(org) => format!("{}:{}", org, user_id),
-        None => format!("platform:{}", user_id),
-    };
-
-    // 1. Try cache first (O(1) lookup)
-    if let Some(cached_perms) = cache.get(&cache_key).await {
-        return Ok(cached_perms);
-    }
-
-    // 2. Cache miss: Fetch from database
-    let perms_models = PermissionsStore::list_user_permissions(DB::Conn(db), user_id).await?;
-
-    let perms_strings: Vec<String> = perms_models
-        .into_iter()
-        .map(|p| format!("{}:{}#{}", p.namespace, p.object_id, p.relation))
-        .collect();
-
-    // 3. Store in cache for future requests
-    cache.insert(cache_key, perms_strings.clone()).await;
 
     Ok(perms_strings)
 }
@@ -163,19 +124,17 @@ async fn fetch_and_cache_user(
     cache: &Cache<String, crate::entities::users::Model>,
     user_id: &str,
 ) -> Result<crate::entities::users::Model> {
-    use crate::store::{users::UserStore, DB};
+    use crate::db::DB;
+    use crate::store::users::UserStore;
 
-    // 1. Try cache first (O(1) lookup)
     if let Some(cached_user) = cache.get(user_id).await {
         return Ok(cached_user);
     }
 
-    // 2. Cache miss: Fetch from database
     let user = UserStore::find_by_id(DB::Conn(db), user_id)
         .await?
         .ok_or_else(|| AppError::Unauthorized("User not found".to_string()))?;
 
-    // 3. Store in cache for future requests
     cache.insert(user_id.to_string(), user.clone()).await;
 
     Ok(user)
@@ -187,8 +146,9 @@ async fn validate_current_impersonation_authority(
     target: &users::Model,
     org_slug: Option<&str>,
 ) -> Result<()> {
+    use crate::db::DB;
     use crate::store::{
-        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore, DB,
+        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore,
     };
 
     let actor_user = UserStore::find_by_id(DB::Conn(db), &actor.sub)
@@ -240,7 +200,8 @@ async fn validate_current_impersonation_authority(
 }
 
 async fn fetch_permissions_uncached(db: &DatabaseConnection, user_id: &str) -> Result<Vec<String>> {
-    use crate::store::{permissions::PermissionsStore, DB};
+    use crate::db::DB;
+    use crate::store::permissions::PermissionsStore;
 
     Ok(
         PermissionsStore::list_user_permissions(DB::Conn(db), user_id)
@@ -266,7 +227,8 @@ pub async fn extract_user_from_jwt(
     let jwt_service = &state.jwt_service;
     let permission_cache = &state.permission_cache;
     let user_cache = &state.user_cache;
-    use crate::store::{sessions::SessionStore, DB};
+    use crate::db::DB;
+    use crate::store::sessions::SessionStore;
 
     // Extract token from Authorization header
     let token = req
@@ -278,7 +240,6 @@ pub async fn extract_user_from_jwt(
             AppError::Unauthorized("Missing or invalid Authorization header".to_string())
         })?;
 
-    // Validate token
     let claims = jwt_service.validate_authos_token(token)?;
     let user_id = claims.sub.clone();
 
@@ -312,7 +273,6 @@ pub async fn extract_user_from_jwt(
             .ok_or_else(|| AppError::Unauthorized("Target user not found".to_string()))?;
         validate_current_impersonation_authority(db, &actor, &user, claims.org.as_deref()).await?;
 
-        // Fetch permissions for impersonated user
         let permissions = fetch_permissions_uncached(db, &user_id).await?;
 
         // Store impersonation context
@@ -347,7 +307,6 @@ pub async fn extract_user_from_jwt(
         // Load user from cache or database
         let user = fetch_and_cache_user(db, user_cache, &claims.sub).await?;
 
-        // Fetch and cache permissions
         let permissions = fetch_and_cache_permissions(db, permission_cache, &user_id).await?;
 
         // Store user in request extensions
@@ -417,7 +376,8 @@ pub async fn require_platform_owner(
 }
 
 async fn has_current_platform_authority(db: &DatabaseConnection, user_id: &str) -> Result<bool> {
-    use crate::store::{users::UserStore, DB};
+    use crate::db::DB;
+    use crate::store::users::UserStore;
 
     Ok(UserStore::find_by_id(DB::Conn(db), user_id)
         .await?
@@ -431,7 +391,8 @@ pub async fn check_org_membership(
     org_id: &str,
     required_roles: &[&str],
 ) -> Result<memberships::Model> {
-    use crate::store::{memberships::MembershipStore, DB};
+    use crate::db::DB;
+    use crate::store::memberships::MembershipStore;
 
     let membership = MembershipStore::find_by_org_and_user(DB::Conn(db), org_id, user_id)
         .await?
@@ -453,15 +414,6 @@ pub async fn check_org_owner(db: &DatabaseConnection, user_id: &str, org_id: &st
     Ok(())
 }
 
-/// Helper function to check if user is organization admin or owner
-pub async fn check_org_admin(
-    db: &DatabaseConnection,
-    user_id: &str,
-    org_id: &str,
-) -> Result<memberships::Model> {
-    check_org_membership(db, user_id, org_id, &["owner", "admin"]).await
-}
-
 /// Extractor struct for organization slug path parameter
 #[derive(Deserialize)]
 pub struct OrgSlugParam {
@@ -477,7 +429,8 @@ pub async fn require_active_organization(
     req: Request,
     next: Next,
 ) -> std::result::Result<Response, AppError> {
-    use crate::store::{organizations::OrganizationStore, DB};
+    use crate::db::DB;
+    use crate::store::organizations::OrganizationStore;
 
     // Get organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &path.org_slug)
@@ -495,7 +448,7 @@ pub async fn require_active_organization(
     Ok(next.run(req).await)
 }
 
-// ===== Email Rate Limiting =====
+// Email Rate Limiting
 
 /// In-memory rate limiter for email operations (password reset, registration, etc.)
 #[derive(Clone)]
@@ -553,7 +506,7 @@ impl EmailRateLimiter {
         false
     }
 
-    /// Cleanup expired entries (call periodically)
+    /// Drop keys whose window has fully expired; called by the cleanup job.
     pub async fn cleanup(&self) {
         let now = Instant::now();
 
@@ -566,7 +519,7 @@ impl EmailRateLimiter {
     }
 }
 
-// ===== MFA Rate Limiting Middleware =====
+// MFA Rate Limiting Middleware
 
 /// In-memory rate limiter for MFA verification attempts
 #[allow(dead_code)]
@@ -652,7 +605,7 @@ impl MfaRateLimiter {
         false
     }
 
-    /// Cleanup expired entries (call periodically)
+    /// Drop keys whose window has fully expired; called by the cleanup job.
     #[allow(dead_code)]
     pub async fn cleanup(&self) {
         let now = Instant::now();
@@ -674,7 +627,6 @@ impl MfaRateLimiter {
 }
 
 /// Global MFA rate limiter instance
-#[allow(dead_code)]
 pub static EMAIL_RATE_LIMITER: std::sync::LazyLock<EmailRateLimiter> =
     std::sync::LazyLock::new(|| {
         EmailRateLimiter::new(5) // Max 5 emails per hour per email address
@@ -697,8 +649,7 @@ pub async fn mfa_rate_limit_middleware(
     let ip = req
         .extensions()
         .get::<std::net::SocketAddr>()
-        .map(|addr| addr.ip())
-        .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+        .map_or_else(|| "127.0.0.1".parse().unwrap(), std::net::SocketAddr::ip);
 
     // Check IP-based rate limiting first
     if MFA_RATE_LIMITER.is_rate_limited_ip(ip).await {
@@ -729,7 +680,7 @@ pub async fn mfa_rate_limit_middleware(
     Ok(next.run(req).await)
 }
 
-// ===== Request Information Extraction Middleware =====
+// Request Information Extraction Middleware
 
 /// Request information extracted for audit logging and risk assessment
 #[derive(Clone, Debug)]
@@ -769,20 +720,10 @@ pub fn get_request_info(request: &Request) -> &RequestInfo {
         .expect("RequestInfo middleware not applied to request")
 }
 
-// ===== HTTP Request Duration Metrics Middleware =====
-
-/// Middleware to track HTTP request duration for observability.
+/// Record `sso_http_request_duration_seconds`.
 ///
-/// Records `sso_http_request_duration_seconds` histogram with labels:
-/// - `method`: HTTP method (GET, POST, etc.)
-/// - `route`: Route pattern (e.g., `/api/organizations/:slug/users`) - NOT the actual path
-/// - `status`: HTTP status code class (2xx, 4xx, 5xx)
-///
-/// **Cardinality Control**: Uses Axum's `MatchedPath` to get route patterns instead of
-/// raw paths, preventing metric explosion from path parameters (e.g., `/users/uuid-123`).
-///
-/// **Placement**: This middleware should be applied as one of the outermost layers
-/// to capture the full request lifecycle including auth, parsing, and response generation.
+/// Labels use `MatchedPath`, not the raw path: raw paths carry ids and would
+/// explode metric cardinality. Must sit outermost to time the whole request.
 pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
     let start = Instant::now();
 
@@ -791,8 +732,7 @@ pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
     let route = request
         .extensions()
         .get::<MatchedPath>()
-        .map(|mp| mp.as_str().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |mp| mp.as_str().to_string());
 
     let method = request.method().to_string();
 
@@ -825,30 +765,23 @@ pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
     response
 }
 
-// ============================================================================
 // Security Audit Item 3: Dynamic Efficient CORS
-// ============================================================================
 
 use axum::http::{header, HeaderValue, Method};
 
-/// Middleware to handle CORS dynamically based on organization domains AND service redirect URIs.
+/// Origin allowlist built from org custom domains and service redirect URIs.
 ///
-/// This replaces the permissive `CorsLayer::new().allow_origin(Any)` with
-/// a secure, domain-aware CORS policy:
-///
-/// 1. Platform dashboard URL is always allowed
-/// 2. Checks domain_cache (L1) for previously validated origins
-/// 3. Falls back to database lookup for organization custom domains (L2)
-/// 4. Falls back to service redirect URI origin check (L2)
-/// 5. Caches results for 5 minutes to reduce database load
+/// Replaces a blanket `allow_origin(Any)`. Decisions are cached for 5 minutes
+/// because the miss path costs two database lookups per preflight.
 pub async fn dynamic_cors_middleware(
     State(state): State<crate::state::AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    use crate::store::{organizations::OrganizationStore, services::ServiceStore, DB};
+    use crate::db::DB;
+    use crate::store::{organizations::OrganizationStore, services::ServiceStore};
 
-    // 1. Check Origin Header - clone to avoid borrow issues
+    // Cloned: the header borrow would outlive the request mutation below.
     let origin_header = match request.headers().get(header::ORIGIN).cloned() {
         Some(h) => h,
         None => return next.run(request).await, // Not a CORS request
@@ -859,7 +792,7 @@ pub async fn dynamic_cors_middleware(
         Err(_) => return next.run(request).await,
     };
 
-    // 2. Check Platform Dashboard URL (Always allowed)
+    // The platform dashboard is always an allowed origin.
     // Trim trailing slash to match origin format
     let platform_url = state
         .config
@@ -891,7 +824,6 @@ pub async fn dynamic_cors_middleware(
         return allow_cors(request, next, origin_header).await;
     }
 
-    // 3. Check Cache (L1)
     // The cache is keyed by the full origin string (covers both custom domains and redirect URIs)
     if let Some(is_allowed) = state.domain_cache.get(&origin_str).await {
         if is_allowed {
@@ -902,11 +834,9 @@ pub async fn dynamic_cors_middleware(
         }
     }
 
-    // 4. Check Database (L2)
     let db = DB::Conn(&state.db);
     let mut is_allowed = false;
 
-    // Check A: Is it an Organization Custom Domain?
     if let Ok(Some(org)) = OrganizationStore::find_by_custom_domain(db.clone(), &domain).await {
         if org.status == "active" && org.domain_verified {
             is_allowed = true;
@@ -921,7 +851,6 @@ pub async fn dynamic_cors_middleware(
         }
     }
 
-    // 5. Update Cache
     // Cache the full origin string result (unified for both sources)
     state.domain_cache.insert(origin_str, is_allowed).await;
 
@@ -969,10 +898,11 @@ async fn allow_cors(req: Request, next: Next, origin: HeaderValue) -> Response {
     response
 }
 
-// ===== Custom Domain Resolution Middleware =====
+// Custom Domain Resolution Middleware
 
-/// Extension type for storing resolved organization from custom domain
+/// Resolved custom-domain tenant, attached for handlers that need it.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CustomDomainOrg {
     pub organization: organizations::Model,
 }
@@ -986,7 +916,8 @@ pub async fn resolve_custom_domain(
     mut req: Request,
     next: Next,
 ) -> std::result::Result<Response, AppError> {
-    use crate::store::{organizations::OrganizationStore, DB};
+    use crate::db::DB;
+    use crate::store::organizations::OrganizationStore;
 
     // Extract Host header
     let host = req
@@ -1003,7 +934,6 @@ pub async fn resolve_custom_domain(
         return Ok(next.run(req).await);
     }
 
-    // Try to find organization by custom domain
     if let Ok(Some(org)) = OrganizationStore::find_by_custom_domain(DB::Conn(&db), domain).await {
         // Store organization in request extensions
         req.extensions_mut()
@@ -1013,9 +943,9 @@ pub async fn resolve_custom_domain(
     Ok(next.run(req).await)
 }
 
-// ===== API Key Authentication Middleware =====
+// API Key Authentication Middleware
 
-use crate::auth::api_key::ApiKeyService;
+use crate::crypto::api_key::ApiKeyService;
 
 /// Service Principal identity for API key authenticated requests
 #[derive(Clone, Debug)]
@@ -1050,7 +980,8 @@ pub async fn extract_api_key(
     mut req: Request,
     next: Next,
 ) -> std::result::Result<Response, AppError> {
-    use crate::store::{api_keys::ApiKeyStore, services::ServiceStore, DB};
+    use crate::db::DB;
+    use crate::store::{api_keys::ApiKeyStore, services::ServiceStore};
 
     let api_key = req
         .headers()
@@ -1104,41 +1035,32 @@ pub async fn extract_api_key(
 }
 
 async fn service_organization_is_active(db: &DatabaseConnection, org_id: &str) -> Result<bool> {
-    use crate::store::{organizations::OrganizationStore, DB};
+    use crate::db::DB;
+    use crate::store::organizations::OrganizationStore;
 
     Ok(OrganizationStore::find_by_id(DB::Conn(db), org_id)
         .await?
         .is_some_and(|organization| organization.status == "active"))
 }
 
-// ============================================================================
-// SCIM Authentication
-// ============================================================================
-
 /// SCIM Authentication Context
 /// Contains the verified SCIM token and associated organization
 #[derive(Clone, Debug)]
 pub struct ScimAuth {
+    /// Carried for handlers that need the token's own metadata.
+    #[allow(dead_code)]
     pub token: crate::entities::scim_tokens::Model,
     pub org_id: String,
 }
 
-/// SCIM Authentication Middleware
-///
-/// Verifies the Bearer token in the Authorization header and ensures it's a valid SCIM token.
-/// The token must:
-/// 1. Be present in the Authorization header as "Bearer <token>"
-/// 2. Exist in the scim_tokens table
-/// 3. Be active (not revoked)
-/// 4. Not be expired (if expiration is set)
-///
-/// On success, adds the ScimAuth to request extensions.
+/// Authenticate a SCIM bearer token and attach `ScimAuth` to the request.
 pub async fn scim_auth_middleware(
     State(db): State<DatabaseConnection>,
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
-    use crate::store::{scim_tokens::ScimTokenStore, DB};
+    use crate::db::DB;
+    use crate::store::scim_tokens::ScimTokenStore;
 
     // Extract Authorization header
     let auth_header = request
@@ -1154,7 +1076,6 @@ pub async fn scim_auth_middleware(
 
     let token = auth_header.trim_start_matches("Bearer ").trim();
 
-    // Verify the token
     let scim_token = ScimTokenStore::verify_for_active_org(DB::Conn(&db), token)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -1195,9 +1116,10 @@ pub async fn scim_auth_middleware(
 #[cfg(test)]
 mod impersonation_authority_tests {
     use super::*;
+    use crate::db::DB;
     use crate::entities::users;
     use crate::store::{
-        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore, DB,
+        memberships::MembershipStore, organizations::OrganizationStore, users::UserStore,
     };
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{ActiveModelTrait, Database, Set};
@@ -1335,8 +1257,9 @@ mod impersonation_authority_tests {
 #[cfg(test)]
 mod platform_authority_tests {
     use super::*;
+    use crate::db::DB;
     use crate::entities::users;
-    use crate::store::{users::UserStore, DB};
+    use crate::store::users::UserStore;
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{ActiveModelTrait, Database, Set};
 
@@ -1390,7 +1313,8 @@ mod platform_authority_tests {
 #[cfg(test)]
 mod service_principal_tenant_status_tests {
     use super::*;
-    use crate::store::{organizations::OrganizationStore, users::UserStore, DB};
+    use crate::db::DB;
+    use crate::store::{organizations::OrganizationStore, users::UserStore};
     use migration::{Migrator, MigratorTrait};
     use sea_orm::Database;
 

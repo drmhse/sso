@@ -59,3 +59,8 @@ __pycache__/
 *.py[cod]
 web-client
 auth-os
+
+# Local QA harness: generated env files and state, and a config that carries a
+# plaintext platform-owner password. Local artifacts, never repo content.
+.authos-qa/
+authos-qa.config.json

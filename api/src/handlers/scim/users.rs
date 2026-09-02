@@ -1,6 +1,8 @@
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::permissions::{RelationTuple, SUBJECT_TYPE_USER};
 use crate::entities::users;
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::ScimAuth;
 use crate::services::job_queue::JobQueueService;
 use crate::services::scim_filter::{ScimFilterParser, ScimOperator};
@@ -13,7 +15,6 @@ use crate::store::{
     services::ServiceStore,
     sessions::SessionStore,
     users::{UserEmailFilter, UserEmailFilterOp, UserStore},
-    DB,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -87,7 +88,7 @@ fn ensure_scim_can_deprovision_membership(
 
 async fn deprovision_scim_user_in_transaction(
     db: DB<'_>,
-    audit_actor: &crate::services::audit_actor::AuditHandle,
+    audit_actor: &crate::audit::actor::AuditHandle,
     org_id: &str,
     user_id: &str,
     deactivate_owned_user: Option<&str>,
@@ -218,9 +219,7 @@ async fn scoped_email_conflict(
     let existing =
         UserStore::find_by_email_with_context(DB::Conn(&state.db), email, Some(org_id)).await?;
 
-    Ok(existing
-        .map(|user| current_user_id.map(|id| user.id != id).unwrap_or(true))
-        .unwrap_or(false))
+    Ok(existing.is_some_and(|user| current_user_id.is_none_or(|id| user.id != id)))
 }
 
 fn parse_user_email_filters(filter: &str) -> std::result::Result<Vec<UserEmailFilter>, ScimError> {
@@ -832,8 +831,8 @@ pub async fn delete_user(
 #[cfg(test)]
 mod deprovision_tests {
     use super::*;
+    use crate::audit::actor::AuditHandle;
     use crate::entities::audit_outbox;
-    use crate::services::audit_actor::AuditHandle;
     use crate::store::{identities::IdentityStore, sessions::SessionStore};
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, PaginatorTrait, TransactionTrait};

@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
+import { rustSourceRoots } from './lib/rust-sources.mjs';
+
 const root = path.resolve(import.meta.dirname, '..');
 const matrixPath = path.join(root, 'docs/security/tenant-isolation-matrix.json');
 const matrix = JSON.parse(fs.readFileSync(matrixPath, 'utf8'));
@@ -34,7 +36,7 @@ function collectRustSources(directory) {
     }
   }
 }
-collectRustSources(path.join(root, 'api/src'));
+for (const dir of rustSourceRoots(root)) collectRustSources(dir);
 const allRust = rustSources.join('\n');
 const routes = new Set(
   [router, main].flatMap((source) =>

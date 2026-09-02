@@ -17,6 +17,8 @@
     "check:capacity": "python3 scripts/test-authos-capacity.py && python3 scripts/authos-capacity.py --scenarios deploy/qualification/capacity-scenarios.json --validate-only",
     "check:failures": "python3 scripts/test-authos-local-failures.py && python3 scripts/authos-local-failures.py --manifest deploy/qualification/local-failure-cases.json",
     "check:licenses": "node scripts/check-first-party-licenses.mjs",
+    "check:layers": "node scripts/check-layers.mjs",
+    "check:test-support": "bash scripts/check-test-support-isolation.sh",
     "check:audit-policy": "node scripts/check-audit-transaction-policy.mjs",
     "check:pagination-policy": "node scripts/check-pagination-policy.mjs",
     "qualify:backup:sqlite": "bash scripts/qualify-sqlite-backup-restore.sh",

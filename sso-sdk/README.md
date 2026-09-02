@@ -84,6 +84,34 @@ const context = await sso.auth.getContext({
 });
 ```
 
+### Upstream domain routing
+
+Claim an email domain for a tenant and decide which provider its users must
+use. A route only takes effect once the DNS TXT record is verified:
+
+```ts
+const route = await sso.organizations.domainRoutes.create('acme-corp', {
+  domain: 'acme.com',
+  upstream_provider_id: 'prov_123',
+  login_policy: 'upstream_only',
+});
+
+// publish route.verification_token as a TXT record, then:
+const verified = await sso.organizations.domainRoutes.verify('acme-corp', route.id);
+```
+
+### Platform MFA metrics
+
+```ts
+const platformWide = await sso.platform.mfa.getMetrics({ days: 7 });
+const forOrg = await sso.platform.mfa.getMetrics({
+  org_id: 'org_123',
+  start_date: '2026-08-01',
+  end_date: '2026-08-31',
+});
+const alerts = await sso.platform.mfa.getSuspiciousActivity();
+```
+
 ### Provider token handoff
 
 ```ts
@@ -120,6 +148,8 @@ const resourceToken = await sso.auth.enterprise.exchangeIdJag({
 - Hosted auth context for login surfaces
 - Linked accounts and provider-token request completion flows
 - Organization, service, analytics, audit-log, and platform-owner APIs
+- Upstream domain routing (Home Realm Discovery) and upstream provider config
+- Platform MFA metrics, suspicious-activity alerts, and managed bootstrap config
 - Service API helpers including backend-only provider token retrieval
 - Enterprise-managed authorization helpers for ID-JAG resource access
 

@@ -4,8 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { rustSourceRoots } from './lib/rust-sources.mjs';
+
 const root = path.resolve(import.meta.dirname, '..');
-const sourceRoot = path.join(root, 'api', 'src');
+// Every workspace crate, not just the top one.
+const sourceRoots = rustSourceRoots(root);
 const macroPattern = /tracing::(?:trace|debug|info|warn|error)!\(/g;
 const sensitiveIdentifier =
   /(?:^|[^A-Za-z0-9_])(?:[A-Za-z0-9_]+\.)?(?:[A-Za-z0-9_]+_)?(?:email|password|access_token|refresh_token|client_secret|api_key|authorization|cookie|secret)(?:[^A-Za-z0-9_]|$)/;
@@ -83,7 +86,7 @@ export function sensitiveTracingLines(source) {
 
 function main() {
   const violations = [];
-  for (const file of rustFiles(sourceRoot)) {
+  for (const file of sourceRoots.flatMap((dir) => rustFiles(dir))) {
     const source = fs.readFileSync(file, 'utf8');
     for (const line of sensitiveTracingLines(source)) {
       violations.push(`${path.relative(root, file)}:${line}`);

@@ -1,6 +1,6 @@
-#![allow(dead_code)]
-
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
@@ -16,7 +16,6 @@ use crate::store::{
     totp::TotpStore,
     users::UserStore,
     verified_domains::{VerifiedDomainStore, DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY},
-    DB,
 };
 use axum::{
     extract::{Query, State},
@@ -84,7 +83,6 @@ pub use crate::error::Json400;
 // Re-export RefreshTokenResponse from session module for use in login/register flows
 pub use super::session::RefreshTokenResponse;
 
-// Register Request
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub email: String,
@@ -99,19 +97,16 @@ pub struct RegisterRequest {
     pub state: Option<String>,
 }
 
-// Register Response
 #[derive(Debug, Serialize)]
 pub struct RegisterResponse {
     pub message: String,
 }
 
-// Verify Email Query
 #[derive(Debug, Deserialize)]
 pub struct VerifyEmailQuery {
     pub token: String,
 }
 
-// Login Request
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub email: String,
@@ -122,12 +117,9 @@ pub struct LoginRequest {
     pub service_slug: Option<String>,
     /// Service callback URI for hosted password login. Validated before tokens are returned.
     pub redirect_uri: Option<String>,
-    /// Caller state to preserve through hosted service callbacks.
-    pub state: Option<String>,
     pub saml_state: Option<String>,
 }
 
-// Forgot Password Request
 #[derive(Debug, Deserialize)]
 pub struct ForgotPasswordRequest {
     pub email: String,
@@ -137,26 +129,22 @@ pub struct ForgotPasswordRequest {
     pub state: Option<String>,
 }
 
-// Forgot Password Response
 #[derive(Debug, Serialize)]
 pub struct ForgotPasswordResponse {
     pub message: String,
 }
 
-// Reset Password Request
 #[derive(Debug, Deserialize)]
 pub struct ResetPasswordRequest {
     pub token: String,
     pub new_password: String,
 }
 
-// Reset Password Response
 #[derive(Debug, Serialize)]
 pub struct ResetPasswordResponse {
     pub message: String,
 }
 
-// Resend Verification Request
 #[derive(Debug, Deserialize)]
 pub struct ResendVerificationRequest {
     pub email: String,
@@ -166,7 +154,6 @@ pub struct ResendVerificationRequest {
     pub state: Option<String>,
 }
 
-// Resend Verification Response
 #[derive(Debug, Serialize)]
 pub struct ResendVerificationResponse {
     pub message: String,
@@ -263,9 +250,7 @@ pub(crate) async fn reject_upstream_only_local_auth(
         return Ok(());
     };
 
-    let applies_to_context = context_org_id
-        .map(|org_id| org_id == domain.org_id)
-        .unwrap_or(true);
+    let applies_to_context = context_org_id.is_none_or(|org_id| org_id == domain.org_id);
 
     if applies_to_context
         && domain.login_policy == DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY
@@ -316,7 +301,7 @@ pub async fn register(
     }
 
     let password_hash =
-        crate::services::concurrency::hash_password_bounded(req.password.clone()).await?;
+        crate::crypto::concurrency::hash_password_bounded(req.password.clone()).await?;
 
     // Clone values needed inside the closure
     let email = req.email.clone();
@@ -603,10 +588,8 @@ pub async fn login(
     )
     .await?;
 
-    // Determine the hash to verify against:
-    // - If user exists and has password: use their hash
-    // - If user doesn't exist or has no password: use DUMMY_HASH (timing attack mitigation)
-    // Security Audit Item 6: This prevents email enumeration via timing side-channel
+    // Unknown or password-less accounts verify against DUMMY_HASH so the
+    // response time cannot be used to enumerate registered emails.
     let (user, password_hash, is_dummy) = match &user_result {
         Some(u) if u.deleted_at.is_none() && u.password_hash.is_some() => {
             (Some(u), u.password_hash.as_ref().unwrap().clone(), false)
@@ -615,7 +598,7 @@ pub async fn login(
     };
 
     let is_valid =
-        crate::services::concurrency::verify_password_bounded(req.password.clone(), password_hash)
+        crate::crypto::concurrency::verify_password_bounded(req.password.clone(), password_hash)
             .await?;
 
     // Return error if:
@@ -726,7 +709,6 @@ pub async fn login(
         "Password login risk assessment"
     );
 
-    // Check if MFA is enabled for this user
     let mfa_enabled = TotpStore::is_enabled(DB::Conn(&state.db), &user.id).await?;
 
     // If MFA is enabled or risk engine requires it, return pre-auth token
@@ -894,7 +876,7 @@ pub async fn login(
 
     // Create session with refresh token
     let token_hash = hash_token(&token);
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
@@ -1228,7 +1210,7 @@ pub async fn reset_password(
     .await?;
 
     let password_hash =
-        crate::services::concurrency::hash_password_bounded(req.new_password.clone()).await?;
+        crate::crypto::concurrency::hash_password_bounded(req.new_password.clone()).await?;
 
     // Complete all fallible CPU work before the transaction. The conditional
     // token claim, password update, and session revocation then commit or roll
@@ -1370,16 +1352,16 @@ pub async fn resend_verification(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
+
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::sso::OAuthClient;
+
     use crate::email::{EmailService, SmtpConfig};
     use crate::entities::users;
-    use crate::rsa_keys::GeneratedKey;
+
+    use crate::audit::actor::AuditHandle;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::{
         identities::IdentityStore,
@@ -1391,7 +1373,7 @@ mod tests {
         verified_domains::{VerifiedDomainStore, DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY},
     };
     use axum::{extract::State, Extension, Json};
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
@@ -1407,81 +1389,11 @@ mod tests {
         password: String,
     }
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
+    use crate::test_support::test_jwt_service;
 
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
-
-    async fn setup_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect in-memory sqlite");
-        Migrator::up(&db, None).await.expect("run migrations");
-        db
-    }
+    use crate::test_support::setup_db;
 
     fn hash_password(password: &str) -> String {
         let salt = SaltString::generate(&mut OsRng);
@@ -1627,7 +1539,6 @@ mod tests {
                 org_slug: org_slug.map(str::to_string),
                 service_slug: service_slug.map(str::to_string),
                 redirect_uri: None,
-                state: None,
                 saml_state: None,
             }),
         )
@@ -1649,7 +1560,6 @@ mod tests {
                 org_slug: Some(fixture.org_slug.clone()),
                 service_slug: None,
                 redirect_uri: None,
-                state: None,
                 saml_state: None,
             }),
         )

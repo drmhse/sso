@@ -2,7 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
-const entitiesDir = path.resolve('api/src/entities');
+import { entitiesDir as resolveEntitiesDir } from './lib/rust-sources.mjs';
+
+const entitiesDir = resolveEntitiesDir();
 const sensitiveField = /(?:^|_)(?:password_hash|token_hash|client_secret_hash|private_key_encrypted|secret_encrypted|client_secret_encrypted|access_token_encrypted|refresh_token_encrypted|smtp_password_encrypted|api_key_encrypted|webhook_secret_encrypted|access_token|refresh_token|verification_token|api_key|auth_header|encryption_key_id|secret|token)$/;
 const failures = [];
 

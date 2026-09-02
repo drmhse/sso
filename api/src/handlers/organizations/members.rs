@@ -1,6 +1,8 @@
 use crate::constants::{DEFAULT_MAX_USERS, DEFAULT_TIER_NAME, VALID_ORG_ROLES};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::{memberships, users};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::services::permission_service::{
@@ -10,7 +12,7 @@ use crate::state::AppState;
 use crate::store::{
     memberships::MembershipStore, organization_roles::OrganizationRoleStore,
     organization_tiers::OrganizationTierStore, organizations::OrganizationStore,
-    permissions::PermissionsStore, services::ServiceStore, users::UserStore, DB,
+    permissions::PermissionsStore, services::ServiceStore, users::UserStore,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -78,7 +80,7 @@ pub struct MemberServiceAccessGrant {
 
 async fn transfer_ownership_with_db(
     db: DB<'_>,
-    audit_actor: &crate::services::audit_actor::AuditHandle,
+    audit_actor: &crate::audit::actor::AuditHandle,
     org_id: &str,
     previous_owner_id: &str,
     previous_owner_email: &str,
@@ -173,7 +175,6 @@ pub async fn list_members(
 ) -> Result<Json<MemberListResponse>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -258,7 +259,6 @@ pub async fn update_member_role(
 ) -> Result<Json<OrganizationMember>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -429,7 +429,6 @@ pub async fn remove_member(
 ) -> Result<Json<()>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -452,7 +451,6 @@ pub async fn remove_member(
         ));
     }
 
-    // Get target membership
     let target_membership =
         MembershipStore::find_by_org_and_user(DB::Conn(&state.db), &organization.id, &user_id)
             .await?
@@ -729,12 +727,10 @@ pub async fn transfer_ownership(
 ) -> Result<Json<OrganizationMember>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // Check if user is owner
     crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
 
     let org_id = organization.id.clone();
@@ -782,7 +778,7 @@ pub async fn transfer_ownership(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::audit_actor::AuditHandle;
+    use crate::audit::actor::AuditHandle;
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, TransactionTrait};
 

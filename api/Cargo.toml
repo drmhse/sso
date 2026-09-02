@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/*", "migration"]
+
 [package]
 name = "sso"
 version = "0.1.40"
@@ -11,7 +14,6 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "timeout", "set-header", "limit"] }
 tower_governor = "0.3"
-forwarded-header-value = "0.1"
 include_dir = "0.7"
 mime_guess = "2.0"
 
@@ -21,17 +23,24 @@ mime_guess = "2.0"
 # relocate and forces a full C rebuild on every fresh checkout.
 rsa = { version = "0.9", features = ["sha2"] }
 x509-cert = "0.2"
-const-oid = "0.9"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "chrono", "migrate", "sqlite", "postgres", "mysql"] }
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
 migration = { path = "migration", default-features = false }
+
+# Layer crates (see COMPRESSION.md for the enforced layer order)
+authos-core = { path = "crates/authos-core", default-features = false }
+authos-entities = { path = "crates/authos-entities", default-features = false }
+authos-crypto = { path = "crates/authos-crypto", default-features = false }
+authos-db = { path = "crates/authos-db", default-features = false }
+authos-audit = { path = "crates/authos-audit", default-features = false }
+authos-store = { path = "crates/authos-store", default-features = false }
+authos-services = { path = "crates/authos-services", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # JWT
-jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 
 # OAuth2 - Rustls only
 oauth2 = { version = "5.0", default-features = false }
@@ -42,7 +51,6 @@ reqwest = { version = "0.13", default-features = false, features = ["form", "jso
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0.103"
-thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
@@ -50,13 +58,8 @@ time = { version = "0.3", features = ["serde", "formatting"] }
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8.6"
-hmac = "0.12"
-futures = "0.3"
-async-trait = "0.1"
-num_cpus = "1.16"
 
 # Encryption
-aes-gcm = "0.10"
 base64 = "0.22"
 subtle = "2.5"
 
@@ -67,11 +70,8 @@ http = "1.0"
 argon2 = "0.5"
 
 # Email - Rustls only
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname"] }
 
 # TOTP/MFA
-totp-rs = { version = "5.5", features = ["gen_secret", "qr"] }
-qrcode = "0.14"
 
 # WebAuthn - DISABLE defaults to avoid OpenSSL
 # 0.6 replaced OpenSSL with RustCrypto, which is what removes the last C
@@ -79,7 +79,6 @@ qrcode = "0.14"
 webauthn-rs = { version = "0.6.1-dev", default-features = false, features = ["danger-allow-state-serialisation"] }
 
 # DNS
-hickory-resolver = "0.26"
 
 # Regex
 regex = "1.10"
@@ -88,11 +87,8 @@ regex = "1.10"
 url = "2.5"
 
 # GeoIP
-maxminddb = "0.27"
-geoutils = "0.5"
 
 # Audit
-strum = { version = "0.25", features = ["derive"] }
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
@@ -110,9 +106,6 @@ quick-xml = "0.41"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 # x509-parser version managed by rcgen/webauthn-rs
 flate2 = "1.0"
-pkcs1 = "0.7.5"
-pkcs8 = "0.10"
-tar = "0.4.46"
 
 [[bin]]
 name = "sso_sqlite"
@@ -131,9 +124,15 @@ required-features = ["db_mysql"]
 
 [features]
 default = ["db_sqlite"]
-db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite", "migration/db_sqlite"]
-db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres", "migration/db_psql"]
-db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql", "migration/db_mysql"]
+db_sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite", "migration/db_sqlite", "authos-db/db_sqlite", "authos-store/db_sqlite", "authos-services/db_sqlite", "authos-testkit/db_sqlite"]
+db_psql = ["sea-orm/sqlx-postgres", "sqlx/postgres", "migration/db_psql", "authos-db/db_psql", "authos-store/db_psql", "authos-services/db_psql", "authos-testkit/db_psql"]
+db_mysql = ["sea-orm/sqlx-mysql", "sqlx/mysql", "migration/db_mysql", "authos-db/db_mysql", "authos-store/db_mysql", "authos-services/db_mysql", "authos-testkit/db_mysql"]
+
+[dev-dependencies]
+authos-testkit = { path = "crates/authos-testkit", default-features = false }
+authos-crypto = { path = "crates/authos-crypto", features = ["test-support"], default-features = false }
+authos-audit = { path = "crates/authos-audit", features = ["test-support"], default-features = false }
+authos-services = { path = "crates/authos-services", features = ["test-support"], default-features = false }
 
 [patch.crates-io]
 sqlx-mysql = { path = "vendor/sqlx-mysql" }

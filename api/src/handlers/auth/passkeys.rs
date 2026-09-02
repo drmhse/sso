@@ -1,13 +1,12 @@
-#![allow(dead_code)]
-
-use crate::auth::jwt::JwtService;
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::crypto::jwt::JwtService;
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::services::webauthn::WebAuthnService;
 use crate::state::AppState;
 use crate::store::users::UserStore;
 use crate::store::webauthn_challenges::WebAuthnChallengeStore;
-use crate::store::DB;
 use crate::store::{
     identities::IdentityStore, memberships::MembershipStore, organizations::OrganizationStore,
     services::ServiceStore, sessions::SessionStore, user_passkeys::UserPasskeysStore,
@@ -144,8 +143,7 @@ fn redirect_uri_allowed(service: &crate::entities::services::Model, redirect_uri
         .redirect_uris
         .as_deref()
         .and_then(|uris| serde_json::from_str::<Vec<String>>(uris).ok())
-        .map(|uris| !uris.is_empty() && uris.iter().any(|uri| uri == redirect_uri))
-        .unwrap_or(false)
+        .is_some_and(|uris| !uris.is_empty() && uris.iter().any(|uri| uri == redirect_uri))
 }
 
 /// POST /auth/passkeys/register/start
@@ -661,7 +659,7 @@ pub async fn authenticate_finish(
             .and_then(|ctx| ctx.service_slug.as_deref()),
     )?;
 
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
     let token_hash = JwtService::hash_token(&token);
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
@@ -839,20 +837,19 @@ async fn validate_passkey_login_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
-    use crate::rsa_keys::GeneratedKey;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::{
         organizations::OrganizationStore,
         services::ServiceStore,
         users::{UserCreationOptions, UserStore},
     };
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::{ActiveModelTrait, Database, Set};
@@ -874,73 +871,9 @@ mod tests {
         ));
     }
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
-
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
+    use crate::test_support::test_jwt_service;
 
     async fn setup_passkey_state_with_suspended_org() -> AppState {
         let db = Database::connect("sqlite::memory:")
@@ -1173,8 +1106,8 @@ mod tests {
     fn auth_user_for(user: crate::entities::users::Model) -> AuthUser {
         let now = Utc::now();
         AuthUser {
-            claims: crate::auth::jwt::Claims {
-                token_use: crate::auth::jwt::TokenUse::ManagementAccess,
+            claims: crate::crypto::jwt::Claims {
+                token_use: crate::crypto::jwt::TokenUse::ManagementAccess,
                 sub: user.id.clone(),
                 email: user.email.clone(),
                 is_platform_owner: user.is_platform_owner,

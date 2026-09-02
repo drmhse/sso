@@ -1,14 +1,3 @@
-// Auth module - handles all authentication-related endpoints
-// This module is organized into logical sub-modules:
-// - oauth: OAuth2 flows (end-user SSO and admin authentication)
-// - device: Device authorization flow (RFC 8628)
-// - session: Session management (refresh token, logout)
-// - password: Email/password authentication
-// - mfa: Multi-factor authentication
-// - hrd: Home Realm Discovery (email domain lookup)
-// - passkeys: WebAuthn/FIDO2 passkey authentication
-// - magic: Passwordless magic link authentication
-
 pub mod device;
 pub(crate) mod email_delivery;
 pub mod enterprise;
@@ -20,7 +9,6 @@ pub mod passkeys;
 pub mod password;
 pub mod session;
 pub mod upstream_saml;
-pub mod utils;
 
 // Re-export all public handlers from sub-modules
 

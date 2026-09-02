@@ -1,12 +1,12 @@
-#![allow(dead_code)]
-
-use crate::auth::jwt::JwtService;
 use crate::constants::{
     DEFAULT_MAX_ORGS_PER_USER, DEFAULT_TIER_NAME, MAX_NAME_LENGTH, MAX_SLUG_LENGTH,
     MIN_NAME_LENGTH, MIN_SLUG_LENGTH, RESERVED_SLUGS,
 };
+use crate::crypto::jwt::JwtService;
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::{memberships, organization_tiers, organizations, platform_audit_log, users};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{
     PermissionService, CAP_ORG_SETTINGS_MANAGE, CAP_RISK_EVENTS_VIEW, CAP_RISK_POLICIES_MANAGE,
@@ -15,7 +15,7 @@ use crate::state::AppState;
 use crate::store::{
     memberships::MembershipStore, organization_tiers::OrganizationTierStore,
     organizations::OrganizationStore, risk_rules::RiskRulesStore, services::ServiceStore,
-    sessions::SessionStore, DB,
+    sessions::SessionStore,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -159,12 +159,10 @@ pub async fn create_organization(
                     ));
                 }
 
-                // Get free tier
                 let free_tier = OrganizationTierStore::find_by_name(db.clone(), DEFAULT_TIER_NAME)
                     .await?
                     .ok_or_else(|| AppError::NotFound("Free tier not found".to_string()))?;
 
-                // Create organization
                 let organization = OrganizationStore::create(
                     db.clone(),
                     &slug,
@@ -244,8 +242,7 @@ pub async fn create_organization(
         )
         .map_err(|e| AppError::InternalServerError(format!("Failed to create JWT: {}", e)))?;
 
-    // Generate refresh token
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&access_token);
@@ -300,7 +297,6 @@ pub async fn get_organization(
 ) -> Result<Json<OrganizationResponse>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -328,7 +324,6 @@ pub async fn update_organization(
 ) -> Result<Json<OrganizationResponse>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -384,7 +379,6 @@ pub async fn delete_organization(
 ) -> Result<Json<()>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -512,7 +506,6 @@ pub async fn select_organization(
 ) -> Result<Json<SelectOrganizationResponse>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -533,7 +526,6 @@ pub async fn select_organization(
                 AppError::Forbidden("You are not a member of this organization".to_string())
             })?;
 
-    // Check MAU limit (billing enforcement)
     crate::services::tier_enforcement::TierService::check_mau_limit(
         DB::Conn(&state.db),
         &organization.id,
@@ -552,8 +544,7 @@ pub async fn select_organization(
         )
         .map_err(|e| AppError::InternalServerError(format!("Failed to create JWT: {}", e)))?;
 
-    // Generate refresh token
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
 
     // Store session with refresh token
     let token_hash = JwtService::hash_token(&access_token);
@@ -614,15 +605,6 @@ pub async fn select_organization(
 
 // Helper functions
 
-pub async fn get_organization_by_id(
-    pool: &DatabaseConnection,
-    org_id: &str,
-) -> Result<organizations::Model> {
-    OrganizationStore::find_by_id(DB::Conn(pool), org_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))
-}
-
 pub async fn get_organization_stats(
     pool: &DatabaseConnection,
     org_id: &str,
@@ -635,24 +617,6 @@ pub async fn get_organization_stats(
     let tier = OrganizationTierStore::find_by_org_id(DB::Conn(pool), org_id).await?;
 
     Ok((membership_count, service_count, tier))
-}
-
-pub async fn ensure_organization_active(
-    pool: &DatabaseConnection,
-    org_id: &str,
-) -> Result<organizations::Model> {
-    let org = OrganizationStore::find_by_id(DB::Conn(pool), org_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-
-    if org.status != "active" {
-        return Err(AppError::Forbidden(format!(
-            "Organization is not active. Current status: {}",
-            org.status
-        )));
-    }
-
-    Ok(org)
 }
 
 // Validation helper functions
@@ -701,16 +665,15 @@ pub fn validate_organization_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
-    use crate::rsa_keys::GeneratedKey;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::users::{UserCreationOptions, UserStore};
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::Database;
@@ -719,79 +682,14 @@ mod tests {
     struct OrgSwitchFixture {
         state: AppState,
         auth_user: AuthUser,
-        alpha_slug: String,
         beta_id: String,
         beta_slug: String,
         gamma_slug: String,
     }
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("generate test rsa key");
-        let private_key = STANDARD.encode(
-            rsa.private_key_pem()
-                .expect("encode private key pem for tests"),
-        );
-        let public_key = STANDARD.encode(
-            rsa.public_key_pem()
-                .expect("encode public key pem for tests"),
-        );
-
-        JwtService::new(
-            &private_key,
-            &public_key,
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("create test jwt service")
-    }
+    use crate::test_support::test_jwt_service;
 
     async fn setup_org_switch_fixture() -> OrgSwitchFixture {
         let db = Database::connect("sqlite::memory:")
@@ -901,7 +799,6 @@ mod tests {
         OrgSwitchFixture {
             state,
             auth_user,
-            alpha_slug: alpha.slug,
             beta_id: beta.id,
             beta_slug: beta.slug,
             gamma_slug: gamma.slug,
@@ -1012,19 +909,6 @@ mod tests {
     }
 }
 
-pub fn validate_email(email: &str) -> Result<()> {
-    if !email.contains('@') || email.len() < 5 {
-        return Err(AppError::BadRequest("Invalid email format".to_string()));
-    }
-
-    let parts: Vec<&str> = email.split('@').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(AppError::BadRequest("Invalid email format".to_string()));
-    }
-
-    Ok(())
-}
-
 // Risk Settings Request/Response Types
 #[derive(Debug, Serialize)]
 pub struct GetRiskSettingsResponse {
@@ -1060,11 +944,10 @@ pub async fn get_risk_settings(
     Extension(_auth_user): Extension<AuthUser>,
     Path(org_slug): Path<String>,
 ) -> Result<Json<GetRiskSettingsResponse>> {
-    // Find organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-    let org = ensure_organization_active(&state.db, &org.id).await?;
+    let org = crate::store::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     require_any_capability(
         &state,
@@ -1075,7 +958,6 @@ pub async fn get_risk_settings(
     )
     .await?;
 
-    // Get risk rules
     let risk_rules = RiskRulesStore::find_by_org(DB::Conn(&state.db), &org.id)
         .await?
         .ok_or_else(|| AppError::NotFound("Risk settings not found".to_string()))?;
@@ -1098,11 +980,10 @@ pub async fn update_risk_settings(
     Path(org_slug): Path<String>,
     Json(req): Json<UpdateRiskSettingsRequest>,
 ) -> Result<Json<UpdateRiskSettingsResponse>> {
-    // Find organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-    let org = ensure_organization_active(&state.db, &org.id).await?;
+    let org = crate::store::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     require_capability(
         &state,
@@ -1220,11 +1101,10 @@ pub async fn reset_risk_settings(
     Extension(_auth_user): Extension<AuthUser>,
     Path(org_slug): Path<String>,
 ) -> Result<Json<UpdateRiskSettingsResponse>> {
-    // Find organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
-    let org = ensure_organization_active(&state.db, &org.id).await?;
+    let org = crate::store::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
     require_capability(
         &state,

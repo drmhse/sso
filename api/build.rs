@@ -50,7 +50,7 @@ fn emit_rerun_if_changed_recursive(path: &Path) {
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|error| panic!("failed to collect {}: {error}", path.display()));
 
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let entry_path = entry.path();

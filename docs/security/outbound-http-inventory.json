@@ -2,7 +2,7 @@
   "version": 1,
   "entries": [
     {
-      "path": "api/src/services/safe_http.rs",
+      "path": "api/crates/authos-crypto/src/crypto/safe_http.rs",
       "classification": "central_policy",
       "destination": "Caller-provided external HTTP(S) URLs",
       "credentials": "Caller-specific",
@@ -10,7 +10,7 @@
       "remediation": "Keep this as the only general-purpose configurable-destination client and add proxy/DNS-rebinding integration tests."
     },
     {
-      "path": "api/src/services/domain_verification.rs",
+      "path": "api/crates/authos-services/src/services/domain_verification.rs",
       "classification": "reviewed_custom",
       "destination": "Operator-requested domain on port 80",
       "credentials": "One-time public verification token only",
@@ -18,7 +18,7 @@
       "remediation": "Retain explicit IP iteration, reserved-address rejection, no redirects, Host header control, and the response bound."
     },
     {
-      "path": "api/src/billing/providers/polar.rs",
+      "path": "api/crates/authos-services/src/billing/providers/polar.rs",
       "classification": "central_policy",
       "destination": "Configured Polar API base URL",
       "credentials": "Polar bearer API key",
@@ -26,7 +26,7 @@
       "remediation": "Retain DNS validation, pinned resolution, disabled redirects, bounded JSON parsing, and generic errors that do not echo response bodies, configured URLs, or bearer keys."
     },
     {
-      "path": "api/src/billing/providers/stripe.rs",
+      "path": "api/crates/authos-services/src/billing/providers/stripe.rs",
       "classification": "central_policy",
       "destination": "Configured Stripe API base URL",
       "credentials": "Stripe bearer API key",

@@ -3,7 +3,10 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
-const rootPath = new URL('../api/src/', import.meta.url).pathname;
+import { rustSourceRoots, REPO_ROOT } from './lib/rust-sources.mjs';
+
+const sourceRoots = rustSourceRoots(REPO_ROOT);
+const rootPath = new URL('../api/', import.meta.url).pathname;
 
 function rustFiles(directory) {
   return readdirSync(directory).flatMap((entry) => {
@@ -46,7 +49,7 @@ for (const control of negativeControls) {
 }
 
 const failures = [];
-for (const file of rustFiles(rootPath)) {
+for (const file of sourceRoots.flatMap((dir) => rustFiles(dir))) {
   if (file.endsWith('/utils/pagination.rs')) continue;
   const source = readFileSync(file, 'utf8');
   for (const [name, pattern] of forbidden) {

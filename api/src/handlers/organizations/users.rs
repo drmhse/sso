@@ -1,3 +1,4 @@
+use crate::db::DB;
 use crate::entities::users;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
@@ -7,7 +8,7 @@ use crate::services::permission_service::{
 use crate::state::AppState;
 use crate::store::{
     identities::IdentityStore, organizations::OrganizationStore, services::ServiceStore,
-    sessions::SessionStore, subscriptions::SubscriptionStore, users::UserStore, DB,
+    sessions::SessionStore, subscriptions::SubscriptionStore, users::UserStore,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -134,7 +135,6 @@ pub async fn list_end_users(
 ) -> Result<Json<EndUserListResponse>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -189,8 +189,7 @@ pub async fn list_end_users(
             email_verified_at: None,
             created_at: DateTime::parse_from_rfc3339(&row.created_at)
                 .ok()
-                .map(|dt| dt.naive_utc())
-                .unwrap_or_else(|| Utc::now().naive_utc()),
+                .map_or_else(|| Utc::now().naive_utc(), |dt| dt.naive_utc()),
             updated_at: None,
             deleted_at: None,
         })
@@ -229,12 +228,10 @@ pub async fn list_end_users(
             status: sub_row.status,
             current_period_end: chrono::DateTime::parse_from_rfc3339(&sub_row.current_period_end)
                 .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc)),
             created_at: chrono::DateTime::parse_from_rfc3339(&sub_row.subscription_created_at)
                 .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc)),
         };
         subscriptions_by_user
             .entry(sub_row.user_id)
@@ -259,8 +256,7 @@ pub async fn list_end_users(
             provider_user_id: id_row.provider_user_id,
             created_at: chrono::DateTime::parse_from_rfc3339(&id_row.created_at)
                 .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc)),
         };
         identities_by_user
             .entry(id_row.user_id)
@@ -307,14 +303,12 @@ pub async fn get_end_user(
 ) -> Result<Json<EndUserDetailResponse>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_end_user_viewer(&state, &organization.id, &user.id).await?;
 
-    // Get end-user
     let end_user_obj = UserStore::find_by_id(DB::Conn(&state.db), &end_user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("End-user not found".to_string()))?;
@@ -355,12 +349,10 @@ pub async fn get_end_user(
             status: sub_row.status,
             current_period_end: chrono::DateTime::parse_from_rfc3339(&sub_row.current_period_end)
                 .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc)),
             created_at: chrono::DateTime::parse_from_rfc3339(&sub_row.created_at)
                 .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc)),
         })
         .collect();
 
@@ -380,8 +372,7 @@ pub async fn get_end_user(
             provider_user_id: id_row.provider_user_id,
             created_at: chrono::DateTime::parse_from_rfc3339(&id_row.created_at)
                 .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc)),
         })
         .collect();
 
@@ -479,7 +470,6 @@ pub async fn revoke_end_user_sessions(
 ) -> Result<Json<serde_json::Value>> {
     let user = &auth_user.user;
 
-    // Find organization
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -517,72 +507,26 @@ pub async fn revoke_end_user_sessions(
 #[cfg(test)]
 mod end_user_tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::jwt::JwtService;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::db::DB;
     use crate::entities::users;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::{
-        identities::IdentityStore, memberships::MembershipStore, users::UserStore, DB,
-    };
+    use crate::store::{identities::IdentityStore, memberships::MembershipStore, users::UserStore};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
     struct Fixture {
         state: AppState,

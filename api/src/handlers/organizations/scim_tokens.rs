@@ -1,9 +1,10 @@
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{PermissionService, CAP_INTEGRATIONS_MANAGE};
 use crate::services::tier_enforcement::TierService;
 use crate::state::AppState;
-use crate::store::{organizations::OrganizationStore, scim_tokens::ScimTokenStore, DB};
+use crate::store::{organizations::OrganizationStore, scim_tokens::ScimTokenStore};
 use axum::{
     extract::{Path, State},
     Json,
@@ -63,7 +64,6 @@ pub async fn create_scim_token(
     Path(org_slug): Path<String>,
     Json(req): Json<CreateScimTokenRequest>,
 ) -> Result<Json<CreateScimTokenResponse>> {
-    // Find organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -79,7 +79,6 @@ pub async fn create_scim_token(
     )
     .await?;
 
-    // Generate SCIM token
     let (plain_token, prefix, hash) = ScimTokenStore::generate();
 
     // Parse expires_at if provided
@@ -93,7 +92,6 @@ pub async fn create_scim_token(
         None
     };
 
-    // Create SCIM token in database
     let token_model = ScimTokenStore::create(
         DB::Conn(&state.db),
         &org.id,
@@ -124,14 +122,12 @@ pub async fn list_scim_tokens(
     auth_user: AuthUser,
     Path(org_slug): Path<String>,
 ) -> Result<Json<Vec<ScimTokenResponse>>> {
-    // Find organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
     require_integration_manager(&state, &org.id, &auth_user.user.id).await?;
 
-    // List tokens
     let tokens = ScimTokenStore::list_by_org(DB::Conn(&state.db), &org.id).await?;
 
     let response = tokens
@@ -161,7 +157,6 @@ pub async fn revoke_scim_token(
     auth_user: AuthUser,
     Path((org_slug, token_id)): Path<(String, String)>,
 ) -> Result<Json<()>> {
-    // Find organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -180,7 +175,6 @@ pub async fn delete_scim_token(
     auth_user: AuthUser,
     Path((org_slug, token_id)): Path<(String, String)>,
 ) -> Result<Json<()>> {
-    // Find organization
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;

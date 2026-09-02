@@ -1,13 +1,14 @@
-use crate::auth::sso::Provider;
-use crate::auth::token_refresher;
 use crate::constants::TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS;
+use crate::crypto::sso::Provider;
+use crate::db::DB;
 use crate::entities::identities;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
+use crate::services::token_refresher;
 use crate::state::AppState;
 use crate::store::{
     identities::IdentityStore, organization_oauth_credentials::OrganizationOAuthCredentialsStore,
-    services::ServiceStore, token_refresh_locks::TokenRefreshLockStore, users::UserStore, DB,
+    services::ServiceStore, token_refresh_locks::TokenRefreshLockStore, users::UserStore,
 };
 use axum::{
     extract::{Path, State},
@@ -41,7 +42,6 @@ pub async fn get_provider_token(
         ));
     }
 
-    // 1. Verify service has scopes configured for this provider
     let service = ServiceStore::find_by_org_slug_and_service_slug(
         DB::Conn(&state.db),
         &auth_user.claims.org.clone().unwrap_or_default(),
@@ -70,7 +70,6 @@ pub async fn get_provider_token(
     let org_id = service.org_id.clone();
     let service_id = service.id.clone();
 
-    // 2. Get user's identity for this provider, scoped to this specific service
     // This ensures we only access tokens that were obtained via this service's OAuth credentials
     // and provides full service-level isolation
     let identity = IdentityStore::find_by_user_and_provider(
@@ -88,7 +87,7 @@ pub async fn get_provider_token(
         ))
     })?;
 
-    // 3. Check if token is expired or about to expire (< 5 minutes)
+    // Refreshed early: a token expiring mid-request would fail downstream.
     if let Some(expires_at_naive) = &identity.expires_at {
         let expires_at_utc: DateTime<Utc> =
             DateTime::from_naive_utc_and_offset(*expires_at_naive, Utc);
@@ -115,7 +114,6 @@ pub async fn get_provider_token(
         }
     }
 
-    // 4. Decrypt and return existing token
     let access_token = decrypt_token(
         state.encryption.as_deref(),
         &identity.id,
@@ -180,7 +178,7 @@ async fn refresh_provider_token(
     )?
     .ok_or_else(|| AppError::OAuth("No refresh token available".to_string()))?;
 
-    // 1. Determine which credentials to use (same logic as background job)
+    // Must match the credential choice in jobs/token_refresh.rs.
     let (client_id, client_secret) = if let Some(org_id) = &identity.issuing_org_id {
         // Case 1: BYOO Token
         let creds = OrganizationOAuthCredentialsStore::find_by_org_and_provider(
@@ -206,7 +204,6 @@ async fn refresh_provider_token(
             .await
             .map_err(|e| AppError::OAuth(format!("Failed to create OAuth client: {}", e)))?;
 
-        // For now, return the credentials directly since that's what the existing code expects
         let secret = encryption
             .decrypt_with_context(
                 &creds.client_secret_encrypted,
@@ -225,8 +222,7 @@ async fn refresh_provider_token(
             .await?
             .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-        let config = crate::config::Config::from_env()
-            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        let config = crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
 
         // Case 2: Platform Credentials (used for both admin and non-admin users)
         match provider {
@@ -260,7 +256,6 @@ async fn refresh_provider_token(
         }
     };
 
-    // 2. Call provider's token refresh endpoint using centralized module
     let new_token = match provider {
         Provider::Github => {
             return Err(AppError::OAuth(
@@ -273,8 +268,8 @@ async fn refresh_provider_token(
                 .map_err(|e| AppError::OAuth(format!("Token refresh failed: {}", e)))?
         }
         Provider::Google => {
-            let config = crate::config::Config::from_env()
-                .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+            let config =
+                crate::config::Config::from_env().map_err(AppError::InternalServerError)?;
             token_refresher::refresh_google_token(
                 &refresh_token,
                 &client_id,
@@ -483,19 +478,20 @@ mod token_storage_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::jwt::JwtService;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::db::DB;
     use crate::entities::users;
     use crate::middleware::AuthUser;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::{organizations::OrganizationStore, users::UserStore, DB};
+    use crate::store::{organizations::OrganizationStore, users::UserStore};
     use axum::extract::Path;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use migration::{Migrator, MigratorTrait};
@@ -503,52 +499,7 @@ mod tests {
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
     struct Fixture {
         state: AppState,

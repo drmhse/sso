@@ -1,12 +1,13 @@
 //! Audit log endpoints for organizations
 
 use crate::db::models::OrganizationAuditLogWithUser;
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit::OrganizationAuditService;
 use crate::services::permission_service::{PermissionService, CAP_AUDIT_LOGS_VIEW};
 use crate::state::AppState;
-use crate::store::{organizations::OrganizationStore, DB};
+use crate::store::organizations::OrganizationStore;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -262,7 +263,7 @@ pub async fn get_organization_audit_logs(
         has_prev: page > 1,
     };
 
-    let log_entries: Vec<AuditLogEntry> = logs.into_iter().map(|l| l.into()).collect();
+    let log_entries: Vec<AuditLogEntry> = logs.into_iter().map(std::convert::Into::into).collect();
     Ok(Json(AuditLogResponse {
         logs: log_entries,
         pagination,
@@ -524,7 +525,7 @@ mod tests {
             .await
             .expect("connect in-memory sqlite");
         Migrator::up(&db, None).await.expect("run migrations");
-        let audit_reconciler = crate::services::audit_actor::AuditHandle::new(db.clone());
+        let audit_reconciler = crate::audit::actor::AuditHandle::new(db.clone());
         let owner_a = UserStore::find_or_create_with_options(
             DB::Conn(&db),
             "audit-owner-a@example.com",

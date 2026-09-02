@@ -1,5 +1,7 @@
 use crate::db::models::{SamlCertificateInfo, SamlPublishedCertificateInfo, User};
-use crate::error::{with_retrying_transaction, AppError, Json400, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Json400, Result};
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::services::permission_service::{PermissionService, CAP_SERVICES_MANAGE};
 use crate::services::tier_enforcement::TierService;
@@ -12,7 +14,6 @@ use crate::store::{
     saml_signing_keys::{SamlSigningKeysStore, SAML_CERTIFICATE_OVERLAP_DAYS},
     saml_states::SamlStateStore,
     services::ServiceStore,
-    DB,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -196,7 +197,7 @@ fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Result<S
     let encoded = format!("&{};", name);
 
     quick_xml::escape::unescape(&encoded)
-        .map(|value| value.into_owned())
+        .map(std::borrow::Cow::into_owned)
         .map_err(|error| {
             AppError::BadRequest(format!(
                 "Invalid or unknown SAMLRequest entity reference: {}",
@@ -495,7 +496,6 @@ impl SamlResponseBuilder {
             AppError::InternalServerError(format!("Failed to build SAML assertion XML: {error}"))
         };
 
-        // Start saml:Assertion
         let mut assertion = BytesStart::new("saml:Assertion");
         assertion.push_attribute(("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion"));
         assertion.push_attribute(("ID", self.assertion_id.as_str()));
@@ -660,7 +660,6 @@ impl SamlResponseBuilder {
             AppError::InternalServerError(format!("Failed to build SAML response XML: {error}"))
         };
 
-        // Start samlp:Response
         let mut response = BytesStart::new("samlp:Response");
         response.push_attribute(("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol"));
         response.push_attribute(("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion"));
@@ -1092,13 +1091,11 @@ fn canonicalize_xml(xml: &str) -> Result<String> {
                 if ns_stack.len() > 1 {
                     ns_stack.pop();
                 }
-                writer
-                    .write_event(Event::End(e.to_owned()))
-                    .map_err(|error| {
-                        AppError::InternalServerError(format!(
-                            "Failed to canonicalize XML end element: {error}"
-                        ))
-                    })?;
+                writer.write_event(Event::End(e.clone())).map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "Failed to canonicalize XML end element: {error}"
+                    ))
+                })?;
             }
             Ok(Event::Empty(e)) => {
                 // Empty elements are expanded to start/end pairs by reader config
@@ -1340,15 +1337,9 @@ fn canonicalize_start_element(
 /// Note: quick-xml writer handles basic escaping, but we need to ensure
 /// specific C14N character replacements for tabs, newlines, carriage returns
 fn normalize_attribute_value(value: &str) -> String {
-    // According to C14N spec, attribute values should have:
-    // - & -> &amp; (handled by quick-xml)
-    // - < -> &lt; (handled by quick-xml)
-    // - " -> &quot; (handled by quick-xml)
-    // - \t (0x9) -> &#x9;
-    // - \n (0xA) -> &#xA;
-    // - \r (0xD) -> &#xD;
-    // We only handle the special whitespace characters here since quick-xml
-    // will handle the basic XML escaping when writing
+    // C14N also requires tab, newline and carriage return in attribute values
+    // to become numeric references. quick-xml emits the &amp;/&lt;/&quot;
+    // escapes itself, so only the whitespace trio is handled here.
     value
         .replace('\t', "&#x9;")
         .replace('\n', "&#xA;")
@@ -1359,12 +1350,8 @@ fn normalize_attribute_value(value: &str) -> String {
 /// Note: quick-xml writer handles basic escaping, we just need to handle
 /// carriage returns specifically as per C14N
 fn normalize_text(text: &str) -> String {
-    // According to C14N spec, text content should have:
-    // - & -> &amp; (handled by quick-xml)
-    // - < -> &lt; (handled by quick-xml)
-    // - > -> &gt; (handled by quick-xml when necessary)
-    // - \r (0xD) -> &#xD;
-    // We only handle carriage returns here
+    // In text content quick-xml handles &amp;/&lt;/&gt;, leaving only the
+    // carriage return to be emitted as a numeric reference.
     text.replace('\r', "&#xD;")
 }
 
@@ -1894,7 +1881,7 @@ pub async fn generate_saml_certificate(
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("Encryption service not available".into()))?;
 
-    let keygen_permit = crate::services::concurrency::ASYMMETRIC_KEYGEN_SEMAPHORE
+    let keygen_permit = crate::crypto::concurrency::ASYMMETRIC_KEYGEN_SEMAPHORE
         .acquire()
         .await
         .map_err(|_| AppError::InternalServerError("SAML key generation unavailable".into()))?;
@@ -2009,7 +1996,7 @@ pub async fn generate_saml_certificate(
                     ));
                 }
 
-                // 2. Check if a concurrent request just installed a certificate.
+                // Check if a concurrent request just installed a certificate.
                 let certificate = if let Some(existing_cert) =
                     SamlSigningKeysStore::find_active_by_service(db.clone(), &service_id).await?
                 {
@@ -2630,13 +2617,11 @@ pub async fn saml_idp_login(
         ));
     }
 
-    // Get ACS URL from service configuration
     let acs_url = service
         .saml_acs_url
         .as_ref()
         .ok_or_else(|| AppError::BadRequest("No ACS URL configured for this service".into()))?;
 
-    // Get signing key
     let signing_key = SamlSigningKeysStore::find_signing_key_by_service_at(
         DB::Conn(&state.db),
         &service.id,
@@ -2680,7 +2665,7 @@ pub async fn saml_idp_login(
     if let Some(ref attr_mapping_json) = service.saml_attribute_mapping {
         if let Ok(mapping) = serde_json::from_str::<HashMap<String, String>>(attr_mapping_json) {
             // Apply custom attribute mappings
-            for (source, saml_attr_name) in mapping.iter() {
+            for (source, saml_attr_name) in &mapping {
                 match source.as_str() {
                     "email" => {
                         if saml_attr_name != "email" {
@@ -2712,7 +2697,6 @@ pub async fn saml_idp_login(
         None, // No InResponseTo for IdP-initiated flow
     );
 
-    // Build the Assertion element using the builder
     let assertion_xml = saml_builder.build_assertion()?;
 
     // Check if we should sign the assertion
@@ -2731,7 +2715,6 @@ pub async fn saml_idp_login(
         assertion_xml
     };
 
-    // Build the complete SAML Response using the builder
     let response_xml = saml_builder.build_response(&assertion_with_signature)?;
 
     // Check if we should sign the response
@@ -2753,7 +2736,6 @@ pub async fn saml_idp_login(
     ensure_saml_assertion_snapshot_is_current(DB::Conn(&state.db), &user.user.id, &org, &service)
         .await?;
 
-    // Base64 encode the response
     let saml_response_b64 = BASE64.encode(saml_response_xml.as_bytes());
 
     // Generate HTML auto-post form
@@ -2800,7 +2782,6 @@ pub async fn complete_saml_authentication(
     expected_service_id: Option<&str>,
     user: &User,
 ) -> Result<Response> {
-    // Get SAML state
     let saml_state = SamlStateStore::find_by_state_id(DB::Conn(&state.db), saml_state_id)
         .await?
         .ok_or_else(|| AppError::BadRequest("Invalid or expired SAML state".into()))?;
@@ -2816,7 +2797,6 @@ pub async fn complete_saml_authentication(
     let (service, org) =
         load_current_saml_completion_context(DB::Conn(&state.db), &saml_state, &user.id).await?;
 
-    // Get signing key
     let signing_key = SamlSigningKeysStore::find_signing_key_by_service_at(
         DB::Conn(&state.db),
         &service.id,
@@ -2861,7 +2841,7 @@ pub async fn complete_saml_authentication(
             // Apply custom attribute mappings
             // Format: {"source_field": "saml_attribute_name"}
             // e.g., {"email": "urn:oid:0.9.2342.19200300.100.1.3", "id": "uid"}
-            for (source, saml_attr_name) in mapping.iter() {
+            for (source, saml_attr_name) in &mapping {
                 match source.as_str() {
                     "email" => {
                         // If email is explicitly mapped, use the custom name
@@ -2952,7 +2932,6 @@ pub async fn complete_saml_authentication(
         ));
     }
 
-    // Base64 encode the response
     let saml_response_b64 = BASE64.encode(saml_response_xml.as_bytes());
 
     // Generate HTML auto-post form
@@ -3307,7 +3286,6 @@ async fn process_saml_logout_request(
         logout_response_xml
     };
 
-    // Base64 encode the response
     let saml_response_b64 = BASE64.encode(saml_response_xml.as_bytes());
 
     // Generate HTML auto-post form to send LogoutResponse back to SP

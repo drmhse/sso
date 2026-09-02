@@ -3,13 +3,15 @@
 //! Implements platform impersonation functionality following RFC 8693 (Token Exchange)
 //! Allows platform owners and organization admins to impersonate users for support purposes.
 
-use crate::auth::jwt::JwtService;
+use crate::crypto::jwt::JwtService;
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::{platform_audit_log, users as users_entity};
-use crate::error::{with_retrying_transaction, AppError};
+use crate::error::AppError;
 use crate::middleware::{AuthUser, ImpersonationContext};
 use crate::state::AppState;
 use crate::store::{
-    memberships::MembershipStore, organizations::OrganizationStore, sessions::SessionStore, DB,
+    memberships::MembershipStore, organizations::OrganizationStore, sessions::SessionStore,
 };
 use axum::{
     extract::{Extension, Json, State},
@@ -54,17 +56,11 @@ pub struct UserInfo {
     pub org_name: Option<String>,
 }
 
-/// Impersonate a user
+/// Mint a short-lived token acting as another user.
 ///
-/// This endpoint allows platform owners to impersonate any user, and organization admins
-/// to impersonate users within their organization. All impersonation actions are logged
-/// to the audit trail with high severity.
-///
-/// # Security Considerations
-/// - Tokens have very short TTL (15 minutes)
-/// - All actions during impersonation are logged with actor context
-/// - Impersonation is tracked in audit logs with HIGH severity
-/// - Supports both platform owner and org admin impersonation
+/// Platform owners may impersonate anyone, org admins only within their own org.
+/// TTL is 15 minutes and every action is audited at HIGH severity with actor
+/// context, so the real principal stays attributable.
 pub async fn impersonate_user(
     State(state): State<AppState>,
     Extension(auth_user): Extension<AuthUser>,
@@ -127,12 +123,12 @@ pub async fn impersonate_user(
     let (org_slug, service_slug) = if let Some(org) = impersonation_org.as_ref() {
         (Some(org.slug.clone()), None::<String>)
     } else if let Some(first_membership) = target_memberships.first() {
-        // Get org slug from first membership
         let org = OrganizationStore::find_by_id(DB::Conn(db), &first_membership.org_id).await?;
 
         if let Some(org) = org {
-            // For now, we use the first organization context
-            // In a production system, impersonation request should specify which org context
+            // Falls back to the target's first membership because the request
+            // carries no org context; callers wanting a specific tenant must
+            // pass one.
             (Some(org.slug), None::<String>)
         } else {
             (None, None)

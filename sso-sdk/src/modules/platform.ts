@@ -19,6 +19,13 @@ import {
   PlatformAnalyticsDateRangeParams,
   ImpersonateRequest,
   ImpersonateResponse,
+  ManagedConfigResponse,
+  ApplyManagedConfigResponse,
+  MfaMetricsSummary,
+  MfaDailyMetricsRow,
+  GetMfaMetricsParams,
+  GenerateMfaMetricsParams,
+  SuspiciousActivityAlert,
 } from '../types';
 
 /**
@@ -598,4 +605,143 @@ export class PlatformModule {
     }>('/api/platform/operations/status');
     return response.data;
   }
+
+  /**
+   * Managed-deployment configuration.
+   *
+   * Only usable on deployments installed with managed config paths; otherwise
+   * every method here fails. Check `apply_command_configured` before calling
+   * {@link apply}.
+   */
+  public bootstrap = {
+    /**
+     * Read the managed configuration file and the last apply status.
+     *
+     * @returns The config, its path, and whether applying is possible
+     *
+     * @example
+     * ```typescript
+     * const managed = await sso.platform.bootstrap.getConfig();
+     * if (managed.apply_command_configured) {
+     *   await sso.platform.bootstrap.apply();
+     * }
+     * ```
+     */
+    getConfig: async (): Promise<ManagedConfigResponse> => {
+      const response = await this.http.get<ManagedConfigResponse>(
+        '/api/platform/bootstrap/config'
+      );
+      return response.data;
+    },
+
+    /**
+     * Replace the managed configuration.
+     *
+     * The server validates the new document against the current one and
+     * rejects changes it will not accept, so send a full config object.
+     *
+     * @param config Complete managed configuration document
+     * @returns The stored config as the server now sees it
+     */
+    updateConfig: async (
+      config: Record<string, unknown>
+    ): Promise<ManagedConfigResponse> => {
+      const response = await this.http.patch<ManagedConfigResponse>(
+        '/api/platform/bootstrap/config',
+        config
+      );
+      return response.data;
+    },
+
+    /**
+     * Schedule the host's apply command so the stored config takes effect.
+     *
+     * Returns as soon as the run is scheduled; it does not wait for it.
+     *
+     * @returns Whether the apply was scheduled
+     */
+    apply: async (): Promise<ApplyManagedConfigResponse> => {
+      const response = await this.http.post<ApplyManagedConfigResponse>(
+        '/api/platform/bootstrap/apply'
+      );
+      return response.data;
+    },
+  };
+
+  /**
+   * Platform-wide MFA analytics.
+   *
+   * Figures come from the daily `mfa_daily_metrics` rollup, which the server
+   * regenerates in the background, so today's row lags until it is rebuilt.
+   */
+  public mfa = {
+    /**
+     * Read the daily MFA rollup.
+     *
+     * Omit `org_id` for the platform-wide row. Pass `start_date` and `end_date`
+     * together for an explicit range, or `days` for a trailing window.
+     *
+     * @param params Scope and period
+     * @returns One entry per day, newest first
+     *
+     * @example
+     * ```typescript
+     * const platformWide = await sso.platform.mfa.getMetrics({ days: 7 });
+     * const forOrg = await sso.platform.mfa.getMetrics({
+     *   org_id: 'org_123',
+     *   start_date: '2026-08-01',
+     *   end_date: '2026-08-31',
+     * });
+     * ```
+     */
+    getMetrics: async (
+      params?: GetMfaMetricsParams
+    ): Promise<MfaMetricsSummary[]> => {
+      const response = await this.http.get<MfaMetricsSummary[]>(
+        '/api/platform/mfa/metrics',
+        { params }
+      );
+      return response.data;
+    },
+
+    /**
+     * Rebuild one day's rollup immediately instead of waiting for the
+     * background job. Omit `org_id` for the platform-wide row.
+     *
+     * @param params Scope and date, defaulting to today
+     * @returns The regenerated row
+     */
+    generateMetrics: async (
+      params?: GenerateMfaMetricsParams
+    ): Promise<MfaDailyMetricsRow> => {
+      const response = await this.http.post<MfaDailyMetricsRow>(
+        '/api/platform/mfa/metrics/generate',
+        undefined,
+        { params }
+      );
+      return response.data;
+    },
+
+    /**
+     * List MFA failure patterns flagged as suspicious.
+     *
+     * @param params Optional `org_id` to scope to one organization
+     * @returns Up to 100 alerts, most recent first
+     *
+     * @example
+     * ```typescript
+     * const alerts = await sso.platform.mfa.getSuspiciousActivity();
+     * const locked = alerts.filter((alert) => alert.is_suspicious);
+     * ```
+     */
+    getSuspiciousActivity: async (params?: {
+      org_id?: string;
+    }): Promise<SuspiciousActivityAlert[]> => {
+      const response = await this.http.get<SuspiciousActivityAlert[]>(
+        '/api/platform/mfa/suspicious-activity',
+        { params }
+      );
+      return response.data;
+    },
+  };
 }

@@ -29,10 +29,20 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def rust_source_roots(root: Path = ROOT) -> list[Path]:
+    """api/ is a cargo workspace: the top crate plus one crate per layer."""
+    roots = [root / "api/src"]
+    crates = root / "api/crates"
+    if crates.is_dir():
+        roots.extend(sorted(p / "src" for p in crates.iterdir() if (p / "src").is_dir()))
+    return roots
+
+
 def source_metrics(root: Path = ROOT) -> set[str]:
     names: set[str] = set()
-    for path in (root / "api/src").rglob("*.rs"):
-        names.update(SOURCE_METRIC.findall(path.read_text(encoding="utf-8")))
+    for source_root in rust_source_roots(root):
+        for path in source_root.rglob("*.rs"):
+            names.update(SOURCE_METRIC.findall(path.read_text(encoding="utf-8")))
     return names
 
 

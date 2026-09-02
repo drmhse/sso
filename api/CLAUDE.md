@@ -24,6 +24,54 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `20251010000000_add_login_events.sql` - Analytics tracking
 - **IMPORTANT**: Never alter DB directly without migration file; and never run the migrations manually, they are ran by the app during startup.
 
+## Workspace Layout
+
+`api/` is a cargo workspace, not a single crate. The root package `sso` is the
+HTTP layer; everything below it is a layer crate under `api/crates/`. Layers may
+only depend downward, and cargo enforces that (a cycle will not compile).
+
+| Crate | Holds | May depend on |
+|---|---|---|
+| `authos-core` | config, constants, error, utils, client_ip, rsa_keys, runtime_metadata | - |
+| `authos-entities` | sea-orm models | core |
+| `authos-crypto` | jwt, api_key, mfa, refresh_tokens, sso, safe_http, concurrency, encryption | core |
+| `authos-db` | connection (`DB`), transaction helpers, models | core, entities |
+| `authos-audit` | audit actor | core, entities, db |
+| `authos-store` | store layer | core, entities, crypto, db, audit |
+| `authos-services` | services, billing, email, jobs, device_flow, token_refresher | all of the above |
+| `sso` (`api/src`) | handlers, router, middleware, state, http_security, lite_web | all |
+| `authos-testkit` | shared test fixtures | dev-dependency only |
+
+Each crate's `lib.rs` re-exports the layers below it under their original module
+names, so `crate::error`, `crate::store`, `crate::entities` resolve everywhere;
+you rarely need to write `authos_core::` explicitly.
+
+`api/src/main.rs` and the three `sso_{sqlite,psql,mysql}.rs` binaries are 3-line
+shims over `sso::run()`. Do not put logic in them: the crate used to be compiled
+twice per build because `sso_sqlite.rs` was `include!("main.rs")`.
+
+**Backend features.** Only crates with backend-conditional code carry
+`db_sqlite`/`db_psql`/`db_mysql`, and they forward to every dependency that also
+has such code, dev-dependencies included. Every internal dependency is declared
+`default-features = false`. This matters: the transaction helpers differ in
+arity per backend, so a mixed-feature graph fails to compile or, worse, selects
+the wrong path. `npm run check:test-support` asserts the backends stay mutually
+exclusive.
+
+**`test-support` features** (`authos-crypto`, `authos-audit`, `authos-services`)
+unlock test-only shortcuts - the all-zero device-trust fallback key, context-free
+encrypt/decrypt, a worker-less `AuditHandle`. They are reachable only through
+dev-dependencies and must never enter a production build; the same check script
+enforces this.
+
+**Adding a module:** put it in the lowest layer that can hold it, add it to
+`scripts/check-layers.mjs`'s layer table, and run `npm run check:layers`.
+
+**Policy checks scan the whole workspace.** Anything walking Rust sources must
+use `scripts/lib/rust-sources.mjs` (or the Python equivalent in
+`check-monitoring-assets.py`), never a bare `api/src`, or it will silently stop
+covering the layer crates.
+
 ## Architecture Overview
 
 This is a comprehensive multi-tenant SSO platform built in Rust using Axum, supporting B2B2C scenarios with OAuth2 providers (GitHub, Google, Microsoft), Stripe billing integration, analytics, and advanced identity management.
@@ -31,25 +79,25 @@ This is a comprehensive multi-tenant SSO platform built in Rust using Axum, supp
 ### Core Components
 
 **Authentication System:**
-- Dual authentication flows: end-user SSO and admin OAuth (`src/auth/sso.rs`)
-- JWT token management with revocation tracking (`src/auth/jwt.rs`)
-- Device flow for CLIs/mobile apps with enhanced state management (`src/auth/device_flow.rs`)
+- Dual authentication flows: end-user SSO and admin OAuth (`api/crates/authos-crypto/src/crypto/sso.rs`)
+- JWT token management with revocation tracking (`api/crates/authos-crypto/src/crypto/jwt.rs`)
+- Device flow for CLIs/mobile apps with enhanced state management (`api/crates/authos-services/src/services/device_flow.rs`)
 - Admin authentication for platform/organization management
 - Social account identity linking and unlinking (`src/handlers/identities.rs`)
 
 **Database Layer:**
-- SQLite with SQLx ORM (`src/db/`)
+- SQLite with SQLx ORM (`api/crates/authos-db/src/db/`)
 - Comprehensive schema: users, organizations, services, login_events, identities, oauth_states
 - Batched database writer for high-throughput device code creation (256 items per batch, 5ms timeout)
 - Aggressive WAL checkpointing (TRUNCATE mode every 10 seconds) for performance
 - Background jobs for token refresh and maintenance
 
 **Organization Management:**
-- Multi-tenant organizations with member roles and invitations (`src/handlers/organizations.rs`, `src/handlers/invitations.rs`)
+- Multi-tenant organizations with member roles and invitations (`src/handlers/organizations/`, `src/handlers/invitations.rs`)
 - Bring Your Own OAuth (BYOO) - custom OAuth credentials per organization
 - End-user (customer) management with session control
 - Service per-organization model with auto-provisioned plans and grants
-- Platform owner governance and approval workflows (`src/handlers/platform.rs`)
+- Platform owner governance and approval workflows (`src/handlers/platform/`)
 
 **Analytics & Monitoring:**
 - Comprehensive login event tracking and analytics (`src/handlers/analytics.rs`)
@@ -64,9 +112,9 @@ This is a comprehensive multi-tenant SSO platform built in Rust using Axum, supp
 - Service limits enforcement based on organization tiers
 
 **Integration Services:**
-- Stripe webhooks for subscription billing (`src/handlers/webhook.rs`, `src/billing/stripe.rs`)
-- Token encryption service for secure credential storage (`src/encryption/`)
-- Background token refresh job with encryption support (`src/jobs/token_refresh.rs`)
+- Stripe webhooks for subscription billing (`src/handlers/webhook.rs`, `api/crates/authos-services/src/billing/providers/stripe.rs`)
+- Token encryption service for secure credential storage (`api/crates/authos-crypto/src/encryption/`)
+- Background token refresh job with encryption support (`api/crates/authos-services/src/jobs/token_refresh.rs`)
 
 ### API Structure
 

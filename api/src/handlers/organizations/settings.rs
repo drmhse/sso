@@ -1,10 +1,11 @@
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{PermissionService, CAP_ORG_SETTINGS_MANAGE};
 use crate::state::AppState;
 use crate::store::{
     organization_oauth_credentials::OrganizationOAuthCredentialsStore,
-    organizations::OrganizationStore, DB,
+    organizations::OrganizationStore,
 };
 use axum::{
     extract::{Path, State},
@@ -89,7 +90,6 @@ pub async fn set_org_oauth_credentials(
     }
     validate_oauth_credentials_input(&req)?;
 
-    // Get encryption service
     let encryption = crate::encryption::EncryptionService::new().map_err(|e| {
         AppError::InternalServerError(format!("Encryption service unavailable: {}", e))
     })?;
@@ -100,10 +100,10 @@ pub async fn set_org_oauth_credentials(
         &provider,
     )
     .await?;
-    let credential_id = existing
-        .as_ref()
-        .map(|credential| credential.id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let credential_id = existing.as_ref().map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |credential| credential.id.clone(),
+    );
 
     // Encrypt client secret
     let client_secret_encrypted = encryption
@@ -119,7 +119,6 @@ pub async fn set_org_oauth_credentials(
 
     let encryption_key_id = encryption.key_id().to_string();
 
-    // Upsert credentials using store layer
     OrganizationOAuthCredentialsStore::upsert(
         DB::Conn(&state.db),
         &credential_id,
@@ -228,7 +227,6 @@ pub async fn set_org_smtp(
             AppError::InternalServerError("Failed to encrypt SMTP password".to_string())
         })?;
 
-    // Update organization SMTP settings
     OrganizationStore::update_smtp_config(
         DB::Conn(&state.db),
         &organization.id,
@@ -264,7 +262,7 @@ pub async fn get_org_smtp(
 
     Ok(Json(SmtpConfigResponse {
         host: organization.smtp_host.unwrap_or_default(),
-        port: organization.smtp_port.map(|p| p as u16).unwrap_or(587),
+        port: organization.smtp_port.map_or(587, |p| p as u16),
         username: organization.smtp_username.unwrap_or_default(),
         from_email: organization.smtp_from_email.unwrap_or_default(),
         from_name: organization.smtp_from_name,
@@ -325,42 +323,32 @@ mod secret_validation_tests {
 #[cfg(test)]
 mod settings_tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
+
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::config::Config;
+    use crate::crypto::sso::OAuthClient;
     use crate::entities::users;
     use crate::middleware::AuthUser;
-    use crate::rsa_keys::GeneratedKey;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::db::DB;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
     use crate::store::{
         memberships::MembershipStore,
         organizations::OrganizationStore,
         users::{UserCreationOptions, UserStore},
-        DB,
     };
     use axum::extract::Path;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("rsa");
-        JwtService::new(
-            &STANDARD.encode(rsa.private_key_pem().expect("pem")),
-            &STANDARD.encode(rsa.public_key_pem().expect("pem")),
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("jwt")
-    }
+    use crate::test_support::test_jwt_service;
 
     struct Fixture {
         state: AppState,

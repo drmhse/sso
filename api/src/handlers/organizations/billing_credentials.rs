@@ -3,14 +3,16 @@
 //! Allows organizations to configure their own billing provider credentials
 //! to charge their end-users directly.
 
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::services::audit_builder::OrgAuditBuilder;
 use crate::services::permission_service::{PermissionService, CAP_BILLING_MANAGE};
 use crate::state::AppState;
 use crate::store::{
     organization_billing_credentials::OrganizationBillingCredentialsStore,
-    organizations::OrganizationStore, DB,
+    organizations::OrganizationStore,
 };
 use axum::{
     extract::{Path, State},
@@ -129,7 +131,6 @@ pub async fn set_billing_credentials(
     }
     validate_billing_credentials_input(&req)?;
 
-    // Get encryption service
     let encryption = crate::encryption::EncryptionService::new().map_err(|e| {
         AppError::InternalServerError(format!("Encryption service unavailable: {}", e))
     })?;
@@ -141,10 +142,10 @@ pub async fn set_billing_credentials(
         &req.mode,
     )
     .await?;
-    let credential_id = existing
-        .as_ref()
-        .map(|credential| credential.id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let credential_id = existing.as_ref().map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |credential| credential.id.clone(),
+    );
 
     // Encrypt API key
     let api_key_encrypted = encryption

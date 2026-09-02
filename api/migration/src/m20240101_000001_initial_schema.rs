@@ -9,9 +9,7 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         let backend = db.get_database_backend();
 
-        // ============================================================================
         // 1. USERS & IDENTITIES
-        // ============================================================================
 
         manager
             .create_table(
@@ -146,15 +144,11 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Partial indexes for identities (SQLite and PostgreSQL)
-        // if matches!(backend, sea_orm::DatabaseBackend::Sqlite | sea_orm::DatabaseBackend::Postgres) {
-        //     db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_identities_platform_unique ON identities(user_id, provider) WHERE issuing_org_id IS NULL AND issuing_service_id IS NULL").await?;
-        //     db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_identities_service_unique ON identities(user_id, provider, issuing_org_id, issuing_service_id) WHERE issuing_org_id IS NOT NULL AND issuing_service_id IS NOT NULL").await?;
-        // }
+        // Identity uniqueness is context-aware (platform vs service) and lives in
+        // IdentityStore, not in a partial index: MySQL has none, so the constraint
+        // could not be expressed identically across all three backends.
 
-        // ============================================================================
         // 2. SESSIONS & AUTHENTICATION STATE
-        // ============================================================================
 
         manager
             .create_table(
@@ -411,9 +405,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // ============================================================================
         // 3. PASSWORD & MFA
-        // ============================================================================
 
         manager
             .create_table(
@@ -620,9 +612,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // ============================================================================
         // 4. PASSKEYS & WEBAUTHN
-        // ============================================================================
 
         manager
             .create_table(
@@ -2982,9 +2972,7 @@ impl Migration {
     }
 }
 
-// ============================================================================
 // IDEN DEFINITIONS
-// ============================================================================
 
 #[derive(DeriveIden)]
 enum Users {

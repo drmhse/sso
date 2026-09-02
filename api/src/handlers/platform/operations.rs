@@ -1,8 +1,9 @@
+use crate::db::DB;
 use crate::entities::{siem_configs, webhook_deliveries};
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
-use crate::store::{system_jobs::SystemJobStore, DB};
+use crate::store::system_jobs::SystemJobStore;
 use axum::{extract::State, Extension, Json};
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::Serialize;

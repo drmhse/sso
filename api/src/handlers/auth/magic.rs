@@ -1,11 +1,13 @@
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
+use crate::error::{AppError, Result};
 use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
 use crate::handlers::auth::password::reject_upstream_only_local_auth;
 use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
     magic_links::MagicLinksStore, memberships::MembershipStore, organizations::OrganizationStore,
-    services::ServiceStore, sessions::SessionStore, users::UserStore, DB,
+    services::ServiceStore, sessions::SessionStore, users::UserStore,
 };
 use axum::{
     extract::{Query, State},
@@ -19,7 +21,6 @@ use serde::{Deserialize, Serialize};
 // Import session response type
 pub use super::session::RefreshTokenResponse;
 
-// Magic Link Request
 #[derive(Debug, Deserialize)]
 pub struct MagicLinkRequest {
     pub email: String,
@@ -29,13 +30,11 @@ pub struct MagicLinkRequest {
     pub state: Option<String>,
 }
 
-// Magic Link Response
 #[derive(Debug, Serialize)]
 pub struct MagicLinkResponse {
     pub message: String,
 }
 
-// Verify Magic Link Query
 #[derive(Debug, Deserialize)]
 pub struct VerifyMagicLinkQuery {
     pub token: String,
@@ -79,19 +78,19 @@ fn parse_magic_context(
         let org_slug = value
             .get("org_slug")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let service_slug = value
             .get("service_slug")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let redirect_uri = value
             .get("redirect_uri")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         let state = value
             .get("state")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         return (org_slug, service_slug, redirect_uri, state);
     }
 
@@ -475,7 +474,6 @@ pub async fn verify_magic_link(
     Extension(request_info): Extension<RequestInfo>,
     Query(query): Query<VerifyMagicLinkQuery>,
 ) -> Result<impl IntoResponse> {
-    // Find the magic link token
     let magic_link = MagicLinksStore::find_by_token(DB::Conn(&state.db), &query.token)
         .await?
         .ok_or_else(|| AppError::BadRequest("Invalid or expired magic link".to_string()))?;
@@ -497,8 +495,8 @@ pub async fn verify_magic_link(
             .filter(|user| user.deleted_at.is_none())
             .ok_or_else(|| AppError::NotFound("User not found".to_string()))?
     } else {
-        // Auto-create user if email verification is not required
-        // For now, we require the user to exist
+        // Magic links never provision accounts: an attacker could otherwise
+        // create users for arbitrary addresses.
         return Err(AppError::BadRequest(
             "User not found. Please register first.".to_string(),
         ));
@@ -571,7 +569,7 @@ pub async fn verify_magic_link(
 
             // Create session with refresh token
             let token_hash = hash_token(&token);
-            let refresh_token = crate::auth::refresh_tokens::generate();
+            let refresh_token = crate::crypto::refresh_tokens::generate();
             let now = Utc::now();
             let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
             let refresh_expires_at = now + chrono::Duration::days(30);

@@ -61,7 +61,6 @@ impl MigrationTrait for Migration {
 }
 
 impl Migration {
-    // ===== SQLITE =====
     // SQLite supports adding a nullable REFERENCES column in place. Avoid the
     // older table-copy/drop/rename strategy: when migrations run through a
     // multi-connection pool, its PRAGMA and DDL statements can execute on
@@ -263,7 +262,6 @@ impl Migration {
         Ok(())
     }
 
-    // ===== POSTGRESQL =====
     async fn up_postgres<'a>(
         &self,
         manager: &SchemaManager<'a>,
@@ -363,7 +361,6 @@ impl Migration {
         Ok(())
     }
 
-    // ===== MYSQL =====
     async fn up_mysql<'a>(
         &self,
         manager: &SchemaManager<'a>,

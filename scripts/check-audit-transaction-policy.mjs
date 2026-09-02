@@ -1,8 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { rustSourceRoots } from "./lib/rust-sources.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
+// The api/ tree is a cargo workspace; scan every crate, not just the top one.
 const sourceRoot = path.join(root, "api", "src");
+const sourceRoots = rustSourceRoots(root);
 
 function rustFiles(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -16,9 +19,9 @@ function count(source, expression) {
   return [...source.matchAll(expression)].length;
 }
 
-const files = rustFiles(sourceRoot).filter(
-  (file) => !file.endsWith(path.join("services", "audit_actor.rs")),
-);
+const files = sourceRoots
+  .flatMap((dir) => rustFiles(dir))
+  .filter((file) => !file.endsWith(path.join("audit", "actor.rs")));
 const source = files.map((file) => fs.readFileSync(file, "utf8")).join("\n");
 const coupled = count(source, /\.log_(?:org|login|mfa|platform)_with_db\s*\(/g);
 const standalone = count(source, /\.log_(?:org|login|mfa|platform)\s*\(/g);
@@ -27,7 +30,7 @@ const generic = count(
   /enqueue_(?:org|login|mfa|platform)_with_connection\s*\(/g,
 );
 
-const expected = { coupled: 50, standalone: 4, generic: 5 };
+const expected = { coupled: 50, standalone: 3, generic: 5 };
 for (const [kind, actual] of Object.entries({ coupled, standalone, generic })) {
   if (actual !== expected[kind]) {
     throw new Error(
@@ -41,7 +44,6 @@ const standaloneAllowlist = new Map([
   ["api/src/handlers/user.rs", 1],
   ["api/src/handlers/auth/mfa.rs", 1],
   ["api/src/handlers/auth/oauth.rs", 1],
-  ["api/src/handlers/auth/utils.rs", 1],
 ]);
 for (const file of files) {
   const relative = path.relative(root, file);
@@ -68,9 +70,9 @@ if (platformHelperCalls !== 10) {
 }
 
 for (const relative of [
-  "api/src/services/audit.rs",
+  "api/crates/authos-services/src/services/audit.rs",
   "api/src/handlers/platform/mod.rs",
-  "api/src/store/login_events.rs",
+  "api/crates/authos-store/src/store/login_events.rs",
 ]) {
   const contents = fs.readFileSync(path.join(root, relative), "utf8");
   if (/audit_log[^;\n]*\.insert|new_event\.insert/.test(contents)) {

@@ -1,14 +1,16 @@
-use crate::auth::jwt::Claims;
+use crate::crypto::jwt::Claims;
 use crate::db::models::User;
+use crate::db::transaction::{with_deadlock_retry, with_retrying_transaction};
+use crate::db::DB;
 use crate::entities::users;
-use crate::error::{with_deadlock_retry, with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::services::audit_builder::MfaAuditBuilder;
 use crate::state::AppState;
 use crate::store::{
     device_codes::DeviceCodeStore, distributed_locks::DistributedLockStore,
     identities::IdentityStore, memberships::MembershipStore, organizations::OrganizationStore,
-    services::ServiceStore, sessions::SessionStore, users::UserStore, DB,
+    services::ServiceStore, sessions::SessionStore, users::UserStore,
 };
 use axum::{extract::State, response::Response, Extension, Form, Json};
 use chrono::Utc;
@@ -20,7 +22,6 @@ pub use super::session::RefreshTokenResponse;
 // Import hash_token from password module
 use super::password::hash_token;
 
-// MFA Verify Request
 #[derive(Debug, Deserialize)]
 pub struct MfaVerifyRequest {
     pub preauth_token: String,
@@ -359,7 +360,7 @@ pub async fn verify_mfa_login(
 
     // Create session with refresh token
     let token_hash = hash_token(&token);
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
     let refresh_expires_at = now + chrono::Duration::days(30);
@@ -573,7 +574,7 @@ async fn complete_mfa_login_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwt::TokenUse;
+    use crate::crypto::jwt::TokenUse;
     use crate::store::{organizations::OrganizationStore, services::ServiceStore};
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, EntityTrait};

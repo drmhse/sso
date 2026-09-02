@@ -64,6 +64,9 @@ pub async fn process_saml_response(
     ))
 }
 
+// Kept unread: this is the contract process_saml_response will return once
+// upstream assertion verification lands.
+#[allow(dead_code)]
 pub struct SamlUserInfo {
     pub email: String,
     pub provider_user_id: Option<String>,

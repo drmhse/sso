@@ -1,10 +1,12 @@
 use crate::db::models::{Organization, OrganizationTier, User};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::prelude::OrganizationTiers;
 use crate::entities::{organization_tiers, organizations};
-use crate::error::{with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
-use crate::store::{organizations::OrganizationStore, DB};
+use crate::store::organizations::OrganizationStore;
 use axum::{
     extract::{Path, Query, State},
     Extension, Json,
@@ -17,9 +19,7 @@ use serde_json::json;
 use super::create_audit_log;
 use super::org_model_to_old;
 
-// ============================================================================
 // Request/Response Types
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct ListOrganizationsQuery {
@@ -98,9 +98,7 @@ pub struct UpdateFeatureOverridesRequest {
     pub allow_overage: Option<bool>,
 }
 
-// ============================================================================
 // Platform Governance Endpoints
-// ============================================================================
 
 /// GET /api/platform/tiers
 /// List all available organization tiers
@@ -154,7 +152,6 @@ pub async fn list_organizations(
     let (limit, offset) =
         crate::utils::pagination::signed_limit_offset(query.limit, query.offset, 50, 100);
 
-    // Get total count using store
     let total = OrganizationStore::count_with_filters(
         DB::Conn(&state.db),
         query.status.as_deref(),
@@ -212,10 +209,10 @@ pub async fn list_organizations(
             is_platform_owner: row.owner_is_platform_owner.unwrap_or(false),
             password_hash: None,
             email_verified_at: None,
-            created_at: row
-                .owner_created_at
-                .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
-                .unwrap_or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap()),
+            created_at: row.owner_created_at.map_or_else(
+                || chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                |dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc),
+            ),
         };
 
         // Fetch tier if present
@@ -332,7 +329,6 @@ pub async fn approve_organization(
                 let updated_org_model = org_active.update(&db).await?;
                 let updated_org = org_model_to_old(updated_org_model);
 
-                // Create audit log
                 create_audit_log(
                     &db,
                     &approver_id,
@@ -409,7 +405,6 @@ pub async fn reject_organization(
                 let updated_org_model = org_active.update(&db).await?;
                 let updated_org = org_model_to_old(updated_org_model);
 
-                // Create audit log
                 create_audit_log(
                     &db,
                     &user_id,
@@ -480,7 +475,6 @@ pub async fn suspend_organization(
                 let updated_org_model = org_active.update(&db).await?;
                 let updated_org = org_model_to_old(updated_org_model);
 
-                // Create audit log
                 create_audit_log(
                     &db,
                     &user_id,
@@ -550,7 +544,6 @@ pub async fn activate_organization(
                 let updated_org_model = org_active.update(&db).await?;
                 let updated_org = org_model_to_old(updated_org_model);
 
-                // Create audit log
                 create_audit_log(
                     &db,
                     &user_id,
@@ -634,7 +627,6 @@ pub async fn update_organization_tier(
                 let updated_org_model = org_active.update(&db).await?;
                 let updated_org = org_model_to_old(updated_org_model);
 
-                // Create audit log
                 create_audit_log(
                     &db,
                     &user_id,
@@ -733,7 +725,6 @@ pub async fn update_organization_features(
             let features_json = features_json.clone();
             let req_clone = serde_json::to_value(&req).unwrap_or_default();
             Box::pin(async move {
-                // Update the feature overrides using the store method
                 let updated_org_model = OrganizationStore::update_feature_overrides(
                     db.clone(),
                     &org_id,
@@ -743,7 +734,6 @@ pub async fn update_organization_features(
 
                 let updated_org = org_model_to_old(updated_org_model);
 
-                // Create audit log
                 create_audit_log(
                     &db,
                     &user_id,
@@ -808,22 +798,22 @@ mod tests {
 #[cfg(test)]
 mod governance_tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::jwt::JwtService;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::db::DB;
     use crate::entities::users;
     use crate::middleware::AuthUser;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
     use crate::store::{
         memberships::MembershipStore,
         users::{UserCreationOptions, UserStore},
-        DB,
     };
     use axum::extract::Path;
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -832,52 +822,7 @@ mod governance_tests {
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
     struct Fixture {
         state: AppState,

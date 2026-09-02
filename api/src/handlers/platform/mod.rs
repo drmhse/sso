@@ -1,11 +1,3 @@
-#![allow(dead_code)]
-
-// Platform module - handles all platform governance, analytics, and user management endpoints
-// This module is organized into logical sub-modules:
-// - governance: Organization approval, tier management, and lifecycle operations
-// - analytics: Platform-wide metrics, growth trends, and reporting
-// - users: User search, platform owner management, and MFA administration
-
 pub mod analytics;
 pub mod bootstrap;
 pub mod governance;
@@ -14,11 +6,11 @@ pub mod operations;
 pub mod users;
 
 use crate::db::models::{Organization, PlatformAuditLog, User};
+use crate::db::transaction::with_retrying_transaction;
+use crate::db::DB;
 use crate::entities::{organizations, platform_audit_log, users as users_entity};
-use crate::error::{with_retrying_transaction, Result};
-use crate::store::{
-    organizations::OrganizationStore, platform_audit_log::PlatformAuditLogStore, DB,
-};
+use crate::error::Result;
+use crate::store::{organizations::OrganizationStore, platform_audit_log::PlatformAuditLogStore};
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, Set};
 use serde::{Deserialize, Serialize};
@@ -62,9 +54,7 @@ use axum::{
     Extension, Json,
 };
 
-// ============================================================================
 // Model Conversion Helpers (Shared across sub-modules)
-// ============================================================================
 
 /// Convert organizations::Model to Organization
 pub(crate) fn org_model_to_old(model: organizations::Model) -> Organization {
@@ -111,9 +101,7 @@ pub(crate) fn user_model_to_old(model: users_entity::Model) -> User {
     }
 }
 
-// ============================================================================
 // Audit Log Helpers (Shared across sub-modules)
-// ============================================================================
 
 /// Create an audit log entry
 pub(crate) async fn create_audit_log<C>(
@@ -141,7 +129,7 @@ where
         created_at: Set(now),
     };
 
-    crate::services::audit_actor::enqueue_platform_with_connection(db, new_log).await?;
+    crate::audit::actor::enqueue_platform_with_connection(db, new_log).await?;
 
     Ok(PlatformAuditLog {
         id,
@@ -154,9 +142,7 @@ where
     })
 }
 
-// ============================================================================
 // Additional Platform Endpoints (not in the split categories)
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct AuditLogQuery {
@@ -272,7 +258,6 @@ pub async fn get_audit_log(
     let (limit, offset) =
         crate::utils::pagination::signed_limit_offset(query.limit, query.offset, 50, 100);
 
-    // Get total count using store
     let total = PlatformAuditLogStore::count_with_filters(
         DB::Conn(&state.db),
         query.action.as_deref(),
@@ -366,12 +351,14 @@ pub async fn get_recent_organizations(
     Ok(Json(organizations))
 }
 
-// ============================================================================
 // MFA Metrics and Analytics
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct MfaMetricsQuery {
+    /// Omit for the platform-wide rollup; supply an id for one organization.
+    pub org_id: Option<String>,
+    /// Inclusive `YYYY-MM-DD` range. Both bounds are required together and
+    /// take precedence over `days`.
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub days: Option<i64>,
@@ -379,31 +366,57 @@ pub struct MfaMetricsQuery {
 
 /// GET /api/platform/mfa/metrics - Get MFA usage metrics
 pub async fn get_mfa_metrics(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     auth_user: Extension<AuthUser>,
     Query(query): Query<MfaMetricsQuery>,
-) -> Result<Json<serde_json::Value>> {
-    use serde_json::json;
-
-    // Only platform owners can access metrics
+) -> Result<Json<Vec<crate::services::metrics::MfaMetricsSummary>>> {
     if !auth_user.user.is_platform_owner {
         return Err(AppError::Forbidden(
             "Platform owner access required".to_string(),
         ));
     }
 
-    // Platform owners need to specify an org_id to get detailed metrics
-    // For now, return aggregate summary
-    let days = query.days.unwrap_or(30);
+    let org_id = query.org_id.as_deref();
 
-    // Return empty metrics structure since platform-level metrics require org_id
-    let metrics = json!({
-        "message": "Platform MFA metrics",
-        "note": "Use /api/platform/mfa/metrics?org_id=:id for organization-specific metrics",
-        "period_days": days
-    });
+    let metrics = match (&query.start_date, &query.end_date) {
+        (Some(start), Some(end)) => {
+            let start = parse_metrics_date(start, "start_date")?;
+            let end = parse_metrics_date(end, "end_date")?;
+            if start > end {
+                return Err(AppError::BadRequest(
+                    "start_date must not be after end_date".to_string(),
+                ));
+            }
+            state
+                .metrics_service
+                .get_mfa_metrics_in_range(org_id, start, end)
+                .await?
+        }
+        (None, None) => {
+            let days = query.days.unwrap_or(30);
+            if !(1..=366).contains(&days) {
+                return Err(AppError::BadRequest(
+                    "days must be between 1 and 366".to_string(),
+                ));
+            }
+            state
+                .metrics_service
+                .get_mfa_metrics(org_id, Some(days))
+                .await?
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "start_date and end_date must be supplied together".to_string(),
+            ))
+        }
+    };
 
     Ok(Json(metrics))
+}
+
+fn parse_metrics_date(value: &str, field: &str) -> Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest(format!("{field} must be YYYY-MM-DD")))
 }
 
 /// GET /api/platform/mfa/suspicious-activity - Get suspicious MFA activity alerts
@@ -420,7 +433,7 @@ pub async fn get_suspicious_activity(
     }
 
     // org_id is optional - if not provided, returns all suspicious activity
-    let org_id = params.get("org_id").map(|s| s.as_str());
+    let org_id = params.get("org_id").map(std::string::String::as_str);
 
     let alerts = state
         .metrics_service
@@ -445,7 +458,7 @@ pub async fn generate_daily_metrics(
     }
 
     // org_id is optional - if not provided, generates platform-wide metrics
-    let org_id = params.get("org_id").map(|s| s.as_str());
+    let org_id = params.get("org_id").map(std::string::String::as_str);
 
     let date_str = params
         .get("date")

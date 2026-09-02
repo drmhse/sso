@@ -1,9 +1,10 @@
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
 use crate::store::{
     login_events::LoginEventStore, organizations::OrganizationStore, services::ServiceStore,
-    users::UserStore, DB,
+    users::UserStore,
 };
 use axum::{
     extract::{Query, State},
@@ -12,9 +13,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
 // Request/Response Types
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct AnalyticsDateRangeQuery {
@@ -63,9 +62,7 @@ pub struct TopOrganization {
     pub login_count_30d: i64,
 }
 
-// ============================================================================
 // Platform Analytics Endpoints
-// ============================================================================
 
 /// GET /api/platform/analytics/overview
 /// Get high-level platform metrics
@@ -79,7 +76,6 @@ pub async fn get_platform_overview(
         ));
     }
 
-    // Get total organizations using store
     let total_organizations = OrganizationStore::count_all(DB::Conn(&state.db)).await? as i64;
 
     // Get total platform admins (platform owners and org owners/admins) using store
@@ -88,7 +84,6 @@ pub async fn get_platform_overview(
     // Get total end-users (regular users, non-admins) using store
     let total_end_users = UserStore::count_all(DB::Conn(&state.db), true).await? as i64;
 
-    // Get total services using store
     let total_services = ServiceStore::count_all(DB::Conn(&state.db)).await? as i64;
 
     // Get logins in last 24 hours using store
@@ -176,9 +171,9 @@ pub async fn get_growth_trends(
 
     for item in org_trends {
         trends_map
-            .entry(item.date.to_string())
+            .entry(item.date.clone())
             .or_insert_with(|| GrowthTrendPoint {
-                date: item.date.to_string(),
+                date: item.date.clone(),
                 new_organizations: 0,
                 new_users: 0,
             })
@@ -260,7 +255,6 @@ pub async fn get_top_organizations(
         ));
     }
 
-    // Get top organizations using store
     let organizations = OrganizationStore::get_top_organizations(DB::Conn(&state.db), 10).await?;
 
     let result = organizations

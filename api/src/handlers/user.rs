@@ -1,14 +1,16 @@
-use crate::auth::mfa::MfaService;
+use crate::crypto::mfa::MfaService;
+use crate::db::transaction::{with_deadlock_retry, with_retrying_transaction};
+use crate::db::DB;
 use crate::encryption::EncryptionService;
 use crate::entities::prelude::{TotpBackupCodes, UserDevices, UserTotpSecrets};
 use crate::entities::{mfa_audit_log, totp_backup_codes, user_devices, user_totp_secrets, users};
-use crate::error::{with_deadlock_retry, with_retrying_transaction, AppError, Result};
+use crate::error::{AppError, Result};
 use crate::middleware::RequestInfo;
 use crate::services::audit_builder::MfaAuditBuilder;
 use crate::services::permission_service::PermissionService;
 use crate::state::AppState;
 use crate::store::{
-    organizations::OrganizationStore, user_devices::UserDevicesStore, users::UserStore, DB,
+    organizations::OrganizationStore, user_devices::UserDevicesStore, users::UserStore,
 };
 use axum::{
     extract::{Extension, Query, State},
@@ -228,7 +230,7 @@ pub async fn get_mfa_status(
     };
 
     Ok(Json(MfaStatusResponse {
-        enabled: totp_secret.map(|s| s.enabled).unwrap_or(false),
+        enabled: totp_secret.is_some_and(|s| s.enabled),
         has_backup_codes,
     }))
 }
@@ -393,7 +395,7 @@ pub async fn verify_and_enable_mfa(
     // Pre-hash all backup codes before the transaction to avoid doing work inside retry loop
     let mut backup_code_hashes: Vec<(String, String)> = Vec::new();
     for code in &backup_codes {
-        let code_hash = crate::services::concurrency::hash_password_bounded(code.clone()).await?;
+        let code_hash = crate::crypto::concurrency::hash_password_bounded(code.clone()).await?;
         backup_code_hashes.push((Uuid::new_v4().to_string(), code_hash));
     }
 
@@ -440,13 +442,11 @@ pub async fn verify_and_enable_mfa(
                         AppError::BadRequest("MFA setup expired, please retry".to_string())
                     })?;
 
-                // Update user_totp_secrets
                 let mut totp_active: user_totp_secrets::ActiveModel = current_secret.into();
                 totp_active.enabled = Set(true);
                 totp_active.enabled_at = Set(Some(Utc::now().naive_utc()));
                 totp_active.update(&db).await?;
 
-                // Delete existing backup codes
                 TotpBackupCodes::delete_many()
                     .filter(totp_backup_codes::Column::UserId.eq(&user_id))
                     .exec(&db)
@@ -596,7 +596,7 @@ pub async fn regenerate_backup_codes(
     // Pre-hash all backup codes before the transaction
     let mut backup_code_hashes: Vec<(String, String)> = Vec::new();
     for code in &backup_codes {
-        let code_hash = crate::services::concurrency::hash_password_bounded(code.clone()).await?;
+        let code_hash = crate::crypto::concurrency::hash_password_bounded(code.clone()).await?;
         backup_code_hashes.push((Uuid::new_v4().to_string(), code_hash));
     }
 
@@ -620,9 +620,9 @@ pub async fn regenerate_backup_codes(
                 let new_backup_codes = backup_code_hashes
                     .iter()
                     .map(|(id, code_hash)| totp_backup_codes::ActiveModel {
-                        id: Set(id.to_string()),
+                        id: Set(id.clone()),
                         user_id: Set(user_id.clone()),
-                        code_hash: Set(code_hash.to_string()),
+                        code_hash: Set(code_hash.clone()),
                         used: Set(false),
                         ..Default::default()
                     })
@@ -654,7 +654,7 @@ async fn claim_backup_code_with_audit(
     pool: &DatabaseConnection,
     backup_code_id: &str,
     backup_audit: (
-        &crate::services::audit_actor::AuditHandle,
+        &crate::audit::actor::AuditHandle,
         mfa_audit_log::ActiveModel,
     ),
 ) -> Result<bool> {
@@ -674,7 +674,7 @@ pub(crate) async fn claim_backup_code_with_audit_in_db(
     db: DB<'_>,
     backup_code_id: &str,
     backup_audit: (
-        &crate::services::audit_actor::AuditHandle,
+        &crate::audit::actor::AuditHandle,
         mfa_audit_log::ActiveModel,
     ),
 ) -> Result<bool> {
@@ -777,7 +777,7 @@ pub(crate) async fn verify_mfa_code_candidate(
         .await?;
 
         for backup_code in backup_codes {
-            if crate::services::concurrency::verify_password_bounded(
+            if crate::crypto::concurrency::verify_password_bounded(
                 code.to_string(),
                 backup_code.code_hash.clone(),
             )
@@ -801,7 +801,7 @@ pub async fn verify_mfa_code_with_backup_audit(
     user_id: &str,
     code: &str,
     backup_audit: (
-        &crate::services::audit_actor::AuditHandle,
+        &crate::audit::actor::AuditHandle,
         mfa_audit_log::ActiveModel,
     ),
 ) -> Result<Option<MfaVerificationMethod>> {
@@ -856,7 +856,7 @@ mod backup_code_claim_tests {
         .insert(&db)
         .await
         .unwrap();
-        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let audit = crate::audit::actor::AuditHandle::without_worker(db.clone());
         let event = MfaAuditBuilder::new(&user.id, "backup_code_used")
             .success(true)
             .build();
@@ -910,7 +910,7 @@ mod backup_code_claim_tests {
             .unwrap()
         );
 
-        let audit = crate::services::audit_actor::AuditHandle::without_worker(db.clone());
+        let audit = crate::audit::actor::AuditHandle::without_worker(db.clone());
         let transaction = db.begin().await.unwrap();
         let event = MfaAuditBuilder::new(&user.id, "backup_code_used")
             .success(true)
@@ -946,9 +946,7 @@ mod backup_code_claim_tests {
     }
 }
 
-// ============================================================================
 // PASSWORD MANAGEMENT
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct SetPasswordRequest {
@@ -1001,7 +999,7 @@ pub async fn change_password(
         )
     })?;
 
-    let is_valid = crate::services::concurrency::verify_password_bounded(
+    let is_valid = crate::crypto::concurrency::verify_password_bounded(
         req.current_password.clone(),
         current_password_hash.clone(),
     )
@@ -1014,9 +1012,8 @@ pub async fn change_password(
     }
 
     let new_password_hash =
-        crate::services::concurrency::hash_password_bounded(req.new_password.clone()).await?;
+        crate::crypto::concurrency::hash_password_bounded(req.new_password.clone()).await?;
 
-    // Update password
     UserStore::update_password_hash(DB::Conn(&state.db), &user.id, &new_password_hash).await?;
 
     // Optionally revoke all other sessions for security
@@ -1067,9 +1064,8 @@ pub async fn set_password(
     }
 
     let password_hash =
-        crate::services::concurrency::hash_password_bounded(req.new_password.clone()).await?;
+        crate::crypto::concurrency::hash_password_bounded(req.new_password.clone()).await?;
 
-    // Update password
     UserStore::update_password_hash(DB::Conn(&state.db), &user.id, &password_hash).await?;
 
     Ok(Json(SetPasswordResponse {
@@ -1470,7 +1466,6 @@ pub async fn update_device_name(
         return Err(AppError::NotFound("Device not found".to_string()));
     }
 
-    // Get updated device
     let updated_device =
         UserDevicesStore::find_by_id_and_user(db.clone(), &device_id, &auth_user.claims.sub)
             .await?
@@ -1547,7 +1542,6 @@ pub async fn trust_device(
         return Err(AppError::NotFound("Device not found".to_string()));
     }
 
-    // Get updated device
     let updated_device =
         UserDevicesStore::find_by_id_and_user(db.clone(), &device_id, &auth_user.claims.sub)
             .await?
@@ -1604,71 +1598,27 @@ fn validate_email_format(email: &str) -> Result<()> {
 #[cfg(test)]
 mod password_route_tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::jwt::JwtService;
+    use crate::crypto::sso::OAuthClient;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::db::DB;
     use crate::entities::users;
     use crate::middleware::AuthUser;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::{users::UserStore, DB};
+    use crate::store::users::UserStore;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
     struct Fixture {
         state: AppState,
@@ -1705,7 +1655,7 @@ mod password_route_tests {
             .await
             .expect("create pw user");
         let current_password = "correct-horse-1".to_string();
-        let hashed = crate::services::concurrency::hash_password_bounded(current_password.clone())
+        let hashed = crate::crypto::concurrency::hash_password_bounded(current_password.clone())
             .await
             .expect("hash");
         UserStore::update_password_hash(DB::Conn(&db), &pw_model.id, &hashed)
@@ -1885,83 +1835,29 @@ mod password_route_tests {
 #[cfg(test)]
 mod mfa_flow_tests {
     use super::*;
-    use crate::auth::jwt::JwtService;
-    use crate::auth::sso::OAuthClient;
+
     use crate::billing::providers::disabled::DisabledBillingProvider;
-    use crate::config::Config;
+    use crate::crypto::sso::OAuthClient;
+
     use crate::middleware::AuthUser;
-    use crate::rsa_keys::GeneratedKey;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::db::DB;
     use crate::services::{
-        audit_actor::AuditHandle, events::EventDispatcher, metrics::MfaMetricsService,
-        risk_engine::RiskEngine,
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::{users::UserStore, DB};
+    use crate::store::users::UserStore;
     use axum::Extension;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
     use sea_orm::Database;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
-        Config {
-            database_url: "sqlite::memory:".to_string(),
-            jwt_expiration_hours: 24,
-            db_max_connections: 5,
-            db_min_connections: 1,
-            db_acquire_timeout_secs: 30,
-            db_idle_timeout_secs: 600,
-            db_max_lifetime_secs: 1800,
-            platform_github_client_id: None,
-            platform_github_client_secret: None,
-            platform_github_redirect_uri: None,
-            platform_google_client_id: None,
-            platform_google_client_secret: None,
-            platform_google_redirect_uri: None,
-            platform_microsoft_client_id: None,
-            platform_microsoft_client_secret: None,
-            platform_microsoft_redirect_uri: None,
-            platform_github_auth_url: None,
-            platform_github_token_url: None,
-            platform_github_user_api_url: None,
-            platform_google_auth_url: None,
-            platform_google_token_url: None,
-            platform_google_user_api_url: None,
-            platform_microsoft_auth_url: None,
-            platform_microsoft_token_url: None,
-            platform_microsoft_user_api_url: None,
-            stripe_secret_key: None,
-            stripe_webhook_secret: None,
-            stripe_api_base_url: None,
-            server_host: "127.0.0.1".to_string(),
-            server_port: 3001,
-            base_url: "http://localhost:3001".to_string(),
-            platform_dashboard_base_url: "http://localhost:3001".to_string(),
-            full_web_client_base_url: None,
-            platform_owner_email: None,
-            platform_owner_password: None,
-            managed_config_path: None,
-            managed_state_path: None,
-            managed_status_path: None,
-            managed_request_path: None,
-            disable_rate_limiting: true,
-            job_processor_interval_secs: 10,
-            job_processor_batch_size: 10,
-        }
-    }
+    use crate::test_support::test_config;
 
-    fn test_jwt_service(config: &Config) -> JwtService {
-        let rsa = GeneratedKey::generate().expect("rsa");
-        JwtService::new(
-            &STANDARD.encode(rsa.private_key_pem().expect("pem")),
-            &STANDARD.encode(rsa.public_key_pem().expect("pem")),
-            config.jwt_expiration_hours,
-            "test-key",
-            &config.base_url,
-        )
-        .expect("jwt")
-    }
+    use crate::test_support::test_jwt_service;
 
     fn request_info() -> Extension<RequestInfo> {
         Extension(RequestInfo {

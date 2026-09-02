@@ -94,8 +94,8 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
    (`api/src/middleware.rs`). CORS is not an authorization boundary.
 3. **Bearer token to authenticated user.** RS256 verification and expiration
    checks are followed by a database lookup for a non-expired session on
-   ordinary access-token requests (`api/src/auth/jwt.rs`,
-   `api/src/middleware.rs`, `api/src/store/sessions.rs`).
+   ordinary access-token requests (`api/crates/authos-crypto/src/crypto/jwt.rs`,
+   `api/src/middleware.rs`, `api/crates/authos-store/src/store/sessions.rs`).
 4. **User to organization/service.** Organization membership, built-in roles,
    relationship tuples, and resource-specific checks are performed in handlers
    and stores. The reviewed schema uses a shared database; no database
@@ -103,13 +103,13 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
    complete application query scoping.
 5. **API/SCIM key to service/organization.** API keys resolve to one service;
    SCIM tokens resolve to one organization. Both are stored as hashes and
-   checked by route middleware (`api/src/auth/api_key.rs`,
-   `api/src/middleware.rs`, `api/src/store/scim_tokens.rs`).
+   checked by route middleware (`api/crates/authos-crypto/src/crypto/api_key.rs`,
+   `api/src/middleware.rs`, `api/crates/authos-store/src/store/scim_tokens.rs`).
 6. **AuthOS to external endpoints.** Webhook, SIEM, configurable OAuth/OIDC,
    and configured Stripe/Polar billing paths use `SafeHttpClient` in the
    reviewed call sites. It resolves and pins public addresses, disables
    redirects, and billing/OAuth response readers enforce 64 KiB bounds
-   (`api/src/services/safe_http.rs`). GeoIP setup remains outside that shared
+   (`api/crates/authos-crypto/src/crypto/safe_http.rs`). GeoIP setup remains outside that shared
    policy and comprehensive proxy/DNS-rebinding integration evidence is not yet
    published.
 7. **Process to database and secret material.** The database stores identity,
@@ -118,7 +118,7 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
    secrets. Only the explicit `AUTHOS_ALLOW_UNENCRYPTED_DEVELOPMENT=true`
    escape hatch permits a missing key, and it is unsafe for persistent data;
    JWT signing keys are supplied as environment variables
-   (`api/src/encryption/mod.rs`, `api/src/main.rs`).
+   (`api/crates/authos-crypto/src/encryption/mod.rs`, `api/src/lib.rs`).
 8. **Foreground request to background work.** Email, webhook, refresh, cleanup,
    metrics, and audit work crosses asynchronous queues/tasks. Delivery,
    idempotency, shutdown, and failure handling require separate evidence.
@@ -128,7 +128,7 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
 ### Password, recovery, magic-link, MFA, and passkey flows
 
 - Passwords and MFA backup codes use Argon2 with per-secret salts
-  (`api/src/handlers/auth/password.rs`, `api/src/auth/mfa.rs`). Password login
+  (`api/src/handlers/auth/password.rs`, `api/crates/authos-crypto/src/crypto/mfa.rs`). Password login
   performs a dummy Argon2 verification for unknown/passwordless users to reduce
   a timing distinction. Deterministic handler tests qualify the response shape,
   and a bounded sampler supports deployment observations; neither is a
@@ -137,17 +137,17 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
   SHA-256 hashes with expirations. Reset and verification consumption perform
   conditional one-time updates; magic-link and WebAuthn challenge consumption
   delete the record and check affected rows. SQLite races prove one winner for
-  each (`api/src/store/password_reset.rs`, `api/src/store/email_verification.rs`,
-  `api/src/store/magic_links.rs`, `api/src/store/webauthn_challenges.rs`).
+  each (`api/crates/authos-store/src/store/password_reset.rs`, `api/crates/authos-store/src/store/email_verification.rs`,
+  `api/crates/authos-store/src/store/magic_links.rs`, `api/crates/authos-store/src/store/webauthn_challenges.rs`).
 - MFA pre-authentication tokens expire after five minutes. Consumption uses a
-  distributed lock keyed by JWT `jti` (`api/src/auth/jwt.rs`,
+  distributed lock keyed by JWT `jti` (`api/crates/authos-crypto/src/crypto/jwt.rs`,
   `api/src/handlers/auth/mfa.rs`). Multi-node replay behavior is **unverified**.
 - WebAuthn uses `webauthn-rs`, binds the RP to a domain-backed HTTPS
   `BASE_URL` (or localhost), stores five-minute ceremony state, checks the
   registering user, consumes challenges, and atomically applies the complete
   updated credential state without allowing stale ceremony state to overwrite a
-  concurrent winner (`api/src/main.rs`, `api/src/services/webauthn.rs`,
-  `api/src/store/user_passkeys.rs`, `api/src/handlers/auth/passkeys.rs`). Full
+  concurrent winner (`api/src/lib.rs`, `api/crates/authos-services/src/services/webauthn.rs`,
+  `api/crates/authos-store/src/store/user_passkeys.rs`, `api/src/handlers/auth/passkeys.rs`). Full
   origin/RP, real cloned-authenticator, multi-replica, and deployment
   enumeration-timing tests remain required.
 
@@ -155,14 +155,14 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
 
 - Access tokens are RS256 JWTs. Ordinary authenticated requests also require a
   non-expired session matching the token's SHA-256 hash, enabling session
-  deletion to revoke access (`api/src/auth/jwt.rs`, `api/src/middleware.rs`).
+  deletion to revoke access (`api/crates/authos-crypto/src/crypto/jwt.rs`, `api/src/middleware.rs`).
 - Refresh tokens are 256-bit opaque random values stored only as SHA-256 hashes.
   Rotation conditionally replaces the current hash and records the consumed
   ancestor in one transaction; the session row represents the family, and
   ancestor reuse deletes it. SQLite regressions cover hash-only storage,
   one-winner concurrent rotation, family revocation, expiry, and logout
-  (`api/src/auth/refresh_tokens.rs`, `api/src/handlers/auth/session.rs`,
-  `api/src/store/sessions.rs`). PostgreSQL/MySQL runtime migration and
+  (`api/crates/authos-crypto/src/crypto/refresh_tokens.rs`, `api/src/handlers/auth/session.rs`,
+  `api/crates/authos-store/src/store/sessions.rs`). PostgreSQL/MySQL runtime migration and
   distributed multi-replica race qualification remain **gaps**. The migration
   clears legacy plaintext refresh values and forces affected clients to
   reauthenticate.
@@ -173,7 +173,7 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
   management routes accept only management and impersonation profiles;
   resource and MFA tokens are rejected there. OAuth token exchange validates
   only the external-resource profile and exact requested resource audience
-  (`api/src/auth/jwt.rs`, `api/src/middleware.rs`,
+  (`api/crates/authos-crypto/src/crypto/jwt.rs`, `api/src/middleware.rs`,
   `api/src/handlers/auth/enterprise.rs`). A local confusion matrix covers wrong
   type/use/audience/issuer/actor/key/algorithm. External resource servers must
   still invoke the resource-audience validator with their configured audience;
@@ -184,7 +184,7 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
   and JWKS publishes the same complete verification set. Local regressions
   cover old/new overlap, active-only issuance, unknown and retired `kid`, wrong
   previous-key material, duplicate configuration, and multi-key JWKS
-  (`api/src/auth/jwt.rs`, `api/src/main.rs`). A release-candidate rollover with
+  (`api/crates/authos-crypto/src/crypto/jwt.rs`, `api/src/lib.rs`). A release-candidate rollover with
   downstream JWKS caches, retirement timing, restored keys, and emergency
   compromise response remains **unverified**.
 
@@ -193,13 +193,13 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
 - OAuth state is persisted with an expiration and flow context; callbacks load
   and delete it before token exchange. PKCE is generated for upstream flows and
   enforced for public service types (`api/src/handlers/auth/oauth.rs`,
-  `api/src/store/oauth_states.rs`). Concurrency and all error branches require
+  `api/crates/authos-store/src/store/oauth_states.rs`). Concurrency and all error branches require
   replay tests.
 - Registered service redirect URIs are revalidated before service redirects in
   reviewed callback paths. A complete open-redirect inventory remains
   **unverified** because several flows construct return locations.
 - Device codes have separate rate limits and database state
-  (`api/src/router.rs`, `api/src/store/device_codes.rs`). Polling interval,
+  (`api/src/router.rs`, `api/crates/authos-store/src/store/device_codes.rs`). Polling interval,
   binding, expiry, and concurrent exchange require end-to-end evidence.
 - AuthOS does not currently provide an OAuth authorization-code server or
   OpenID Connect provider and does not issue ID tokens. Standards discovery is
@@ -245,7 +245,7 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
   (`api/src/middleware.rs`, `api/src/handlers/scim/`).
 - Service API middleware resolves a hashed API key by prefix, performs a
   constant-time hash comparison, checks expiration, and supplies the bound
-  service plus serialized permissions (`api/src/auth/api_key.rs`,
+  service plus serialized permissions (`api/crates/authos-crypto/src/crypto/api_key.rs`,
   `api/src/middleware.rs`). Every service handler still needs a negative test
   proving its permission and resource binding.
 - Tenant administration handlers generally resolve an organization from the

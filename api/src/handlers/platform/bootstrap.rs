@@ -1,10 +1,11 @@
-use crate::auth::jwt::JwtService;
+use crate::crypto::jwt::JwtService;
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::handlers::auth::session::RefreshTokenResponse;
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::state::AppState;
 use crate::store::{
-    distributed_locks::DistributedLockStore, sessions::SessionStore, users::UserStore, DB,
+    distributed_locks::DistributedLockStore, sessions::SessionStore, users::UserStore,
 };
 use axum::{extract::State, Extension, Json};
 use chrono::Utc;
@@ -72,10 +73,10 @@ pub async fn apply_managed_config(
     require_platform_owner(&auth_user)?;
 
     let paths = managed_paths(&state)?;
-    let request_path =
-        state.config.managed_request_path.clone().ok_or_else(|| {
-            AppError::NotFound("Managed apply queue is not configured".to_string())
-        })?;
+    let request_path = state
+        .config
+        .managed_request_path
+        .ok_or_else(|| AppError::NotFound("Managed apply queue is not configured".to_string()))?;
 
     let queued_status = json!({
         "status": "queued",
@@ -142,7 +143,7 @@ pub async fn bootstrap_login(
     let access_token = state
         .jwt_service
         .create_token(&user.id, &user.email, true, None, None)?;
-    let refresh_token = crate::auth::refresh_tokens::generate();
+    let refresh_token = crate::crypto::refresh_tokens::generate();
     let expires_at =
         (Utc::now() + chrono::Duration::hours(state.config.jwt_expiration_hours)).naive_utc();
     let refresh_expires_at = (Utc::now() + chrono::Duration::days(30)).naive_utc();

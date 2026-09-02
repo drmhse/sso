@@ -1,6 +1,6 @@
-use crate::auth::jwt::JwtService;
-use crate::auth::sso::OAuthClient;
 use crate::billing::BillingProvider;
+use crate::crypto::jwt::JwtService;
+use crate::crypto::sso::OAuthClient;
 use axum::extract::FromRef;
 use moka::future::Cache;
 use sea_orm::DatabaseConnection;
@@ -33,10 +33,8 @@ pub struct AppState {
     // Max capacity: 10,000 users (adjust based on available RAM)
     pub permission_cache: Cache<String, Vec<String>>,
 
-    // User Model Cache: Key = user_id (String), Value = User model
-    // TTL: 30 seconds (security-conscious - faster permission revocation detection)
-    // Max capacity: 10,000 users
-    // IMPORTANT: Invalidate cache on user updates (password change, role change, etc.)
+    // Short TTL so a revoked permission or changed password stops working
+    // quickly; writers must still invalidate explicitly.
     pub user_cache: Cache<String, crate::entities::users::Model>,
 
     // Security Audit Item 3: CORS Domain Cache for dynamic CORS validation
@@ -46,7 +44,7 @@ pub struct AppState {
 
     // Buffered audit actor: removes 66% of write pressure from login critical path
     // Batches audit events and writes them asynchronously with retry on DB locks
-    pub audit_actor: crate::services::audit_actor::AuditHandle,
+    pub audit_actor: crate::audit::actor::AuditHandle,
 
     pub config: crate::config::Config,
 }

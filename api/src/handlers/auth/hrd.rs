@@ -1,8 +1,8 @@
+use crate::db::DB;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::store::{
-    organizations::OrganizationStore, services::ServiceStore,
-    verified_domains::VerifiedDomainStore, DB,
+    organizations::OrganizationStore, services::ServiceStore, verified_domains::VerifiedDomainStore,
 };
 use axum::{
     extract::{Query, State},
@@ -60,17 +60,10 @@ pub struct AuthContextResponse {
     pub support_available: bool,
 }
 
-/// Home Realm Discovery: Lookup an email address to determine which IdP to use
+/// Home Realm Discovery: map an email domain to its upstream connection.
 ///
-/// This endpoint implements HRD (Home Realm Discovery) which allows users to
-/// simply enter their email address, and the system automatically determines
-/// which identity provider they should authenticate with.
-///
-/// # Flow
-/// 1. User enters email (e.g., "john@acme.com")
-/// 2. System extracts domain ("acme.com")
-/// 3. System checks if domain is verified and mapped to an upstream provider
-/// 4. Returns the connection ID if found, or indicates fallback auth method
+/// Only *verified* domains resolve, otherwise anyone could claim a tenant's
+/// domain and redirect its users. Unmapped domains fall back to local auth.
 pub async fn lookup_email(
     State(state): State<AppState>,
     Json(payload): Json<LookupEmailRequest>,
@@ -191,8 +184,7 @@ pub async fn get_auth_context(
                 .redirect_uris
                 .as_deref()
                 .and_then(|uris| serde_json::from_str::<Vec<String>>(uris).ok())
-                .map(|uris| !uris.is_empty() && uris.iter().any(|uri| uri == redirect_uri))
-                .unwrap_or(false)
+                .is_some_and(|uris| !uris.is_empty() && uris.iter().any(|uri| uri == redirect_uri))
         });
 
         Some(AuthServiceContext {

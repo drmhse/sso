@@ -49,6 +49,7 @@ import {
 } from '../types';
 import { AuditLogsModule } from './organizations/audit';
 import { WebhooksModule } from './organizations/webhooks';
+import { DomainRoutesModule } from './organizations/domain-routes';
 import { UpstreamProvidersModule } from './organizations/upstream-providers';
 
 /**
@@ -58,6 +59,7 @@ export class OrganizationsModule {
   constructor(private http: HttpClient) {
     this.auditLogs = new AuditLogsModule(http);
     this.webhooks = new WebhooksModule(http);
+    this.domainRoutes = new DomainRoutesModule(http);
     this.upstreamProviders = new UpstreamProvidersModule(http);
   }
 
@@ -70,6 +72,7 @@ export class OrganizationsModule {
    * Webhooks management
    */
   public webhooks: WebhooksModule;
+  public domainRoutes: DomainRoutesModule;
 
   /**
    * Upstream provider (Enterprise SSO) management

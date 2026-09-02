@@ -1,3 +1,4 @@
+use crate::db::DB;
 use crate::error::AppError;
 use crate::middleware::AuthUser;
 use crate::services::permission_service::{PermissionService, CAP_AUDIT_LOGS_VIEW};
@@ -7,7 +8,6 @@ use crate::store::{
         LoginEventStore, LoginTrendPoint, LoginsByProvider, LoginsByService, RecentLogin,
     },
     organizations::OrganizationStore,
-    DB,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -48,7 +48,6 @@ pub async fn get_login_trends(
         .and_hms_opt(0, 0, 0)
         .unwrap();
 
-    // Query login trends using store
     let trends = LoginEventStore::get_login_trends(
         DB::Conn(&state.db),
         &organization.id,

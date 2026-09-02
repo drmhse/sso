@@ -1,0 +1,28 @@
+[package]
+name = "authos-audit"
+version = "0.1.40"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
+migration = { path = "../../migration", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0.103"
+tracing = "0.1"
+authos-core = { path = "../authos-core", default-features = false }
+authos-entities = { path = "../authos-entities", default-features = false }
+authos-db = { path = "../authos-db", default-features = false }
+
+[features]
+# Test-only shortcuts. Reachable only through dev-dependencies.
+test-support = []
+
+[dev-dependencies]
+authos-testkit = { path = "../authos-testkit", default-features = false }
+authos-store = { path = "../authos-store", default-features = false }
+authos-crypto = { path = "../authos-crypto", features = ["test-support"], default-features = false }
