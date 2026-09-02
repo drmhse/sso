@@ -7,6 +7,23 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.10 - 2026-09-02
+
+### Changed
+
+- The runtime image is 42% smaller: 19.67 MiB to 11.41 MiB compressed for
+  `sqlite-amd64`, measured by building both Dockerfiles against the same
+  release binary. Two causes. `RUN chmod 0555 /app/sso` ran after the binary
+  was copied, and changing a file's mode rewrites the whole file into a new
+  layer, so the 17.4 MiB binary was stored twice; the mode is now set by
+  `COPY --chmod`. And the image installed `libgcc` and `ca-certificates`,
+  neither of which it needs: the binaries are statically linked musl with no
+  dynamic dependencies, and `alpine:3.20` already ships
+  `ca-certificates-bundle`. Verified in the rebuilt image that the binary still
+  executes and unwinds a panic without `libgcc`, that the entrypoint still runs
+  at mode 0555, and that the trust store and the healthcheck's `wget` are
+  present.
+
 ## 0.8.9 - 2026-09-02
 
 ### Changed
