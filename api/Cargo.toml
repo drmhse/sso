@@ -146,3 +146,11 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Test fixtures generate an RSA key per test, which costs ~2s unoptimised and
+# ~0.05s here. Applies to the test profile too, since it inherits dev.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
