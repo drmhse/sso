@@ -790,8 +790,10 @@ jobs:
     needs: qualify
     uses: ./.github/workflows/publish-npm-packages.yml
     with:
-      mode: prepare
+      # Ordered so check:release-policy still sees `mode: prepare` against the
+      # permission ceiling below it.
       source_qualified: true
+      mode: prepare
     permissions:
       # This is the permission ceiling for every job in the reusable workflow.
       # Its prepare/qualification jobs still narrow themselves to contents:read;
