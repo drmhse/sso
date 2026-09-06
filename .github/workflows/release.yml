@@ -149,9 +149,13 @@ jobs:
         with:
           workspaces: api -> target
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit@0.22.2
+
       - name: Audit Rust dependencies
         run: |
-          cargo install cargo-audit --locked --version 0.22.2
           cargo audit --file api/Cargo.lock
           cargo audit --file api/migration/Cargo.lock
 
@@ -782,10 +786,12 @@ jobs:
   prepare_npm:
     name: Prepare coordinated npm artifacts
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    # Consumes no build output; `needs: build` only serialised it behind the images.
+    needs: qualify
     uses: ./.github/workflows/publish-npm-packages.yml
     with:
       mode: prepare
+      source_qualified: true
     permissions:
       # This is the permission ceiling for every job in the reusable workflow.
       # Its prepare/qualification jobs still narrow themselves to contents:read;

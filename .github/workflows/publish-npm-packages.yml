@@ -13,6 +13,11 @@ on:
         required: false
         default: 0.0.0-dry-run.0
         type: string
+      source_qualified:
+        description: Caller already qualified this exact SHA, so skip re-qualifying it
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -31,7 +36,7 @@ concurrency:
 jobs:
   qualify:
     name: Qualify npm release source
-    if: inputs.mode != 'publish'
+    if: inputs.mode != 'publish' && !inputs.source_qualified
     runs-on: ubuntu-latest
     timeout-minutes: 60
     services:
@@ -163,9 +168,13 @@ jobs:
         with:
           workspaces: api -> target
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit@0.22.2
+
       - name: Audit Rust dependencies
         run: |
-          cargo install cargo-audit --locked --version 0.22.2
           cargo audit --file api/Cargo.lock
           cargo audit --file api/migration/Cargo.lock
 
@@ -217,7 +226,8 @@ jobs:
 
   package:
     name: Build immutable npm artifacts
-    if: inputs.mode != 'publish'
+    # `skipped` is the source_qualified path; a skipped need would otherwise skip this too.
+    if: ${{ !cancelled() && inputs.mode != 'publish' && (needs.qualify.result == 'success' || needs.qualify.result == 'skipped') }}
     needs: qualify
     runs-on: ubuntu-latest
     permissions:
