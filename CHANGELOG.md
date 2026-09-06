@@ -7,6 +7,23 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.12 - 2026-09-06
+
+### Fixed
+
+- The release and publish workflows can complete. Both gated on
+  `npm audit --audit-level=moderate` over the whole dependency tree, which fails
+  on three moderate advisories in `qs` that are reachable only through `express`.
+  `@drmhse/authos-node` declares `express` as a dev and a peer dependency, so a
+  consumer installing the package never receives it and supplies its own — no
+  shipped artifact is affected. There is also nowhere to move: `qs` 6.15.3 is the
+  newest release and the advisory range covers it, and npm's advertised fix is
+  `express` 5, a breaking change. Both gates now audit production dependencies,
+  where the tree reports no vulnerabilities. `security.yml` still audits
+  everything, so the advisory stays visible and will be acted on when `qs`
+  publishes a fix. The v0.8.11 release failed at this gate and published no
+  artifacts.
+
 ## 0.8.11 - 2026-09-06
 
 ### Fixed
