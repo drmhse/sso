@@ -7,6 +7,26 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.11 - 2026-09-06
+
+### Fixed
+
+- The API crate no longer rebuilds on every single build. `api/build.rs` emitted
+  `cargo:rerun-if-changed` for `../lite-web-client/dist` before checking whether
+  that path exists, and cargo treats a `rerun-if-changed` target that is missing
+  as permanently stale — it says so directly, as
+  `StaleItem(MissingFile { path: ".../lite-web-client/dist" })`. Because `dist`
+  is gitignored, it is absent in every fresh clone and on every CI runner, so
+  the build script re-ran and all three `sso` targets re-checked on every build,
+  all 50,989 lines of the root package, whether or not anything had changed. The
+  script now emits only for paths that exist, and tracks the
+  `../lite-web-client` directory itself so that building the lite client for the
+  first time still retriggers: creating `dist` moves the parent's mtime. Changes
+  to an existing `dist` file retrigger as before. Measured on this workspace
+  with `dist` absent: a no-op `cargo check --workspace` goes from 1.30s to
+  0.18s, and from 6.00s to 0.47s with the target directory wiped against a warm
+  build cache — one crate rebuilt becomes none, out of 444 units.
+
 ## 0.8.10 - 2026-09-02
 
 ### Changed
