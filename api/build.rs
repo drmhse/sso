@@ -16,9 +16,12 @@ fn main() {
     let staged_dist_dir = out_dir.join("lite-web-dist");
 
     println!("cargo:rerun-if-env-changed=AUTHOS_BUILD_VERSION");
-    emit_rerun_if_changed(&package_json);
-    emit_rerun_if_changed(&vite_config);
-    emit_rerun_if_changed(&entry_html);
+    // The directory itself, so building the lite client for the first time still
+    // retriggers: creating `dist` inside it moves its mtime.
+    emit_rerun_if_changed(&workspace_dir);
+    emit_existing_rerun_if_changed(&package_json);
+    emit_existing_rerun_if_changed(&vite_config);
+    emit_existing_rerun_if_changed(&entry_html);
     emit_rerun_if_changed_recursive(&src_dir);
     emit_rerun_if_changed_recursive(&dist_dir);
     emit_git_rerun_hints(&manifest_dir);
@@ -38,12 +41,20 @@ fn emit_rerun_if_changed(path: &Path) {
     println!("cargo:rerun-if-changed={}", path.display());
 }
 
-fn emit_rerun_if_changed_recursive(path: &Path) {
-    emit_rerun_if_changed(path);
+fn emit_existing_rerun_if_changed(path: &Path) {
+    if path.exists() {
+        emit_rerun_if_changed(path);
+    }
+}
 
+fn emit_rerun_if_changed_recursive(path: &Path) {
+    // Emitting a path that does not exist makes cargo hold the target stale
+    // forever, so `dist` being unbuilt would rebuild the crate every time.
     if !path.exists() {
         return;
     }
+
+    emit_rerun_if_changed(path);
 
     let mut entries = fs::read_dir(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
