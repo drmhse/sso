@@ -97,8 +97,11 @@ jobs:
       - name: Install workspace dependencies
         run: npm ci
 
+      # Production scope: this gate decides whether a release ships, and dev and
+      # peer dependencies are never installed by a consumer. security.yml still
+      # audits everything, so an advisory here stays visible.
       - name: Audit npm dependencies
-        run: npm audit --audit-level=moderate
+        run: npm audit --audit-level=moderate --omit=dev
 
       - name: Validate trust and installer metadata
         run: |
